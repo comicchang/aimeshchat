@@ -144,8 +144,9 @@ class SSHTransport(Transport):
 
         Ensures the ControlMaster is alive before executing.
 
-        On connection errors (exit 255 + SSH error patterns), retries
-        with ``host.fallback_ssh_alias`` if available.
+        On connection errors (exit 255 + SSH error patterns) **or**
+        ControlMaster creation failures, retries with
+        ``host.fallback_ssh_alias`` if available.
         """
         alias = host.ssh_alias
         cm = self._masters.get(alias)
@@ -153,45 +154,21 @@ class SSHTransport(Transport):
             cm = ControlMaster(alias, ssh_bin=self._ssh)
             self._masters[alias] = cm
 
-        # Ensure master is alive (lazy warm).
-        if not cm.is_alive():
-            cm.create()
+        # Ensure master is alive (lazy warm) — catch failure for fallback.
+        try:
+            if not cm.is_alive():
+                cm.create()
+        except TransportError:
+            if not host.fallback_ssh_alias:
+                raise
+            log.warning(
+                "ControlMaster create for %s failed, retrying with fallback %s",
+                alias,
+                host.fallback_ssh_alias,
+            )
+            return self._execute_on_fallback(request, host, workdir, session_id)
 
-        # Build remote command.
-        # shell_prefix must be expanded on the REMOTE host, not locally.
-        # We combine everything into a single shell string passed to ssh,
-        # using shlex.quote to prevent local expansion of $HOME/$PATH.
-        remote_exec = f"{self._python} -m codeagent.remote_exec"
-        if host.shell_prefix:
-            # Wrap in sh -c so shell_prefix vars expand on remote side
-            remote_cmd_str = f"{host.shell_prefix}; {remote_exec}"
-            remote_cmd = ["sh", "-c", remote_cmd_str]
-        else:
-            remote_cmd = [self._python, "-m", "codeagent.remote_exec"]
-
-        req = make_request(
-            command="run",
-            task=request.task,
-            workdir=workdir or request.workdir,
-            backend=request.backend or "",
-            agent=request.agent,
-            model=request.model,
-            session_id=session_id,
-            skip_permissions=request.skip_permissions,
-            timeout=_DEFAULT_TIMEOUT,
-        )
-
-        ssh_cmd = cm.ssh_cmd(*remote_cmd)
-        log.debug("SSH execute: %s", " ".join(ssh_cmd))
-
-        result = _run_ssh_wire(
-            ssh_cmd,
-            req,
-            workdir=workdir,
-            host_name=alias,
-            backend=request.backend or "",
-            timeout=_DEFAULT_TIMEOUT,
-        )
+        result = self._run_on_host(request, host, cm, alias, workdir, session_id)
 
         # On connection error (exit 255 + SSH error patterns), retry with fallback.
         if (
@@ -204,29 +181,79 @@ class SSHTransport(Transport):
                 alias,
                 host.fallback_ssh_alias,
             )
-            fallback_cm = self._masters.get(host.fallback_ssh_alias)
-            if fallback_cm is None:
-                fallback_cm = ControlMaster(
-                    host.fallback_ssh_alias, ssh_bin=self._ssh
-                )
-                self._masters[host.fallback_ssh_alias] = fallback_cm
-
-            if not fallback_cm.is_alive():
-                fallback_cm.create()
-
-            fallback_ssh_cmd = fallback_cm.ssh_cmd(*remote_cmd)
-            log.debug("SSH fallback execute: %s", " ".join(fallback_ssh_cmd))
-
-            result = _run_ssh_wire(
-                fallback_ssh_cmd,
-                req,
-                workdir=workdir,
-                host_name=host.fallback_ssh_alias,
-                backend=request.backend or "",
-                timeout=_DEFAULT_TIMEOUT,
-            )
+            return self._execute_on_fallback(request, host, workdir, session_id)
 
         return result
+
+    # ── Internal helpers ────────────────────────────────────────────────
+
+    def _execute_on_fallback(
+        self,
+        request: RunRequest,
+        host: HostSpec,
+        workdir: str,
+        session_id: str | None = None,
+    ) -> RunResult:
+        """Execute using ``host.fallback_ssh_alias``.
+
+        Called when the primary ControlMaster fails to create **or** the
+        primary execution returns exit 255 with an SSH error pattern.
+        """
+        fallback_alias = host.fallback_ssh_alias
+        fallback_cm = self._masters.get(fallback_alias)
+        if fallback_cm is None:
+            fallback_cm = ControlMaster(fallback_alias, ssh_bin=self._ssh)
+            self._masters[fallback_alias] = fallback_cm
+
+        if not fallback_cm.is_alive():
+            fallback_cm.create()
+
+        return self._run_on_host(
+            request, host, fallback_cm, fallback_alias, workdir, session_id
+        )
+
+    def _run_on_host(
+        self,
+        request: RunRequest,
+        host: HostSpec,
+        cm: ControlMaster,
+        host_name: str,
+        workdir: str,
+        session_id: str | None = None,
+    ) -> RunResult:
+        """Build remote command and execute on *cm*."""
+        # shell_prefix must be expanded on the REMOTE host, not locally.
+        remote_exec = f"{self._python} -m codeagent.remote_exec"
+        if host.shell_prefix:
+            remote_cmd_str = f"{host.shell_prefix}; {remote_exec}"
+            remote_cmd = ["sh", "-c", remote_cmd_str]
+        else:
+            remote_cmd = [self._python, "-m", "codeagent.remote_exec"]
+
+        req = make_request(
+            command="run",
+            task=request.task,
+            workdir=workdir or request.workdir,
+            backend=request.backend or "",
+            agent=request.agent,
+            model=request.model,
+            skills=request.skills,
+            session_id=session_id,
+            skip_permissions=request.skip_permissions,
+            timeout=_DEFAULT_TIMEOUT,
+        )
+
+        ssh_cmd = cm.ssh_cmd(*remote_cmd)
+        log.debug("SSH execute: %s", " ".join(ssh_cmd))
+
+        return _run_ssh_wire(
+            ssh_cmd,
+            req,
+            workdir=workdir,
+            host_name=host_name,
+            backend=request.backend or "",
+            timeout=_DEFAULT_TIMEOUT,
+        )
 
 
 # ── SSH wire-protocol runner ────────────────────────────────────────────

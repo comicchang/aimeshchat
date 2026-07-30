@@ -652,3 +652,19 @@ class TestProcessGroupIsolation:
         assert "_run_go_wrapper" not in code
         assert "_run_omp" not in code
         assert "subprocess.Popen" not in code
+
+
+class TestMakeRequest:
+    """make_request builds correct wire dicts."""
+
+    def test_skills_included_when_set(self):
+        req = make_request(command="run", task="t", workdir="/w", timeout=10, skills="my-skills")
+        assert req["skills"] == "my-skills"
+
+    def test_skills_omitted_when_none(self):
+        req = make_request(command="run", task="t", workdir="/w", timeout=10)
+        assert "skills" not in req
+
+    def test_skills_omitted_when_empty(self):
+        req = make_request(command="run", task="t", workdir="/w", timeout=10, skills="")
+        assert "skills" not in req

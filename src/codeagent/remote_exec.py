@@ -73,6 +73,7 @@ def _handle_run(req: dict) -> None:
     model = req.get("model")
     resume_session_id = req.get("resume_session_id")
     skip_permissions = req.get("skip_permissions", True)
+    skills = req.get("skills")
     timeout = req.get("timeout", 600)
 
     _send({"type": "accepted", "wire_version": WIRE_VERSION})
@@ -90,6 +91,7 @@ def _handle_run(req: dict) -> None:
         backend=backend,
         agent=agent,
         model=model,
+        skills=skills,
         skip_permissions=skip_permissions,
         timeout=timeout,
         resume_session_id=resume_session_id,

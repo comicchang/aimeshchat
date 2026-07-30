@@ -229,6 +229,7 @@ def make_request(
     backend: str = "",
     agent: str | None = None,
     model: str | None = None,
+    skills: str | None = None,
     session_id: str | None = None,
     skip_permissions: bool = True,
     timeout: int = 600,
@@ -248,6 +249,8 @@ def make_request(
             req["agent"] = agent
         if model:
             req["model"] = model
+        if skills:
+            req["skills"] = skills
         if session_id:
             req["resume_session_id"] = session_id
         req["skip_permissions"] = skip_permissions

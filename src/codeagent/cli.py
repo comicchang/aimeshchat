@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
@@ -17,8 +19,11 @@ from codeagent.domain import (
 )
 from codeagent.routing.resolver import resolve_target
 from codeagent.session.registry import SessionRegistry
+from codeagent.transport.base import TransportError
 from codeagent.transport.local import LocalTransport
 from codeagent.transport.ssh import SSHTransport
+
+log = logging.getLogger(__name__)
 
 
 def _get_transport(host: HostSpec, repo_map=None):
@@ -65,6 +70,8 @@ def _build_parser() -> argparse.ArgumentParser:
     route_p.add_argument("--dry-run", action="store_true")
     route_p.add_argument("--new-session", action="store_true")
     route_p.add_argument("--no-auto-resume", action="store_true")
+    route_p.add_argument("--skip-permissions", action="store_true", default=False)
+    route_p.add_argument("--skills")
     route_p.add_argument("--session-key")
     route_p.add_argument("--output")
 
@@ -126,9 +133,26 @@ def _execute(request: RunRequest, target: Target, registry: SessionRegistry, rep
                 result = transport.execute(request, host, target.workdir, session_id=backend_session_id)
             else:
                 transport = _get_transport(target.host, repo_map)
-                if hasattr(transport, 'warm'):
-                    transport.warm(target.host)
-                result = transport.execute(request, target.host, target.workdir, session_id=backend_session_id)
+                try:
+                    if hasattr(transport, 'warm'):
+                        transport.warm(target.host)
+                    result = transport.execute(request, target.host, target.workdir, session_id=backend_session_id)
+                except TransportError:
+                    if not target.host.fallback_ssh_alias:
+                        raise
+                    log.warning(
+                        "warm/execute for %s failed, retrying with fallback %s",
+                        target.host.ssh_alias,
+                        target.host.fallback_ssh_alias,
+                    )
+                    fallback_host = dataclasses.replace(
+                        target.host,
+                        ssh_alias=target.host.fallback_ssh_alias,
+                        fallback_ssh_alias="",
+                    )
+                    if hasattr(transport, 'warm'):
+                        transport.warm(fallback_host)
+                    result = transport.execute(request, fallback_host, target.workdir, session_id=backend_session_id)
         except Exception as exc:
             # Transport failed — mark session as failed
             registry.mark_failed(ns_key)
@@ -189,6 +213,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "exit_code": result.returncode,
         }, indent=2))
     return result.returncode
+
+
+def _build_route_prompt(topic: str, task: str) -> str:
+    """Wrap task with standard route prompt for structured output."""
+    return (
+        "你正在执行一项代码调研任务。\n\n"
+        "输出要求：\n"
+        "1. 直接输出调研结果\n"
+        "2. 结构清晰，使用标题分段\n"
+        "3. 关键发现用代码引用佐证\n"
+        "4. 结尾给出结论和建议\n\n"
+        f"主题：{topic}\n\n"
+        f"任务：{task}"
+    )
 
 
 def _cmd_route(args: argparse.Namespace) -> int:
@@ -253,6 +291,10 @@ def _cmd_route(args: argparse.Namespace) -> int:
     except KeyError:
         print(f"error: topic not found: {topic_name}", file=sys.stderr)
         return 1
+
+    # Wrap task with structured prompt unless --raw
+    if not getattr(args, 'raw', False):
+        task_text = _build_route_prompt(topic_name, task_text)
 
     request = RunRequest(
         task=task_text,

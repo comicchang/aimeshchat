@@ -13,6 +13,7 @@ from codeagent.transport.base import TransportError
 from codeagent.transport.control_master import ControlMaster, list_sockets, socket_path, stop_by_alias, stop_all
 from codeagent.transport.local import LocalTransport, _run_wire
 from codeagent.transport.ssh import SSHTransport, _run_ssh_wire, _is_ssh_error
+from codeagent.transport.relay import RelayTransport
 from codeagent.wire.protocol import (
     MSG_ACCEPTED,
     MSG_ERROR,
@@ -823,6 +824,61 @@ class TestSSHTransport:
 
         mock_cm.create.assert_called_once()
 
+    @patch("codeagent.transport.ssh.ControlMaster")
+    @patch("subprocess.Popen")
+    def test_execute_fallback_on_warm_failure(self, mock_popen: MagicMock, mock_cm_cls: MagicMock):
+        """On ControlMaster create failure, retries with fallback_ssh_alias."""
+        primary_cm = MagicMock()
+        primary_cm.is_alive.return_value = False
+        primary_cm.create.side_effect = TransportError("failed to create master for primary")
+
+        fallback_cm = MagicMock()
+        fallback_cm.is_alive.return_value = True
+        fallback_cm.ssh_cmd.return_value = [
+            "ssh", "-S", "/tmp/fallback.sock", "fallback", "python3", "-m", "codeagent.remote_exec",
+        ]
+
+        mock_cm_cls.side_effect = [primary_cm, fallback_cm]
+        mock_proc_ok = _mock_popen_success()
+        mock_popen.return_value = mock_proc_ok
+
+        transport = SSHTransport()
+        host = HostSpec(
+            name="remote",
+            ssh_alias="primary",
+            hostnames=("primary",),
+            fallback_ssh_alias="fallback",
+        )
+        req = _make_run_request()
+        result = transport.execute(req, host, "/workdir")
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        assert result.host == "fallback"
+        primary_cm.create.assert_called_once()
+        fallback_cm.create.assert_not_called()  # fallback is_alive → True
+        # Only one Popen call — fallback execution only
+        assert mock_popen.call_count == 1
+
+    @patch("codeagent.transport.ssh.ControlMaster")
+    def test_execute_warm_failure_no_fallback_raises(self, mock_cm_cls: MagicMock):
+        """ControlMaster create failure without fallback re-raises TransportError."""
+        mock_cm = MagicMock()
+        mock_cm.is_alive.return_value = False
+        mock_cm.create.side_effect = TransportError("failed to create master")
+        mock_cm_cls.return_value = mock_cm
+
+        transport = SSHTransport()
+        host = HostSpec(
+            name="remote",
+            ssh_alias="primary",
+            hostnames=("primary",),
+            fallback_ssh_alias="",
+        )
+        req = _make_run_request()
+        with pytest.raises(TransportError, match="failed to create master"):
+            transport.execute(req, host, "/workdir")
+
     def test_check_returns_false_for_unknown_host(self):
         """check() returns False for hosts with no ControlMaster."""
         transport = SSHTransport()
@@ -927,3 +983,72 @@ class TestIsSSHError:
 
     def test_multiple_patterns(self):
         assert _is_ssh_error("Connection refused and also Host key verification failed") is True
+
+
+# ---------------------------------------------------------------------------
+# RelayTransport tests
+# ---------------------------------------------------------------------------
+
+
+class TestRelayTransport:
+    """Tests for RelayTransport."""
+
+    def test_relay_transport_init(self, tmp_path: Path):
+        """RelayTransport requires a valid relay_zsh path."""
+        relay_zsh = tmp_path / "relay.zsh"
+        relay_zsh.touch()
+        transport = RelayTransport(str(relay_zsh))
+        assert transport._relay_zsh == str(relay_zsh)
+
+    def test_relay_transport_init_missing_zsh(self):
+        """RelayTransport raises TransportError if relay_zsh is empty."""
+        with pytest.raises(TransportError, match="relay_zsh is required"):
+            RelayTransport("")
+
+    def test_relay_transport_init_not_found(self, tmp_path: Path):
+        """RelayTransport raises TransportError if relay_zsh doesn't exist."""
+        with pytest.raises(TransportError, match="relay_zsh not found"):
+            RelayTransport(str(tmp_path / "nonexistent.zsh"))
+
+    def test_relay_builds_correct_command(self, tmp_path: Path):
+        """RelayTransport.execute builds correct relay command."""
+        relay_zsh = tmp_path / "relay.zsh"
+        relay_zsh.touch()
+        transport = RelayTransport(str(relay_zsh))
+
+        host = HostSpec(
+            name="test",
+            ssh_alias="clouddev-user.android.xiaomi.com",
+            hostnames=("clouddev-user.android.xiaomi.com",),
+            description="test relay host",
+        )
+        request = _make_run_request(
+            task="test task",
+            workdir="/tmp",
+            backend="opencode",
+            skip_permissions=True,
+            timeout=120,
+        )
+
+        # Mock _run_with_pty to capture argv
+        captured_argv = None
+
+        def mock_run_with_pty(argv, timeout=600):
+            nonlocal captured_argv
+            captured_argv = argv
+            return RunResult(returncode=0, stdout="", stderr="")
+
+        transport._run_with_pty = mock_run_with_pty
+
+        transport.execute(request, host, "/tmp")
+
+        assert captured_argv is not None
+        assert captured_argv[0] == "zsh"
+        assert captured_argv[1] == "-c"
+        # The command should contain source, relay-login, and the target
+        cmd = captured_argv[2]
+        assert "source" in cmd
+        assert "relay-login" in cmd
+        assert "clouddev-user.android.xiaomi.com" in cmd
+        assert "base64 -d" in cmd
+        assert "codeagent.remote_exec" in cmd

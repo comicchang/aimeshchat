@@ -66,6 +66,7 @@ class LocalTransport(Transport):
             backend=request.backend or "",
             agent=request.agent,
             model=request.model,
+            skills=request.skills,
             session_id=session_id,
             skip_permissions=request.skip_permissions,
         )

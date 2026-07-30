@@ -17,7 +17,9 @@ import os
 import pty
 import select
 import shlex
+import signal
 import subprocess
+import sys
 import time
 from typing import Optional
 
@@ -29,8 +31,6 @@ from codeagent.wire.protocol import (
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
-    decode_line,
-    encode_line,
 )
 
 log = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ class RelayTransport(Transport):
             "workdir": workdir,
             "backend": request.backend or "opencode",
             "skip_permissions": request.skip_permissions,
-            "timeout": request.timeout if hasattr(request, 'timeout') else _EXEC_TIMEOUT,
+            "timeout": request.timeout,
         }
         if request.agent:
             wire_req["agent"] = request.agent
@@ -100,110 +100,166 @@ class RelayTransport(Transport):
             remote_cmd = f"{host.shell_prefix}; {remote_cmd}"
 
         # Build relay command: zsh -c "source <relay_zsh> && relay-login <target> <remote_cmd>"
-        target = host.ssh_alias  # relay-login target (e.g., clouddev-user.android.xiaomi.com)
+        target = host.ssh_alias
         relay_cmd = (
             f"source {shlex.quote(self._relay_zsh)} && "
             f"relay-login {shlex.quote(target)} {shlex.quote(remote_cmd)}"
         )
         argv = ["zsh", "-c", relay_cmd]
 
-        return self._run_with_pty(argv)
+        return self._run_with_pty(argv, timeout=request.timeout)
 
-    def _run_with_pty(self, argv: list[str]) -> RunResult:
+    def _run_with_pty(self, argv: list[str], timeout: int = _EXEC_TIMEOUT) -> RunResult:
         """Execute with PTY allocation for relay expect/QR code interaction.
 
-        Adapted from code_route.py's _run_with_pty.
+        Adapted from code_route.py's _run_with_pty:
+        - os.setsid() + TIOCSCTTY for controlling TTY
+        - Bidirectional stdin↔PTY master forwarding (for QR/expect)
+        - Wire JSON parsing with non-JSON forwarded to stderr
+        - os.killpg on timeout (kills entire process group)
         """
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
-        session_id = None
+        session_id: Optional[str] = None
         exit_code = 0
+        master_fd: Optional[int] = None
+        slave_fd: Optional[int] = None
 
         try:
             master_fd, slave_fd = pty.openpty()
+
+            def _preexec() -> None:
+                """Set up controlling TTY for child process."""
+                os.setsid()
+                try:
+                    import fcntl
+                    import termios
+
+                    fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+                except (ImportError, OSError):
+                    pass
+
             proc = subprocess.Popen(
                 argv,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
                 close_fds=True,
+                preexec_fn=_preexec,
             )
             os.close(slave_fd)
+            slave_fd = None
 
-            deadline = time.time() + _EXEC_TIMEOUT
+            deadline = time.time() + timeout
             buffer = ""
+
+            # Get stdin fd for forwarding (QR/expect interaction)
+            stdin_fd: Optional[int] = None
+            try:
+                if sys.stdin.isatty():
+                    stdin_fd = sys.stdin.fileno()
+            except (AttributeError, ValueError):
+                pass
 
             while time.time() < deadline:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
 
-                ready, _, _ = select.select([master_fd], [], [], min(remaining, 1.0))
-                if not ready:
-                    continue
+                read_fds = [master_fd]
+                if stdin_fd is not None:
+                    read_fds.append(stdin_fd)
 
                 try:
-                    data = os.read(master_fd, 4096)
-                except OSError:
+                    ready, _, _ = select.select(read_fds, [], [], min(remaining, 1.0))
+                except (ValueError, OSError):
                     break
 
-                if not data:
-                    break
-
-                text = data.decode("utf-8", errors="replace")
-                buffer += text
-
-                # Process complete lines
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    # Try to parse as wire protocol JSON
+                # Forward stdin → PTY master (for QR code / expect interaction)
+                if stdin_fd is not None and stdin_fd in ready:
                     try:
-                        msg = json.loads(line)
-                        msg_type = msg.get("type", "")
-
-                        if msg_type == MSG_SESSION:
-                            session_id = msg.get("id")
-                        elif msg_type == MSG_RESULT:
-                            stdout_chunks.append(msg.get("stdout", ""))
-                            exit_code = msg.get("exit_code", 0)
-                        elif msg_type == MSG_ERROR:
-                            stderr_chunks.append(msg.get("message", ""))
-                            exit_code = msg.get("exit_code", 1)
-                        elif msg_type in (MSG_READY, MSG_ACCEPTED):
-                            pass  # protocol handshake
+                        chunk = os.read(stdin_fd, 4096)
+                        if chunk:
+                            os.write(master_fd, chunk)
                         else:
-                            # Non-wire output (relay UI, QR codes, etc.) → stderr
-                            stderr_chunks.append(line)
-                    except (json.JSONDecodeError, AttributeError):
-                        # Non-JSON output → likely relay UI → stderr
-                        stderr_chunks.append(line)
+                            stdin_fd = None  # stdin closed
+                    except OSError:
+                        stdin_fd = None
 
-            # Timeout
+                # Read PTY master output
+                if master_fd in ready:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+
+                    if not data:
+                        break
+
+                    text = data.decode("utf-8", errors="replace")
+                    buffer += text
+
+                    # Process complete lines
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        # Try to parse as wire protocol JSON
+                        try:
+                            msg = json.loads(line)
+                            msg_type = msg.get("type", "")
+
+                            if msg_type == MSG_SESSION:
+                                session_id = msg.get("id")
+                            elif msg_type == MSG_RESULT:
+                                stdout_chunks.append(msg.get("stdout", ""))
+                                exit_code = msg.get("exit_code", 0)
+                            elif msg_type == MSG_ERROR:
+                                stderr_chunks.append(msg.get("message", ""))
+                                exit_code = msg.get("exit_code", 1)
+                            elif msg_type in (MSG_READY, MSG_ACCEPTED):
+                                pass  # protocol handshake
+                            else:
+                                # Non-wire output (relay UI, QR codes, etc.) → stderr
+                                stderr_chunks.append(line)
+                        except (json.JSONDecodeError, AttributeError):
+                            # Non-JSON output → likely relay UI → stderr
+                            stderr_chunks.append(line)
+
+            # Timeout: kill entire process group
             if time.time() >= deadline:
                 try:
-                    proc.kill()
-                except ProcessLookupError:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
                     pass
-                stderr_chunks.append(f"timeout after {_EXEC_TIMEOUT}s")
+                stderr_chunks.append(f"timeout after {timeout}s")
                 exit_code = -1
 
-            proc.wait(timeout=5)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
         except Exception as e:
             stderr_chunks.append(f"relay execution error: {e}")
             exit_code = 1
         finally:
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+            if slave_fd is not None:
+                try:
+                    os.close(slave_fd)
+                except OSError:
+                    pass
 
         return RunResult(
-            returncode=exit_code or proc.returncode,
+            returncode=exit_code,
             stdout="\n".join(stdout_chunks),
             stderr="\n".join(stderr_chunks),
             session_id=session_id,

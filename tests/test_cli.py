@@ -191,13 +191,49 @@ class TestRouteExecution:
             mock.patch("codeagent.cli._execute", return_value=result) as mock_exec,
             mock.patch("codeagent.cli.SessionRegistry"),
         ):
-            rc = main(["route", "TestTopic", "analyze code"])
+            rc = main(["route", "TestTopic", "analyze code", "--raw"])
         assert rc == 0
         mock_exec.assert_called_once()
         call_args = mock_exec.call_args
         request = call_args.args[0] if call_args.args else call_args[1].get("request")
         assert request.task == "analyze code"
         assert request.topic == "TestTopic"
+
+    def test_route_wraps_task_with_prompt(self, capsys, tmp_path):
+        from codeagent.cli import main
+
+        rm = _make_repo_map(tmp_path)
+        result = _make_run_result()
+        with (
+            mock.patch("codeagent.cli.load_repo_map", return_value=rm),
+            mock.patch("codeagent.cli._execute", return_value=result) as mock_exec,
+            mock.patch("codeagent.cli.SessionRegistry"),
+        ):
+            rc = main(["route", "TestTopic", "analyze code"])
+        assert rc == 0
+        call_args = mock_exec.call_args
+        request = call_args.args[0]
+        # Default (no --raw) should wrap with structured prompt
+        assert "你正在执行一项代码调研任务" in request.task
+        assert "analyze code" in request.task
+        assert request.raw is False
+
+    def test_route_raw_skips_prompt(self, capsys, tmp_path):
+        from codeagent.cli import main
+
+        rm = _make_repo_map(tmp_path)
+        result = _make_run_result()
+        with (
+            mock.patch("codeagent.cli.load_repo_map", return_value=rm),
+            mock.patch("codeagent.cli._execute", return_value=result) as mock_exec,
+            mock.patch("codeagent.cli.SessionRegistry"),
+        ):
+            rc = main(["route", "TestTopic", "analyze code", "--raw"])
+        assert rc == 0
+        call_args = mock_exec.call_args
+        request = call_args.args[0]
+        assert request.task == "analyze code"
+        assert request.raw is True
 
     def test_route_passes_backend_agent_model(self, capsys, tmp_path):
         from codeagent.cli import main
@@ -210,7 +246,7 @@ class TestRouteExecution:
             mock.patch("codeagent.cli.SessionRegistry"),
         ):
             rc = main([
-                "route", "TestTopic", "task",
+                "route", "TestTopic", "task", "--raw",
                 "--backend", "mybackend",
                 "--agent", "myagent",
                 "--model", "mymodel",
@@ -221,6 +257,27 @@ class TestRouteExecution:
         assert request.backend == "mybackend"
         assert request.agent == "myagent"
         assert request.model == "mymodel"
+
+    def test_route_passes_skills_and_skip_permissions(self, capsys, tmp_path):
+        from codeagent.cli import main
+
+        rm = _make_repo_map(tmp_path)
+        result = _make_run_result()
+        with (
+            mock.patch("codeagent.cli.load_repo_map", return_value=rm),
+            mock.patch("codeagent.cli._execute", return_value=result) as mock_exec,
+            mock.patch("codeagent.cli.SessionRegistry"),
+        ):
+            rc = main([
+                "route", "TestTopic", "task", "--raw",
+                "--skills", "my-skills",
+                "--skip-permissions",
+            ])
+        assert rc == 0
+        call_args = mock_exec.call_args
+        request = call_args.args[0]
+        assert request.skills == "my-skills"
+        assert request.skip_permissions is True
 
     def test_route_no_task_exits_1(self, capsys, tmp_path):
         """route <topic> with no task and empty stdin should error."""
@@ -454,6 +511,131 @@ class TestSkipPermissionsDefault:
             main(["route", "TestTopic", "task"])
         request = mock_exec.call_args.args[0]
         assert request.skip_permissions is False
+
+
+# ── TestExecuteFallback ──────────────────────────────────────────────────
+
+
+class TestExecuteFallback:
+    """_execute fallback on warm() failure."""
+
+    def test_warm_failure_tries_fallback(self, tmp_path):
+        """When warm() raises TransportError and host has fallback, retries with fallback alias."""
+        from codeagent.cli import _execute
+        from codeagent.domain import RepoEntry, RunRequest, Target
+        from codeagent.transport.base import TransportError
+
+        host = HostSpec(
+            name="primary",
+            ssh_alias="primary",
+            hostnames=("primary",),
+            transport="ssh",
+            fallback_ssh_alias="fallback",
+        )
+        repo = RepoEntry(host="primary", path="/work")
+        target = Target(host=host, repo=repo)
+        request = RunRequest(task="do stuff", workdir="/work", backend="opencode")
+
+        fallback_result = RunResult(returncode=0, stdout="ok", stderr="", host="fallback")
+
+        registry = mock.MagicMock()
+        registry.compute_key.return_value = "test-key"
+        registry.lookup.return_value = None
+        registry.run_with_lock.return_value = mock.MagicMock(__enter__=mock.MagicMock(), __exit__=mock.MagicMock())
+
+        transport = mock.MagicMock()
+        # warm() raises on primary, succeeds on fallback
+        transport.warm.side_effect = [TransportError("master create failed"), None]
+        transport.execute.return_value = fallback_result
+
+        with mock.patch("codeagent.cli._get_transport", return_value=transport):
+            result = _execute(request, target, registry)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        # warm called twice: primary (fails) + fallback (succeeds)
+        assert transport.warm.call_count == 2
+        fallback_host = transport.warm.call_args_list[1][0][0]
+        assert fallback_host.ssh_alias == "fallback"
+        assert fallback_host.fallback_ssh_alias == ""  # cleared to prevent loops
+        # execute called with fallback host
+        execute_host = transport.execute.call_args[0][1]
+        assert execute_host.ssh_alias == "fallback"
+
+    def test_warm_failure_no_fallback_propagates(self, tmp_path):
+        """When warm() raises and no fallback, the error propagates as transport error."""
+        from codeagent.cli import _execute
+        from codeagent.domain import RepoEntry, RunRequest, Target
+        from codeagent.transport.base import TransportError
+
+        host = HostSpec(
+            name="primary",
+            ssh_alias="primary",
+            hostnames=("primary",),
+            transport="ssh",
+            fallback_ssh_alias="",
+        )
+        repo = RepoEntry(host="primary", path="/work")
+        target = Target(host=host, repo=repo)
+        request = RunRequest(task="do stuff", workdir="/work", backend="opencode")
+
+        registry = mock.MagicMock()
+        registry.compute_key.return_value = "test-key"
+        registry.lookup.return_value = None
+        registry.run_with_lock.return_value = mock.MagicMock(__enter__=mock.MagicMock(), __exit__=mock.MagicMock())
+
+        transport = mock.MagicMock()
+        transport.warm.side_effect = TransportError("master create failed")
+
+        with mock.patch("codeagent.cli._get_transport", return_value=transport):
+            result = _execute(request, target, registry)
+
+        # Should return transport error result
+        assert result.returncode == 1
+        assert "transport error" in result.stderr
+        assert "master create failed" in result.stderr
+        registry.mark_failed.assert_called_once()
+
+    def test_execute_failure_tries_fallback(self, tmp_path):
+        """When execute() raises TransportError and host has fallback, retries with fallback alias."""
+        from codeagent.cli import _execute
+        from codeagent.domain import RepoEntry, RunRequest, Target
+        from codeagent.transport.base import TransportError
+
+        host = HostSpec(
+            name="primary",
+            ssh_alias="primary",
+            hostnames=("primary",),
+            transport="ssh",
+            fallback_ssh_alias="fallback",
+        )
+        repo = RepoEntry(host="primary", path="/work")
+        target = Target(host=host, repo=repo)
+        request = RunRequest(task="do stuff", workdir="/work", backend="opencode")
+
+        fallback_result = RunResult(returncode=0, stdout="ok", stderr="", host="fallback")
+
+        registry = mock.MagicMock()
+        registry.compute_key.return_value = "test-key"
+        registry.lookup.return_value = None
+        registry.run_with_lock.return_value = mock.MagicMock(__enter__=mock.MagicMock(), __exit__=mock.MagicMock())
+
+        transport = mock.MagicMock()
+        # warm succeeds, execute raises, then fallback succeeds
+        transport.warm.return_value = None
+        transport.execute.side_effect = [TransportError("execute failed"), fallback_result]
+
+        with mock.patch("codeagent.cli._get_transport", return_value=transport):
+            result = _execute(request, target, registry)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        # warm called twice: primary + fallback
+        assert transport.warm.call_count == 2
+        # execute called twice: primary (fails) + fallback (succeeds)
+        assert transport.execute.call_count == 2
+        fallback_host = transport.execute.call_args_list[1][0][1]
+        assert fallback_host.ssh_alias == "fallback"
 
 
 # ── TestNoSubcommand ─────────────────────────────────────────────────────
