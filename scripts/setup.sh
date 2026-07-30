@@ -1,76 +1,44 @@
 #!/bin/bash
-# codeagent-py setup — install package + skills + config
+# codeagent-py development bootstrap — NOT for production deployment.
+#
+# Production: run `dotai setup` (handles clone, uv tool install, skill linking).
+# This script is for local development checkout only.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== codeagent-py setup ==="
+echo "=== codeagent-py development setup ==="
 
-# 1. Install package
-echo "[1/5] Installing codeagent package..."
-cd "$PROJECT_DIR"
-if command -v uv >/dev/null 2>&1; then
-    uv tool install . --force 2>&1 || pip install -e . --user 2>&1
-else
-    pip install -e . --user 2>&1
+# 1. Install package via uv
+echo "[1/3] Installing codeagent package..."
+if ! command -v uv >/dev/null 2>&1; then
+    echo "  ✗ uv not found. Install: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
+    exit 1
 fi
+cd "$PROJECT_DIR"
+uv tool install . --force 2>&1
 echo "  ✓ codeagent installed"
 
 # 2. Verify CLI
-echo "[2/5] Verifying CLI..."
-if codeagent --version >/dev/null 2>&1; then
-    echo "  ✓ $(codeagent --version)"
-else
-    echo "  ✗ codeagent not in PATH — add ~/.local/bin to PATH"
+echo "[2/3] Verifying CLI..."
+if ! codeagent --version >/dev/null 2>&1; then
+    echo "  ✗ codeagent not in PATH after install." >&2
+    echo "  Run: export PATH=\"\$HOME/.local/bin:\$PATH\"" >&2
+    exit 1
 fi
+echo "  ✓ $(codeagent --version)"
 
-# 3. Create config directory
-echo "[3/5] Setting up config..."
-mkdir -p ~/.config/codeagent
-if [ ! -f ~/.config/codeagent/repo-map.json ]; then
-    if [ -f "$PROJECT_DIR/examples/repo-map.json" ]; then
-        cp "$PROJECT_DIR/examples/repo-map.json" ~/.config/codeagent/repo-map.json
-        echo "  ✓ Created ~/.config/codeagent/repo-map.json (from example)"
-        echo "    ⚠ Edit this file with your actual host configurations"
-    fi
-else
-    echo "  ✓ ~/.config/codeagent/repo-map.json already exists"
+# 3. Verify remote exec helper
+echo "[3/3] Verifying remote exec helper..."
+if ! codeagent-remote-exec --help >/dev/null 2>&1; then
+    echo "  ✗ codeagent-remote-exec not in PATH." >&2
+    exit 1
 fi
-
-# 4. Link skills to dotai local-skills
-echo "[4/5] Linking skills..."
-DOTAI_SKILLS="${HOME}/src/dotai/external/local-skills"
-if [ -d "$DOTAI_SKILLS" ]; then
-    for skill_dir in "$PROJECT_DIR/skills"/*/; do
-        skill_name=$(basename "$skill_dir")
-        target="$DOTAI_SKILLS/$skill_name"
-        if [ -L "$target" ]; then
-            echo "  ✓ $skill_name already linked"
-        elif [ -d "$target" ]; then
-            echo "  ⚠ $skill_name exists as directory (not symlink), skipping"
-        else
-            ln -s "$skill_dir" "$target"
-            echo "  ✓ Linked $skill_name → $skill_dir"
-        fi
-    done
-else
-    echo "  ⚠ dotai local-skills not found at $DOTAI_SKILLS, skipping skill linking"
-fi
-
-# 5. Remote deploy helper
-REPO_URL="https://github.com/comicchang/codeagent-py"
-echo "[5/5] Remote deploy info:"
-echo "  On each remote host, run:"
-echo "    pip install git+${REPO_URL}"
-echo "  Or for development:"
-echo "    git clone ${REPO_URL} ~/src/codeagent-py && cd ~/src/codeagent-py && pip install -e ."
+echo "  ✓ codeagent-remote-exec available"
 
 echo ""
-echo "=== Setup complete ==="
+echo "=== Development setup complete ==="
 echo ""
-echo "Next steps:"
-echo "  1. Edit ~/.config/codeagent/repo-map.json with your hosts"
-echo "  2. Deploy to remote hosts: ssh <host> 'cd ~/src/codeagent-py && pip install -e .'"
-echo "  3. Test: codeagent route list"
-echo "  4. Test: codeagent run 'echo hello' --host <alias>"
+echo "Production deployment: run 'dotai setup' on each machine."
+echo "Edit ~/.config/codeagent/repo-map.json with your host configurations."

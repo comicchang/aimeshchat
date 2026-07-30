@@ -1,6 +1,6 @@
 ---
 name: codeagent
-description: 使用 codeagent CLI 在本机或 repo-map 注册的远程仓执行代码 Agent。触发条件：目标源码不在当前机器、跨机器/多仓调研、需要持久 session、SSH/relay-login 路由，或需要持久上下文 Oracle 咨询。
+description: 使用 codeagent CLI 在本机或 repo-map 注册的远程仓执行代码 Agent。触发条件：目标源码不在当前机器、跨机器/多仓调研、需要持久 session、SSH/relay-login 路由。
 requires:
   online: true
 ---
@@ -14,7 +14,7 @@ requires:
 - topic 有 `.repo-map.json`
 - 目标 host 与本机 hostname 不匹配
 - 需要在 SSH/relay-login 主机运行工具
-- 需要持久 session/oracle
+- 需要持久 session
 
 不要路由：
 - CWD 已位于目标仓且本机可直接 Read/Grep/LSP
