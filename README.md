@@ -10,7 +10,7 @@ Unified CLI for executing AI code agents across local and remote machines, with 
 - **SSH transport**: Independent ControlMaster per host, no global ControlPersist changes
 - **Session persistence**: SQLite-backed registry, auto-resume by namespace key
 - **Topic routing**: repo-map.json maps topics to host/path, with local detection
-- **Remote helper**: `python -m codeagent.remote_exec` deployed via setup
+- **Remote helper**: `codeagent-remote-exec` console entrypoint, deployed via `dotai setup`
 - **Wire protocol**: JSONL over SSH stdin/stdout, no shell quoting issues
 
 ## Installation
@@ -227,14 +227,15 @@ codeagent CLI
 
 ## Remote Deployment
 
-The remote helper is deployed via the existing setup flow:
+Remote hosts need `codeagent-remote-exec` on PATH. Deploy via dotai setup:
 
 ```bash
-# On each remote machine (part of setup):
-python -m codeagent.remote_exec
+# On each remote machine (part of dotai setup):
+dotai setup
 ```
 
-No separate installation needed.
+This installs `codeagent` and `codeagent-remote-exec` via `uv tool install` from the
+cloned codeagent-py repo. No manual pip install needed.
 
 ## Relationship to code-route
 

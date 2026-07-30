@@ -21,6 +21,7 @@ from codeagent.wire.protocol import (
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
+    WIRE_VERSION,
     decode_line,
     encode_line,
     make_request,
@@ -240,7 +241,7 @@ class SSHTransport(Transport):
             skills=request.skills,
             session_id=session_id,
             skip_permissions=request.skip_permissions,
-            timeout=_DEFAULT_TIMEOUT,
+            timeout=request.timeout,
         )
 
         ssh_cmd = cm.ssh_cmd(*remote_cmd)
@@ -252,7 +253,7 @@ class SSHTransport(Transport):
             workdir=workdir,
             host_name=host_name,
             backend=request.backend or "",
-            timeout=_DEFAULT_TIMEOUT,
+            timeout=request.timeout,
         )
 
 
@@ -318,7 +319,13 @@ def _run_ssh_wire(
             continue
 
         if msg.type == MSG_READY:
-            # Helper sent ready before processing — expected.
+            # Check wire version compatibility
+            remote_ver = msg.payload.get("wire_version", 0)
+            if remote_ver != WIRE_VERSION:
+                raise TransportError(
+                    f"wire version mismatch: remote={remote_ver}, local={WIRE_VERSION}. "
+                    f"Update codeagent-py on the remote host."
+                )
             continue
         if msg.type == MSG_ACCEPTED:
             continue

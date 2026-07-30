@@ -425,7 +425,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     if handler is None:
         parser.print_help()
         return 1
-    return handler(args)
+
+    try:
+        return handler(args)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

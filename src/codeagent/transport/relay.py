@@ -219,7 +219,15 @@ class RelayTransport(Transport):
                             elif msg_type == MSG_ERROR:
                                 stderr_chunks.append(msg.get("message", ""))
                                 exit_code = msg.get("exit_code", 1)
-                            elif msg_type in (MSG_READY, MSG_ACCEPTED):
+                            elif msg_type == MSG_READY:
+                                # Check wire version compatibility
+                                remote_ver = msg.get("wire_version", 0)
+                                if remote_ver != WIRE_VERSION:
+                                    stderr_chunks.append(
+                                        f"wire version mismatch: remote={remote_ver}, local={WIRE_VERSION}"
+                                    )
+                                    exit_code = 1
+                            elif msg_type == MSG_ACCEPTED:
                                 pass  # protocol handshake
                             else:
                                 # Non-wire output (relay UI, QR codes, etc.) → stderr

@@ -13,6 +13,7 @@ from codeagent.wire.protocol import (
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
+    WIRE_VERSION,
     decode_line,
     encode_line,
     make_request,
@@ -76,6 +77,7 @@ class LocalTransport(Transport):
             workdir=workdir,
             host_name=LOCAL_HOST_MARKER,
             backend=request.backend or "",
+            timeout=request.timeout,
         )
 
 
@@ -141,6 +143,13 @@ def _run_wire(
             continue
 
         if msg.type == MSG_READY:
+            # Check wire version compatibility
+            remote_ver = msg.payload.get("wire_version", 0)
+            if remote_ver != WIRE_VERSION:
+                raise TransportError(
+                    f"wire version mismatch: remote={remote_ver}, local={WIRE_VERSION}. "
+                    f"Update codeagent-py on the remote host."
+                )
             continue
         if msg.type == MSG_ACCEPTED:
             continue

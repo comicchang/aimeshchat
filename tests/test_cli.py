@@ -152,8 +152,10 @@ class TestRouteWhere:
 
         rm = _make_repo_map(tmp_path)
         with mock.patch("codeagent.cli.load_repo_map", return_value=rm):
-            with pytest.raises(KeyError, match="NoSuchTopic"):
-                main(["route", "where", "NoSuchTopic"])
+            rc = main(["route", "where", "NoSuchTopic"])
+            assert rc == 1
+            captured = capsys.readouterr()
+            assert "NoSuchTopic" in captured.err
 
 
 # ── TestRouteDryRun ──────────────────────────────────────────────────────
