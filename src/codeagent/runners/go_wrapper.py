@@ -50,11 +50,11 @@ class GoWrapperRunner(BaseRunner):
     def _build_cmd(self, request: RunRequest) -> list[str]:
         cmd = [self.config.binary]
 
-        # Resume path
-        if request.session_key and not request.new_session:
+        # Resume path — use resume_session_id (backend ID), not session_key (namespace)
+        if request.resume_session_id and not request.new_session:
             cmd.append("resume")
-            cmd.append(request.session_key)
-        elif request.session_key and request.new_session:
+            cmd.append(request.resume_session_id)
+        elif request.resume_session_id and request.new_session:
             # --new-session overrides resume — just pass task normally
             pass
 
@@ -127,6 +127,15 @@ class GoWrapperRunner(BaseRunner):
                 result.backend = m.group(1)
 
         return result
+
+    def _cleanup(self) -> None:
+        """Clean up temp output file."""
+        output_file = getattr(self, "_output_file", None)
+        if output_file:
+            try:
+                output_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 

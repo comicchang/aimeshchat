@@ -8,25 +8,35 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import sys
-import time
-from pathlib import Path
+
+from codeagent.domain import RunRequest
+from codeagent.runners import GoWrapperRunner, OMPRunner
+from codeagent.runners.base import RunnerConfig
 
 WIRE_VERSION = 1
+MAX_LINE_LENGTH = 1_048_576  # 1 MiB
 SUPPORTED_COMMANDS = {"run", "ping", "capabilities"}
 
 
 def _read_request() -> dict | None:
-    """Read one JSON line from stdin."""
+    """Read one JSON line from stdin, with max-length guard."""
     line = sys.stdin.readline()
     if not line:
         return None
+    line = line.strip()
+    if len(line) > MAX_LINE_LENGTH:
+        _send({"type": "error", "message": f"request line exceeds {MAX_LINE_LENGTH} bytes"})
+        return None
     try:
-        return json.loads(line.strip())
+        obj = json.loads(line)
     except json.JSONDecodeError as e:
         _send({"type": "error", "message": f"invalid JSON: {e}"})
         return None
+    if not isinstance(obj, dict):
+        _send({"type": "error", "message": "request must be a JSON object"})
+        return None
+    return obj
 
 
 def _send(obj: dict) -> None:
@@ -61,155 +71,51 @@ def _handle_run(req: dict) -> None:
     backend = req.get("backend", "opencode")
     agent = req.get("agent")
     model = req.get("model")
-    session_id = req.get("resume_session_id")
+    resume_session_id = req.get("resume_session_id")
     skip_permissions = req.get("skip_permissions", True)
     timeout = req.get("timeout", 600)
 
     _send({"type": "accepted", "wire_version": WIRE_VERSION})
 
-    # Expand workdir
+    # Expand workdir here (NOT in config loader)
     workdir = os.path.expanduser(workdir)
     if not os.path.isdir(workdir):
         _send({"type": "error", "message": f"workdir not found: {workdir}"})
         return
 
-    if backend == "omp":
-        _run_omp(task, workdir, model, session_id, skip_permissions, timeout)
-    else:
-        _run_go_wrapper(task, workdir, backend, agent, model, session_id, skip_permissions, timeout)
-
-
-def _run_go_wrapper(task, workdir, backend, agent, model, session_id, skip_permissions, timeout):
-    """Execute via Go codeagent-wrapper binary."""
-    import subprocess
-    import tempfile
-
-    cmd = [os.path.expanduser("~/.claude/bin/codeagent-wrapper")]
-    if session_id:
-        cmd += ["resume", session_id, task, workdir]
-    else:
-        if backend:
-            cmd += ["--backend", backend]
-        if agent:
-            cmd += ["--agent", agent]
-        if model:
-            cmd += ["--model", model]
-        if skip_permissions:
-            cmd.append("--skip-permissions")
-
-        # Use --output for structured result
-        output_file = tempfile.mktemp(suffix=".json", prefix="codeagent-")
-        cmd += ["--output", output_file, "-", workdir]
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=task if not session_id else None,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=workdir,
-        )
-
-        # Extract session_id from stderr
-        sid = None
-        for line in (proc.stderr or "").splitlines():
-            if line.startswith("SESSION_ID:"):
-                sid = line.split(":", 1)[1].strip()
-                break
-
-        # Try structured output
-        if not sid and "output_file" in dir():
-            try:
-                with open(output_file) as f:
-                    data = json.loads(f.read())
-                    sid = data.get("session_id")
-                os.unlink(output_file)
-            except (FileNotFoundError, json.JSONDecodeError):
-                pass
-
-        if sid:
-            _send({"type": "session", "id": sid})
-
-        _send({
-            "type": "result",
-            "stdout": proc.stdout or "",
-            "stderr": proc.stderr or "",
-            "exit_code": proc.returncode,
-        })
-    except subprocess.TimeoutExpired:
-        _send({"type": "error", "message": f"timeout after {timeout}s"})
-    except FileNotFoundError:
-        _send({"type": "error", "message": "codeagent-wrapper not found"})
-    except Exception as e:
-        _send({"type": "error", "message": str(e)})
-
-
-def _run_omp(task, workdir, model, session_id, skip_permissions, timeout):
-    """Execute via omp CLI."""
-    import subprocess
-    import tempfile
-
-    # Write task to temp file (omp doesn't read stdin)
-    prompt_file = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", prefix="codeagent-omp-",
-        delete=False, dir=tempfile.gettempdir()
+    # Build RunRequest from wire fields
+    request = RunRequest(
+        task=task,
+        workdir=workdir,
+        backend=backend,
+        agent=agent,
+        model=model,
+        skip_permissions=skip_permissions,
+        timeout=timeout,
+        resume_session_id=resume_session_id,
     )
-    prompt_file.write(task)
-    prompt_file.close()
-    os.chmod(prompt_file.name, 0o600)
 
-    cmd = ["omp", "--print", "--mode", json.dumps("json"), "--cwd", workdir]
-    if session_id:
-        cmd += ["--resume", session_id]
-    if model:
-        cmd += ["--model", model]
-    if skip_permissions:
-        cmd.append("--auto-approve")
-    cmd += [f"@{prompt_file.name}"]
+    # Select runner by backend
+    config = RunnerConfig(timeout=timeout)
+    if backend == "omp":
+        runner = OMPRunner(config=config)
+    else:
+        runner = GoWrapperRunner(config=config)
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=workdir,
-        )
+    # Run via tested runner implementation
+    result = runner.run(request)
 
-        # Parse JSONL output
-        sid = None
-        final_message = ""
-        for line in (proc.stdout or "").splitlines():
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") == "session":
-                sid = obj.get("id")
-                if sid:
-                    _send({"type": "session", "id": sid})
-            elif obj.get("type") == "assistant":
-                msg_end = obj.get("message_end", {})
-                final_message = msg_end.get("message", final_message)
+    # Send session ID if available
+    if result.session_id:
+        _send({"type": "session", "id": result.session_id})
 
-        _send({
-            "type": "result",
-            "stdout": final_message,
-            "stderr": proc.stderr or "",
-            "exit_code": proc.returncode,
-        })
-    except subprocess.TimeoutExpired:
-        _send({"type": "error", "message": f"timeout after {timeout}s"})
-    except FileNotFoundError:
-        _send({"type": "error", "message": "omp not found"})
-    except Exception as e:
-        _send({"type": "error", "message": str(e)})
-    finally:
-        try:
-            os.unlink(prompt_file.name)
-        except OSError:
-            pass
+    # Send result
+    _send({
+        "type": "result",
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exit_code": result.returncode,
+    })
 
 
 def main() -> None:
@@ -222,7 +128,10 @@ def main() -> None:
         if req is None:
             break
 
-        cmd = req.get("command", "run")
+        cmd = req.get("command")
+        if not isinstance(cmd, str) or not cmd:
+            _send({"type": "error", "message": "request missing or invalid 'command' field"})
+            continue
         version = req.get("wire_version", 0)
 
         if version > WIRE_VERSION:

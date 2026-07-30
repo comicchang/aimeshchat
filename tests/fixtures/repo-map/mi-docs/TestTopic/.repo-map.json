@@ -1,7 +1,7 @@
 {
-  "description": "OHOS reverse engineering",
+  "description": "Test topic",
   "repos": [
-    {"host": "yellow", "path": "~/src/P1-4.0", "note": "OHOS 7.0"},
-    {"host": "devbox", "path": "/data/build", "note": "cloud build"}
+    {"host": "devhost", "path": "~/src/project-a", "note": "Project A"},
+    {"host": "devbox", "path": "/data/build", "note": "Cloud build"}
   ]
 }

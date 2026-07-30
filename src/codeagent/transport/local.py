@@ -1,7 +1,6 @@
 """Local transport — runs tasks on the current machine via subprocess."""
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 from typing import TYPE_CHECKING
@@ -11,9 +10,9 @@ from codeagent.transport.base import Transport, TransportError
 from codeagent.wire.protocol import (
     MSG_ACCEPTED,
     MSG_ERROR,
+    MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
-    WireMessage,
     decode_line,
     encode_line,
     make_request,
@@ -52,7 +51,13 @@ class LocalTransport(Transport):
         """No-op — nothing to tear down."""
         log.debug("LocalTransport.stop: no-op for %s", host.name)
 
-    def execute(self, request: RunRequest, host: HostSpec, workdir: str) -> RunResult:
+    def execute(
+        self,
+        request: RunRequest,
+        host: HostSpec,
+        workdir: str,
+        session_id: str | None = None,
+    ) -> RunResult:
         """Run *request* locally and return the result."""
         req = make_request(
             command="run",
@@ -61,7 +66,7 @@ class LocalTransport(Transport):
             backend=request.backend or "",
             agent=request.agent,
             model=request.model,
-            session_id=request.session_key if not request.new_session else None,
+            session_id=session_id,
             skip_permissions=request.skip_permissions,
         )
         return _run_wire(
@@ -87,8 +92,7 @@ def _run_wire(
 ) -> RunResult:
     """Execute a remote-exec helper (local or over SSH) and collect the result.
 
-    Sends *request* as a single JSONL line on stdin, then reads response
-    lines until a terminal message (``result`` or ``error``) arrives.
+    Uses ``Popen.communicate(timeout=deadline)`` for proper timeout handling.
 
     Returns a ``RunResult`` even on error (with ``returncode=-1`` for
     wire-level errors).
@@ -96,27 +100,36 @@ def _run_wire(
     payload = encode_line(request)
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            input=payload,
-            capture_output=True,
-            timeout=timeout,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise TransportError(f"execution timed out after {timeout}s") from exc
     except FileNotFoundError as exc:
         raise TransportError(f"helper binary not found: {cmd[0]}") from exc
 
-    stdout = proc.stdout.decode("utf-8", errors="replace")
-    stderr = proc.stderr.decode("utf-8", errors="replace")
-
-    # Parse JSONL response lines.
     session_id: str | None = None
     result_stdout = ""
     result_stderr = ""
-    exit_code = proc.returncode
+    exit_code = -1
 
-    for raw_line in stdout.splitlines():
+    try:
+        stdout, stderr = proc.communicate(input=payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise TransportError(f"execution timed out after {timeout}s")
+    except Exception:
+        proc.kill()
+        proc.wait()
+        raise
+
+    stdout_str = stdout.decode("utf-8", errors="replace") if stdout else ""
+    stderr_str = stderr.decode("utf-8", errors="replace") if stderr else ""
+
+    # Parse JSONL response lines.
+    for raw_line in stdout_str.splitlines():
         raw_line = raw_line.strip()
         if not raw_line:
             continue
@@ -126,6 +139,10 @@ def _run_wire(
             # Non-JSON noise — treat as stdout.
             continue
 
+        if msg.type == MSG_READY:
+            continue
+        if msg.type == MSG_ACCEPTED:
+            continue
         if msg.type == MSG_SESSION:
             session_id = msg.session_id
         elif msg.type == MSG_RESULT:
@@ -138,11 +155,11 @@ def _run_wire(
             exit_code = -1
 
     # If the helper produced no structured output, fall back to raw stderr.
-    if not result_stderr and stderr:
-        result_stderr = stderr
+    if not result_stderr and stderr_str:
+        result_stderr = stderr_str
 
     return RunResult(
-        returncode=exit_code,
+        returncode=exit_code if exit_code != -1 else proc.returncode,
         stdout=result_stdout,
         stderr=result_stderr,
         session_id=session_id,

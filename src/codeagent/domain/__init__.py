@@ -88,13 +88,15 @@ class RunRequest:
     model: Optional[str] = None
     skills: Optional[str] = None
     skip_permissions: bool = True
-    session_key: Optional[str] = None
+    session_key: Optional[str] = None  # namespace for registry lookup (NOT backend session ID)
     new_session: bool = False
     no_auto_resume: bool = False
     topic: Optional[str] = None
     repo_index: int = 0
     host: Optional[str] = None
     raw: bool = False
+    timeout: int = 600
+    resume_session_id: Optional[str] = None  # actual backend session ID for resume (passed by CLI from registry lookup)
 
 
 @dataclass

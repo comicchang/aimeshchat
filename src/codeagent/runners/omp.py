@@ -52,16 +52,17 @@ class OMPRunner(BaseRunner):
         if request.workdir:
             cmd.extend(["--cwd", request.workdir])
 
-        # Resume existing session
-        if request.session_key and not request.new_session:
-            cmd.extend(["--resume", request.session_key])
+        # Resume existing session — use resume_session_id (backend ID), not session_key (namespace)
+        if request.resume_session_id and not request.new_session:
+            cmd.extend(["--resume", request.resume_session_id])
 
         # Model
         if request.model:
             cmd.extend(["--model", request.model])
 
         # Auto-approve (skip interactive confirmations)
-        cmd.append("--auto-approve")
+        if request.skip_permissions:
+            cmd.append("--auto-approve")
 
         # Write prompt to temp file (omp rejects stdin pipe)
         self._prompt_file = self._write_prompt_file(request.task)
@@ -142,3 +143,7 @@ class OMPRunner(BaseRunner):
             except OSError:
                 pass
             self._prompt_file = None
+
+    def _cleanup(self) -> None:
+        """Clean up prompt temp file."""
+        self._cleanup_prompt_file()

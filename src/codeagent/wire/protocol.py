@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 WIRE_VERSION = 1
+MAX_LINE_LENGTH = 1_048_576  # 1 MiB — reject absurdly large lines
 
 # ── message type constants ──────────────────────────────────────────────
 MSG_READY = "ready"
@@ -95,26 +96,126 @@ def encode_line(obj: dict[str, Any]) -> bytes:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
 
 
+# ── required-field schema per response message type ────────────────────
+_RESPONSE_REQUIRED: dict[str, dict[str, type]] = {
+    MSG_ACCEPTED:     {"wire_version": int},
+    MSG_READY:        {"wire_version": int},
+    MSG_SESSION:      {"id": str},
+    MSG_RESULT:       {"exit_code": int, "stdout": str, "stderr": str},
+    MSG_ERROR:        {"message": str},
+    MSG_PONG:         {"wire_version": int},
+    MSG_CAPABILITIES: {},  # no strictly required fields beyond type
+}
+
+
 def decode_line(line: str | bytes) -> WireMessage:
-    """Parse a JSONL line into a WireMessage.
+    """Parse a JSONL line into a validated ``WireMessage``.
 
     Raises:
-        ValueError: if the line is not valid JSON or has no ``type`` key.
+        ValueError: on empty input, non-dict JSON, missing ``type``,
+            lines exceeding ``MAX_LINE_LENGTH``, or wrong field types
+            for the declared message type.
     """
     if isinstance(line, bytes):
         line = line.decode("utf-8")
     line = line.strip()
     if not line:
         raise ValueError("empty wire line")
+    if len(line) > MAX_LINE_LENGTH:
+        raise ValueError(f"wire line exceeds {MAX_LINE_LENGTH} bytes")
     try:
         obj: dict[str, Any] = json.loads(line)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError(f"wire message must be a JSON object, got {type(obj).__name__}")
 
     msg_type = obj.pop("type", None)
-    if not msg_type:
-        raise ValueError("wire message has no 'type' field")
+    if not isinstance(msg_type, str) or not msg_type:
+        raise ValueError("wire message 'type' must be a non-empty string")
+
+    # Validate required fields and their types for known message types.
+    schema = _RESPONSE_REQUIRED.get(msg_type)
+    if schema is not None:
+        for field, expected_type in schema.items():
+            if field not in obj:
+                raise ValueError(f"{msg_type!r} message missing required field {field!r}")
+            if not isinstance(obj[field], expected_type):
+                raise ValueError(
+                    f"{msg_type!r} message field {field!r} must be {expected_type.__name__}, "
+                    f"got {type(obj[field]).__name__}"
+                )
     return WireMessage(type=msg_type, payload=obj)
+
+
+# ── request encoding / decoding ─────────────────────────────────────────
+
+_REQUEST_REQUIRED: dict[str, dict[str, type]] = {
+    CMD_RUN:          {"task": str, "workdir": str, "timeout": int},
+    CMD_PING:         {},
+    CMD_CAPABILITIES: {},
+}
+
+
+def encode_request(command: str, **kwargs: Any) -> str:
+    """Validate and encode a request as a JSONL string.
+
+    Raises:
+        ValueError: on unknown command, missing required fields, or
+            wrong field types.
+    """
+    if not isinstance(command, str) or not command:
+        raise ValueError("command must be a non-empty string")
+    schema = _REQUEST_REQUIRED.get(command)
+    if schema is None:
+        raise ValueError(f"unknown command: {command}")
+    for field, expected_type in schema.items():
+        if field not in kwargs:
+            raise ValueError(f"command {command!r} requires field {field!r}")
+        if not isinstance(kwargs[field], expected_type):
+            raise ValueError(
+                f"command {command!r} field {field!r} must be {expected_type.__name__}, "
+                f"got {type(kwargs[field]).__name__}"
+            )
+    obj: dict[str, Any] = {"wire_version": WIRE_VERSION, "command": command, **kwargs}
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def decode_request(line: str | bytes) -> dict[str, Any]:
+    """Parse and validate a request line (client → remote).
+
+    Returns the parsed dict (with ``command`` present).  Raises
+    ``ValueError`` on any validation failure.
+    """
+    if isinstance(line, bytes):
+        line = line.decode("utf-8")
+    line = line.strip()
+    if not line:
+        raise ValueError("empty wire line")
+    if len(line) > MAX_LINE_LENGTH:
+        raise ValueError(f"wire line exceeds {MAX_LINE_LENGTH} bytes")
+    try:
+        obj: dict[str, Any] = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError(f"wire request must be a JSON object, got {type(obj).__name__}")
+
+    cmd = obj.get("command")
+    if not isinstance(cmd, str) or not cmd:
+        raise ValueError("request 'command' must be a non-empty string")
+    schema = _REQUEST_REQUIRED.get(cmd)
+    if schema is None:
+        raise ValueError(f"unknown command: {cmd}")
+    for field, expected_type in schema.items():
+        if field not in obj:
+            raise ValueError(f"command {cmd!r} missing required field {field!r}")
+        if not isinstance(obj[field], expected_type):
+            raise ValueError(
+                f"command {cmd!r} field {field!r} must be {expected_type.__name__}, "
+                f"got {type(obj[field]).__name__}"
+            )
+    return obj
 
 
 # ── message factories (client side) ─────────────────────────────────────

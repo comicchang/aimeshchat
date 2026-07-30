@@ -2,7 +2,7 @@
 
 Multi-host code agent orchestration with SSH, session persistence, and routing.
 
-Unified CLI for executing AI code agents (codex/claude/gemini/opencode/omp) across local and remote machines, with automatic session resumption and topic-based routing.
+Unified CLI for executing AI code agents across local and remote machines, with automatic session resumption and topic-based routing.
 
 ## Features
 
@@ -10,7 +10,7 @@ Unified CLI for executing AI code agents (codex/claude/gemini/opencode/omp) acro
 - **SSH transport**: Independent ControlMaster per host, no global ControlPersist changes
 - **Session persistence**: SQLite-backed registry, auto-resume by namespace key
 - **Topic routing**: repo-map.json maps topics to host/path, with local detection
-- **Remote helper**: `python -m codeagent.remote_exec` deployed via dotai setup
+- **Remote helper**: `python -m codeagent.remote_exec` deployed via setup
 - **Wire protocol**: JSONL over SSH stdin/stdout, no shell quoting issues
 
 ## Installation
@@ -27,19 +27,34 @@ Or install as CLI tool:
 uv tool install .
 ```
 
+## Quick Start
+
+```bash
+# 1. Create config directory
+mkdir -p ~/.config/codeagent
+
+# 2. Copy example configs (see below)
+cp examples/repo-map.json ~/.config/codeagent/
+cp examples/models.json ~/.codeagent/
+
+# 3. Verify
+codeagent route list
+codeagent ssh status
+```
+
 ## Usage
 
 ```bash
 # Local execution
-codeagent "analyze the rendering pipeline"
+codeagent run "analyze the rendering pipeline"
 
 # SSH to remote host
-codeagent --host yellow "list all Binder classes" ~/src/P1-4.0
+codeagent run "list all source files" ~/src/project --host dev-server
 
 # Route via repo-map (topic → host → path)
-codeagent route OHOS-玻璃 "analyze frosted glass implementation" --repo 0
+codeagent route MyTopic "analyze module X" --repo 0
 codeagent route list
-codeagent route where "13-AOSP"
+codeagent route where "MyTopic"
 
 # Session management
 codeagent sessions list
@@ -48,9 +63,9 @@ codeagent sessions reset <key>
 codeagent sessions bind --key <k> --id <session-id>
 
 # SSH connection management
-codeagent ssh warm yellow dev3 gen8-cf
+codeagent ssh warm dev-server build-box
 codeagent ssh status
-codeagent ssh stop yellow
+codeagent ssh stop dev-server
 ```
 
 ## Configuration
@@ -61,25 +76,133 @@ Location (searched in order):
 1. `$CODEAGENT_REPO_MAP`
 2. `~/.config/codeagent/repo-map.json`
 3. `~/.codeagent/repo-map.json`
-4. `~/src/dotai/profiles/policy/repo-map.json`
 
 ```json
 {
-  "midocs_root": "~/Dropbox/logseq/pages/mi-docs",
+  "midocs_root": "~/docs",
+  "relay_zsh": "",
   "hosts": {
-    "yellow": {
-      "ssh_alias": "yellow",
-      "hostnames": ["yellow", "mcshyucs192069"],
+    "dev-server": {
+      "ssh_alias": "dev-server",
+      "hostnames": ["dev-server", "build-host-001"],
+      "description": "Main development server",
       "transport": "ssh",
-      "shell_prefix": "export PATH=$HOME/.linuxbrew/bin:$PATH"
+      "shell_prefix": "export PATH=$HOME/.local/bin:$PATH",
+      "fallback_ssh_alias": ""
+    },
+    "build-box": {
+      "ssh_alias": "build-box.internal",
+      "hostnames": ["build-box"],
+      "description": "CI/build machine",
+      "transport": "ssh",
+      "shell_prefix": "",
+      "fallback_ssh_alias": ""
+    },
+    "cloud-dev": {
+      "ssh_alias": "cloud-dev.example.com",
+      "hostnames": ["cloud-dev-user"],
+      "description": "Cloud development environment",
+      "transport": "relay-login",
+      "shell_prefix": "",
+      "fallback_ssh_alias": ""
     }
   }
 }
 ```
 
+### Topic .repo-map.json
+
+Place in `{midocs_root}/<TopicName>/.repo-map.json`:
+
+```json
+{
+  "description": "My project analysis",
+  "repos": [
+    {"host": "dev-server", "path": "~/src/main-project", "note": "Main codebase"},
+    {"host": "build-box", "path": "/opt/build/workspace", "note": "Build artifacts"}
+  ]
+}
+```
+
 ### models.json
 
-Agent presets at `~/.codeagent/models.json` (shared with Go codeagent-wrapper).
+Agent presets at `~/.codeagent/models.json` (shared with Go codeagent-wrapper):
+
+```json
+{
+  "default_backend": "opencode",
+  "default_model": "provider/model-name",
+  "agents": {
+    "explore": {
+      "backend": "opencode",
+      "model": "provider/fast-model",
+      "description": "Code exploration (1M context, low cost)"
+    },
+    "develop": {
+      "backend": "codex",
+      "model": "provider/strong-model",
+      "description": "Code implementation",
+      "yolo": true
+    },
+    "reviewer": {
+      "backend": "claude",
+      "model": "provider/reasoning-model",
+      "description": "Code review"
+    },
+    "oracle": {
+      "backend": "codex",
+      "model": "provider/strong-model",
+      "description": "Persistent context technical advisor",
+      "yolo": true
+    },
+    "oracle-arch": {
+      "backend": "codex",
+      "model": "provider/strong-model",
+      "description": "Architecture decisions"
+    }
+  }
+}
+```
+
+Use `--agent <name>` to select a preset. The `oracle` preset with session persistence enables cross-consultation context.
+
+## Session Management
+
+Sessions are auto-resumed by default. Key = `host:workdir:backend:agent`.
+
+```bash
+# View all sessions
+codeagent sessions list
+
+# Filter by host or topic
+codeagent sessions list --host dev-server
+codeagent sessions list --topic MyTopic
+
+# Force new session (don't resume)
+codeagent --new-session "start fresh analysis"
+
+# Manual session binding
+codeagent sessions bind --key "dev-server:/src:opencode:explore" --id abc123
+```
+
+## SSH Connection Management
+
+ControlMaster sockets are managed independently per host:
+
+```bash
+# Pre-establish connections (e.g., at session start)
+codeagent ssh warm dev-server build-box
+
+# Check status
+codeagent ssh status
+#   dev-server: alive (/run/user/1000/codeagent/ssh/abc123.sock)
+#   build-box: dead
+
+# Close connections
+codeagent ssh stop dev-server
+```
+
+Socket path: `$XDG_RUNTIME_DIR/codeagent/ssh/<host-hash>.sock`
 
 ## Architecture
 
@@ -104,27 +227,32 @@ codeagent CLI
 
 ## Remote Deployment
 
-The remote helper is deployed via the existing dotai setup flow:
+The remote helper is deployed via the existing setup flow:
 
 ```bash
-# On each remote machine (already part of dotai setup):
+# On each remote machine (part of setup):
 python -m codeagent.remote_exec
 ```
 
-No separate installation needed — `codeagent-py` is added to dotai's setup scripts.
-
-## Development
-
-```bash
-uv run pytest tests/ -v    # 155 tests
-uv run codeagent --version
-```
+No separate installation needed.
 
 ## Relationship to code-route
 
 `codeagent` replaces `code_route.py` as the routing/execution layer. The Go `codeagent-wrapper` binary is preserved as-is for codex/claude/gemini/opencode backends.
 
-Migration: `code_route.py` commands map directly:
-- `code_route.py list` → `codeagent route list`
-- `code_route.py where <topic>` → `codeagent route where <topic>`
-- `code_route.py route <topic>` → `codeagent route <topic> <task>`
+| Old command | New command |
+|-------------|-------------|
+| `python3 code_route.py list` | `codeagent route list` |
+| `python3 code_route.py where <topic>` | `codeagent route where <topic>` |
+| `echo task \| python3 code_route.py route <topic>` | `codeagent route <topic> <task>` |
+
+## Development
+
+```bash
+uv run pytest tests/ -v    # Run all tests
+uv run codeagent --version # Verify CLI
+```
+
+## License
+
+MIT

@@ -1,0 +1,27 @@
+{
+  "default_backend": "opencode",
+  "default_model": "provider/model-name",
+  "backends": {
+    "codex": { "api_key": "sk-..." },
+    "claude": { "base_url": "http://localhost:8080", "api_key": "sk-ant-..." }
+  },
+  "agents": {
+    "explore": {
+      "backend": "opencode",
+      "model": "provider/fast-model",
+      "description": "Code exploration (1M context, low cost)"
+    },
+    "develop": {
+      "backend": "codex",
+      "model": "provider/strong-model",
+      "description": "Code implementation",
+      "reasoning": "high",
+      "yolo": true
+    },
+    "reviewer": {
+      "backend": "claude",
+      "model": "provider/reasoning-model",
+      "description": "Code review"
+    }
+  }
+}

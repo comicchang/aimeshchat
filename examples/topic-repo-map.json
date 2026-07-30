@@ -1,0 +1,7 @@
+{
+  "description": "Example project",
+  "repos": [
+    {"host": "dev-server", "path": "~/src/main-project", "note": "Main codebase"},
+    {"host": "devbox", "path": "/data/workspace", "note": "Cloud build"}
+  ]
+}

@@ -95,12 +95,12 @@ class TestLoadRepoMapHappy:
         global_json, _ = _load_fixture(tmp_path)
         rm = load_repo_map(global_json)
 
-        assert set(rm.hosts.keys()) == {"yellow", "devbox"}
-        yellow = rm.hosts["yellow"]
-        assert isinstance(yellow, HostSpec)
-        assert yellow.ssh_alias == "yellow"
-        assert yellow.transport == "ssh"
-        assert yellow.hostnames == ("yellow", "mcshyucs192069")
+        assert set(rm.hosts.keys()) == {"devhost", "devbox"}
+        devhost = rm.hosts["devhost"]
+        assert isinstance(devhost, HostSpec)
+        assert devhost.ssh_alias == "devhost"
+        assert devhost.transport == "ssh"
+        assert devhost.hostnames == ("devhost", "build-host-001")
 
     def test_topics_parsed(self, tmp_path: Path) -> None:
         global_json, _ = _load_fixture(tmp_path)
@@ -114,10 +114,10 @@ class TestLoadRepoMapHappy:
         tspec = rm.topics["TestTopic"]
 
         assert isinstance(tspec, TopicSpec)
-        assert tspec.description == "OHOS reverse engineering"
+        assert tspec.description == "Test topic"
         assert len(tspec.repos) == 2
-        assert tspec.repos[0].host == "yellow"
-        assert tspec.repos[0].note == "OHOS 7.0"
+        assert tspec.repos[0].host == "devhost"
+        assert tspec.repos[0].note == "Project A"
         assert tspec.repos[1].host == "devbox"
 
     def test_domain_topic_method(self, tmp_path: Path) -> None:
@@ -127,7 +127,7 @@ class TestLoadRepoMapHappy:
 
         entry = rm.topic("TestTopic").repo(0)
         assert isinstance(entry, RepoEntry)
-        assert entry.host == "yellow"
+        assert entry.host == "devhost"
 
     def test_domain_repo_map_topic_method(self, tmp_path: Path) -> None:
         """RepoMap.topic() raises KeyError for missing topics."""
@@ -144,17 +144,17 @@ class TestLoadRepoMapHappy:
         assert "~" not in rm.relay_zsh
         assert rm.relay_zsh.endswith("/relay.zsh")
 
-    def test_host_shell_prefix_expanded(
+    def test_host_shell_prefix_preserved(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """shell_prefix containing env vars is expanded at load time."""
+        """shell_prefix is kept as-is — it's a remote shell command."""
         global_json, _ = _load_fixture(tmp_path)
         monkeypatch.setenv("HOME", "/home/testuser")
         rm = load_repo_map(global_json)
 
-        prefix = rm.hosts["yellow"].shell_prefix
-        assert "~" not in prefix
-        assert "/home/testuser" in prefix
+        prefix = rm.hosts["devhost"].shell_prefix
+        # Remote shell command, not expanded locally
+        assert "$HOME" in prefix or "$PATH" in prefix or prefix == ""
 
     def test_host_defaults(self, tmp_path: Path) -> None:
         """A host with only required fields gets correct defaults."""
@@ -201,28 +201,32 @@ class TestLoadRepoMapPathExpansion:
 
         assert "~" not in str(rm.midocs_root)
 
-    def test_repo_path_expanded(self, tmp_path: Path) -> None:
+    def test_repo_path_not_expanded(self, tmp_path: Path) -> None:
+        """Remote repo paths are NOT expanded locally — they're for the remote host."""
         global_json, midocs = _load_fixture(tmp_path)
         topic_json = midocs / "TestTopic" / ".repo-map.json"
         topic_data = json.loads(topic_json.read_text())
-        topic_data["repos"] = [{"host": "yellow", "path": "~/src/code"}]
+        topic_data["repos"] = [{"host": "devhost", "path": "~/src/code"}]
         _write_json(topic_json, topic_data)
         rm = load_repo_map(global_json)
 
-        assert "~" not in rm.topics["TestTopic"].repos[0].path
+        # Remote path kept as-is (not expanded on local Mac)
+        assert rm.topics["TestTopic"].repos[0].path == "~/src/code"
 
-    def test_env_var_in_repo_path(
+    def test_env_var_in_repo_path_preserved(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Remote env vars are NOT expanded locally."""
         monkeypatch.setenv("CODE_ROOT", "/workspace")
         global_json, midocs = _load_fixture(tmp_path)
         topic_json = midocs / "TestTopic" / ".repo-map.json"
         topic_data = json.loads(topic_json.read_text())
-        topic_data["repos"] = [{"host": "yellow", "path": "$CODE_ROOT/src"}]
+        topic_data["repos"] = [{"host": "devhost", "path": "$CODE_ROOT/src"}]
         _write_json(topic_json, topic_data)
         rm = load_repo_map(global_json)
 
-        assert rm.topics["TestTopic"].repos[0].path == "/workspace/src"
+        # Remote env var kept as-is (expanded on remote host)
+        assert rm.topics["TestTopic"].repos[0].path == "$CODE_ROOT/src"
 
 
 # ── load_repo_map: empty / missing midocs_root ─────────────────────────
@@ -442,7 +446,7 @@ class TestLoadRepoMapErrors:
         global_json, midocs = _load_fixture(tmp_path)
         topic_json = midocs / "TestTopic" / ".repo-map.json"
         _write_json(topic_json, {
-            "repos": [{"host": "yellow"}],
+            "repos": [{"host": "devhost"}],
         })
         with pytest.raises(KeyError):
             load_repo_map(global_json)

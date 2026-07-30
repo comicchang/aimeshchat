@@ -1,47 +1,46 @@
-"""Abstract base transport for local and remote execution."""
+"""Abstract base transport — remote execution channel."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import Optional
 
-if TYPE_CHECKING:
-    from codeagent.domain import HostSpec, RunRequest, RunResult
+from codeagent.domain import HostSpec, RunRequest, RunResult
 
 
 class Transport(ABC):
-    """Base class for execution transports.
+    """Execution transport — local and remote.
+
+    LocalTransport spawns remote_exec helper locally (wire protocol).
+    SSHTransport/RelayTransport spawn remote_exec on remote hosts.
 
     Lifecycle:
         warm(host) → pre-establish connection (idempotent)
         check(host) → verify connection alive
-        execute(request, host, workdir) → run a task
+        execute(request, host, workdir, session_id) → run a task
         stop(host) → tear down connection
-
-    Implementations MUST be safe to call warm/stop multiple times.
     """
 
     @abstractmethod
     def warm(self, host: HostSpec) -> None:
-        """Pre-establish the connection to *host*.
-
-        Idempotent — no-op if already warm.
-        Raises ``TransportError`` on failure.
-        """
+        """Pre-establish connection. Idempotent."""
 
     @abstractmethod
     def check(self, host: HostSpec) -> bool:
-        """Return True if the connection to *host* is alive."""
+        """Return True if connection is alive."""
 
     @abstractmethod
     def stop(self, host: HostSpec) -> None:
-        """Tear down the connection to *host*.
-
-        Idempotent — no-op if already stopped.
-        """
+        """Tear down connection. Idempotent."""
 
     @abstractmethod
-    def execute(self, request: RunRequest, host: HostSpec, workdir: str) -> RunResult:
-        """Execute *request* on *host* in *workdir* and return the result."""
+    def execute(
+        self,
+        request: RunRequest,
+        host: HostSpec,
+        workdir: str,
+        session_id: Optional[str] = None,
+    ) -> RunResult:
+        """Execute request on remote host. Returns result with session_id."""
 
 
 class TransportError(Exception):

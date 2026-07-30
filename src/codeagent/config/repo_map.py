@@ -29,6 +29,7 @@ def _default_repo_map_path() -> Path:
         Path.home() / ".config" / "codeagent" / "repo-map.json",
         Path.home() / ".codeagent" / "repo-map.json",
         Path.home() / "src" / "dotai" / "profiles" / "policy" / "repo-map.json",
+        Path.home() / "projects" / "config" / "repo-map.json",
     ]
     for c in candidates:
         if c.is_file():
@@ -93,7 +94,7 @@ def load_repo_map(path: Path | str | None = None) -> RepoMap:
             ssh_alias=ssh_alias,
             hostnames=tuple(cfg.get("hostnames") or ()),
             description=cfg.get("description", ""),
-            shell_prefix=expand_path(cfg.get("shell_prefix", "")),
+            shell_prefix=cfg.get("shell_prefix", "").strip(),
             transport=transport,
             fallback_ssh_alias=fallback,
         )
@@ -120,7 +121,7 @@ def load_repo_map(path: Path | str | None = None) -> RepoMap:
                     )
                 repos.append(RepoEntry(
                     host=host_key,
-                    path=expand_path(entry["path"]),
+                    path=entry["path"].strip(),
                     note=entry.get("note", ""),
                 ))
 

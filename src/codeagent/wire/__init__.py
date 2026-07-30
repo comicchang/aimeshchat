@@ -1,9 +1,12 @@
 """Wire protocol for JSONL communication with remote exec helpers."""
 from codeagent.wire.protocol import (
+    MAX_LINE_LENGTH,
     WIRE_VERSION,
     WireMessage,
     decode_line,
+    decode_request,
     encode_line,
+    encode_request,
     make_accepted,
     make_capabilities,
     make_error,
@@ -16,10 +19,13 @@ from codeagent.wire.protocol import (
 )
 
 __all__ = [
+    "MAX_LINE_LENGTH",
     "WIRE_VERSION",
     "WireMessage",
     "decode_line",
+    "decode_request",
     "encode_line",
+    "encode_request",
     "make_accepted",
     "make_capabilities",
     "make_error",

@@ -24,11 +24,13 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Callable, Generator, Optional, TypeVar
 
 from codeagent.domain import LOCAL_HOST_MARKER, RunRequest, RunResult, SessionRecord, Target
 from codeagent.session.key import compute_session_key
 from codeagent.session.lock import SessionLock
+
+T = TypeVar("T")
 
 
 def _state_dir() -> Path:
@@ -133,7 +135,8 @@ class SessionRegistry:
         """Write a "starting" record for *key*.
 
         Called immediately when a new session is being spawned (i.e.
-        ``--new-session`` or no existing record found).
+        ``--new-session`` or no existing record found).  Holds
+        SessionLock(key) to prevent races with concurrent spawns.
         """
         now = time.time()
         backend = (request.backend or "opencode").lower()
@@ -143,7 +146,7 @@ class SessionRegistry:
         model = request.model or ""
         topic = request.topic or ""
 
-        with self._connect() as conn:
+        with SessionLock(key), self._connect() as conn:
             conn.execute(
                 """\
                 INSERT INTO sessions
@@ -151,7 +154,7 @@ class SessionRegistry:
                      topic, status, created_at, updated_at)
                 VALUES (?, '', ?, ?, ?, ?, ?, ?, 'starting', ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
-                    session_id = '',
+                    session_id = COALESCE(NULLIF(excluded.session_id, ''), sessions.session_id),
                     backend    = excluded.backend,
                     host       = excluded.host,
                     workdir    = excluded.workdir,
@@ -172,6 +175,26 @@ class SessionRegistry:
                 "UPDATE sessions SET session_id = ?, status = 'observed', updated_at = ? "
                 "WHERE key = ?",
                 (session_id, now, key),
+            )
+
+    def mark_active(self, key: str) -> None:
+        """Transition to "active" — runner confirmed the session is running."""
+        now = time.time()
+        with SessionLock(key), self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET status = 'active', updated_at = ? "
+                "WHERE key = ?",
+                (now, key),
+            )
+
+    def mark_failed(self, key: str) -> None:
+        """Transition to "failed" — runner reported an error."""
+        now = time.time()
+        with SessionLock(key), self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET status = 'failed', updated_at = ? "
+                "WHERE key = ?",
+                (now, key),
             )
 
     def upsert(
@@ -294,13 +317,43 @@ class SessionRegistry:
     def cleanup_stale(self, max_age_seconds: float = 86400) -> int:
         """Remove sessions stuck in 'starting' or 'observed' for too long.
 
-        Returns the number of rows deleted.
+        Returns the number of rows deleted.  Holds per-key locks for
+        each stale session to avoid racing with active operations.
         """
         cutoff = time.time() - max_age_seconds
+        # First, collect the keys to delete
         with self._connect() as conn:
-            cur = conn.execute(
-                "DELETE FROM sessions WHERE status IN ('starting', 'observed') "
-                "AND updated_at < ?",
-                (cutoff,),
-            )
-            return cur.rowcount
+            stale_keys = [
+                row[0] for row in conn.execute(
+                    "SELECT key FROM sessions WHERE status IN ('starting', 'observed') "
+                    "AND updated_at < ?",
+                    (cutoff,),
+                ).fetchall()
+            ]
+
+        deleted = 0
+        # Delete each under its own lock
+        for key in stale_keys:
+            with SessionLock(key), self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM sessions WHERE key = ? AND status IN ('starting', 'observed') "
+                    "AND updated_at < ?",
+                    (key, cutoff),
+                )
+                deleted += cur.rowcount
+
+        return deleted
+
+    @contextmanager
+    def run_with_lock(self, key: str) -> Generator[SessionLock, None, None]:
+        """Hold SessionLock(key) for the entire execution turn.
+
+        Use this when the caller needs to perform multiple registry
+        operations atomically under a single lock:
+
+            with registry.run_with_lock(key) as lock:
+                # multiple reads/writes here
+                pass
+        """
+        with SessionLock(key) as lock:
+            yield lock

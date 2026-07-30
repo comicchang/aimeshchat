@@ -7,6 +7,11 @@ Key format: "{host}:{normalized_workdir}:{backend}:{agent_or_profile}"
 - backend: one of codex/claude/gemini/opencode/omp (defaults to "opencode")
 - agent: agent preset name, or "" if none
 
+This key is a **NAMESPACE key** for registry lookup — it identifies the session
+namespace (same host+workdir+backend+agent).  It is NOT the backend session ID.
+The actual backend session ID is stored in SessionRecord.session_id after the
+runner captures it.
+
 Model is intentionally excluded: upgrading a model within the same session
 namespace is a normal operation and should not create a new session.
 """

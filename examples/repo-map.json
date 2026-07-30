@@ -1,11 +1,11 @@
 {
   "midocs_root": "~/docs",
-  "relay_zsh": "~/.relay/relay.zsh",
+  "relay_zsh": "",
   "hosts": {
-    "devhost": {
-      "ssh_alias": "devhost",
-      "hostnames": ["devhost", "build-host-001"],
-      "description": "Main dev server",
+    "dev-server": {
+      "ssh_alias": "dev-server",
+      "hostnames": ["dev-server", "build-host-001"],
+      "description": "Main development server",
       "transport": "ssh",
       "shell_prefix": "export PATH=$HOME/.local/bin:$PATH",
       "fallback_ssh_alias": ""
@@ -13,7 +13,7 @@
     "devbox": {
       "ssh_alias": "cloud-dev.example.com",
       "hostnames": ["cloud-dev-user"],
-      "description": "Cloud dev",
+      "description": "Cloud development environment",
       "transport": "relay-login",
       "shell_prefix": "",
       "fallback_ssh_alias": ""

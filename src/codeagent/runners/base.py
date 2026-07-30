@@ -1,6 +1,7 @@
 """Abstract base runner — contract for all backend executors."""
 from __future__ import annotations
 
+import os
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -38,30 +39,57 @@ class BaseRunner(ABC):
 
     def run(self, request: RunRequest) -> RunResult:
         """Execute a task and return the result."""
+        import signal
+
         cmd = self._build_cmd(request)
         if not cmd:
             return RunResult(returncode=1, stderr="failed to build command")
 
+        proc = None
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.config.timeout,
                 cwd=request.workdir or None,
+                start_new_session=True,
             )
-        except FileNotFoundError as exc:
-            return RunResult(returncode=127, stderr=str(exc))
-        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = proc.communicate(
+                input=request.task,
+                timeout=self.config.timeout,
+            )
+            proc_obj = subprocess.CompletedProcess(
+                cmd, proc.returncode, stdout, stderr
+            )
+        except subprocess.TimeoutExpired:
+            if proc is not None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            self._cleanup()
             return RunResult(
                 returncode=-1,
-                stdout=exc.stdout or "",
-                stderr=exc.stderr or f"timeout after {self.config.timeout}s",
+                stderr=f"timeout after {self.config.timeout}s",
             )
+        except FileNotFoundError as exc:
+            self._cleanup()
+            return RunResult(returncode=127, stderr=str(exc))
         except OSError as exc:
+            self._cleanup()
             return RunResult(returncode=1, stderr=str(exc))
 
-        return self._parse_output(proc, request)
+        return self._parse_output(proc_obj, request)
+
+    def _cleanup(self) -> None:
+        """Clean up temporary resources. Subclasses should override."""
+        pass
 
     # ------------------------------------------------------------------
     # Subclass contract

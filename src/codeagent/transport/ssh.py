@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from codeagent.domain import RunResult
 from codeagent.transport.base import Transport, TransportError
-from codeagent.transport.control_master import ControlMaster
+from codeagent.transport.control_master import ControlMaster, list_sockets, stop_by_alias, stop_all
 from codeagent.wire.protocol import (
+    MSG_ACCEPTED,
     MSG_ERROR,
     MSG_READY,
     MSG_RESULT,
@@ -34,6 +36,20 @@ _READY_TIMEOUT = 15
 
 # Default per-request timeout passed to the remote helper.
 _DEFAULT_TIMEOUT = 600
+
+# SSH error patterns that indicate a connection-level failure (exit 255).
+_SSH_ERROR_PATTERNS = (
+    "Connection refused",
+    "Connection timed out",
+    "Connection reset by peer",
+    "No route to host",
+    "Network is unreachable",
+    "Name or service not known",
+    "Could not resolve hostname",
+    "Permission denied",
+    "Host key verification failed",
+    "Connection closed by remote host",
+)
 
 
 class SSHTransport(Transport):
@@ -71,32 +87,65 @@ class SSHTransport(Transport):
         cm.create()
 
     def check(self, host: HostSpec) -> bool:
-        """Return True if the ControlMaster for *host* is alive."""
-        cm = self._masters.get(host.ssh_alias)
-        if cm is None:
-            return False
-        return cm.is_alive()
+        """Return True if the ControlMaster for *host* is alive.
+
+        Works cross-process: if the socket is not in the local ``_masters``
+        dict, falls back to looking up the socket via ``.meta`` files.
+        """
+        alias = host.ssh_alias
+        cm = self._masters.get(alias)
+        if cm is not None:
+            return cm.is_alive()
+        # Cross-process: find socket by alias via .meta files.
+        for sock_alias, sock_path in list_sockets():
+            if sock_alias == alias:
+                cm = ControlMaster(alias, ssh_bin=self._ssh)
+                cm._socket = sock_path
+                return cm.is_alive()
+        return False
 
     def stop(self, host: HostSpec) -> None:
         """Tear down the ControlMaster for *host*.
 
-        Idempotent — no-op if already stopped.
+        Works cross-process: uses ``stop_by_alias`` which reads ``.meta``
+        files to locate the socket, so it works even when ``_masters`` is
+        empty (new CLI process).
         """
         alias = host.ssh_alias
-        cm = self._masters.pop(alias, None)
-        if cm is not None:
-            cm.stop()
+        # Remove from local cache if present.
+        self._masters.pop(alias, None)
+        # Always delegate to the cross-process stop.
+        stop_by_alias(alias, ssh_bin=self._ssh)
 
     def stop_all(self) -> None:
-        """Tear down every open ControlMaster."""
-        for alias, cm in list(self._masters.items()):
-            cm.stop()
-        self._masters.clear()
+        """Tear down every open ControlMaster.
 
-    def execute(self, request: RunRequest, host: HostSpec, workdir: str) -> RunResult:
+        Uses the cross-process ``stop_all`` from control_master which
+        iterates over ``.meta`` files.
+        """
+        self._masters.clear()
+        stop_all(ssh_bin=self._ssh)
+
+    def list_sockets(self) -> list[tuple[str, Path]]:
+        """Return all managed sockets as ``(alias, socket_path)`` tuples.
+
+        Needed by the CLI for ``ssh status`` display.
+        """
+        return list_sockets()
+
+    def execute(
+        self,
+        request: RunRequest,
+        host: HostSpec,
+        workdir: str,
+        session_id: str | None = None,
+    ) -> RunResult:
         """Run *request* on *host* in *workdir* via SSH.
 
         Ensures the ControlMaster is alive before executing.
+
+        On connection errors (exit 255 + SSH error patterns), retries
+        with ``host.fallback_ssh_alias`` if available.
         """
         alias = host.ssh_alias
         cm = self._masters.get(alias)
@@ -108,6 +157,18 @@ class SSHTransport(Transport):
         if not cm.is_alive():
             cm.create()
 
+        # Build remote command.
+        # shell_prefix must be expanded on the REMOTE host, not locally.
+        # We combine everything into a single shell string passed to ssh,
+        # using shlex.quote to prevent local expansion of $HOME/$PATH.
+        remote_exec = f"{self._python} -m codeagent.remote_exec"
+        if host.shell_prefix:
+            # Wrap in sh -c so shell_prefix vars expand on remote side
+            remote_cmd_str = f"{host.shell_prefix}; {remote_exec}"
+            remote_cmd = ["sh", "-c", remote_cmd_str]
+        else:
+            remote_cmd = [self._python, "-m", "codeagent.remote_exec"]
+
         req = make_request(
             command="run",
             task=request.task,
@@ -115,15 +176,15 @@ class SSHTransport(Transport):
             backend=request.backend or "",
             agent=request.agent,
             model=request.model,
-            session_id=request.session_key if not request.new_session else None,
+            session_id=session_id,
             skip_permissions=request.skip_permissions,
             timeout=_DEFAULT_TIMEOUT,
         )
 
-        ssh_cmd = cm.ssh_cmd(self._python, "-m", "codeagent.remote_exec")
+        ssh_cmd = cm.ssh_cmd(*remote_cmd)
         log.debug("SSH execute: %s", " ".join(ssh_cmd))
 
-        return _run_ssh_wire(
+        result = _run_ssh_wire(
             ssh_cmd,
             req,
             workdir=workdir,
@@ -131,6 +192,41 @@ class SSHTransport(Transport):
             backend=request.backend or "",
             timeout=_DEFAULT_TIMEOUT,
         )
+
+        # On connection error (exit 255 + SSH error patterns), retry with fallback.
+        if (
+            result.returncode == 255
+            and host.fallback_ssh_alias
+            and _is_ssh_error(result.stderr)
+        ):
+            log.warning(
+                "SSH connection to %s failed (exit 255), retrying with fallback %s",
+                alias,
+                host.fallback_ssh_alias,
+            )
+            fallback_cm = self._masters.get(host.fallback_ssh_alias)
+            if fallback_cm is None:
+                fallback_cm = ControlMaster(
+                    host.fallback_ssh_alias, ssh_bin=self._ssh
+                )
+                self._masters[host.fallback_ssh_alias] = fallback_cm
+
+            if not fallback_cm.is_alive():
+                fallback_cm.create()
+
+            fallback_ssh_cmd = fallback_cm.ssh_cmd(*remote_cmd)
+            log.debug("SSH fallback execute: %s", " ".join(fallback_ssh_cmd))
+
+            result = _run_ssh_wire(
+                fallback_ssh_cmd,
+                req,
+                workdir=workdir,
+                host_name=host.fallback_ssh_alias,
+                backend=request.backend or "",
+                timeout=_DEFAULT_TIMEOUT,
+            )
+
+        return result
 
 
 # ── SSH wire-protocol runner ────────────────────────────────────────────
@@ -148,11 +244,12 @@ def _run_ssh_wire(
     """Run an SSH command that hosts ``codeagent.remote_exec`` and exchange
     a single JSONL request/response cycle.
 
-    Unlike the local transport (which uses ``subprocess.run`` with input),
-    we use ``Popen`` so we can stream the request on stdin while reading
-    the response lines from stdout in real time.  This lets us capture
-    ``session`` messages that may arrive *before* the final ``result``.
+    Uses ``Popen.communicate(timeout=deadline)`` for proper timeout handling.
+    Stderr from the SSH process is captured and included in RunResult.stderr
+    for diagnostics.
     """
+    payload = encode_line(request)
+
     try:
         proc = subprocess.Popen(
             ssh_cmd,
@@ -163,58 +260,50 @@ def _run_ssh_wire(
     except FileNotFoundError as exc:
         raise TransportError(f"ssh binary not found: {ssh_cmd[0]}") from exc
 
-    payload = encode_line(request)
     session_id: str | None = None
     result_stdout = ""
     result_stderr = ""
     exit_code = -1
 
     try:
-        # Write the request and close stdin so the remote helper knows
-        # we're done sending.
-        assert proc.stdin is not None
-        proc.stdin.write(payload)
-        proc.stdin.flush()
-        proc.stdin.close()
-
-        # Read lines until we get a terminal message or EOF.
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                msg = decode_line(line)
-            except ValueError:
-                # Non-JSON noise — skip.
-                continue
-
-            if msg.type == MSG_READY:
-                # Helper sent ready before processing — expected.
-                continue
-            if msg.type == MSG_SESSION:
-                session_id = msg.session_id
-            elif msg.type == MSG_RESULT:
-                result_stdout = msg.stdout
-                result_stderr = msg.stderr
-                exit_code = msg.exit_code
-                break
-            elif msg.type == MSG_ERROR:
-                result_stderr = msg.message
-                exit_code = -1
-                break
-
-        # Collect any remaining stderr from SSH itself.
-        assert proc.stderr is not None
-        ssh_stderr = proc.stderr.read().decode("utf-8", errors="replace")
-        proc.wait(timeout=30)
-
+        stdout, stderr = proc.communicate(input=payload, timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.wait()
         raise TransportError(f"SSH execution timed out after {timeout}s")
     except Exception:
         proc.kill()
+        proc.wait()
         raise
+
+    stdout_str = stdout.decode("utf-8", errors="replace") if stdout else ""
+    ssh_stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
+
+    # Parse JSONL response lines.
+    for raw_line in stdout_str.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            msg = decode_line(raw_line)
+        except ValueError:
+            # Non-JSON noise — skip.
+            continue
+
+        if msg.type == MSG_READY:
+            # Helper sent ready before processing — expected.
+            continue
+        if msg.type == MSG_ACCEPTED:
+            continue
+        if msg.type == MSG_SESSION:
+            session_id = msg.session_id
+        elif msg.type == MSG_RESULT:
+            result_stdout = msg.stdout
+            result_stderr = msg.stderr
+            exit_code = msg.exit_code
+        elif msg.type == MSG_ERROR:
+            result_stderr = msg.message
+            exit_code = -1
 
     # If we got no structured result, use the SSH stderr as a diagnostic.
     if exit_code == -1 and not result_stderr and ssh_stderr:
@@ -222,7 +311,7 @@ def _run_ssh_wire(
 
     # If the process exited non-zero and we have no wire-level exit code,
     # propagate the SSH exit code.
-    if exit_code == -1 and proc.returncode != 0:
+    if exit_code == -1 and proc.returncode is not None and proc.returncode != 0:
         exit_code = proc.returncode
 
     return RunResult(
@@ -234,3 +323,8 @@ def _run_ssh_wire(
         host=host_name,
         workdir=workdir,
     )
+
+
+def _is_ssh_error(stderr: str) -> bool:
+    """Check if stderr contains SSH connection error patterns."""
+    return any(pattern in stderr for pattern in _SSH_ERROR_PATTERNS)

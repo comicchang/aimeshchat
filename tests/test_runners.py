@@ -24,10 +24,15 @@ def _completed(
     returncode: int = 0,
     stdout: str = "",
     stderr: str = "",
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(
-        args=[], returncode=returncode, stdout=stdout, stderr=stderr
-    )
+) -> mock.MagicMock:
+    """Create a mock proc that behaves like a Popen process object."""
+    proc = mock.MagicMock()
+    proc.communicate.return_value = (stdout, stderr)
+    proc.returncode = returncode
+    proc.pid = 12345
+    proc.stdout = stdout
+    proc.stderr = stderr
+    return proc
 
 
 # ── GoWrapperRunner ─────────────────────────────────────────────────────
@@ -52,14 +57,27 @@ class TestGoWrapperRunner:
 
     def test_resume_cmd(self) -> None:
         r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(task="continue", session_key="abc123")
+        req = RunRequest(task="continue", resume_session_id="backend-sess-42")
         cmd = r._build_cmd(req)
         assert cmd[1] == "resume"
-        assert "abc123" in cmd
+        assert "backend-sess-42" in cmd
+        # session_key (namespace) should NOT be used
+        assert req.session_key is None
+
+    def test_resume_uses_session_id_not_session_key(self) -> None:
+        r = self._runner(binary="/usr/bin/wrapper")
+        req = RunRequest(
+            task="continue",
+            session_key="namespace-key",
+            resume_session_id="backend-id-99",
+        )
+        cmd = r._build_cmd(req)
+        assert "backend-id-99" in cmd
+        assert "namespace-key" not in cmd
 
     def test_new_session_overrides_resume(self) -> None:
         r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(task="start fresh", session_key="abc123", new_session=True)
+        req = RunRequest(task="start fresh", resume_session_id="backend-sess-42", new_session=True)
         cmd = r._build_cmd(req)
         # "resume" should NOT appear when new_session=True
         assert "resume" not in cmd
@@ -197,7 +215,8 @@ class TestGoWrapperRunner:
             json.dumps({"session_id": "s1", "backend": "claude", "status": "ok"})
         )
 
-        with mock.patch("subprocess.run", return_value=_completed(0, "ok", "")):
+        mock_popen = mock.MagicMock(return_value=_completed(0, "ok", ""))
+        with mock.patch("subprocess.Popen", mock_popen):
             r = self._runner(binary="/usr/bin/wrapper", output_dir=tmp_path)
             # Patch _build_cmd to set _output_file to our known path
             with mock.patch.object(
@@ -226,10 +245,16 @@ class TestGoWrapperRunner:
         assert "No such file" in result.stderr or "not found" in result.stderr.lower()
 
     def test_run_timeout(self) -> None:
-        with mock.patch(
-            "subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="wrapper", timeout=5),
-        ):
+        mock_proc = mock.MagicMock()
+        mock_proc.pid = 9999
+        exc = subprocess.TimeoutExpired(cmd="wrapper", timeout=5)
+        exc.proc = mock_proc
+
+        mock_popen = mock.MagicMock()
+        mock_popen.return_value = mock_proc
+        mock_proc.communicate.side_effect = exc
+
+        with mock.patch("subprocess.Popen", mock_popen):
             r = self._runner(binary="/usr/bin/wrapper")
             r.config.timeout = 5
             result = r.run(RunRequest(task="long task"))
@@ -237,11 +262,83 @@ class TestGoWrapperRunner:
             assert "timeout" in result.stderr.lower()
 
     def test_run_os_error(self) -> None:
-        with mock.patch("subprocess.run", side_effect=OSError("permission denied")):
+        mock_popen = mock.MagicMock(side_effect=OSError("permission denied"))
+        with mock.patch("subprocess.Popen", mock_popen):
             r = self._runner(binary="/usr/bin/wrapper")
             result = r.run(RunRequest(task="hello"))
             assert result.returncode == 1
             assert "permission denied" in result.stderr
+
+    def test_output_file_cleanup_on_success(self, tmp_path: Path) -> None:
+        """Output temp file should be cleaned up after successful run."""
+        out_file = tmp_path / "go_out_clean.json"
+        out_file.write_text(json.dumps({"session_id": "s1", "backend": "claude", "status": "ok"}))
+
+        mock_popen = mock.MagicMock(return_value=_completed(0, "ok", ""))
+        with mock.patch("subprocess.Popen", mock_popen):
+            r = self._runner(binary="/usr/bin/wrapper", output_dir=tmp_path)
+            orig_build = r._build_cmd
+
+            def patched_build(req):
+                cmd = orig_build(req)
+                r._output_file = out_file
+                return cmd
+
+            with mock.patch.object(r, "_build_cmd", side_effect=patched_build):
+                result = r.run(RunRequest(task="fix it"))
+                assert result.returncode == 0
+                # Output file should be cleaned up by _cleanup
+                assert not out_file.exists()
+
+    def test_output_file_cleanup_on_failure(self, tmp_path: Path) -> None:
+        """Output temp file should be cleaned up even when process fails."""
+        out_file = tmp_path / "go_out_fail.json"
+        out_file.write_text(json.dumps({"session_id": "s1", "backend": "claude", "status": "error", "error": "crash"}))
+
+        mock_popen = mock.MagicMock(return_value=_completed(1, "", "error"))
+        with mock.patch("subprocess.Popen", mock_popen):
+            r = self._runner(binary="/usr/bin/wrapper", output_dir=tmp_path)
+            orig_build = r._build_cmd
+
+            def patched_build(req):
+                cmd = orig_build(req)
+                r._output_file = out_file
+                return cmd
+
+            with mock.patch.object(r, "_build_cmd", side_effect=patched_build):
+                result = r.run(RunRequest(task="fix it"))
+                assert result.returncode == 1
+                # Output file should be cleaned up by _cleanup
+                assert not out_file.exists()
+
+    def test_output_file_cleanup_on_timeout(self, tmp_path: Path) -> None:
+        """Output temp file should be cleaned up on timeout."""
+        out_file = tmp_path / "go_out_timeout.json"
+        out_file.write_text("{}")
+
+        mock_proc = mock.MagicMock()
+        mock_proc.pid = 9999
+        exc = subprocess.TimeoutExpired(cmd="wrapper", timeout=5)
+        exc.proc = mock_proc
+
+        mock_popen = mock.MagicMock()
+        mock_popen.return_value = mock_proc
+        mock_proc.communicate.side_effect = exc
+
+        with mock.patch("subprocess.Popen", mock_popen):
+            r = self._runner(binary="/usr/bin/wrapper", output_dir=tmp_path)
+            orig_build = r._build_cmd
+
+            def patched_build(req):
+                cmd = orig_build(req)
+                r._output_file = out_file
+                return cmd
+
+            with mock.patch.object(r, "_build_cmd", side_effect=patched_build):
+                result = r.run(RunRequest(task="long task"))
+                assert result.returncode == -1
+                # Output file should be cleaned up by _cleanup
+                assert not out_file.exists()
 
 
 # ── OMPRunner ────────────────────────────────────────────────────────────
@@ -262,7 +359,9 @@ class TestOMPRunner:
         assert cmd[0] == "/usr/local/bin/omp"
         assert "--print" in cmd
         assert "--mode" in cmd
-        assert "json" in cmd
+        # Mode must be literal "json", not json.dumps("json")
+        mode_idx = cmd.index("--mode")
+        assert cmd[mode_idx + 1] == "json"
         assert "--cwd" in cmd
         assert "/src" in cmd
         assert "--auto-approve" in cmd
@@ -271,18 +370,41 @@ class TestOMPRunner:
         # Clean up
         r._cleanup_prompt_file()
 
+    def test_mode_is_literal_json(self) -> None:
+        """Verify --mode is literal 'json', not json.dumps('json') which would be '"json"'."""
+        r = self._runner(binary="/usr/bin/omp")
+        req = RunRequest(task="test")
+        cmd = r._build_cmd(req)
+        mode_idx = cmd.index("--mode")
+        mode_value = cmd[mode_idx + 1]
+        assert mode_value == "json", f"expected literal 'json', got: {mode_value!r}"
+        assert not mode_value.startswith('"'), "should not be json.dumps output"
+        r._cleanup_prompt_file()
+
     def test_resume_cmd(self) -> None:
         r = self._runner(binary="/usr/bin/omp")
-        req = RunRequest(task="continue", workdir="/src", session_key="sess-1")
+        req = RunRequest(task="continue", workdir="/src", resume_session_id="backend-sess-1")
         cmd = r._build_cmd(req)
         assert "--resume" in cmd
-        assert cmd[cmd.index("--resume") + 1] == "sess-1"
+        assert cmd[cmd.index("--resume") + 1] == "backend-sess-1"
+        r._cleanup_prompt_file()
+
+    def test_resume_uses_session_id_not_session_key(self) -> None:
+        r = self._runner(binary="/usr/bin/omp")
+        req = RunRequest(
+            task="continue",
+            session_key="namespace-key",
+            resume_session_id="backend-id-99",
+        )
+        cmd = r._build_cmd(req)
+        assert "backend-id-99" in cmd
+        assert "namespace-key" not in cmd
         r._cleanup_prompt_file()
 
     def test_no_resume_when_new_session(self) -> None:
         r = self._runner(binary="/usr/bin/omp")
         req = RunRequest(
-            task="fresh start", session_key="old-sess", new_session=True
+            task="fresh start", resume_session_id="old-sess", new_session=True
         )
         cmd = r._build_cmd(req)
         assert "--resume" not in cmd
@@ -294,6 +416,22 @@ class TestOMPRunner:
         cmd = r._build_cmd(req)
         assert "--model" in cmd
         assert cmd[cmd.index("--model") + 1] == "gpt-5"
+        r._cleanup_prompt_file()
+
+    def test_auto_approve_when_skip_permissions(self) -> None:
+        """--auto-approve should be present when skip_permissions=True (default)."""
+        r = self._runner(binary="/usr/bin/omp")
+        req = RunRequest(task="do it")  # skip_permissions defaults to True
+        cmd = r._build_cmd(req)
+        assert "--auto-approve" in cmd
+        r._cleanup_prompt_file()
+
+    def test_no_auto_approve_when_not_skip_permissions(self) -> None:
+        """--auto-approve should be absent when skip_permissions=False."""
+        r = self._runner(binary="/usr/bin/omp")
+        req = RunRequest(task="do it", skip_permissions=False)
+        cmd = r._build_cmd(req)
+        assert "--auto-approve" not in cmd
         r._cleanup_prompt_file()
 
     def test_prompt_file_is_0600(self) -> None:
@@ -416,7 +554,8 @@ class TestOMPRunner:
             '{"type": "assistant", "message_end": {"message": "Done!"}}\n'
             '{"type": "agent_end"}\n'
         )
-        with mock.patch("subprocess.run", return_value=_completed(0, stdout, "")):
+        mock_popen = mock.MagicMock(return_value=_completed(0, stdout, ""))
+        with mock.patch("subprocess.Popen", mock_popen):
             r = self._runner(binary="/usr/bin/omp")
             result = r.run(RunRequest(task="fix it", workdir="/code"))
             assert result.returncode == 0
@@ -429,10 +568,16 @@ class TestOMPRunner:
         assert result.returncode == 127
 
     def test_run_timeout(self) -> None:
-        with mock.patch(
-            "subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="omp", timeout=30),
-        ):
+        mock_proc = mock.MagicMock()
+        mock_proc.pid = 9999
+        exc = subprocess.TimeoutExpired(cmd="omp", timeout=30)
+        exc.proc = mock_proc
+
+        mock_popen = mock.MagicMock()
+        mock_popen.return_value = mock_proc
+        mock_proc.communicate.side_effect = exc
+
+        with mock.patch("subprocess.Popen", mock_popen):
             r = self._runner(binary="/usr/bin/omp")
             r.config.timeout = 30
             result = r.run(RunRequest(task="long task"))
@@ -440,7 +585,8 @@ class TestOMPRunner:
             assert "timeout" in result.stderr.lower()
 
     def test_run_os_error(self) -> None:
-        with mock.patch("subprocess.run", side_effect=OSError("disk full")):
+        mock_popen = mock.MagicMock(side_effect=OSError("disk full"))
+        with mock.patch("subprocess.Popen", mock_popen):
             r = self._runner(binary="/usr/bin/omp")
             result = r.run(RunRequest(task="hello"))
             assert result.returncode == 1
@@ -451,7 +597,8 @@ class TestOMPRunner:
     def test_run_cleans_prompt_on_success(self) -> None:
         """Prompt temp file should be deleted after a successful run."""
         stdout = '{"type": "agent_end"}\n'
-        with mock.patch("subprocess.run", return_value=_completed(0, stdout, "")):
+        mock_popen = mock.MagicMock(return_value=_completed(0, stdout, ""))
+        with mock.patch("subprocess.Popen", mock_popen):
             r = self._runner(binary="/usr/bin/omp")
             # Manually call _build_cmd to capture the prompt file path
             req = RunRequest(task="test")
@@ -471,7 +618,8 @@ class TestOMPRunner:
 
     def test_run_cleans_prompt_on_error(self) -> None:
         """Prompt temp file should be deleted even when the process fails."""
-        with mock.patch("subprocess.run", return_value=_completed(1, "", "oops")):
+        mock_popen = mock.MagicMock(return_value=_completed(1, "", "oops"))
+        with mock.patch("subprocess.Popen", mock_popen):
             r = self._runner(binary="/usr/bin/omp")
             result = r.run(RunRequest(task="test"))
             assert result.returncode == 1
@@ -501,3 +649,29 @@ class TestBaseRunnerContract:
         result = d.run(RunRequest(task="hello"))
         assert result.returncode == 0
         assert result.stdout.strip() == "hello"
+
+    def test_timeout_calls_killpg(self) -> None:
+        """BaseRunner should call os.killpg on timeout."""
+        mock_proc = mock.MagicMock()
+        mock_proc.pid = 12345
+
+        class Dummy(BaseRunner):
+            def _build_cmd(self, request):
+                return ["echo", request.task]
+            def _parse_output(self, proc, request):
+                return RunResult(returncode=0)
+
+        timeout_exc = subprocess.TimeoutExpired(cmd="echo", timeout=5)
+        timeout_exc.proc = mock_proc
+
+        mock_popen = mock.MagicMock()
+        mock_popen.return_value = mock_proc
+        mock_proc.communicate.side_effect = timeout_exc
+
+        with mock.patch("subprocess.Popen", mock_popen), \
+             mock.patch("os.killpg") as mock_killpg, \
+             mock.patch("os.getpgid", return_value=12345):
+            d = Dummy(config=RunnerConfig(timeout=5))
+            result = d.run(RunRequest(task="long"))
+            assert result.returncode == -1
+            mock_killpg.assert_called_once_with(12345, 9)
