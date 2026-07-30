@@ -131,12 +131,15 @@ class SessionRegistry:
             ).fetchone()
         return _row_to_record(row) if row else None
 
-    def mark_starting(self, key: str, request: RunRequest, target: Target) -> None:
+    def mark_starting(self, key: str, request: RunRequest, target: Target, *, clear_session: bool = False) -> None:
         """Write a "starting" record for *key*.
 
         Called immediately when a new session is being spawned (i.e.
         ``--new-session`` or no existing record found).  Holds
         SessionLock(key) to prevent races with concurrent spawns.
+
+        If *clear_session* is True, the old session_id is discarded
+        (used with ``--new-session`` to avoid resuming a stale session).
         """
         now = time.time()
         backend = (request.backend or "opencode").lower()
@@ -147,25 +150,47 @@ class SessionRegistry:
         topic = request.topic or ""
 
         with SessionLock(key), self._connect() as conn:
-            conn.execute(
-                """\
-                INSERT INTO sessions
-                    (key, session_id, backend, host, workdir, agent, model,
-                     topic, status, created_at, updated_at)
-                VALUES (?, '', ?, ?, ?, ?, ?, ?, 'starting', ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    session_id = COALESCE(NULLIF(excluded.session_id, ''), sessions.session_id),
-                    backend    = excluded.backend,
-                    host       = excluded.host,
-                    workdir    = excluded.workdir,
-                    agent      = excluded.agent,
-                    model      = excluded.model,
-                    topic      = excluded.topic,
-                    status     = 'starting',
-                    updated_at = excluded.updated_at
-                """,
-                (key, backend, host, workdir, agent, model, topic, now, now),
-            )
+            if clear_session:
+                # Force-clear old session_id for --new-session
+                conn.execute(
+                    """\
+                    INSERT INTO sessions
+                        (key, session_id, backend, host, workdir, agent, model,
+                         topic, status, created_at, updated_at)
+                    VALUES (?, '', ?, ?, ?, ?, ?, ?, 'starting', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        session_id = '',
+                        backend    = excluded.backend,
+                        host       = excluded.host,
+                        workdir    = excluded.workdir,
+                        agent      = excluded.agent,
+                        model      = excluded.model,
+                        topic      = excluded.topic,
+                        status     = 'starting',
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, backend, host, workdir, agent, model, topic, now, now),
+                )
+            else:
+                conn.execute(
+                    """\
+                    INSERT INTO sessions
+                        (key, session_id, backend, host, workdir, agent, model,
+                         topic, status, created_at, updated_at)
+                    VALUES (?, '', ?, ?, ?, ?, ?, ?, 'starting', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        session_id = COALESCE(NULLIF(excluded.session_id, ''), sessions.session_id),
+                        backend    = excluded.backend,
+                        host       = excluded.host,
+                        workdir    = excluded.workdir,
+                        agent      = excluded.agent,
+                        model      = excluded.model,
+                        topic      = excluded.topic,
+                        status     = 'starting',
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, backend, host, workdir, agent, model, topic, now, now),
+                )
 
     def mark_observed(self, key: str, session_id: str) -> None:
         """Transition to "observed" once the runner has captured the session id."""

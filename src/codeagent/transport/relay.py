@@ -95,7 +95,7 @@ class RelayTransport(Transport):
         wire_b64 = base64.b64encode(wire_line.encode("utf-8")).decode("ascii")
 
         # Build remote command
-        remote_cmd = f"printf '%s' {wire_b64} | base64 -d | python3 -m codeagent.remote_exec"
+        remote_cmd = f"printf '%s' {wire_b64} | base64 -d | codeagent-remote-exec"
         if host.shell_prefix:
             remote_cmd = f"{host.shell_prefix}; {remote_cmd}"
 
@@ -121,7 +121,7 @@ class RelayTransport(Transport):
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
         session_id: Optional[str] = None
-        exit_code = 0
+        exit_code: Optional[int] = None  # None = no wire result received
         master_fd: Optional[int] = None
         slave_fd: Optional[int] = None
 
@@ -242,6 +242,10 @@ class RelayTransport(Transport):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+
+            # No wire result received — use process exit code or default to error
+            if exit_code is None:
+                exit_code = proc.returncode if proc.returncode is not None else 1
 
         except Exception as e:
             stderr_chunks.append(f"relay execution error: {e}")

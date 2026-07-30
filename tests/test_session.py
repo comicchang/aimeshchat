@@ -623,7 +623,6 @@ class TestConcurrentAccess:
             assert rec is not None
             assert rec.session_id == f"sess-{i}"
 
-    @pytest.mark.xfail(reason="subprocess __file__ in -c mode", strict=False)
     def test_process_concurrent_upserts(self, db_path: Path, tmp_path: Path) -> None:
         """Multiple processes upserting different keys via subprocess."""
         import subprocess as sp

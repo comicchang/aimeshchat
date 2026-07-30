@@ -10,9 +10,11 @@ import json
 import os
 import sys
 
+from codeagent import __version__
 from codeagent.domain import RunRequest
 from codeagent.runners import GoWrapperRunner, OMPRunner
 from codeagent.runners.base import RunnerConfig
+from codeagent.wire.protocol import decode_request
 
 WIRE_VERSION = 1
 MAX_LINE_LENGTH = 1_048_576  # 1 MiB
@@ -20,23 +22,15 @@ SUPPORTED_COMMANDS = {"run", "ping", "capabilities"}
 
 
 def _read_request() -> dict | None:
-    """Read one JSON line from stdin, with max-length guard."""
+    """Read one JSON line from stdin, validate with decode_request."""
     line = sys.stdin.readline()
     if not line:
         return None
-    line = line.strip()
-    if len(line) > MAX_LINE_LENGTH:
-        _send({"type": "error", "message": f"request line exceeds {MAX_LINE_LENGTH} bytes"})
-        return None
     try:
-        obj = json.loads(line)
-    except json.JSONDecodeError as e:
-        _send({"type": "error", "message": f"invalid JSON: {e}"})
+        return decode_request(line)
+    except ValueError as e:
+        _send({"type": "error", "message": str(e)})
         return None
-    if not isinstance(obj, dict):
-        _send({"type": "error", "message": "request must be a JSON object"})
-        return None
-    return obj
 
 
 def _send(obj: dict) -> None:
@@ -49,7 +43,7 @@ def _handle_ping(req: dict) -> None:
     _send({
         "type": "pong",
         "wire_version": WIRE_VERSION,
-        "package_version": "0.1.0",
+        "package_version": __version__,
         "capabilities": ["run", "ping", "capabilities"],
         "hostname": os.uname().nodename,
     })
@@ -123,7 +117,7 @@ def _handle_run(req: dict) -> None:
 def main() -> None:
     """Main loop — read requests from stdin, write responses to stdout."""
     # Send ready signal
-    _send({"type": "ready", "wire_version": WIRE_VERSION, "package_version": "0.1.0"})
+    _send({"type": "ready", "wire_version": WIRE_VERSION, "package_version": __version__})
 
     while True:
         req = _read_request()

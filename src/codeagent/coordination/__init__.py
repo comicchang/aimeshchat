@@ -1,16 +1,11 @@
-"""Coordination subsystem — mailbox protocol for multi-agent orchestration.
+"""Coordination subsystem — placeholder for future multi-agent protocol.
 
-This module provides the mailbox-based coordination protocol used by
-tmux-agent-manager and tmux-agent-worker. It is intentionally kept
-separate from the execution subsystem (transport/runner/session).
+Mailbox protocol (CLI, models, store) authoritative source:
+  https://github.com/comicchang/tmux-agent-skills  (tools/mailbox)
 
-Key components:
-- mailbox_cli: standalone CLI for inbox/processing/archive lifecycle
-- models: message types, status, roster
-- store: filesystem-based atomic inbox store
-
-The mailbox root defaults to $MAILBOX_ROOT env var, falling back to
-$XDG_STATE_HOME/codeagent/mailbox or ~/.local/state/codeagent/mailbox.
+This package intentionally does NOT bundle mailbox code to avoid drift.
+dotai setup installs tmux-agent-skills separately when tmux-agent skills
+are enabled.
 """
 from __future__ import annotations
 

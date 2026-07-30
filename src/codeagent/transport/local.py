@@ -71,7 +71,7 @@ class LocalTransport(Transport):
             skip_permissions=request.skip_permissions,
         )
         return _run_wire(
-            [self._python, "-m", "codeagent.remote_exec"],
+            ["codeagent-remote-exec"],
             req,
             workdir=workdir,
             host_name=LOCAL_HOST_MARKER,

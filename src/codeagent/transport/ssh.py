@@ -223,12 +223,12 @@ class SSHTransport(Transport):
     ) -> RunResult:
         """Build remote command and execute on *cm*."""
         # shell_prefix must be expanded on the REMOTE host, not locally.
-        remote_exec = f"{self._python} -m codeagent.remote_exec"
+        remote_exec = "codeagent-remote-exec"
         if host.shell_prefix:
             remote_cmd_str = f"{host.shell_prefix}; {remote_exec}"
             remote_cmd = ["sh", "-c", remote_cmd_str]
         else:
-            remote_cmd = [self._python, "-m", "codeagent.remote_exec"]
+            remote_cmd = ["codeagent-remote-exec"]
 
         req = make_request(
             command="run",

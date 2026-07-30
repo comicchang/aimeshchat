@@ -144,10 +144,17 @@ class TestResolveIsLocal:
         host = HostSpec(name="x", ssh_alias="x", hostnames=())
         assert resolve_is_local(host) is False
 
-    def test_substring_match(self):
-        """resolve_is_local uses substring matching."""
-        host = HostSpec(name="x", ssh_alias="x", hostnames=("mac",))
-        # will match if hostname contains "mac" (case-insensitive)
-        actual = socket.gethostname().split(".", 1)[0].lower()
-        expected = "mac" in actual
-        assert resolve_is_local(host) is expected
+    def test_exact_match(self):
+        """resolve_is_local uses exact short hostname matching (not substring)."""
+        actual = socket.gethostname().split(".")[0].lower()
+        host = HostSpec(name="x", ssh_alias="x", hostnames=(actual,))
+        assert resolve_is_local(host) is True
+
+    def test_no_substring_false_positive(self):
+        """resolve_is_local does NOT match substring (e.g. 'dev' != 'dev3')."""
+        host = HostSpec(name="x", ssh_alias="x", hostnames=("dev",))
+        # 'dev' should not match 'dev3', 'devbox', etc.
+        actual = socket.gethostname().split(".")[0].lower()
+        if actual == "dev":
+            pytest.skip("hostname is exactly 'dev'")
+        assert resolve_is_local(host) is False

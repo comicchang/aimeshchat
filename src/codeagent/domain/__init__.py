@@ -134,10 +134,14 @@ def current_hostname() -> str:
 
 
 def resolve_is_local(host: HostSpec, hostname: Optional[str] = None) -> bool:
-    """判断是否本机。substring 匹配。"""
+    """判断是否本机。exact match on short hostname or FQDN。"""
     actual = (hostname or current_hostname()).lower()
+    actual_short = actual.split(".")[0]
     for candidate in host.hostnames:
         c = candidate.lower()
-        if c and c in actual:
+        if not c:
+            continue
+        c_short = c.split(".")[0]
+        if c == actual or c_short == actual_short:
             return True
     return False

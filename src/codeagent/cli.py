@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+
+from codeagent import __version__
 import json
 import logging
 import sys
@@ -39,7 +41,7 @@ def _get_transport(host: HostSpec, repo_map=None):
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("codeagent", description="Multi-host code agent orchestration")
-    p.add_argument("--version", "-v", action="version", version="%(prog)s 0.1.0")
+    p.add_argument("--version", "-v", action="version", version=f"%(prog)s {__version__}")
 
     sub = p.add_subparsers(dest="command")
 
@@ -123,7 +125,8 @@ def _execute(request: RunRequest, target: Target, registry: SessionRegistry, rep
                 print(f"[codeagent] resuming session {backend_session_id[:12]}... (key={ns_key})", file=sys.stderr)
 
         # Mark starting (preserves existing session_id via COALESCE)
-        registry.mark_starting(ns_key, request, target)
+        registry.mark_starting(ns_key, request, target,
+                               clear_session=request.new_session)
 
         # Execute with exception handling
         try:
@@ -195,7 +198,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         host=args.host,
     )
 
-    repo_map = load_repo_map()
+    repo_map = None
+    try:
+        repo_map = load_repo_map()
+    except FileNotFoundError:
+        if not request.host:
+            raise  # topic routing requires repo-map
+        # ad-hoc host: empty repo-map is fine
+        repo_map = RepoMap(hosts={}, topics={})
     registry = SessionRegistry()
     target = resolve_target(request, repo_map)
     result = _execute(request, target, registry, repo_map)

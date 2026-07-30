@@ -271,7 +271,10 @@ def make_capabilities_request() -> dict[str, Any]:
 # ── message factories (remote side) ─────────────────────────────────────
 
 
-def make_ready(*, wire_version: int = WIRE_VERSION, package_version: str = "0.1.0") -> dict[str, Any]:
+def make_ready(*, wire_version: int = WIRE_VERSION, package_version: str | None = None) -> dict[str, Any]:
+    if package_version is None:
+        from codeagent import __version__
+        package_version = __version__
     return {"type": MSG_READY, "wire_version": wire_version, "package_version": package_version}
 
 
