@@ -1,0 +1,7 @@
+{
+  "description": "OHOS reverse engineering",
+  "repos": [
+    {"host": "yellow", "path": "~/src/P1-4.0", "note": "OHOS 7.0"},
+    {"host": "devbox", "path": "/data/build", "note": "cloud build"}
+  ]
+}

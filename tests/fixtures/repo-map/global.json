@@ -1,0 +1,22 @@
+{
+  "midocs_root": "~/fixtures/mi-docs",
+  "relay_zsh": "~/.relay/relay.zsh",
+  "hosts": {
+    "yellow": {
+      "ssh_alias": "yellow",
+      "hostnames": ["yellow", "mcshyucs192069"],
+      "description": "xiaomi intranet",
+      "transport": "ssh",
+      "shell_prefix": "export PATH=$HOME/.linuxbrew/bin:$PATH",
+      "fallback_ssh_alias": ""
+    },
+    "devbox": {
+      "ssh_alias": "clouddev-user.android.xiaomi.com",
+      "hostnames": ["clouddev-user"],
+      "description": "cloud dev",
+      "transport": "relay-login",
+      "shell_prefix": "",
+      "fallback_ssh_alias": ""
+    }
+  }
+}
