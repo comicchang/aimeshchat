@@ -180,7 +180,7 @@ codeagent sessions list --host dev-server
 codeagent sessions list --topic MyTopic
 
 # Force new session (don't resume)
-codeagent --new-session "start fresh analysis"
+codeagent run "start fresh analysis" --new-session
 
 # Manual session binding
 codeagent sessions bind --key "dev-server:/src:opencode:explore" --id abc123

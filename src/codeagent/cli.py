@@ -214,7 +214,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if not request.host:
             raise  # topic routing requires repo-map
         # ad-hoc host: empty repo-map is fine
-        repo_map = RepoMap(hosts={}, topics={})
+        repo_map = RepoMap(midocs_root=Path("."), hosts={}, topics={})
     registry = SessionRegistry()
     target = resolve_target(request, repo_map)
     result = _execute(request, target, registry, repo_map)

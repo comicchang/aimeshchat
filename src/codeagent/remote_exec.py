@@ -14,10 +14,8 @@ from codeagent import __version__
 from codeagent.domain import RunRequest
 from codeagent.runners import GoWrapperRunner, OMPRunner
 from codeagent.runners.base import RunnerConfig
-from codeagent.wire.protocol import decode_request
+from codeagent.wire.protocol import WIRE_VERSION, MAX_LINE_LENGTH, decode_request
 
-WIRE_VERSION = 1
-MAX_LINE_LENGTH = 1_048_576  # 1 MiB
 SUPPORTED_COMMANDS = {"run", "ping", "capabilities", "mailbox"}
 
 

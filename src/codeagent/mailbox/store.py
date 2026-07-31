@@ -67,6 +67,12 @@ class MailboxStore:
     # ── Session ────────────────────────────────────────────────────────
 
     def session_init(self, session_id: str, manager_id: str, agent_ids: list[str]) -> str:
+        # Validate all IDs before creating anything
+        validate_agent_id(session_id)
+        validate_agent_id(manager_id)
+        for aid in agent_ids:
+            validate_agent_id(aid)
+
         sd = self.session_dir(session_id)
         if sd.exists():
             raise ValueError(f"session already exists: {session_id}")
@@ -326,6 +332,16 @@ class MailboxStore:
             return None
         try:
             d = json.loads(status_file.read_bytes())
+            # Validate required fields
+            if not isinstance(d, dict):
+                return None
+            required = {"session_id", "state", "current_task", "last_conclusion", "updated_at"}
+            if not required.issubset(d.keys()):
+                return None
+            if d.get("session_id") != session_id:
+                return None
+            if d.get("state") not in VALID_STATES:
+                return None
             return StatusSnapshot.from_dict(d)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return None

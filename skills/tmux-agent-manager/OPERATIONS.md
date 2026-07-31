@@ -88,7 +88,7 @@ mailbox finalize \
 
 # 放回 inbox（不处理时）
 mailbox release \
-  --session <session-id> --agent manager --msg-id <id>
+  --session <session-id> --agent manager --msg-id <id> --owner manager
 
 # 统计（shows all4 dirs: inbox/processing/archive/_corrupt）与清理
 mailbox stats --session <session-id> --agent manager

@@ -123,7 +123,8 @@ class RelayTransport(Transport):
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
         session_id: Optional[str] = None
-        exit_code: Optional[int] = None  # None = no wire result received
+        exit_code: Optional[int] = None  # None = no wire result received yet
+        version_mismatch = False
         master_fd: Optional[int] = None
         slave_fd: Optional[int] = None
 
@@ -217,8 +218,11 @@ class RelayTransport(Transport):
                             if msg_type == MSG_SESSION:
                                 session_id = payload.get("id")
                             elif msg_type == MSG_RESULT:
-                                stdout_chunks.append(payload.get("stdout", ""))
-                                exit_code = payload.get("exit_code", 0)
+                                if not version_mismatch:
+                                    stdout_chunks.append(payload.get("stdout", ""))
+                                    exit_code = payload.get("exit_code", 0)
+                                else:
+                                    stderr_chunks.append("ignoring result after wire version mismatch")
                             elif msg_type == MSG_ERROR:
                                 stderr_chunks.append(payload.get("message", ""))
                                 exit_code = payload.get("exit_code", 1)
@@ -230,6 +234,7 @@ class RelayTransport(Transport):
                                         f"wire version mismatch: remote={remote_ver}, local={WIRE_VERSION}"
                                     )
                                     exit_code = 1
+                                    version_mismatch = True
                             elif msg_type == MSG_ACCEPTED:
                                 pass  # protocol handshake
                             else:
