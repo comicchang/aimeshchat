@@ -425,19 +425,24 @@ class SwarmKernel:
 
     def broadcast(self, session_id: str, sender: str,
                   envelope: Envelope) -> list[DeliveryReceipt]:
-        """Broadcast to all room members except sender."""
+        """Broadcast to all room members except sender.
+
+        Each recipient gets its own msg_id — DeliveryEngine's msg_id
+        idempotency would otherwise short-circuit every recipient after
+        the first (one outbox entry per msg_id, so only the first
+        fan-out copy is actually sent).  Per-recipient ids keep every
+        copy durable and deliverable across hosts.
+        """
         session = self._require_session(session_id)
         self._check_broadcast(session, sender)
 
-        msg_id = self._gen_msg_id()
         created_at = self._gen_created_at()
         recipients = session.roster.without(sender)
 
-        # Deliver to mailbox via BROADCAST_TO marker (store fans out)
-        self._sink.deliver(session_id, BROADCAST_TO, envelope, msg_id, created_at, sender)
-
         receipts = []
         for r in recipients:
+            msg_id = self._gen_msg_id()
+            self._sink.deliver(session_id, r, envelope, msg_id, created_at, sender)
             receipts.append(DeliveryReceipt(
                 msg_id=msg_id, recipient=r, status="delivered",
             ))
@@ -453,12 +458,12 @@ class SwarmKernel:
         ch = channels[channel_id]
         self._check_channel(session, ch, sender)
 
-        msg_id = self._gen_msg_id()
         created_at = self._gen_created_at()
 
         for member in ch.members:
             if member == sender:
                 continue
+            msg_id = self._gen_msg_id()  # per-recipient: no delivery short-circuit
             self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
 
         return SendReceipt(msg_id=msg_id, status="delivered",
@@ -486,6 +491,7 @@ class SwarmKernel:
         targets.discard(sender)
 
         for member in sorted(targets):
+            msg_id = self._gen_msg_id()  # per-recipient: no delivery short-circuit
             self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
 
         return SendReceipt(msg_id=msg_id, status="delivered",
