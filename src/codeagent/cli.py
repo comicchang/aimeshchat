@@ -27,20 +27,17 @@ from codeagent.routing.resolver import resolve_target
 from codeagent.session.registry import SessionRegistry
 from codeagent.transport.base import TransportError
 from codeagent.transport.local import LocalTransport
+from codeagent.transport.router import TransportRouter
 from codeagent.transport.ssh import SSHTransport
 
 log = logging.getLogger(__name__)
 
+_router = TransportRouter()
+
 
 def _get_transport(host: HostSpec, repo_map=None):
     """Select transport based on host.transport field."""
-    if host.transport == "relay-login":
-        relay_zsh = getattr(repo_map, 'relay_zsh', '') if repo_map else ''
-        if not relay_zsh:
-            raise ValueError(f"host '{host.name}' uses relay-login but relay_zsh not configured")
-        from codeagent.transport.relay import RelayTransport
-        return RelayTransport(relay_zsh)
-    return SSHTransport()
+    return _router.get(host, repo_map)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -481,12 +478,11 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
             sys.stdout, sys.stderr = old_stdout, old_stderr
         return 0
 
-    # Remote host specified — SSH wire transport.
-    # file mode (or auto fallback): SSH transport
+    # Remote host specified — dispatch through TransportRouter.
     from codeagent.config.repo_map import load_repo_map
     from codeagent.domain import HostSpec, resolve_is_local
-    from codeagent.transport.control_master import ControlMaster
 
+    repo_map = None
     try:
         repo_map = load_repo_map()
         host_spec = repo_map.hosts.get(host)
@@ -503,22 +499,12 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
         mailbox_main(mailbox_args)
         return 0
 
-    # Remote via SSH — use wire protocol over stdin JSONL
-    from codeagent.constants import DEFAULT_MAILBOX_TIMEOUT
-    from codeagent.transport.ssh import _run_ssh_mailbox
-    from codeagent.wire.protocol import make_mailbox_request
+    # Remote via transport selected by TransportRouter.
+    transport = _router.get(host_spec, repo_map)
 
-    cm = ControlMaster(host_spec.ssh_alias)
-    if not cm.is_alive():
-        cm.create()
-
-    req = make_mailbox_request(
-        args=mailbox_args,
-        mailbox_root=mailbox_root or "",
+    exit_code, stdout, stderr = transport.mailbox(
+        host_spec, mailbox_args, mailbox_root=mailbox_root or "",
     )
-    ssh_cmd = cm.ssh_cmd("codeagent-remote-exec")
-
-    exit_code, stdout, stderr = _run_ssh_mailbox(ssh_cmd, req, timeout=DEFAULT_MAILBOX_TIMEOUT)
     if stdout:
         print(stdout, end="")
     if stderr:

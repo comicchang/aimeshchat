@@ -23,3 +23,9 @@ LEASE_TIMEOUT_S = 300  # mailbox claim lease — stale after 5 minutes
 MAX_LINE_LENGTH = 1_048_576  # 1 MiB
 MAX_MAILBOX_BODY = 100_000  # 100 KiB
 
+# ── long-lived stream settings ─────────────────────────────────────────
+STREAM_HEARTBEAT_INTERVAL = 15  # seconds between heartbeat pings
+STREAM_RECONNECT_MAX = 30  # max reconnect backoff in seconds
+STREAM_RECONNECT_BASE = 1  # initial reconnect backoff in seconds
+STREAM_CURSOR_DEFAULT = "0"  # initial cursor value
+

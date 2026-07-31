@@ -4,6 +4,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from codeagent.constants import DEFAULT_MAILBOX_TIMEOUT
 from codeagent.domain import HostSpec, RunRequest, RunResult
 
 
@@ -41,6 +42,22 @@ class Transport(ABC):
         session_id: Optional[str] = None,
     ) -> RunResult:
         """Execute request on remote host. Returns result with session_id."""
+
+    def mailbox(
+        self,
+        host: HostSpec,
+        args: list[str],
+        mailbox_root: str = "",
+        timeout: int = DEFAULT_MAILBOX_TIMEOUT,
+    ) -> tuple[int, str, str]:
+        """Run a mailbox wire request on *host*.
+
+        Returns ``(exit_code, stdout, stderr)``.
+        Subclasses that support mailbox override this.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support mailbox operations"
+        )
 
 
 class TransportError(Exception):

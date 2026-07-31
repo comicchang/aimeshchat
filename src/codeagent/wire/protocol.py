@@ -35,15 +35,18 @@ MSG_ERROR = "error"
 MSG_PONG = "pong"
 MSG_CAPABILITIES = "capabilities"
 MSG_MAILBOX_RESULT = "mailbox_result"
+MSG_STREAM_EVENT = "stream_event"
 
 TERMINAL_TYPES = frozenset({MSG_RESULT, MSG_ERROR, MSG_MAILBOX_RESULT})
 LIFECYCLE_TYPES = frozenset({MSG_READY, MSG_ACCEPTED, MSG_SESSION, MSG_RESULT, MSG_ERROR, MSG_MAILBOX_RESULT})
+STREAM_TYPES = frozenset({MSG_STREAM_EVENT})
 
 # ── command constants ───────────────────────────────────────────────────
 CMD_RUN = "run"
 CMD_PING = "ping"
 CMD_CAPABILITIES = "capabilities"
 CMD_MAILBOX = "mailbox"
+CMD_STREAM = "stream"
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,16 @@ class WireMessage:
         """Wire version from the payload, if present."""
         return self.payload.get("wire_version", 0)
 
+    @property
+    def request_id(self) -> str:
+        """Request ID for stream correlation."""
+        return self.payload.get("request_id", "")
+
+    @property
+    def cursor(self) -> str:
+        """Cursor for resumable event delivery."""
+        return self.payload.get("cursor", "")
+
 
 # ── encode / decode ─────────────────────────────────────────────────────
 
@@ -109,6 +122,7 @@ _RESPONSE_REQUIRED: dict[str, dict[str, type]] = {
     MSG_PONG:          {"wire_version": int},
     MSG_CAPABILITIES:  {},  # no strictly required fields beyond type
     MSG_MAILBOX_RESULT: {"exit_code": int, "stdout": str, "stderr": str},
+    MSG_STREAM_EVENT:  {"request_id": str, "session_id": str, "cursor": str, "payload": dict},
 }
 
 
@@ -159,6 +173,7 @@ _REQUEST_REQUIRED: dict[str, dict[str, type]] = {
     CMD_PING:         {},
     CMD_CAPABILITIES: {},
     CMD_MAILBOX:      {"args": list},
+    CMD_STREAM:       {"session_id": str, "cursor": str},
 }
 
 
@@ -263,6 +278,32 @@ def make_request(
     return req
 
 
+def make_stream_request(
+    *,
+    session_id: str,
+    cursor: str = "0",
+    timeout: int = DEFAULT_EXEC_TIMEOUT,
+    request_id: str = "",
+    wire_version: int = WIRE_VERSION,
+) -> dict[str, Any]:
+    """Build a stream subscription request.
+
+    ``cursor`` is an opaque resume token — pass ``"0"`` for a fresh
+    subscription or the last received cursor to resume after reconnect.
+    ``request_id`` correlates the response; auto-generated if empty.
+    """
+    import uuid
+    req: dict[str, Any] = {
+        "wire_version": wire_version,
+        "command": CMD_STREAM,
+        "session_id": session_id,
+        "cursor": cursor,
+        "timeout": timeout,
+        "request_id": request_id or uuid.uuid4().hex[:12],
+    }
+    return req
+
+
 def make_ping() -> dict[str, Any]:
     """Build a ping request."""
     return {"wire_version": WIRE_VERSION, "command": CMD_PING}
@@ -340,3 +381,25 @@ def make_capabilities(*, wire_version: int = WIRE_VERSION, backends: list[str] |
     if features is not None:
         obj["features"] = features
     return obj
+
+
+def make_stream_event(
+    *,
+    request_id: str,
+    session_id: str,
+    cursor: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a stream_event push frame.
+
+    ``cursor`` is an opaque token the client sends back on reconnect to
+    resume delivery without message loss.
+    ``payload`` carries the event body (e.g. a mailbox message summary).
+    """
+    return {
+        "type": MSG_STREAM_EVENT,
+        "request_id": request_id,
+        "session_id": session_id,
+        "cursor": cursor,
+        "payload": payload,
+    }

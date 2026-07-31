@@ -9,10 +9,19 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
-from codeagent.constants import DEFAULT_MAILBOX_TIMEOUT, DEFAULT_SSH_TIMEOUT
+from codeagent.constants import (
+    DEFAULT_EXEC_TIMEOUT,
+    DEFAULT_MAILBOX_TIMEOUT,
+    DEFAULT_SSH_TIMEOUT,
+    STREAM_CURSOR_DEFAULT,
+    STREAM_HEARTBEAT_INTERVAL,
+    STREAM_RECONNECT_BASE,
+    STREAM_RECONNECT_MAX,
+)
 from codeagent.domain import RunResult
 from codeagent.transport.base import Transport, TransportError
 from codeagent.transport.control_master import ControlMaster, list_sockets, stop_by_alias, stop_all
@@ -20,12 +29,15 @@ from codeagent.wire.protocol import (
     MSG_ACCEPTED,
     MSG_ERROR,
     MSG_MAILBOX_RESULT,
+    MSG_PONG,
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
+    MSG_STREAM_EVENT,
     WIRE_VERSION,
     decode_line,
     encode_line,
+    make_mailbox_request,
     make_request,
 )
 
@@ -182,6 +194,28 @@ class SSHTransport(Transport):
             return self._execute_on_fallback(request, host, workdir, session_id)
 
         return result
+
+    def mailbox(
+        self,
+        host: HostSpec,
+        args: list[str],
+        mailbox_root: str = "",
+        timeout: int = DEFAULT_MAILBOX_TIMEOUT,
+    ) -> tuple[int, str, str]:
+        """Run a mailbox wire request on *host* via SSH ControlMaster.
+
+        Returns ``(exit_code, stdout, stderr)``.
+        """
+        alias = host.ssh_alias
+        cm = self._masters.get(alias)
+        if cm is None:
+            cm = ControlMaster(alias, ssh_bin=self._ssh)
+            self._masters[alias] = cm
+        if not cm.is_alive():
+            cm.create()
+        req = make_mailbox_request(args=args, mailbox_root=mailbox_root)
+        ssh_cmd = cm.ssh_cmd("codeagent-remote-exec")
+        return _run_ssh_mailbox(ssh_cmd, req, timeout=timeout)
 
     # ── Internal helpers ────────────────────────────────────────────────
 
@@ -453,3 +487,262 @@ def _run_ssh_mailbox(
 def _is_ssh_error(stderr: str) -> bool:
     """Check if stderr contains SSH connection error patterns."""
     return any(pattern in stderr for pattern in _SSH_ERROR_PATTERNS)
+
+
+# ── SSHStream — long-lived bidirectional JSONL stream ──────────────────
+
+
+class SSHStream:
+    """Bidirectional JSONL stream to a remote ``codeagent remote-exec serve``.
+
+    Spawns ``ssh <host> codeagent-remote-exec`` (which enters serve mode
+    automatically when ``stream`` is requested), keeps stdin/stdout open,
+    and provides ``poll()`` to wait for stream events with cursor-based
+    resumable delivery.
+
+    Reconnect: on process exit, exponential backoff 1s/2s/4s … max 30s,
+    then re-issues the last request with cursor to resume (at-least-once
+    delivery; consumers deduplicate by ``msg_id``).
+
+    Lifecycle::
+
+        stream = SSHStream(ssh_cmd=["ssh", "host"])
+        stream.open(session_id="s1", agent_id="a1")
+        for event in stream.poll(timeout=300):
+            process(event)
+        stream.close()
+    """
+
+    def __init__(
+        self,
+        *,
+        ssh_cmd: list[str],
+        heartbeat_interval: int = STREAM_HEARTBEAT_INTERVAL,
+        reconnect_base: float = float(STREAM_RECONNECT_BASE),
+        reconnect_max: float = float(STREAM_RECONNECT_MAX),
+    ) -> None:
+        self._ssh_cmd = list(ssh_cmd)
+        self._heartbeat_interval = heartbeat_interval
+        self._reconnect_base = reconnect_base
+        self._reconnect_max = reconnect_max
+
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._session_id = ""
+        self._agent_id = ""
+        self._request_id = ""
+        self._cursor = STREAM_CURSOR_DEFAULT
+        self._timeout = DEFAULT_EXEC_TIMEOUT
+
+        self._last_event_time: float = 0.0
+        self._closed = False
+        self._seen_msg_ids: set[str] = set()
+
+    # ── public API ─────────────────────────────────────────────────────
+
+    def open(
+        self,
+        *,
+        session_id: str,
+        agent_id: str,
+        cursor: str = STREAM_CURSOR_DEFAULT,
+        timeout: int = DEFAULT_EXEC_TIMEOUT,
+    ) -> None:
+        """Open the stream — spawn the SSH process and issue a stream request."""
+        self._session_id = session_id
+        self._agent_id = agent_id
+        self._cursor = cursor
+        self._timeout = timeout
+        self._closed = False
+        self._spawn_and_subscribe()
+
+    def poll(self, timeout: float = 0.0) -> list[dict[str, Any]]:
+        """Read available stream events, blocking up to *timeout* seconds.
+
+        Returns a list of event payload dicts (empty if timeout elapses
+        with no events).  Automatically reconnects on process exit with
+        cursor resume.
+
+        Each event payload includes ``msg_id`` for consumer-side dedup.
+        """
+        if self._closed:
+            return []
+
+        events: list[dict[str, Any]] = []
+        deadline = time.monotonic() + timeout if timeout > 0 else 0.0
+
+        while True:
+            remaining = deadline - time.monotonic() if deadline else float(self._heartbeat_interval)
+            if remaining <= 0:
+                break
+
+            line = self._readline(min(remaining, self._heartbeat_interval))
+            if line is None:
+                # Timeout or EOF
+                if self._proc is not None and self._proc.poll() is not None:
+                    # Process exited — reconnect.  The reconnect sleep is
+                    # not idle wait; reset the deadline so events arriving
+                    # right after reconnection are still delivered.
+                    log.warning("SSHStream: process exited (rc=%s), reconnecting", self._proc.returncode)
+                    self._reconnect()
+                    if deadline:
+                        deadline = time.monotonic() + timeout
+                    continue
+                break
+
+            try:
+                msg = decode_line(line)
+            except ValueError:
+                continue
+
+            self._last_event_time = time.monotonic()
+
+            if msg.type == MSG_READY:
+                continue
+            if msg.type == MSG_ACCEPTED:
+                continue
+            if msg.type == MSG_PONG:
+                # Heartbeat from server — connection alive
+                continue
+            if msg.type == MSG_ERROR:
+                log.error("SSHStream: server error: %s", msg.message)
+                continue
+            if msg.type == MSG_STREAM_EVENT:
+                payload = msg.payload.get("payload", {})
+                msg_id = payload.get("msg_id", "")
+                # At-least-once delivery with msg_id dedup
+                if msg_id and msg_id in self._seen_msg_ids:
+                    continue
+                if msg_id:
+                    self._seen_msg_ids.add(msg_id)
+                self._cursor = msg.cursor
+                events.append(payload)
+
+        return events
+
+    def close(self) -> None:
+        """Shut down the stream gracefully."""
+        self._closed = True
+        if self._proc is not None:
+            try:
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+                self._proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                self._proc.kill()
+                self._proc.wait()
+            self._proc = None
+
+    @property
+    def cursor(self) -> str:
+        """Current resume cursor."""
+        return self._cursor
+
+    @property
+    def is_alive(self) -> bool:
+        """True if the underlying SSH process is running."""
+        return self._proc is not None and self._proc.poll() is None
+
+    # ── internal ───────────────────────────────────────────────────────
+
+    def _spawn_and_subscribe(self) -> None:
+        """Spawn SSH subprocess and issue a stream subscription request."""
+        import uuid
+
+        self._request_id = uuid.uuid4().hex[:12]
+        remote_cmd = ["codeagent-remote-exec"]
+        cmd = list(self._ssh_cmd) + remote_cmd
+
+        log.debug("SSHStream: spawning %s", " ".join(cmd))
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise TransportError(f"ssh binary not found: {cmd[0]}") from exc
+
+        # Wait for ready banner
+        assert self._proc.stdout is not None
+        ready_line = self._proc.stdout.readline()
+        if not ready_line:
+            rc = self._proc.wait()
+            raise TransportError(f"SSHStream: no ready banner (exit {rc})")
+        try:
+            ready_msg = decode_line(ready_line)
+            if ready_msg.type != MSG_READY:
+                raise TransportError(
+                    f"SSHStream: expected ready, got {ready_msg.type}"
+                )
+        except ValueError as exc:
+            raise TransportError(f"SSHStream: bad ready banner: {exc}") from exc
+
+        # Send stream subscription request
+        from codeagent.wire.protocol import make_stream_request
+
+        req = make_stream_request(
+            session_id=self._session_id,
+            cursor=self._cursor,
+            timeout=self._timeout,
+            request_id=self._request_id,
+        )
+        # Also include agent_id for the remote to know which inbox to watch
+        req["agent_id"] = self._agent_id
+        payload = encode_line(req)
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(payload)
+        self._proc.stdin.flush()
+
+        self._last_event_time = time.monotonic()
+
+    def _readline(self, timeout: float) -> str | None:
+        """Read one line from stdout with timeout. Returns None on timeout/EOF."""
+        import select
+
+        if self._proc is None or self._proc.stdout is None:
+            return None
+
+        try:
+            ready, _, _ = select.select([self._proc.stdout], [], [], timeout)
+        except (ValueError, OSError, TypeError, AttributeError):
+            # Non-selectable stream (e.g. io.BytesIO in tests, or a
+            # stream without a fileno) — degrade to a direct read.
+            ready = None
+
+        if ready is not None and not ready:
+            return None  # select timeout
+
+        try:
+            line = self._proc.stdout.readline()
+        except (ValueError, OSError):
+            return None
+        if not line:
+            return None  # EOF
+
+        return line.decode("utf-8", errors="replace")
+
+    def _reconnect(self) -> None:
+        """Reconnect with exponential backoff and cursor resume."""
+        import time as _time
+
+        # Clean up old process
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+                self._proc.wait()
+            except OSError:
+                pass
+            self._proc = None
+
+        backoff = self._reconnect_base
+        while not self._closed:
+            log.info("SSHStream: reconnecting in %.1fs (cursor=%s)", backoff, self._cursor)
+            _time.sleep(backoff)
+            try:
+                self._spawn_and_subscribe()
+                log.info("SSHStream: reconnected")
+                return
+            except (TransportError, OSError) as exc:
+                log.warning("SSHStream: reconnect failed: %s", exc)
+                backoff = min(backoff * 2, self._reconnect_max)

@@ -665,9 +665,12 @@ class TestGetTransport:
         from codeagent.cli import _get_transport
 
         host = HostSpec(name="h", ssh_alias="h", hostnames=("h",))
-        with mock.patch("codeagent.cli.SSHTransport") as ssh_cls:
+        with mock.patch("codeagent.cli._router") as router:
+            sentinel = mock.MagicMock()
+            router.get.return_value = sentinel
             t = _get_transport(host)
-        assert t is ssh_cls.return_value
+        assert t is sentinel
+        router.get.assert_called_once_with(host, None)
 
     def test_relay_login_with_zsh(self, tmp_path):
         from codeagent.cli import _get_transport
@@ -999,28 +1002,25 @@ class TestMailbox:
         assert rc == 5
 
     def test_remote_ad_hoc_host(self, capsys):
-        """Remote host not in repo-map → ad-hoc HostSpec → wire protocol over SSH."""
+        """Remote host not in repo-map → ad-hoc HostSpec → router dispatches transport.mailbox()."""
         from codeagent.cli import main
 
         rm = _make_repo_map()
+        transport = mock.MagicMock()
+        transport.mailbox.return_value = (0, "stdout-line", "stderr-line")
         with (
             mock.patch("codeagent.cli.load_repo_map", return_value=rm),
             mock.patch("codeagent.domain.resolve_is_local", return_value=False),
-            mock.patch("codeagent.transport.control_master.ControlMaster") as cm_cls,
-            mock.patch("codeagent.transport.ssh._run_ssh_mailbox",
-                       return_value=(0, "stdout-line", "stderr-line")) as run_mbox,
-            mock.patch("codeagent.wire.protocol.make_mailbox_request",
-                       return_value={"type": "mailbox_request"}) as make_req,
+            mock.patch("codeagent.cli._router.get", return_value=transport),
         ):
-            cm_cls.return_value.is_alive.return_value = False
             rc = main(["mailbox", "--host", "remotehost",
                        "stats", "--session", "s1", "--agent", "w1"])
         assert rc == 0
-        cm = cm_cls.return_value
-        cm.is_alive.assert_called_once()
-        cm.create.assert_called_once()
-        make_req.assert_called_once()
-        run_mbox.assert_called_once()
+        transport.mailbox.assert_called_once()
+        call_args = transport.mailbox.call_args
+        host_spec = call_args.args[0]
+        assert host_spec.ssh_alias == "remotehost"
+        assert "stats" in call_args.args[1]
         captured = capsys.readouterr()
         assert "stdout-line" in captured.out
         assert "stderr-line" in captured.err
@@ -1041,12 +1041,12 @@ class TestMailbox:
         from codeagent.cli import main
 
         rm = _make_repo_map()
+        transport = mock.MagicMock()
+        transport.mailbox.return_value = (0, "", "")
         with (
             mock.patch("codeagent.cli.load_repo_map", return_value=rm),
             mock.patch("codeagent.domain.resolve_is_local", return_value=False),
-            mock.patch("codeagent.transport.control_master.ControlMaster"),
-            mock.patch("codeagent.transport.ssh._run_ssh_mailbox", return_value=(0, "", "")),
-            mock.patch("codeagent.wire.protocol.make_mailbox_request", return_value={}),
+            mock.patch("codeagent.cli._router.get", return_value=transport),
         ):
             rc = main(["mailbox", "stats", "--session", "s1", "--agent", "w1",
                        "--host", "remotehost"])
@@ -1057,12 +1057,12 @@ class TestMailbox:
         from codeagent.cli import main
 
         rm = _make_repo_map()
+        transport = mock.MagicMock()
+        transport.mailbox.return_value = (0, "", "")
         with (
             mock.patch("codeagent.cli.load_repo_map", return_value=rm),
             mock.patch("codeagent.domain.resolve_is_local", return_value=False),
-            mock.patch("codeagent.transport.control_master.ControlMaster"),
-            mock.patch("codeagent.transport.ssh._run_ssh_mailbox", return_value=(0, "", "")),
-            mock.patch("codeagent.wire.protocol.make_mailbox_request", return_value={}),
+            mock.patch("codeagent.cli._router.get", return_value=transport),
         ):
             rc = main(["mailbox", "stats", "--host=remotehost",
                        "--session", "s1", "--agent", "w1"])
@@ -1072,13 +1072,13 @@ class TestMailbox:
         """Remote path with repo-map FileNotFoundError → ad-hoc host fallback."""
         from codeagent.cli import main
 
+        transport = mock.MagicMock()
+        transport.mailbox.return_value = (0, "ok-out", "")
         with (
             mock.patch("codeagent.config.repo_map.load_repo_map",
                        side_effect=FileNotFoundError("no repo-map")),
             mock.patch("codeagent.domain.resolve_is_local", return_value=False),
-            mock.patch("codeagent.transport.control_master.ControlMaster"),
-            mock.patch("codeagent.transport.ssh._run_ssh_mailbox", return_value=(0, "ok-out", "")),
-            mock.patch("codeagent.wire.protocol.make_mailbox_request", return_value={}),
+            mock.patch("codeagent.cli._router.get", return_value=transport),
         ):
             rc = main(["mailbox", "--host", "adhoc",
                        "stats", "--session", "s1", "--agent", "w1"])

@@ -333,4 +333,4 @@ class TestMainLoop:
         assert "command" in errors[2]["message"]
 
     def test_supported_commands(self):
-        assert SUPPORTED_COMMANDS == {"run", "ping", "capabilities", "mailbox"}
+        assert SUPPORTED_COMMANDS == {"run", "ping", "capabilities", "mailbox", "stream"}

@@ -8,16 +8,25 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import sys
+import time
+from dataclasses import dataclass, field
 
 from codeagent import __version__
-from codeagent.constants import DEFAULT_EXEC_TIMEOUT, MAX_LINE_LENGTH
+from codeagent.mailbox.store import MailboxStore
+from codeagent.constants import (
+    DEFAULT_EXEC_TIMEOUT,
+    MAX_LINE_LENGTH,
+    STREAM_HEARTBEAT_INTERVAL,
+    STREAM_CURSOR_DEFAULT,
+)
 from codeagent.domain import RunRequest
 from codeagent.runners import GoWrapperRunner, OMPRunner
 from codeagent.runners.base import RunnerConfig
 from codeagent.wire.protocol import WIRE_VERSION, decode_request
 
-SUPPORTED_COMMANDS = {"run", "ping", "capabilities", "mailbox"}
+SUPPORTED_COMMANDS = {"run", "ping", "capabilities", "mailbox", "stream"}
 
 
 def _read_request() -> dict | None:
@@ -339,12 +348,105 @@ def _handle_mailbox(req: dict) -> None:
     })
 
 
+# ── stream subscription ────────────────────────────────────────────────
+
+
+@dataclass
+class _StreamSubscription:
+    """Tracks an active stream subscription from a client."""
+
+    request_id: str
+    session_id: str
+    agent_id: str
+    cursor: str  # ISO timestamp of last delivered message, or "0"
+    last_heartbeat: float = field(default_factory=time.monotonic)
+
+
+def _poll_streams(subs: list[_StreamSubscription]) -> None:
+    """Poll mailbox stores for new messages and emit stream_event frames.
+
+    For each subscription, checks the agent's inbox for messages with
+    ``created_at`` greater than the subscription's cursor.  Emits one
+    ``stream_event`` per new message and advances the cursor.
+    """
+    if not subs:
+        return
+
+    store = MailboxStore()
+    now = time.monotonic()
+
+    for sub in subs:
+        try:
+            inbox = store.agent_subdir(sub.session_id, sub.agent_id, "inbox")
+            files = store.list_messages(inbox)
+            for f in files:
+                try:
+                    msg = json.loads(f.read_bytes())
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    continue
+                created = msg.get("created_at", "")
+                msg_id = msg.get("msg_id", f.stem)
+                # Skip messages we've already delivered
+                if sub.cursor != STREAM_CURSOR_DEFAULT and created <= sub.cursor:
+                    continue
+                # Emit event
+                event = {
+                    "type": "stream_event",
+                    "request_id": sub.request_id,
+                    "session_id": sub.session_id,
+                    "cursor": created or msg_id,
+                    "payload": {
+                        "msg_id": msg_id,
+                        "from": msg.get("from", ""),
+                        "to": msg.get("to", ""),
+                        "kind": msg.get("kind", ""),
+                        "subject": msg.get("subject", ""),
+                        "created_at": created,
+                    },
+                }
+                _send(event)
+                sub.cursor = created or msg_id
+        except Exception:
+            # Don't let one subscription's error kill the loop
+            pass
+
+        # Heartbeat: emit a pong if we haven't sent anything recently
+        if now - sub.last_heartbeat >= STREAM_HEARTBEAT_INTERVAL:
+            _send({
+                "type": "pong",
+                "wire_version": WIRE_VERSION,
+                "heartbeat": True,
+            })
+            sub.last_heartbeat = now
+
+
 def main() -> None:
-    """Main loop — read requests from stdin, write responses to stdout."""
-    # Send ready signal
+    """Main loop — read requests from stdin, write responses to stdout.
+
+    Supports both one-shot and long-lived serve modes.  When a ``stream``
+    command is received the subscription is registered and the loop
+    continues to poll for mailbox events between stdin reads.
+    """
     _send({"type": "ready", "wire_version": WIRE_VERSION, "package_version": __version__})
 
+    active_subs: list[_StreamSubscription] = []
+    poll_interval = max(STREAM_HEARTBEAT_INTERVAL / 2, 1.0)
+
     while True:
+        # If we have active subscriptions, use a non-blocking stdin read
+        # so we can poll streams in the background.
+        if active_subs:
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], poll_interval)
+            except (ValueError, OSError, TypeError, AttributeError):
+                # Non-selectable stdin (e.g. io.StringIO in tests) —
+                # fall through to a blocking read below.
+                ready = True
+            if ready is False:
+                # No pending request — poll streams and continue
+                _poll_streams(active_subs)
+                continue
+
         req = _read_request()
         if req is None:
             break
@@ -367,6 +469,34 @@ def main() -> None:
             _handle_run(req)
         elif cmd == "mailbox":
             _handle_mailbox(req)
+        elif cmd == "stream":
+            # Register a new stream subscription
+            session_id = req.get("session_id", "")
+            agent_id = req.get("agent_id", "")
+            cursor = req.get("cursor", STREAM_CURSOR_DEFAULT)
+            request_id = req.get("request_id", "")
+            if not session_id:
+                _send({"type": "error", "message": "stream requires session_id"})
+                continue
+            if not agent_id:
+                _send({"type": "error", "message": "stream requires agent_id"})
+                continue
+            # Replace existing sub for same request_id
+            active_subs[:] = [s for s in active_subs if s.request_id != request_id]
+            sub = _StreamSubscription(
+                request_id=request_id,
+                session_id=session_id,
+                agent_id=agent_id,
+                cursor=cursor,
+            )
+            active_subs.append(sub)
+            _send({
+                "type": "accepted",
+                "wire_version": WIRE_VERSION,
+                "request_id": request_id,
+            })
+            # Immediately poll to deliver any messages already in the inbox
+            _poll_streams(active_subs)
         else:
             _send({"type": "error", "message": f"unknown command: {cmd}"})
 

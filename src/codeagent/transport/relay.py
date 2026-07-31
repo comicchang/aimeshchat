@@ -23,17 +23,19 @@ import sys
 import time
 from typing import Optional
 
-from codeagent.constants import DEFAULT_RELAY_TIMEOUT, MAX_LINE_LENGTH
+from codeagent.constants import DEFAULT_MAILBOX_TIMEOUT, DEFAULT_RELAY_TIMEOUT, MAX_LINE_LENGTH
 from codeagent.domain import HostSpec, RunRequest, RunResult
 from codeagent.transport.base import Transport, TransportError
 from codeagent.wire.protocol import (
     MSG_ACCEPTED,
     MSG_ERROR,
+    MSG_MAILBOX_RESULT,
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
     WIRE_VERSION,
     decode_line,
+    make_mailbox_request,
 )
 
 log = logging.getLogger(__name__)
@@ -116,6 +118,38 @@ class RelayTransport(Transport):
         argv = ["zsh", "-c", relay_cmd]
 
         return self._run_with_pty(argv, timeout=request.timeout)
+
+    def mailbox(
+        self,
+        host: HostSpec,
+        args: list[str],
+        mailbox_root: str = "",
+        timeout: int = DEFAULT_MAILBOX_TIMEOUT,
+    ) -> tuple[int, str, str]:
+        """Run a mailbox wire request via relay-login PTY.
+
+        Returns ``(exit_code, stdout, stderr)``.
+        The mailbox request is base64-encoded and piped to
+        ``codeagent-remote-exec`` through the relay, just like
+        regular execute requests.
+        """
+        req = make_mailbox_request(args=args, mailbox_root=mailbox_root)
+        wire_line = json.dumps(req, ensure_ascii=False)
+        wire_b64 = base64.b64encode(wire_line.encode("utf-8")).decode("ascii")
+
+        remote_cmd = f"printf '%s' {wire_b64} | base64 -d | codeagent-remote-exec"
+        if host.shell_prefix:
+            remote_cmd = f"{host.shell_prefix}; {remote_cmd}"
+
+        target = host.ssh_alias
+        relay_cmd = (
+            f"source {shlex.quote(self._relay_zsh)} && "
+            f"relay-login {shlex.quote(target)} {shlex.quote(remote_cmd)}"
+        )
+        argv = ["zsh", "-c", relay_cmd]
+
+        result = self._run_with_pty(argv, timeout=timeout)
+        return result.returncode, result.stdout, result.stderr
 
     def _run_with_pty(self, argv: list[str], timeout: int = DEFAULT_RELAY_TIMEOUT) -> RunResult:
         """Execute with PTY allocation for relay expect/QR code interaction.
@@ -307,6 +341,14 @@ class RelayTransport(Transport):
                                     exit_code = payload.get("exit_code", 0)
                                 else:
                                     stderr_chunks.append("ignoring result after wire version mismatch")
+                            elif msg_type == MSG_MAILBOX_RESULT:
+                                _set_state("msg:mailbox_result")
+                                if not version_mismatch:
+                                    stdout_chunks.append(payload.get("stdout", ""))
+                                    stderr_chunks.append(payload.get("stderr", ""))
+                                    exit_code = payload.get("exit_code", 0)
+                                else:
+                                    stderr_chunks.append("ignoring mailbox_result after wire version mismatch")
                             elif msg_type == MSG_ERROR:
                                 _set_state("msg:error")
                                 stderr_chunks.append(payload.get("message", ""))
