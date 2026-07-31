@@ -281,6 +281,241 @@ class TestControlMaster:
             with patch("codeagent.transport.control_master._socket_dir", return_value=tmp_path):
                 stop_all()  # should not raise
 
+    # ---------------------------------------------------------------------------
+    # failure paths / cleanup
+    # ---------------------------------------------------------------------------
+
+    def test_socket_property(self, tmp_path: Path):
+        """socket property exposes the socket path."""
+        cm = ControlMaster("testhost", ssh_bin="/usr/bin/ssh")
+        cm._socket = tmp_path / "t.sock"
+        assert cm.socket == cm._socket
+
+    def test_check_alias(self, tmp_path: Path):
+        """check() is an alias for is_alive()."""
+        cm = ControlMaster("testhost", ssh_bin="/usr/bin/ssh")
+        cm._socket = tmp_path / "t.sock"
+        with patch.object(cm, "_check", return_value=0):
+            assert cm.check() is True
+
+    def test_create_ssh_missing_raises(self, tmp_path: Path):
+        """create() raises TransportError when the ssh binary is missing."""
+        cm = ControlMaster("testhost", ssh_bin="nonexistent-ssh-bin-xyz")
+        cm._socket = tmp_path / "t.sock"
+        with patch("shutil.which", return_value=None):
+            with pytest.raises(TransportError, match="ssh binary not found"):
+                cm.create()
+
+    def test_create_subprocess_failure_raises(self, tmp_path: Path):
+        """create() raises TransportError when ssh -M fails."""
+        cm = ControlMaster("testhost", ssh_bin="/usr/bin/ssh")
+        cm._socket = tmp_path / "t.sock"
+        with (
+            patch("shutil.which", return_value="/usr/bin/ssh"),
+            patch.object(cm, "_check", return_value=1),
+            patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="oops", stdout="")),
+        ):
+            with pytest.raises(TransportError, match="oops"):
+                cm.create()
+
+    def test_create_idempotent_when_alive(self, tmp_path: Path):
+        """create() is a no-op when the master is already alive."""
+        cm = ControlMaster("testhost", ssh_bin="/usr/bin/ssh")
+        cm._socket = tmp_path / "t.sock"
+        with (
+            patch.object(cm, "_check", return_value=0),
+            patch("subprocess.run") as mock_run,
+        ):
+            cm.create()
+        mock_run.assert_not_called()
+
+    def test_create_meta_write_failure_logs(self, tmp_path: Path):
+        """create() tolerates a failed .meta write (warns, does not raise)."""
+        cm = ControlMaster("testhost", ssh_bin="/usr/bin/ssh")
+        cm._socket = tmp_path / "t.sock"
+        with (
+            patch("shutil.which", return_value="/usr/bin/ssh"),
+            patch.object(cm, "_check", return_value=1),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("pathlib.Path.write_text", side_effect=OSError("disk full")),
+        ):
+            cm.create()  # should not raise
+        assert not (tmp_path / "t.meta").exists()
+
+    def test_stop_no_socket_noop(self, tmp_path: Path):
+        """stop() without a socket file is a silent no-op."""
+        cm = ControlMaster("testhost", ssh_bin="/usr/bin/ssh")
+        cm._socket = tmp_path / "t.sock"
+        with patch("subprocess.run") as mock_run:
+            cm.stop()
+        mock_run.assert_not_called()
+
+    def test_stop_ssh_missing_cleans_up(self, tmp_path: Path):
+        """stop() cleans up socket + meta even when ssh is gone."""
+        cm = ControlMaster("testhost", ssh_bin="nonexistent-ssh")
+        cm._socket = tmp_path / "t.sock"
+        cm._socket.touch()
+        (tmp_path / "t.meta").write_text('{"alias": "testhost"}')
+        with patch("shutil.which", return_value=None):
+            cm.stop()
+        assert not cm._socket.exists()
+        assert not (tmp_path / "t.meta").exists()
+
+    def test_stop_subprocess_failure_still_cleans(self, tmp_path: Path):
+        """stop() cleans up even when ssh -O exit returns nonzero."""
+        cm = ControlMaster("testhost", ssh_bin="/usr/bin/ssh")
+        cm._socket = tmp_path / "t.sock"
+        cm._socket.touch()
+        (tmp_path / "t.meta").write_text('{"alias": "testhost"}')
+        with (
+            patch("shutil.which", return_value="/usr/bin/ssh"),
+            patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="no master")),
+        ):
+            cm.stop()
+        assert not cm._socket.exists()
+        assert not (tmp_path / "t.meta").exists()
+
+    def test_cleanup_unlink_errors_ignored(self, tmp_path: Path):
+        """OSError during socket/meta unlink is swallowed."""
+        cm = ControlMaster("testhost", ssh_bin="/usr/bin/ssh")
+        cm._socket = tmp_path / "t.sock"
+        cm._socket.touch()
+        (tmp_path / "t.meta").write_text('{"alias": "testhost"}')
+
+        real_unlink = Path.unlink
+        calls = {"n": 0}
+
+        def flaky(self_, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise OSError("busy")
+            return real_unlink(self_, *args, **kwargs)
+
+        with (
+            patch("pathlib.Path.unlink", flaky),
+            patch("shutil.which", return_value="/usr/bin/ssh"),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+        ):
+            cm.stop()
+        assert calls["n"] >= 2
+
+    def test_ssh_cmd_missing_binary_raises(self):
+        """ssh_cmd() raises TransportError when the binary is missing."""
+        cm = ControlMaster("testhost", ssh_bin="nonexistent-ssh")
+        with patch("shutil.which", return_value=None):
+            with pytest.raises(TransportError, match="ssh binary not found"):
+                cm.ssh_cmd("python3")
+
+    def test_check_missing_ssh_returns_1(self, tmp_path: Path):
+        """_check() returns 1 when ssh is missing even if socket exists."""
+        cm = ControlMaster("testhost", ssh_bin="nonexistent-ssh")
+        cm._socket = tmp_path / "t.sock"
+        cm._socket.touch()
+        with patch("shutil.which", return_value=None):
+            assert cm._check() == 1
+
+    def test_socket_dir_xdg(self, tmp_path: Path, monkeypatch):
+        """_socket_dir() uses $XDG_RUNTIME_DIR when set."""
+        import codeagent.transport.control_master as cm_mod
+
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        d = cm_mod._socket_dir()
+        assert d == tmp_path / "codeagent" / "ssh"
+        assert d.exists()
+
+    def test_socket_dir_chmod_failure_ok(self, tmp_path: Path, monkeypatch):
+        """_socket_dir() tolerates a failed chmod."""
+        import codeagent.transport.control_master as cm_mod
+
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        with patch("pathlib.Path.chmod", side_effect=OSError("no perms")):
+            d = cm_mod._socket_dir()
+        assert d.exists()
+
+    def test_list_sockets_missing_dir(self, tmp_path: Path):
+        """list_sockets() returns [] when the socket dir does not exist."""
+        with patch("codeagent.transport.control_master._socket_dir", return_value=tmp_path / "nope"):
+            assert list_sockets() == []
+
+    def test_list_sockets_corrupt_meta(self, tmp_path: Path):
+        """list_sockets() falls back to the stem when .meta is corrupt."""
+        sock = tmp_path / "abc123.sock"
+        sock.touch()
+        (tmp_path / "abc123.meta").write_text("{not valid json")
+        with patch("codeagent.transport.control_master._socket_dir", return_value=tmp_path):
+            sockets = list_sockets()
+        assert sockets == [("abc123", sock)]
+
+    def test_stop_by_alias_no_dir(self, tmp_path: Path):
+        """stop_by_alias() returns False when the socket dir is missing."""
+        with patch("codeagent.transport.control_master._socket_dir", return_value=tmp_path / "nope"):
+            assert stop_by_alias("myhost") is False
+
+    def test_stop_by_alias_corrupt_meta(self, tmp_path: Path):
+        """stop_by_alias() skips corrupt .meta files."""
+        (tmp_path / "abc123.meta").write_text("{bad json")
+        with patch("codeagent.transport.control_master._socket_dir", return_value=tmp_path):
+            assert stop_by_alias("myhost") is False
+
+    def test_stop_by_alias_exit_failure(self, tmp_path: Path):
+        """stop_by_alias() still cleans up when ssh -O exit fails."""
+        sock = tmp_path / "abc123.sock"
+        sock.touch()
+        (tmp_path / "abc123.meta").write_text('{"alias": "myhost"}')
+        with (
+            patch("shutil.which", return_value="/usr/bin/ssh"),
+            patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="no master")),
+            patch("codeagent.transport.control_master._socket_dir", return_value=tmp_path),
+        ):
+            result = stop_by_alias("myhost")
+        assert result is True
+        assert not sock.exists()
+
+    def test_stop_by_alias_unlink_errors_ignored(self, tmp_path: Path):
+        """stop_by_alias() tolerates OSError while unlinking socket/meta."""
+        sock = tmp_path / "abc123.sock"
+        sock.touch()
+        (tmp_path / "abc123.meta").write_text('{"alias": "myhost"}')
+
+        real_unlink = Path.unlink
+        calls = {"n": 0}
+
+        def flaky(self_, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise OSError("busy")
+            return real_unlink(self_, *args, **kwargs)
+
+        with (
+            patch("pathlib.Path.unlink", flaky),
+            patch("shutil.which", return_value="/usr/bin/ssh"),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("codeagent.transport.control_master._socket_dir", return_value=tmp_path),
+        ):
+            result = stop_by_alias("myhost")
+        assert result is True
+        assert calls["n"] >= 2
+
+    def test_stop_all_missing_dir(self, tmp_path: Path):
+        """stop_all() is a no-op when the socket dir is missing."""
+        with patch("codeagent.transport.control_master._socket_dir", return_value=tmp_path / "nope"):
+            stop_all()  # should not raise
+
+    def test_stop_all_corrupt_meta_skipped(self, tmp_path: Path):
+        """stop_all() skips corrupt .meta and stops the valid ones."""
+        (tmp_path / "abc123.meta").write_text("{bad json")
+        (tmp_path / "def456.meta").write_text('{"alias": "host-b"}')
+        (tmp_path / "def456.sock").touch()
+        with (
+            patch("shutil.which", return_value="/usr/bin/ssh"),
+            patch("subprocess.run", return_value=MagicMock(returncode=0)),
+            patch("codeagent.transport.control_master._socket_dir", return_value=tmp_path),
+        ):
+            stop_all()
+        assert not (tmp_path / "def456.meta").exists()
+        assert not (tmp_path / "def456.sock").exists()
+
 
 # ---------------------------------------------------------------------------
 # _run_wire (local) tests

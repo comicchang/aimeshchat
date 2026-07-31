@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -185,3 +187,452 @@ class TestStore:
     def test_path_traversal_blocked(self, store):
         with pytest.raises(ValueError, match="invalid agent"):
             store.session_init("../escape", "mgr", ["w1"])
+
+
+# ── TestResolveRoot ──────────────────────────────────────────────────────
+
+
+class TestResolveRoot:
+    def test_default_fallback(self, monkeypatch):
+        from codeagent.mailbox.store import resolve_root
+
+        monkeypatch.delenv("MAILBOX_ROOT", raising=False)
+        assert resolve_root() == Path.home() / "Dropbox" / "logseq" / "pages" / "mi-docs" / ".mailbox"
+
+    def test_env_override(self, tmp_path, monkeypatch):
+        from codeagent.mailbox.store import resolve_root
+
+        monkeypatch.setenv("MAILBOX_ROOT", str(tmp_path))
+        assert resolve_root() == tmp_path
+
+
+# ── TestReadSession ──────────────────────────────────────────────────────
+
+
+class TestReadSession:
+    def test_missing_returns_none(self, store):
+        assert store.read_session("s1") is None
+
+    def test_corrupt_returns_none(self, store):
+        (store.root / "s1").mkdir()
+        (store.root / "s1" / "session.json").write_text("{not json")
+        assert store.read_session("s1") is None
+
+
+# ── TestSendErrors ───────────────────────────────────────────────────────
+
+
+class TestSendErrors:
+    def test_session_not_found(self, store):
+        with pytest.raises(ValueError, match="session not found"):
+            store.send("nosuch", "mgr", "w1", "s", "b")
+
+    def test_sender_not_in_roster(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="sender not in roster"):
+            store.send("s1", "ghost", "w1", "s", "b")
+
+    def test_corrupt_metadata(self, store):
+        (store.root / "s1").mkdir()
+        (store.root / "s1" / "session.json").write_text("{not json")
+        with pytest.raises(ValueError, match="metadata not found or corrupt"):
+            store.send("s1", "mgr", "w1", "s", "b")
+
+    def test_recipient_inbox_missing(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        import shutil
+
+        shutil.rmtree(store.agent_subdir("s1", "w1", "inbox"))
+        with pytest.raises(ValueError, match="agent not in session"):
+            store.send("s1", "mgr", "w1", "s", "b")
+
+    def test_msg_id_collision_retries(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        (inbox / "dup.json").write_text('{}')
+        with mock.patch("codeagent.mailbox.store.gen_msg_id", side_effect=["dup", "dup2"]):
+            result = store.send("s1", "mgr", "w1", "s", "b", "TASK")
+        assert "dup2.json" in result
+        assert (inbox / "dup.json").exists()
+
+
+# ── TestPeekErrors ───────────────────────────────────────────────────────
+
+
+class TestPeekErrors:
+    def test_missing_inbox_dir(self, store):
+        import shutil
+
+        store.session_init("s1", "mgr", ["w1"])
+        shutil.rmtree(store.agent_subdir("s1", "w1", "inbox"))
+        assert store.peek("s1", "w1") == {"pending": 0, "messages": []}
+
+    def test_unreadable_message(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        (inbox / "mgr_1.json").write_text("{not json")
+        peek = store.peek("s1", "w1")
+        assert peek["pending"] == 1
+        assert peek["messages"][0]["subject"] == "(unreadable)"
+
+
+# ── TestReadCorruption ───────────────────────────────────────────────────
+
+
+class TestReadCorruption:
+    def test_corrupt_message_moved_to_corrupt(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        (inbox / "mgr_bad.json").write_text("{not json")
+        assert store.read("s1", "w1", "w1") is None
+        corrupt = store.agent_subdir("s1", "w1", "_corrupt")
+        assert list(corrupt.glob("*.json")) == [corrupt / "mgr_bad.json"]
+
+    def test_invalid_message_moved_to_corrupt(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        (inbox / "mgr_1.json").write_text(json.dumps({
+            "session_id": "other-session", "from": "mgr", "to": "w1",
+            "subject": "hi", "body": "there", "kind": "TASK",
+            "msg_id": "mgr_1", "created_at": "2025-01-01T00:00:00Z",
+        }))
+        assert store.read("s1", "w1", "w1") is None
+        corrupt = store.agent_subdir("s1", "w1", "_corrupt")
+        assert (corrupt / "mgr_1.json").exists()
+
+    def test_claim_collision_retries(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        sent = store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        msg_id = sent.split("/")[-1].replace(".json", "")
+        processing = store.agent_subdir("s1", "w1", "processing")
+        processing.mkdir(parents=True, exist_ok=True)
+        (processing / f".tmp-claim-{msg_id}-w1-1234.json").touch()
+
+        with mock.patch("random.randint", return_value=1234):
+            msg = store.read("s1", "w1", "w1")
+        assert msg is not None
+        assert msg["subject"] == "t"
+        assert store.peek("s1", "w1")["pending"] == 0
+
+    def test_replace_oserror_retries(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("race lost")
+            return real_replace(src, dst)
+
+        with mock.patch("os.replace", flaky):
+            msg = store.read("s1", "w1", "w1")
+        assert msg is not None
+        assert calls["n"] >= 2
+
+
+# ── TestFinalizeErrors ───────────────────────────────────────────────────
+
+
+class TestFinalizeErrors:
+    def _read_one(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        return store.read("s1", "w1", "w1")
+
+    def test_invalid_msg_id(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="invalid msg_id"):
+            store.finalize("s1", "w1", "../escape", "w1")
+
+    def test_no_claim(self, store):
+        msg = self._read_one(store)
+        processing = store.agent_subdir("s1", "w1", "processing")
+        for cf in processing.glob(".claim-*.json"):
+            cf.unlink()
+        with pytest.raises(ValueError, match="no claim file"):
+            store.finalize("s1", "w1", msg["msg_id"], "w1")
+
+    def test_multiple_claims(self, store):
+        msg = self._read_one(store)
+        processing = store.agent_subdir("s1", "w1", "processing")
+        (processing / f".claim-{msg['msg_id']}-w2.json").write_text(
+            json.dumps({"owner": "w2", "msg_id": msg["msg_id"]}))
+        with pytest.raises(ValueError, match="multiple claim files"):
+            store.finalize("s1", "w1", msg["msg_id"], "w1")
+
+    def test_msg_not_in_processing(self, store):
+        msg = self._read_one(store)
+        processing = store.agent_subdir("s1", "w1", "processing")
+        (processing / f"{msg['msg_id']}.json").unlink()
+        with pytest.raises(ValueError, match="msg not in processing"):
+            store.finalize("s1", "w1", msg["msg_id"], "w1")
+
+    def test_owner_mismatch(self, store):
+        msg = self._read_one(store)
+        processing = store.agent_subdir("s1", "w1", "processing")
+        for cf in processing.glob(".claim-*.json"):
+            cf.unlink()
+        (processing / f".claim-{msg['msg_id']}-other.json").write_text(
+            json.dumps({"owner": "other", "msg_id": msg["msg_id"]}))
+        with pytest.raises(ValueError, match="owner mismatch"):
+            store.finalize("s1", "w1", msg["msg_id"], "w1")
+
+
+# ── TestReleaseErrors ────────────────────────────────────────────────────
+
+
+class TestReleaseErrors:
+    def test_msg_not_in_processing(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="msg not found in processing"):
+            store.release("s1", "w1", "mgr_1", "w1")
+
+    def test_multiple_claims(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        msg = store.read("s1", "w1", "w1")
+        processing = store.agent_subdir("s1", "w1", "processing")
+        (processing / f".claim-{msg['msg_id']}-w2.json").write_text(
+            json.dumps({"owner": "w2", "msg_id": msg["msg_id"]}))
+        with pytest.raises(ValueError, match="multiple claim files"):
+            store.release("s1", "w1", msg["msg_id"], "w1")
+
+    def test_owner_mismatch(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        msg = store.read("s1", "w1", "w1")
+        processing = store.agent_subdir("s1", "w1", "processing")
+        for cf in processing.glob(".claim-*.json"):
+            cf.unlink()
+        (processing / f".claim-{msg['msg_id']}-other.json").write_text(
+            json.dumps({"owner": "other", "msg_id": msg["msg_id"]}))
+        with pytest.raises(ValueError, match="owner mismatch"):
+            store.release("s1", "w1", msg["msg_id"], "w1")
+
+
+# ── TestRecoverStale ─────────────────────────────────────────────────────
+
+
+class TestRecoverStale:
+    def test_no_processing_dir(self, store):
+        import shutil
+
+        store.session_init("s1", "mgr", ["w1"])
+        shutil.rmtree(store.agent_subdir("s1", "w1", "processing"))
+        result = store.recover_stale("s1", "w1")
+        assert "no processing/ directory" in result
+
+    def test_recovers_expired_claim(self, store):
+        from codeagent.constants import LEASE_TIMEOUT_S
+        from datetime import datetime, timezone, timedelta
+
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        msg = store.read("s1", "w1", "w1")
+        processing = store.agent_subdir("s1", "w1", "processing")
+        old = (datetime.now(timezone.utc) - timedelta(seconds=2 * LEASE_TIMEOUT_S))
+        for cf in processing.glob(".claim-*.json"):
+            cf.write_text(json.dumps({
+                "owner": "w1",
+                "claimed_at": old.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "msg_id": msg["msg_id"],
+            }))
+
+        result = store.recover_stale("s1", "w1")
+        assert "recovered 1" in result
+        assert store.peek("s1", "w1")["pending"] == 1
+        assert list(processing.glob(".claim-*.json")) == []
+
+    def test_fresh_claim_not_recovered(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.read("s1", "w1", "w1")
+        result = store.recover_stale("s1", "w1")
+        assert "recovered 0" in result
+
+    def test_corrupt_claim_skipped(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        processing = store.agent_subdir("s1", "w1", "processing")
+        processing.mkdir(parents=True, exist_ok=True)
+        (processing / ".claim-mgr_1-w1.json").write_text("{bad json")
+        result = store.recover_stale("s1", "w1")
+        assert "recovered 0" in result
+
+    def test_stale_claim_without_msg_file(self, store):
+        from codeagent.constants import LEASE_TIMEOUT_S
+        from datetime import datetime, timezone, timedelta
+
+        store.session_init("s1", "mgr", ["w1"])
+        processing = store.agent_subdir("s1", "w1", "processing")
+        processing.mkdir(parents=True, exist_ok=True)
+        old = (datetime.now(timezone.utc) - timedelta(seconds=2 * LEASE_TIMEOUT_S))
+        (processing / ".claim-mgr_1-w1.json").write_text(json.dumps({
+            "owner": "w1",
+            "claimed_at": old.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "msg_id": "mgr_1",
+        }))
+        result = store.recover_stale("s1", "w1")
+        assert "recovered 0" in result
+
+
+# ── TestWriteStatusErrors ────────────────────────────────────────────────
+
+
+class TestWriteStatusErrors:
+    def test_invalid_state(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="invalid state"):
+            store.write_status("s1", "w1", "NOPE")
+
+    def test_session_not_found(self, store):
+        with pytest.raises(ValueError, match="session not found"):
+            store.write_status("s1", "w1", "BUSY")
+
+    def test_agent_not_in_session(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="agent not in session"):
+            store.write_status("s1", "ghost", "BUSY")
+
+
+# ── TestReadStatusInvalid ────────────────────────────────────────────────
+
+
+class TestReadStatusInvalid:
+    def test_missing_file(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        assert store.read_status("s1", "w1") is None
+
+    def _write(self, store, payload):
+        ad = store.agent_dir("s1", "w1")
+        ad.mkdir(parents=True, exist_ok=True)
+        (ad / "status.json").write_text(json.dumps(payload))
+
+    def test_wrong_keys(self, store):
+        self._write(store, {"session_id": "s1", "state": "BUSY"})
+        assert store.read_status("s1", "w1") is None
+
+    def test_non_string_value(self, store):
+        self._write(store, {
+            "session_id": "s1", "state": "BUSY", "current_task": 5,
+            "last_conclusion": "", "updated_at": "t",
+        })
+        assert store.read_status("s1", "w1") is None
+
+    def test_invalid_state(self, store):
+        self._write(store, {
+            "session_id": "s1", "state": "NOPE", "current_task": "",
+            "last_conclusion": "", "updated_at": "t",
+        })
+        assert store.read_status("s1", "w1") is None
+
+    def test_wrong_session(self, store):
+        self._write(store, {
+            "session_id": "other", "state": "BUSY", "current_task": "",
+            "last_conclusion": "", "updated_at": "t",
+        })
+        assert store.read_status("s1", "w1") is None
+
+    def test_corrupt_json(self, store):
+        ad = store.agent_dir("s1", "w1")
+        ad.mkdir(parents=True, exist_ok=True)
+        (ad / "status.json").write_text("{not json")
+        assert store.read_status("s1", "w1") is None
+
+
+# ── TestClearPurge ───────────────────────────────────────────────────────
+
+
+class TestClearPurge:
+    def test_clear_prune_stale(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        msg = store.read("s1", "w1", "w1")
+        store.finalize("s1", "w1", msg["msg_id"], "w1")
+        result = store.clear("s1", "w1", prune_stale=True)
+        assert "cleared 1" in result
+
+    def test_purge_corrupt(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        corrupt = store.agent_subdir("s1", "w1", "_corrupt")
+        corrupt.mkdir(parents=True, exist_ok=True)
+        (corrupt / "a.json").write_text("{}")
+        (corrupt / "b.json").write_text("{}")
+        result = store.purge("s1", "w1")
+        assert "purged 2" in result
+        assert list(corrupt.glob("*.json")) == []
+
+    def test_purge_empty(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        result = store.purge("s1", "w1")
+        assert "purged 0" in result
+
+
+# ── TestCheckLegacy ──────────────────────────────────────────────────────
+
+
+class TestCheckLegacy:
+    def test_no_messages(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        assert store.check("s1", "w1") == []
+
+    def test_valid_message_archived(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        results = store.check("s1", "w1")
+        assert len(results) == 1
+        assert results[0]["subject"] == "t"
+        archive = store.agent_subdir("s1", "w1", "archive")
+        assert len(list(archive.glob("*.json"))) == 1
+
+    def test_max_messages_limit(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t1", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t2", "b", "TASK")
+        results = store.check("s1", "w1", max_messages=1)
+        assert len(results) == 1
+
+    def test_invalid_message_moved_to_corrupt(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        (inbox / "mgr_1.json").write_text(json.dumps({
+            "session_id": "s1", "from": "mgr", "to": "w1",
+            "subject": "hi", "body": "there", "kind": "TASK",
+            "msg_id": "different-id", "created_at": "2025-01-01T00:00:00Z",
+        }))
+        results = store.check("s1", "w1")
+        assert results == []
+        corrupt = store.agent_subdir("s1", "w1", "_corrupt")
+        assert (corrupt / "mgr_1.json").exists()
+
+
+# ── TestConcurrentRead ───────────────────────────────────────────────────
+
+
+class TestConcurrentRead:
+    def test_claim_race_single_winner(self, store):
+        """Two owners reading the same message — exactly one wins."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+
+        barrier = threading.Barrier(2)
+
+        def reader(owner):
+            barrier.wait()
+            return store.read("s1", "w1", owner)
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(reader, "w1"), ex.submit(reader, "w2")]
+            results = [f.result() for f in futs]
+
+        winners = [r for r in results if r is not None]
+        assert len(winners) == 1
+        assert store.peek("s1", "w1")["pending"] == 0
+        # The message ended up in processing under its msg_id
+        processing = store.agent_subdir("s1", "w1", "processing")
+        assert (processing / f"{winners[0]['msg_id']}.json").exists()
