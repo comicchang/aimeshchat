@@ -54,10 +54,37 @@ class TestCreateSession:
     def test_basic(self, kernel):
         s = kernel.create_session("s1", "mgr", ["w1", "w2"])
         assert s.session_id == "s1"
+
+    def test_second_kernel_restores_session_from_disk(self, store):
+        """回归：CLI 每子命令一个新进程/新 kernel。create-session 写入
+        session.json 后，下一个进程的 kernel 必须能从磁盘恢复它。
+        此前内存-only 导致 register 紧随 create-session 报 session not found。"""
+        k1 = SwarmKernel(store=store)
+        k1.create_session("s1", "mgr", ["w1", "w2"])
+
+        # 模拟下一个 CLI 进程：全新 kernel 实例，同一 store
+        k2 = SwarmKernel(store=store)
+        s = k2.get_session("s1")
+        assert s is not None
         assert s.manager_id == "mgr"
-        assert "mgr" in s.roster
-        assert "w1" in s.roster
-        assert "w2" in s.roster
+        assert "w1" in s.roster and "w2" in s.roster
+        # ACL 也从 swarm-meta.json 恢复
+        assert s.acl.authority == "mgr"
+
+    def test_second_kernel_restores_channel_from_disk(self, store):
+        """回归：channel 跨进程持久化（create-channel 后新进程可见）。"""
+        k1 = SwarmKernel(store=store)
+        k1.create_session("s1", "mgr", ["w1", "w2"])
+        k1.create_channel("s1", "dev", ["mgr", "w1"])
+
+        k2 = SwarmKernel(store=store)
+        assert k2.get_session("s1") is not None
+        channels = k2._channels.get("s1", {})
+        assert "dev" in channels
+        assert set(channels["dev"].members) == {"mgr", "w1"}
+        # 新 kernel 上 channel 可直接发送
+        receipt = k2.channel("s1", "mgr", "dev", _env())
+        assert receipt.status == "delivered"
 
     def test_manager_always_in_roster(self, kernel):
         s = kernel.create_session("s1", "mgr", ["w1"])
