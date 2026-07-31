@@ -31,8 +31,8 @@ uv tool install .
 ## Quick Start
 
 ```bash
-# 1. Create config directory
-mkdir -p ~/.config/codeagent
+# 1. Create config directories
+mkdir -p ~/.config/codeagent ~/.codeagent
 
 # 2. Copy example configs (see below)
 cp examples/repo-map.json ~/.config/codeagent/
@@ -308,11 +308,8 @@ the Go-based `codeagent-wrapper` binary distributed as an npm package.
 
 - **What we use**: `GoWrapperRunner` (`src/codeagent/runners/go_wrapper.py`) wraps the Go
   `codeagent-wrapper` binary to execute AI code agents through a unified interface.
-- **Why Python**: The Go wrapper is the stable agent execution layer — `codeagent-py` adds
-  SSH multi-host transport, SQLite session persistence, topic-based routing, and mailbox-based
-  agent IPC on top.
-- **Conventions**: `.codeagent/` config directory, `~/.codeagent/models.json` agent presets,
-  and namespace key format originate from the myclaude ecosystem.
+- **Installation**: Wrapper is installed via `npx github:stellarlinkco/myclaude` (GitHub npm package, not public registry).
+- **License**: Upstream wrapper is AGPL-3.0. codeagent-py calls it as an independent subprocess.
 
 ### tmux-agent-skills (archived)
 
@@ -323,6 +320,6 @@ were previously maintained at **[comicchang/tmux-agent-skills](https://github.co
 
 ## License
 
-Enlightened Public License (EPL-1.0) — see [LICENSE](LICENSE).
+Enlightened Public License (EnPL-1.0) — see [LICENSE](LICENSE).
 
-Non-players and Enlightened faction players are welcome. Resistance and Machina are excluded.
+Custom license, NOT OSI-approved. Non-players and Enlightened faction players are welcome. Resistance and Machina are excluded.

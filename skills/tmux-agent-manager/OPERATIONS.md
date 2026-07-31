@@ -50,7 +50,7 @@ INIT 的旧 ACK 文件可以作为兼容诊断，但 Manager 不得用 terminal 
 ### 发送
 
 ```bash
-scripts/tmux_worker.py mailbox send \
+mailbox send \
   --session <session-id> --from manager --to aosp --kind TASK \
   --subject "Verify occlusion path" \
   --body "# Role: SourceAnalysis
@@ -79,23 +79,23 @@ tmux send-keys -t <target> C-m
 mailbox peek --session <session-id> --agent manager
 
 # 消费一封消息：inbox→processing，按 owner+lease 自动声明
-scripts/tmux_worker.py mailbox read \
+mailbox read \
   --session <session-id> --agent manager --owner manager [--json]
 
 # 处理完成后归档：processing→archive
-scripts/tmux_worker.py mailbox finalize \
+mailbox finalize \
   --session <session-id> --agent manager --msg-id <id> --owner manager
 
 # 放回 inbox（不处理时）
-scripts/tmux_worker.py mailbox release \
+mailbox release \
   --session <session-id> --agent manager --msg-id <id>
 
 # 统计（shows all4 dirs: inbox/processing/archive/_corrupt）与清理
-scripts/tmux_worker.py mailbox stats --session <session-id> --agent manager
-scripts/tmux_worker.py mailbox clear --session <session-id> --agent manager
+mailbox stats --session <session-id> --agent manager
+mailbox clear --session <session-id> --agent manager
 
 # 崩溃恢复：过期 processing→inbox
-scripts/tmux_worker.py mailbox recover-stale --session <session-id> --agent manager
+mailbox recover-stale --session <session-id> --agent manager
 ```
 
 `mailbox read` 每次读取最早一封、验证 `msg_id` 与文件名并原子移动到 processing；无消息时无输出。处理完成后 `finalize` 归档，继续 read 直到 inbox 为空。archive 是当前收件周期的回看区，只能在 REPORT/artifact 已读并安排后续后 clear。
@@ -115,7 +115,7 @@ Manager responsibilities remain: poll every Worker `status.json` and `mailbox st
 Worker 使用：
 
 ```bash
-scripts/tmux_worker.py mailbox status --session <id> --agent <id> \
+mailbox status --session <id> --agent <id> \
   --state BUSY \
   --current-task "verify occlusion path" \
   --last-conclusion "previous task complete"

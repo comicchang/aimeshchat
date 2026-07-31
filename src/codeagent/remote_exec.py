@@ -126,10 +126,16 @@ def _handle_mailbox(req: dict) -> None:
         _send({"type": "error", "message": "mailbox 'args' must be a list"})
         return
 
-    # Propagate mailbox_root from wire request to child process environment
+    # Propagate mailbox_root from wire request (explicit, not global env)
     mailbox_root = req.get("mailbox_root", "")
     if mailbox_root and isinstance(mailbox_root, str):
-        os.environ["MAILBOX_ROOT"] = mailbox_root
+        # Validate: must be absolute path, no shell metacharacters
+        import re
+        if not re.match(r"^/[a-zA-Z0-9/_.-]+$", mailbox_root):
+            _send({"type": "error", "message": f"invalid mailbox_root: {mailbox_root}"})
+            return
+        # Pass as CLI arg, not global env
+        args = ["--mailbox-root", mailbox_root] + args
 
     # Capture stdout/stderr from mailbox CLI
     old_stdout, old_stderr = sys.stdout, sys.stderr

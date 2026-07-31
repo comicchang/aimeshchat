@@ -298,8 +298,13 @@ class MailboxStore:
     def write_status(self, session_id: str, agent_id: str, state: str, current_task: str = "", last_conclusion: str = "") -> str:
         if state not in VALID_STATES:
             raise ValueError(f"invalid state: {state}")
+        # Verify session and agent exist
+        sd = self.session_dir(session_id)
+        if not sd.exists():
+            raise ValueError(f"session not found: {session_id}")
         ad = self.agent_dir(session_id, agent_id)
-        ad.mkdir(parents=True, exist_ok=True)
+        if not ad.exists():
+            raise ValueError(f"agent not in session: {agent_id}")
 
         status = StatusSnapshot(
             session_id=session_id, state=state,

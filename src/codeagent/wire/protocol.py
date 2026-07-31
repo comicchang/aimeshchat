@@ -100,13 +100,14 @@ def encode_line(obj: dict[str, Any]) -> bytes:
 
 # ── required-field schema per response message type ────────────────────
 _RESPONSE_REQUIRED: dict[str, dict[str, type]] = {
-    MSG_ACCEPTED:     {"wire_version": int},
-    MSG_READY:        {"wire_version": int},
-    MSG_SESSION:      {"id": str},
-    MSG_RESULT:       {"exit_code": int, "stdout": str, "stderr": str},
-    MSG_ERROR:        {"message": str},
-    MSG_PONG:         {"wire_version": int},
-    MSG_CAPABILITIES: {},  # no strictly required fields beyond type
+    MSG_ACCEPTED:      {"wire_version": int},
+    MSG_READY:         {"wire_version": int},
+    MSG_SESSION:       {"id": str},
+    MSG_RESULT:        {"exit_code": int, "stdout": str, "stderr": str},
+    MSG_ERROR:         {"message": str},
+    MSG_PONG:          {"wire_version": int},
+    MSG_CAPABILITIES:  {},  # no strictly required fields beyond type
+    MSG_MAILBOX_RESULT: {"exit_code": int, "stdout": str, "stderr": str},
 }
 
 

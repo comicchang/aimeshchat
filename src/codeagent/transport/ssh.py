@@ -419,12 +419,12 @@ def _run_ssh_mailbox(
             result_stderr = msg.message
             exit_code = 1
 
-    # Fallback: use SSH stderr if no structured result
-    if exit_code == -1 and not result_stderr:
+    # Fallback: use SSH process exit code if no structured result
+    if exit_code == -1:
         ssh_stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
         if ssh_stderr:
             result_stderr = ssh_stderr
-        exit_code = 0
+        exit_code = proc.returncode if proc.returncode is not None else 1
 
     return exit_code, result_stdout, result_stderr
 

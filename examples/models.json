@@ -22,6 +22,17 @@
       "backend": "claude",
       "model": "provider/reasoning-model",
       "description": "Code review"
+    },
+    "oracle-lite": {
+      "backend": "codex",
+      "model": "provider/fast-model",
+      "description": "Cost-effective code review advisor"
+    },
+    "oracle": {
+      "backend": "codex",
+      "model": "provider/strong-model",
+      "description": "Persistent context technical advisor",
+      "yolo": true
     }
   }
 }

@@ -45,16 +45,9 @@ def diagnose(store: MailboxStore, session_id: str, agent_id: str) -> dict:
     except Exception:
         checks["peek_works"] = False
 
-    # 7. Processing dir writable (probe file, then clean up)
+    # 7. Processing dir exists (read-only check)
     processing = store.agent_subdir(session_id, agent_id, "processing")
-    probe_file = processing / ".health-probe"
-    try:
-        processing.mkdir(parents=True, exist_ok=True)
-        probe_file.write_text("probe")
-        probe_file.unlink(missing_ok=True)
-        checks["processing_writable"] = True
-    except Exception:
-        checks["processing_writable"] = False
+    checks["processing_dir_exists"] = processing.is_dir()
 
     # 8. Identity file (if set)
     identity_file = os.environ.get("OMP_MAILBOX_IDENTITY_FILE", "")

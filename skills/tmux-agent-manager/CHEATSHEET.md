@@ -10,7 +10,7 @@
 python3 scripts/tmux_worker.py mailbox-roster --config workers.toml
 
 # Manager → Worker 正式 TASK（直写目标 inbox）
-python3 scripts/tmux_worker.py mailbox send \
+mailbox send \
   --session <session-id> --from manager --to <agent-id> --kind TASK \
   --subject "<task>" --body "<full task + acceptance>"
 

@@ -448,6 +448,8 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
     if not host:
         # Local: direct Python call
         from codeagent.mailbox.cli import main as mailbox_main
+        if mailbox_root:
+            mailbox_args = ["--mailbox-root", mailbox_root] + mailbox_args
         old_stdout, old_stderr = sys.stdout, sys.stderr
         try:
             sys.stdout = sys.__stdout__
