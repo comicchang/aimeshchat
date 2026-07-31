@@ -9,6 +9,9 @@ description = "Multi-host code agent orchestration with SSH, session persistence
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+test = ["pytest-asyncio>=0.21"]
+
 [project.scripts]
 codeagent = "codeagent.cli:main"
 codeagent-remote-exec = "codeagent.remote_exec:main"
@@ -23,3 +26,4 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "--cov=codeagent --cov-report=term-missing --cov-fail-under=85"
+asyncio_mode = "auto"

@@ -17,7 +17,7 @@ from codeagent.runners import GoWrapperRunner, OMPRunner
 from codeagent.runners.base import RunnerConfig
 from codeagent.wire.protocol import WIRE_VERSION, decode_request
 
-SUPPORTED_COMMANDS = {"run", "ping", "capabilities", "mailbox"}
+SUPPORTED_COMMANDS = {"run", "ping", "capabilities", "mailbox", "mailbox-daemon"}
 
 
 def _read_request() -> dict | None:
@@ -176,6 +176,49 @@ def _handle_mailbox(req: dict) -> None:
     })
 
 
+def _handle_mailbox_daemon(req: dict) -> None:
+    """Execute a mailbox-daemon CLI subcommand on the remote host.
+
+    Mirrors the structure of ``_handle_mailbox`` but delegates to
+    :mod:`codeagent.tcp.cli`.
+    """
+    import io
+    args = req.get("args", [])
+    if not isinstance(args, list):
+        _send({"type": "error", "message": "mailbox-daemon 'args' must be a list"})
+        return
+
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    try:
+        sys.stdout = buf_out
+        sys.stderr = buf_err
+        from codeagent.tcp.cli import main as daemon_main
+        daemon_main(args)
+        exit_code = 0
+    except SystemExit as e:
+        code = e.code
+        if code is None:
+            exit_code = 0
+        elif isinstance(code, int):
+            exit_code = code
+        else:
+            buf_err.write(f"{code}\n")
+            exit_code = 1
+    except Exception as e:
+        buf_err.write(f"error: {e}\n")
+        exit_code = 1
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+
+    _send({
+        "type": "mailbox_result",
+        "stdout": buf_out.getvalue(),
+        "stderr": buf_err.getvalue(),
+        "exit_code": exit_code,
+    })
+
+
 def main() -> None:
     """Main loop — read requests from stdin, write responses to stdout."""
     # Send ready signal
@@ -204,6 +247,8 @@ def main() -> None:
             _handle_run(req)
         elif cmd == "mailbox":
             _handle_mailbox(req)
+        elif cmd == "mailbox-daemon":
+            _handle_mailbox_daemon(req)
         else:
             _send({"type": "error", "message": f"unknown command: {cmd}"})
 
