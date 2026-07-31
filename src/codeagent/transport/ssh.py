@@ -667,7 +667,14 @@ class SSHStream:
         import uuid
 
         self._request_id = uuid.uuid4().hex[:12]
-        remote_cmd = ["codeagent-remote-exec"]
+        # Non-interactive SSH omits ~/.local/bin (uv tool default) — same
+        # gap mailbox()/run fix via shell_prefix.  Prepending PATH here
+        # keeps remote serve mode reachable on hosts without repo-map
+        # shell_prefix.  Single-string remote command (OpenSSH joins
+        # argv[4:] with spaces, so multi-arg would lose quoting).
+        remote_cmd = [
+            "export PATH=$HOME/.local/bin:$PATH; codeagent-remote-exec",
+        ]
         cmd = list(self._ssh_cmd) + remote_cmd
 
         log.debug("SSHStream: spawning %s", " ".join(cmd))
