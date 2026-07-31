@@ -1493,6 +1493,23 @@ class TestRunSSHMailbox:
         assert out == "ok"
         assert err == ""
 
+    @patch("subprocess.Popen")
+    def test_malformed_mailbox_result_never_returns_success(self, mock_popen: MagicMock):
+        """A schema-invalid mailbox_result must not fall back to SSH exit 0."""
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (
+            b'{"type":"mailbox_result","stdout":"","stderr":"","exit_code":"session not found: s1"}\n',
+            b"",
+        )
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        exit_code, out, err = _run_ssh_mailbox(["ssh", "host"], {})
+
+        assert exit_code == 1
+        assert out == ""
+        assert "invalid mailbox_result" in err
+
 
 # ---------------------------------------------------------------------------
 # RelayTransport tests

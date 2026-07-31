@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from codeagent.constants import LEASE_TIMEOUT_S
+from codeagent.constants import LEASE_TIMEOUT_S, MAX_MAILBOX_BODY
 from codeagent.mailbox.protocol import (
     VALID_KINDS,
     VALID_STATES,
@@ -136,6 +136,8 @@ class MailboxStore:
             raise ValueError(f"agent not in session: {to_id}")
         if kind not in VALID_KINDS:
             raise ValueError(f"invalid kind: {kind}")
+        if isinstance(body, str) and len(body.encode("utf-8")) > MAX_MAILBOX_BODY:
+            raise ValueError(f"body exceeds {MAX_MAILBOX_BODY}-byte limit")
 
         msg_id = gen_msg_id(from_id)
         while (inbox / f"{msg_id}.json").exists():

@@ -382,6 +382,7 @@ def _run_ssh_mailbox(
     result_stdout = ""
     result_stderr = ""
     exit_code = -1
+    invalid_mailbox_result = False
 
     try:
         stdout, stderr = proc.communicate(input=payload, timeout=timeout)
@@ -403,6 +404,8 @@ def _run_ssh_mailbox(
         try:
             msg = decode_line(raw_line)
         except ValueError:
+            if "mailbox_result" in raw_line:
+                invalid_mailbox_result = True
             continue
 
         if msg.type == MSG_READY:
@@ -414,11 +417,27 @@ def _run_ssh_mailbox(
                 )
             continue
         if msg.type == MSG_MAILBOX_RESULT:
-            result_stdout = msg.payload.get("stdout", "")
-            result_stderr = msg.payload.get("stderr", "")
-            exit_code = msg.payload.get("exit_code", 0)
+            stdout_value = msg.payload.get("stdout")
+            stderr_value = msg.payload.get("stderr")
+            exit_value = msg.payload.get("exit_code")
+            if (
+                not isinstance(stdout_value, str)
+                or not isinstance(stderr_value, str)
+                or type(exit_value) is not int
+            ):
+                invalid_mailbox_result = True
+                continue
+            result_stdout = stdout_value
+            result_stderr = stderr_value
+            exit_code = exit_value
         elif msg.type == MSG_ERROR:
             result_stderr = msg.message
+            exit_code = 1
+
+    if invalid_mailbox_result:
+        if not result_stderr:
+            result_stderr = "invalid mailbox_result response from remote helper"
+        if exit_code in (-1, 0):
             exit_code = 1
 
     # Fallback: use SSH process exit code if no structured result

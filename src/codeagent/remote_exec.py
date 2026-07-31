@@ -154,7 +154,14 @@ def _handle_mailbox(req: dict) -> None:
         mailbox_main(args)
         exit_code = 0
     except SystemExit as e:
-        exit_code = e.code or 0
+        code = e.code
+        if code is None:
+            exit_code = 0
+        elif isinstance(code, int):
+            exit_code = code
+        else:
+            buf_err.write(f"{code}\n")
+            exit_code = 1
     except Exception as e:
         buf_err.write(f"error: {e}\n")
         exit_code = 1

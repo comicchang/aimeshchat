@@ -8,6 +8,7 @@ from unittest import mock
 
 import pytest
 
+from codeagent.constants import MAX_MAILBOX_BODY
 from codeagent.mailbox.protocol import Message, StatusSnapshot, validate_agent_id, validate_message
 from codeagent.mailbox.store import MailboxStore
 
@@ -113,6 +114,13 @@ class TestStore:
         peek = store.peek("s1", "w1")
         assert peek["pending"] == 1
         assert peek["messages"][0]["subject"] == "hello"
+
+    def test_send_rejects_oversized_body(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="body exceeds"):
+            store.send(
+                "s1", "mgr", "w1", "subject", "x" * (MAX_MAILBOX_BODY + 1), "TASK"
+            )
 
     def test_send_invalid_kind(self, store):
         store.session_init("s1", "mgr", ["w1"])

@@ -23,7 +23,7 @@ from codeagent.remote_exec import (
     _send,
     main,
 )
-from codeagent.wire.protocol import WIRE_VERSION
+from codeagent.wire.protocol import WIRE_VERSION, decode_line
 
 
 class TestReadRequest:
@@ -192,6 +192,18 @@ class TestHandleMailbox:
         msg = json.loads(capsys.readouterr().out)
         assert msg["type"] == "mailbox_result"
         assert msg["exit_code"] == 42
+
+    def test_mailbox_system_exit_message_is_wire_valid_failure(self, capsys):
+        with patch(
+            "codeagent.mailbox.cli.main",
+            side_effect=SystemExit("session not found: s1"),
+        ):
+            _handle_mailbox({"args": ["send"]})
+
+        msg = decode_line(capsys.readouterr().out)
+        assert msg.type == "mailbox_result"
+        assert msg.exit_code == 1
+        assert "session not found: s1" in msg.payload["stderr"]
 
 
 class TestMainLoop:
