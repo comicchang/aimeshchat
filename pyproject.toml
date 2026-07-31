@@ -25,3 +25,6 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "--cov=codeagent --cov-report=term-missing --cov-fail-under=85"
+markers = [
+    "integration: integration tests gated on --run-integration",
+]

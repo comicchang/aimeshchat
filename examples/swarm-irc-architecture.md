@@ -1,5 +1,14 @@
 # Swarm IRC Architecture: SSH-Based Cross-Device Agent Communication
 
+> **Implementation status (2025-07)**: This design was implemented in
+> `src/codeagent/swarm/` (kernel, delivery, receiver) and
+> `src/codeagent/hooks/swarm_hooks.py` (OMP lifecycle hooks).
+> The transport router (`transport/router.py`) selects SSH/relay/local.
+>
+> **§7.2 verdict superseded**: The TCP-based daemon approach was NOT implemented.
+> The wire-protocol-over-SSH approach won per the final oracle decision —
+> `TransportRouter` routes through SSH ControlMaster (or relay PTY for bastion hosts).
+
 ## 1. Bottom-Line Recommendation
 
 **Layered architecture with protocol-agnostic core.** The mailbox + wire protocols form the
@@ -84,11 +93,11 @@ and share the same routing table.
 
 ### What's missing for swarm
 
-1. **Protocol kernel**: `SwarmController` abstract interface + routing table
-2. **Backend implementations**: CLI / OMP plugin / Tmux plugin adapters
-3. **Cross-host delivery**: Send to remote agent via SSH → remote mailbox
-4. **Remote polling**: Check remote outboxes for messages addressed to us
-5. **Swarm lifecycle**: Spawn remote worker + join session + teardown
+~~1. **Protocol kernel**: `SwarmController` abstract interface + routing table~~ → `swarm/kernel.py`
+~~2. **Backend implementations**: CLI / OMP plugin / Tmux plugin adapters~~ → `cli.py _swarm_*`, `hooks/swarm_hooks.py`, `scripts/tmux/swarm-watch.sh`
+~~3. **Cross-host delivery**: Send to remote agent via SSH → remote mailbox~~ → `swarm/delivery.py` + `transport/router.py`
+~~4. **Remote polling**: Check remote outboxes for messages addressed to us~~ → `swarm/receiver.py` (stream mode)
+~~5. **Swarm lifecycle**: Spawn remote worker + join session + teardown~~ → `SwarmKernel.register()` / `unregister()`
 
 ---
 

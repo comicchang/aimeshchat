@@ -13,6 +13,7 @@ Unified CLI for executing AI code agents across local and remote machines, with 
 - **Remote helper**: `codeagent-remote-exec` console entrypoint, deployed via `dotai setup`
 - **Mailbox IPC**: session-based direct-inbox for agent-to-agent communication (local + cross-host via SSH)
 - **Wire protocol**: JSONL over SSH stdin/stdout, no shell quoting issues
+- **Swarm IPC**: IRC-style kernel with session/roster/ACL/routing, delivery engine with durable outbox, real-time receiver (watch + stream modes), artifact transport
 
 ## Installation
 
@@ -208,22 +209,35 @@ Socket path: `$XDG_RUNTIME_DIR/codeagent/ssh/<host-hash>.sock`
 ## Architecture
 
 ```
-codeagent CLI
-  ├─ config/repo_map.py    # repo-map.json loader
-  ├─ routing/resolver.py   # topic → host → path resolution
-  ├─ runners/
-  │   ├── go_wrapper.py    # Go codeagent-wrapper (codex/claude/gemini/opencode)
-  │   └── omp.py           # omp CLI
-  ├─ session/
-  │   ├── registry.py      # SQLite session store
-  │   ├── key.py           # namespace key computation
-  │   └── lock.py          # per-key flock
-  ├─ transport/
-  │   ├── local.py         # local subprocess
-  │   ├── ssh.py           # SSH + ControlMaster
-  │   └── control_master.py
-  ├─ wire/protocol.py      # JSONL wire protocol
-  └─ remote_exec.py        # remote helper (deployed to each host)
+┌─────────────────────────────────────────────────────────────────────┐
+│  CLI / Runners                                                      │
+│  ├─ config/repo_map.py       # repo-map.json loader                │
+│  ├─ routing/resolver.py      # topic → host → path resolution      │
+│  ├─ runners/go_wrapper.py    # Go codeagent-wrapper                 │
+│  ├─ runners/omp.py           # omp CLI                             │
+│  ├─ session/registry.py      # SQLite session store                 │
+│  └─ remote_exec.py           # remote helper (deployed to hosts)    │
+├─────────────────────────────────────────────────────────────────────┤
+│  Swarm Layer                                                        │
+│  ├─ swarm/kernel.py          # session/roster/ACL/routing kernel    │
+│  ├─ swarm/delivery.py        # durable outbox → transport delivery  │
+│  ├─ swarm/receiver.py        # real-time push (watch + stream)      │
+│  ├─ swarm/model.py           # AgentLocation, Envelope, Address…    │
+│  └─ hooks/swarm_hooks.py     # OMP plugin lifecycle hooks           │
+├─────────────────────────────────────────────────────────────────────┤
+│  Mailbox (Store / Protocol / CLI)                                   │
+│  ├─ mailbox/store.py         # filesystem CRUD, two-phase read      │
+│  ├─ mailbox/protocol.py      # Message schema, 7 kinds, attachments │
+│  └─ mailbox/cli.py           # standalone mailbox CLI               │
+├─────────────────────────────────────────────────────────────────────┤
+│  Transport Router → Wire Protocol                                   │
+│  ├─ transport/router.py      # centralized host → transport select  │
+│  ├─ transport/ssh.py         # SSH + ControlMaster                  │
+│  ├─ transport/relay.py       # bastion/PTY+expect                   │
+│  ├─ transport/local.py       # local subprocess                     │
+│  ├─ wire/protocol.py         # JSONL wire protocol                  │
+│  └─ artifact.py              # SCP over CM, SHA256 verify           │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Remote Deployment
@@ -238,10 +252,34 @@ dotai setup
 This installs `codeagent` and `codeagent-remote-exec` via `uv tool install` from the
 cloned codeagent-py repo. No manual pip install needed.
 
-## Mailbox (Agent IPC)
+## Swarm IPC
 
-`codeagent mailbox` provides cross-host agent-to-agent communication using
-the session-based direct-inbox protocol:
+IRC-style agent-to-agent communication via `SwarmKernel` — session/roster/ACL/routing with
+pluggable delivery (local mailbox or cross-host via `TransportRouter`) and real-time push.
+
+### Quick Start (localhost)
+
+```bash
+# 1. Create a swarm session with manager + two workers
+codeagent swarm create-session s1 --manager mgr --members w1,w2
+
+# 2. Register agents (location = __local__ for co-located)
+codeagent swarm register s1 mgr   --host __local__
+codeagent swarm register s1 w1    --host __local__
+
+# 3. Send a direct message
+codeagent swarm direct s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "check src/"
+
+# 4. Poll inbox
+codeagent swarm poll s1 --agent w1
+
+# 5. Watch for new messages (continuous)
+codeagent swarm watch s1 --agent mgr --interval 2
+```
+
+### Mailbox CLI
+
+`codeagent mailbox` provides the lower-level store operations used by the kernel:
 
 ```bash
 # Session management
