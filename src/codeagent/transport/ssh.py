@@ -215,7 +215,21 @@ class SSHTransport(Transport):
         if not cm.is_alive():
             cm.create()
         req = make_mailbox_request(args=args, mailbox_root=mailbox_root)
-        ssh_cmd = cm.ssh_cmd("codeagent-remote-exec")
+        remote_exec = "codeagent-remote-exec"
+        if host.shell_prefix:
+            # Non-interactive SSH omits ~/.local/bin etc. — same gap
+            # dotai setup's shell_prefix fills for ``run``; mailbox must
+            # honor it too or remote mailbox fails with command-not-found.
+            prefix = host.shell_prefix
+        else:
+            # uv tool installs to ~/.local/bin by default; prepend it so
+            # remote mailbox works even without repo-map shell_prefix.
+            prefix = "export PATH=$HOME/.local/bin:$PATH"
+        remote_cmd_str = f"{prefix}; {shlex.quote(remote_exec)}"
+        # Single string arg: OpenSSH joins argv[4:] with spaces, so passing
+        # ["sh","-c",cmd] loses quotes and the remote shell only sees the
+        # first word after -c. A single string is executed as-is remotely.
+        ssh_cmd = cm.ssh_cmd(remote_cmd_str)
         return _run_ssh_mailbox(ssh_cmd, req, timeout=timeout)
 
     # ── Internal helpers ────────────────────────────────────────────────

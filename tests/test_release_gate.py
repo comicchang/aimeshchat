@@ -68,10 +68,13 @@ def _remote_exec_available() -> bool:
     if not _localhost_ssh_available():
         return False
     # Check if codeagent-remote-exec is on the SSH session PATH
+    # (non-interactive SSH omits ~/.local/bin — same gap dotai setup's
+    # shell_prefix fills on real hosts; prepend it here for parity)
     try:
         r = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
-             "localhost", "codeagent-remote-exec", "--help"],
+             "localhost",
+             "export PATH=$HOME/.local/bin:$PATH; codeagent-remote-exec --help"],
             capture_output=True, timeout=10,
         )
         if r.returncode == 0:
