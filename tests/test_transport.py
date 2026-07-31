@@ -865,6 +865,105 @@ class TestRunSSHWire:
         )
         assert result.stdout == "done"
 
+    @patch("subprocess.Popen")
+    def test_file_not_found_raises(self, mock_popen: MagicMock):
+        """Missing ssh binary raises TransportError."""
+        mock_popen.side_effect = FileNotFoundError("no such binary")
+        with pytest.raises(TransportError, match="ssh binary not found"):
+            _run_ssh_wire(
+                ["nonexistent-ssh"],
+                {"wire_version": 1, "command": "run", "task": "test"},
+                workdir="/tmp",
+                host_name="host",
+                backend="opencode",
+            )
+
+    @patch("subprocess.Popen")
+    def test_communicate_error_kills_and_reraises(self, mock_popen: MagicMock):
+        """Generic communicate() failure kills the proc and re-raises."""
+        mock_proc = MagicMock()
+        mock_proc.communicate.side_effect = RuntimeError("boom")
+        mock_popen.return_value = mock_proc
+        with pytest.raises(RuntimeError, match="boom"):
+            _run_ssh_wire(
+                ["ssh", "host", "python3"],
+                {"wire_version": 1, "command": "run", "task": "test"},
+                workdir="/tmp",
+                host_name="host",
+                backend="opencode",
+            )
+        mock_proc.kill.assert_called_once()
+        mock_proc.wait.assert_called_once()
+
+    @patch("subprocess.Popen")
+    def test_blank_lines_skipped(self, mock_popen: MagicMock):
+        """Blank lines in stdout are skipped without affecting the result."""
+        mock_proc = MagicMock()
+        result_msg = encode_line({"type": MSG_RESULT, "stdout": "ok", "stderr": "", "exit_code": 0})
+        mock_proc.communicate.return_value = (b"\n\n" + result_msg, b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+        result = _run_ssh_wire(
+            ["ssh", "host", "python3"],
+            {"wire_version": 1, "command": "run", "task": "test"},
+            workdir="/tmp",
+            host_name="host",
+            backend="opencode",
+        )
+        assert result.stdout == "ok"
+
+    @patch("subprocess.Popen")
+    def test_non_json_noise_skipped(self, mock_popen: MagicMock):
+        """Non-JSON output is skipped without affecting the result."""
+        mock_proc = MagicMock()
+        stdout = b"some noise\n" + encode_line({"type": MSG_RESULT, "stdout": "ok", "stderr": "", "exit_code": 0})
+        mock_proc.communicate.return_value = (stdout, b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+        result = _run_ssh_wire(
+            ["ssh", "host", "python3"],
+            {"wire_version": 1, "command": "run", "task": "test"},
+            workdir="/tmp",
+            host_name="host",
+            backend="opencode",
+        )
+        assert result.stdout == "ok"
+
+    @patch("subprocess.Popen")
+    def test_version_mismatch_raises(self, mock_popen: MagicMock):
+        """Wrong remote wire version raises TransportError."""
+        mock_proc = MagicMock()
+        stdout = encode_line({"type": MSG_READY, "wire_version": 99, "package_version": "0.1.0"})
+        mock_proc.communicate.return_value = (stdout, b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+        with pytest.raises(TransportError, match="wire version mismatch"):
+            _run_ssh_wire(
+                ["ssh", "host", "python3"],
+                {"wire_version": 1, "command": "run", "task": "test"},
+                workdir="/tmp",
+                host_name="host",
+                backend="opencode",
+            )
+
+    @patch("subprocess.Popen")
+    def test_error_message_propagated(self, mock_popen: MagicMock):
+        """MSG_ERROR from the helper is propagated to stderr."""
+        mock_proc = MagicMock()
+        stdout = encode_line({"type": MSG_ERROR, "message": "workdir not found"})
+        mock_proc.communicate.return_value = (stdout, b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+        result = _run_ssh_wire(
+            ["ssh", "host", "python3"],
+            {"wire_version": 1, "command": "run", "task": "test"},
+            workdir="/tmp",
+            host_name="host",
+            backend="opencode",
+        )
+        assert result.stderr == "workdir not found"
+        assert result.returncode == 0
+
 
 # ---------------------------------------------------------------------------
 # SSHTransport tests
@@ -1146,6 +1245,81 @@ class TestSSHTransport:
         assert result[1] == ("host-b", Path("/tmp/b.sock"))
         mock_list.assert_called_once()
 
+    @patch("codeagent.transport.ssh.ControlMaster")
+    def test_check_uses_local_master(self, mock_cm_cls: MagicMock):
+        """check() consults the in-process _masters cache when present."""
+        mock_cm = MagicMock()
+        mock_cm.is_alive.return_value = True
+        mock_cm_cls.return_value = mock_cm
+
+        transport = SSHTransport()
+        host = HostSpec(name="remote", ssh_alias="remote-host", hostnames=("remote-host",))
+        transport.warm(host)  # populates _masters[alias]
+
+        assert transport.check(host) is True
+        mock_cm.is_alive.assert_called_once()
+
+    @patch("codeagent.transport.ssh.ControlMaster")
+    def test_check_local_master_not_alive(self, mock_cm_cls: MagicMock):
+        """check() returns False when the cached master is not alive."""
+        mock_cm = MagicMock()
+        mock_cm.is_alive.return_value = False
+        mock_cm_cls.return_value = mock_cm
+
+        transport = SSHTransport()
+        host = HostSpec(name="remote", ssh_alias="remote-host", hostnames=("remote-host",))
+        transport.warm(host)
+
+        assert transport.check(host) is False
+
+    def test_stop_all_clears_masters(self):
+        """stop_all() clears the local cache and delegates to cross-process stop_all."""
+        transport = SSHTransport()
+        transport._masters["host-a"] = MagicMock()
+        transport._masters["host-b"] = MagicMock()
+
+        with patch("codeagent.transport.ssh.stop_all") as mock_stop:
+            transport.stop_all()
+            mock_stop.assert_called_once_with(ssh_bin="ssh")
+        assert transport._masters == {}
+
+    @patch("codeagent.transport.ssh.ControlMaster")
+    @patch("subprocess.Popen")
+    def test_execute_fallback_not_alive_creates(self, mock_popen: MagicMock, mock_cm_cls: MagicMock):
+        """Fallback ControlMaster is created lazily when not alive."""
+        primary_cm = MagicMock()
+        primary_cm.is_alive.return_value = True
+        primary_cm.ssh_cmd.return_value = [
+            "ssh", "-S", "/tmp/primary.sock", "primary", "python3", "-m", "codeagent.remote_exec",
+        ]
+
+        fallback_cm = MagicMock()
+        fallback_cm.is_alive.return_value = False  # not alive → create() path
+        fallback_cm.ssh_cmd.return_value = [
+            "ssh", "-S", "/tmp/fallback.sock", "fallback", "python3", "-m", "codeagent.remote_exec",
+        ]
+
+        mock_cm_cls.side_effect = [primary_cm, fallback_cm]
+        mock_proc_fail = _mock_popen_exit255_stderr("Connection refused")
+        mock_proc_ok = _mock_popen_success()
+        mock_popen.side_effect = [mock_proc_fail, mock_proc_ok]
+
+        transport = SSHTransport()
+        host = HostSpec(
+            name="remote",
+            ssh_alias="primary",
+            hostnames=("primary",),
+            fallback_ssh_alias="fallback",
+        )
+        req = _make_run_request()
+        result = transport.execute(req, host, "/workdir")
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        assert result.host == "fallback"
+        fallback_cm.create.assert_called_once()
+        assert mock_popen.call_count == 2
+
     def test_check_cross_process_via_meta(self, tmp_path: Path):
         """check() finds socket via .meta files in a fresh process (empty _masters)."""
         sock = tmp_path / "abc123.sock"
@@ -1286,6 +1460,38 @@ class TestRunSSHMailbox:
 
         with pytest.raises(TransportError, match="wire version mismatch"):
             _run_ssh_mailbox(["ssh", "host"], {})
+
+    @patch("subprocess.Popen")
+    def test_file_not_found_raises(self, mock_popen: MagicMock):
+        """Missing ssh binary raises TransportError."""
+        mock_popen.side_effect = FileNotFoundError("no such binary")
+        with pytest.raises(TransportError, match="ssh binary not found"):
+            _run_ssh_mailbox(["nonexistent-ssh", "host"], {})
+
+    @patch("subprocess.Popen")
+    def test_communicate_error_kills_and_reraises(self, mock_popen: MagicMock):
+        """Generic communicate() failure kills the proc and re-raises."""
+        mock_proc = MagicMock()
+        mock_proc.communicate.side_effect = RuntimeError("boom")
+        mock_popen.return_value = mock_proc
+        with pytest.raises(RuntimeError, match="boom"):
+            _run_ssh_mailbox(["ssh", "host"], {})
+        mock_proc.kill.assert_called_once()
+        mock_proc.wait.assert_called_once()
+
+    @patch("subprocess.Popen")
+    def test_blank_lines_skipped(self, mock_popen: MagicMock):
+        """Blank lines in stdout are skipped without affecting the result."""
+        mock_proc = MagicMock()
+        stdout = b"\n\n" + encode_line({"type": "mailbox_result", "stdout": "ok", "stderr": "", "exit_code": 0})
+        mock_proc.communicate.return_value = (stdout, b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        exit_code, out, err = _run_ssh_mailbox(["ssh", "host"], {})
+        assert exit_code == 0
+        assert out == "ok"
+        assert err == ""
 
 
 # ---------------------------------------------------------------------------

@@ -59,6 +59,16 @@ class TestLaunchers:
             result = create_pane(PaneConfig())
             assert result is None
 
+    def test_create_pane_with_cwd(self):
+        from codeagent.launchers import create_pane, PaneConfig
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="%6\n")
+            result = create_pane(PaneConfig(session="test", cwd="/work"))
+            assert result == "%6"
+            cmd = mock_run.call_args[0][0]
+            assert "-c" in cmd
+            assert "/work" in cmd
+
 
 class TestAdapters:
     """Tests for codeagent.adapters OMP identity registration."""
@@ -93,3 +103,23 @@ class TestAdapters:
         from codeagent.adapters import unregister_identity
         # Should not raise
         unregister_identity(str(tmp_path / "nonexistent.json"))
+
+    def test_register_identity_default_path(self, tmp_path, monkeypatch):
+        """register_identity() falls back to ~/.omp/mailbox-identity when no env var or explicit path."""
+        from codeagent.adapters import register_identity
+        monkeypatch.delenv("OMP_MAILBOX_IDENTITY_FILE", raising=False)
+        with patch.object(Path, "home", return_value=tmp_path):
+            result = register_identity("sess-3", "worker-3")
+        assert result.exists()
+        assert result.parent == tmp_path / ".omp" / "mailbox-identity"
+        data = json.loads(result.read_text())
+        assert data["session_id"] == "sess-3"
+        assert data["worker_id"] == "worker-3"
+
+    def test_unregister_identity_oserror_ignored(self, tmp_path):
+        """unregister_identity() swallows OSError during unlink."""
+        from codeagent.adapters import unregister_identity
+        identity_file = tmp_path / "locked.json"
+        identity_file.touch()
+        with patch("pathlib.Path.unlink", side_effect=OSError("permission denied")):
+            unregister_identity(str(identity_file))  # should not raise

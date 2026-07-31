@@ -210,6 +210,41 @@ class TestPullArtifactErrors:
                 dest=dest,
             )
 
+    def test_scp_binary_missing(self, tmp_path: Path):
+        """pull_artifact raises TransportError when scp is not on PATH."""
+        dest = tmp_path / "out.json"
+        (tmp_path / "sock").touch()
+        with (
+            mock.patch("codeagent.artifact.socket_path", return_value=tmp_path / "sock"),
+            mock.patch("codeagent.artifact.shutil.which", return_value=None),
+        ):
+            with pytest.raises(TransportError, match="scp binary not found"):
+                pull_artifact(
+                    host_alias="any-host",
+                    remote_root="/tmp",
+                    desc=_VALID_DESC,
+                    dest=dest,
+                )
+
+    def test_scp_failure_raises(self, tmp_path: Path):
+        """pull_artifact propagates a non-zero scp exit as TransportError."""
+        dest = tmp_path / "out.json"
+        (tmp_path / "sock").touch()
+        with (
+            mock.patch("codeagent.artifact.socket_path", return_value=tmp_path / "sock"),
+            mock.patch("codeagent.artifact.shutil.which", return_value="/usr/bin/scp"),
+            mock.patch("subprocess.run", return_value=mock.MagicMock(returncode=1, stderr="scp: no such file")),
+        ):
+            with pytest.raises(TransportError, match="scp failed for art-001") as exc:
+                pull_artifact(
+                    host_alias="any-host",
+                    remote_root="/tmp",
+                    desc=_VALID_DESC,
+                    dest=dest,
+                )
+        assert "scp: no such file" in str(exc.value)
+
+
 
 # ════════════════════════════════════════════════════════════════════════
 # CLI integration smoke tests (in-process, like test_cli.py)

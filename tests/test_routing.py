@@ -144,6 +144,12 @@ class TestResolveIsLocal:
         host = HostSpec(name="x", ssh_alias="x", hostnames=())
         assert resolve_is_local(host) is False
 
+    def test_empty_candidate_skipped(self):
+        """Empty hostname candidates are skipped without matching."""
+        actual = socket.gethostname().split(".")[0].lower()
+        host = HostSpec(name="x", ssh_alias="x", hostnames=("", actual))
+        assert resolve_is_local(host) is True
+
     def test_exact_match(self):
         """resolve_is_local uses exact short hostname matching (not substring)."""
         actual = socket.gethostname().split(".")[0].lower()
