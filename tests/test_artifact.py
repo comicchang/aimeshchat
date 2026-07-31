@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -271,3 +272,43 @@ class TestArtifactCLI:
         assert rc == 1
         err = capsys.readouterr().err
         assert "sha256 mismatch" in err
+
+
+class TestArtifactLocalhostE2E:
+    """Real SSH smoke test — requires localhost SSH access."""
+
+    def test_localhost_pull_and_verify(self, tmp_path):
+        """Pull artifact over real localhost SSH and verify."""
+        import hashlib
+
+        # Check if localhost SSH is available
+        sock_test = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "localhost", "true"],
+            capture_output=True, timeout=10,
+        )
+        if sock_test.returncode != 0:
+            pytest.skip("localhost SSH not available (BatchMode)")
+
+        # Create artifact on disk
+        artifact_dir = tmp_path / "artifacts"
+        artifact_dir.mkdir()
+        content = b"hello artifact"
+        (artifact_dir / "test.txt").write_bytes(content)
+
+        sha256 = hashlib.sha256(content).hexdigest()
+        desc = ArtifactDescriptor(
+            artifact_id="test-001",
+            relative_path="test.txt",
+            size=len(content),
+            sha256=sha256,
+        )
+
+        # Warm ControlMaster
+        from codeagent.transport.control_master import ControlMaster
+        cm = ControlMaster("localhost")
+        cm.create()
+
+        dest = tmp_path / "downloaded.txt"
+        result = pull_artifact("localhost", str(artifact_dir), desc, dest)
+        assert result.exists()
+        assert result.read_bytes() == content
