@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from codeagent.domain import RunRequest, RunResult
+from codeagent.hooks.swarm_hooks import on_agent_start, on_agent_stop
 
 from .base import BaseRunner, RunnerConfig
 
@@ -117,6 +118,23 @@ class OMPRunner(BaseRunner):
         if final_message is not None:
             result.stdout = final_message
 
+        # ── Swarm hook: register agent on session start ────────────────
+        # When SWARM_SESSION_ID is set, register this agent in the swarm
+        # kernel so other agents can discover and message it.
+        swarm_sid = os.environ.get("SWARM_SESSION_ID")
+        if swarm_sid and session_id:
+            try:
+                on_agent_start(
+                    session_id=swarm_sid,
+                    agent_id=session_id,
+                    host_alias="__local__",
+                    backend="omp",
+                )
+                self._swarm_session_id = swarm_sid
+                self._swarm_agent_id = session_id
+            except Exception:
+                pass  # hook errors are advisory, not fatal
+
         return result
 
     # ------------------------------------------------------------------
@@ -145,5 +163,13 @@ class OMPRunner(BaseRunner):
             self._prompt_file = None
 
     def _cleanup(self) -> None:
-        """Clean up prompt temp file."""
+        """Clean up prompt temp file and unregister swarm agent."""
         self._cleanup_prompt_file()
+        # ── Swarm hook: unregister agent on stop ──────────────────────
+        swarm_sid = getattr(self, "_swarm_session_id", None)
+        swarm_aid = getattr(self, "_swarm_agent_id", None)
+        if swarm_sid and swarm_aid:
+            try:
+                on_agent_stop(session_id=swarm_sid, agent_id=swarm_aid)
+            except Exception:
+                pass  # hook errors are advisory, not fatal

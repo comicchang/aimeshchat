@@ -29,6 +29,9 @@ from codeagent.transport.base import TransportError
 from codeagent.transport.local import LocalTransport
 from codeagent.transport.router import TransportRouter
 from codeagent.transport.ssh import SSHTransport
+from codeagent.swarm.kernel import SwarmKernel, LocalDeliverySink
+from codeagent.swarm.model import Address, AddressKind, AgentLocation, Envelope
+from codeagent.mailbox.store import MailboxStore
 
 log = logging.getLogger(__name__)
 
@@ -125,7 +128,284 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_p.add_argument("--sha256", required=True, help="Expected SHA-256 hex digest")
     verify_p.add_argument("--size", type=int, required=True, help="Expected file size in bytes")
 
+    # ── swarm ───────────────────────────────────────────────────────────
+    _build_swarm_parser(sub)
+
     return p
+
+
+def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
+    """Register the ``swarm`` subcommand tree."""
+    swarm_p = sub.add_parser("swarm", help="Swarm kernel operations")
+    swarm_sub = swarm_p.add_subparsers(dest="swarm_cmd")
+
+    # create-session
+    cs_p = swarm_sub.add_parser("create-session", help="Create a new swarm session")
+    cs_p.add_argument("session_id", help="Session identifier")
+    cs_p.add_argument("--manager", required=True, help="Manager agent ID")
+    cs_p.add_argument("--members", required=True, help="Comma-separated member agent IDs")
+
+    # register
+    reg_p = swarm_sub.add_parser("register", help="Register an agent in the routing table")
+    reg_p.add_argument("session_id")
+    reg_p.add_argument("--agent", required=True)
+    reg_p.add_argument("--host", required=True, help="Host alias (or __local__)")
+    reg_p.add_argument("--backend", default="cli", choices=["cli", "omp", "tmux"])
+
+    # direct
+    dir_p = swarm_sub.add_parser("direct", help="Send a direct message")
+    dir_p.add_argument("session_id")
+    dir_p.add_argument("--to", required=True, help="Recipient agent ID")
+    dir_p.add_argument("--from", dest="sender", required=True, help="Sender agent ID")
+    dir_p.add_argument("--kind", default="TASK")
+    dir_p.add_argument("--subject", required=True)
+    dir_p.add_argument("--body", required=True)
+    dir_p.add_argument("--attachment", action="append", default=[], help="Attachment JSON (repeatable)")
+
+    # channel
+    ch_p = swarm_sub.add_parser("channel", help="Send to a channel")
+    ch_p.add_argument("session_id")
+    ch_p.add_argument("channel_id", help="Channel identifier")
+    ch_p.add_argument("--to", dest="sender", required=True, help="Sender agent ID")
+    ch_p.add_argument("--kind", default="TASK")
+    ch_p.add_argument("--subject", default="")
+    ch_p.add_argument("--body", required=True)
+    ch_p.add_argument("--attachment", action="append", default=[])
+
+    # broadcast
+    bc_p = swarm_sub.add_parser("broadcast", help="Broadcast to all session members")
+    bc_p.add_argument("session_id")
+    bc_p.add_argument("--from", dest="sender", required=True, help="Sender (must be authority)")
+    bc_p.add_argument("--kind", default="NOTICE")
+    bc_p.add_argument("--subject", default="")
+    bc_p.add_argument("--body", required=True)
+
+    # notice
+    nt_p = swarm_sub.add_parser("notice", help="Send a notice to the session")
+    nt_p.add_argument("session_id")
+    nt_p.add_argument("--from", dest="sender", required=True)
+    nt_p.add_argument("--topic", required=True)
+    nt_p.add_argument("--audience", default="", help="Audience (reserved for future use)")
+    nt_p.add_argument("--body", required=True)
+    nt_p.add_argument("--ttl", type=int, default=0)
+    nt_p.add_argument("--kind", default="NOTICE")
+    nt_p.add_argument("--subject", required=True)
+
+    # poll
+    pl_p = swarm_sub.add_parser("poll", help="Poll agent inbox")
+    pl_p.add_argument("session_id")
+    pl_p.add_argument("--agent", required=True)
+    pl_p.add_argument("--cursor", default="")
+    pl_p.add_argument("--limit", type=int, default=50)
+
+    # ack
+    ack_p = swarm_sub.add_parser("ack", help="Acknowledge a message")
+    ack_p.add_argument("session_id")
+    ack_p.add_argument("--agent", required=True)
+    ack_p.add_argument("--msg-id", required=True)
+    ack_p.add_argument("--phase", default="consumed", choices=["consumed", "released"])
+
+    # status
+    st_p = swarm_sub.add_parser("status", help="Show session status")
+    st_p.add_argument("session_id")
+
+    # watch
+    wt_p = swarm_sub.add_parser("watch", help="Watch agent inbox (poll loop)")
+    wt_p.add_argument("session_id")
+    wt_p.add_argument("--agent", required=True)
+    wt_p.add_argument("--interval", type=int, default=5, help="Poll interval in seconds")
+    wt_p.add_argument("--iterations", type=int, default=0, help="Max iterations (0 = infinite)")
+
+
+def _get_swarm_kernel(store_root: Optional[Path] = None) -> tuple[SwarmKernel, MailboxStore]:
+    """Create a SwarmKernel with LocalDeliverySink for CLI use."""
+    store = MailboxStore(root=store_root)
+    kernel = SwarmKernel(store=store, sink=LocalDeliverySink(store))
+    return kernel, store
+
+
+def _parse_attachments(raw: list[str]) -> list:
+    """Parse --attachment JSON strings into AttachmentRef objects."""
+    from codeagent.mailbox.protocol import AttachmentRef
+    refs = []
+    for item in raw:
+        d = json.loads(item)
+        refs.append(AttachmentRef.from_dict(d))
+    return refs
+
+
+def _cmd_swarm(args: argparse.Namespace) -> int:
+    """Dispatch swarm subcommands."""
+    cmd = args.swarm_cmd
+    if cmd is None:
+        print("error: specify a swarm subcommand", file=sys.stderr)
+        return 1
+
+    kernel, store = _get_swarm_kernel()
+
+    try:
+        if cmd == "create-session":
+            return _swarm_create_session(kernel, args)
+        elif cmd == "register":
+            return _swarm_register(kernel, args)
+        elif cmd == "direct":
+            return _swarm_direct(kernel, args)
+        elif cmd == "channel":
+            return _swarm_channel(kernel, args)
+        elif cmd == "broadcast":
+            return _swarm_broadcast(kernel, args)
+        elif cmd == "notice":
+            return _swarm_notice(kernel, args)
+        elif cmd == "poll":
+            return _swarm_poll(kernel, args)
+        elif cmd == "ack":
+            return _swarm_ack(kernel, args)
+        elif cmd == "status":
+            return _swarm_status(kernel, args)
+        elif cmd == "watch":
+            return _swarm_watch(kernel, args)
+        else:
+            print(f"error: unknown swarm command: {cmd}", file=sys.stderr)
+            return 1
+    except (ValueError, PermissionError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _swarm_create_session(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    members = [m.strip() for m in args.members.split(",") if m.strip()]
+    session = kernel.create_session(args.session_id, args.manager, members)
+    print(json.dumps({
+        "session_id": session.session_id,
+        "manager_id": session.manager_id,
+        "roster": list(session.roster),
+    }, indent=2))
+    return 0
+
+
+def _swarm_register(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    loc = AgentLocation(
+        agent_id=args.agent,
+        host_alias=args.host,
+        backend=args.backend,
+    )
+    reg = kernel.register(loc, args.session_id)
+    print(json.dumps({
+        "agent_id": reg.agent_id,
+        "session_id": reg.session_id,
+        "host_alias": reg.location.host_alias,
+        "backend": reg.location.backend,
+    }, indent=2))
+    return 0
+
+
+def _swarm_direct(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    attachments = _parse_attachments(args.attachment) if args.attachment else []
+    env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments)
+    receipt = kernel.direct(args.session_id, args.sender, args.to, env)
+    print(json.dumps({
+        "msg_id": receipt.msg_id,
+        "status": receipt.status,
+        "session_id": receipt.session_id,
+        "target": receipt.target,
+    }, indent=2))
+    return 0
+
+
+def _swarm_channel(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    attachments = _parse_attachments(args.attachment) if args.attachment else []
+    env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments)
+    receipt = kernel.channel(args.session_id, args.sender, args.channel_id, env)
+    print(json.dumps({
+        "msg_id": receipt.msg_id,
+        "status": receipt.status,
+        "target": receipt.target,
+    }, indent=2))
+    return 0
+
+
+def _swarm_broadcast(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    env = Envelope(subject=args.subject, body=args.body, kind=args.kind)
+    receipts = kernel.broadcast(args.session_id, args.sender, env)
+    out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def _swarm_notice(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    env = Envelope(subject=args.subject, body=args.body, kind=args.kind)
+    receipt = kernel.notice(args.session_id, args.sender, args.topic, env, ttl=args.ttl)
+    print(json.dumps({
+        "msg_id": receipt.msg_id,
+        "status": receipt.status,
+        "target": receipt.target,
+    }, indent=2))
+    return 0
+
+
+def _swarm_poll(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    result = kernel.poll(args.session_id, args.agent, cursor=args.cursor, limit=args.limit)
+    print(json.dumps({
+        "messages": result.messages,
+        "cursor": result.cursor,
+        "has_more": result.has_more,
+    }, indent=2))
+    return 0
+
+
+def _swarm_ack(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    # For consumed phase, first read the message (inbox → processing) to create
+    # a claim file, then finalize (processing → archive).
+    if args.phase == "consumed":
+        store = kernel._store
+        msg = store.read(args.session_id, args.agent, owner=args.agent)
+        if msg is None:
+            print(f"error: no message to ack: {args.msg_id}", file=sys.stderr)
+            return 1
+    status = kernel.ack(args.session_id, args.agent, args.msg_id, args.phase)
+    print(json.dumps({"status": status}))
+    return 0
+
+
+def _swarm_status(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    session = kernel.get_session(args.session_id)
+    if session is None:
+        print(f"error: session not found: {args.session_id}", file=sys.stderr)
+        return 1
+    locations = {}
+    for member in session.roster:
+        loc = kernel.get_location(args.session_id, member)
+        if loc:
+            locations[member] = {"host": loc.host_alias, "backend": loc.backend}
+    print(json.dumps({
+        "session_id": session.session_id,
+        "manager_id": session.manager_id,
+        "roster": list(session.roster),
+        "acl": {
+            "authority": session.acl.authority,
+            "policy": session.acl.policy,
+        },
+        "locations": locations,
+    }, indent=2))
+    return 0
+
+
+def _swarm_watch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    """Poll loop — prints new messages at --interval seconds."""
+    import time as _time
+    cursor = ""
+    iteration = 0
+    max_iter = args.iterations
+    while True:
+        result = kernel.poll(args.session_id, args.agent, cursor=cursor, limit=50)
+        for msg in result.messages:
+            print(json.dumps(msg, ensure_ascii=False))
+        cursor = result.cursor
+        iteration += 1
+        if max_iter and iteration >= max_iter:
+            break
+        _time.sleep(args.interval)
+    return 0
 
 
 def _execute(request: RunRequest, target: Target, registry: SessionRegistry, repo_map=None) -> RunResult:
@@ -566,6 +846,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "ssh": _cmd_ssh,
         "mailbox": _cmd_mailbox,
         "artifact": _cmd_artifact,
+        "swarm": _cmd_swarm,
     }
     # args.command is guaranteed to be one of the registered subcommands:
     # argparse rejects unknown names, and ``None`` was handled above.

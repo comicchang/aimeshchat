@@ -103,7 +103,7 @@ mailbox clear --session <session-id> --agent <worker-id>
 # 崩溃恢复：过期 processing→inbox
 mailbox recover-stale --session <session-id> --agent <worker-id>
 ```
-Standalone CLI 的命令名固定为 `session-init`、`send`、`peek`、`read`、`finalize`、`release`、`recover-stale`、`check`、`status`、`clear`、`stats`；所有命令直接调用 standalone `mailbox`，不要调用 runner wrapper。CLI resolution order: (1) bundled plugin `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; (2) PATH command `mailbox`（from `codeagent` package via `uv tool install`）；(3) `codeagent mailbox` as unified cross-host entry point。Remote SSH Worker 应按此顺序尝试，禁止使用 `scripts/tmux_worker.py`。
+Standalone CLI 的命令名固定为 `session-init`、`send`、`peek`、`read`、`finalize`、`release`、`recover-stale`、`check`、`status`、`clear`、`stats`；所有命令直接调用 standalone `mailbox`，不要调用 runner wrapper。CLI resolution order: (1) PATH command `mailbox`（from `codeagent` package via `uv tool install`）；(2) `codeagent mailbox` as unified cross-host entry point; (3) for swarm sessions, use `codeagent swarm ...` subcommands. Remote SSH Worker 应按此顺序尝试，禁止使用 `scripts/tmux_worker.py`。
 
 消息 8 个必填字段：`session_id`、`from`、`to`、`subject`、`body`、`kind`、`msg_id`、`created_at`；3 个可选关联字段：`reply_to`、`run_id`、`request_id`。7 种 kind：`TASK`、`REPORT`、`PROGRESS`、`EVIDENCE`、`QUESTION`、`RESPONSE`、`NOTICE`。不要手写或编辑 JSON。修正旧消息必须发新消息，并用 `--reply-to <msg_id>` 回链。
 Mailbox REPORT/NOTICE/QUESTION content is **advisory** evidence and coordination; a TASK message is the formal v2 dispatch envelope, while `status.json` is the active-state snapshot. Neither free-form body text nor send-keys replaces the required status update.

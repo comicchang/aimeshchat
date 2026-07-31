@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from typing import Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 from uuid import uuid4
 
 from codeagent.mailbox.protocol import (
@@ -93,6 +93,8 @@ class SwarmKernel:
         self._channels: dict[str, dict[str, Channel]] = {}
         # session_id → { agent_id → list[Subscription] }
         self._subscriptions: dict[str, dict[str, list[Subscription]]] = {}
+        # Optional receiver for push-mode delivery (D2).
+        self._receiver: Any = None
 
     # ── Session lifecycle ──────────────────────────────────────────────
 
@@ -401,6 +403,14 @@ class SwarmKernel:
 
     # ── Subscribe ──────────────────────────────────────────────────────
 
+    def attach_receiver(self, receiver: Any) -> None:
+        """Attach a SwarmReceiver for push-mode callback routing.
+
+        When a receiver is attached, ``subscribe()`` also registers the
+        callback with the receiver so it fires on stream/watch events.
+        """
+        self._receiver = receiver
+
     def subscribe(
         self,
         session_id: str,
@@ -412,6 +422,8 @@ class SwarmKernel:
         """Register an in-memory callback for new messages.
 
         Callbacks fire on poll() — push simulation until D2 wires real push.
+        When a SwarmReceiver is attached, the callback is also registered
+        there for real-time push delivery.
         """
         self._require_session(session_id)
         sub = Subscription(
@@ -422,6 +434,13 @@ class SwarmKernel:
             kinds=kinds or [],
         )
         self._subscriptions.setdefault(session_id, {}).setdefault(agent_id, []).append(sub)
+        # Route to attached receiver for push-mode delivery (D2).
+        if (
+            self._receiver is not None
+            and session_id == self._receiver._session_id
+            and agent_id == self._receiver._agent_id
+        ):
+            self._receiver.subscribe(callback, channels, kinds)
         return sub
 
     # ── Ack ────────────────────────────────────────────────────────────

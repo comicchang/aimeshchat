@@ -132,7 +132,7 @@ mailbox recover-stale --session <session-id> --agent manager
 ## Plugin and runner integration (preferred, framework-neutral)
 
 The authoritative standalone CLI command set is `session-init`, `send`, `peek`, `read`, `finalize`, `release`, `recover-stale`, `check`, `status`, `clear`, and `stats`; invoke these names directly, never through a runner wrapper. A tmux/oh-my-pi plugin, opencode adapter, or another runner MAY invoke `mailbox peek` at safe boundaries for notification; the **plugin only notifies — never consumes**. The agent reads via `mailbox read`. No skill depends on private runner hooks.
-CLI resolution order is: (1) bundled plugin `~/.omp/plugins/node_modules/omp-mailbox-plugin/bin/mailbox`; (2) PATH command `mailbox` (from `codeagent` package via `uv tool install`); (3) `codeagent mailbox` as unified cross-host entry point. Try these locations in order; never route commands through `scripts/tmux_worker.py`.
+CLI resolution order is: (1) PATH command `mailbox` (from `codeagent` package via `uv tool install`); (2) `codeagent mailbox` as unified cross-host entry point; (3) for swarm sessions, use `codeagent swarm ...` subcommands. Try these locations in order; never route commands through `scripts/tmux_worker.py`.
 
 Manager still polls each `status.json` and inbox statistics for observability. Adapter injection is not a substitute for final REPORT or artifact verification. If no adapter is available, the runner calls the standalone CLI at the documented boundaries. Remote SSH Worker formal communication uses the plugin/direct Syncthing path; an available runner may carry the INIT check prompt, but send-keys is never the payload or proof of delivery.
 
