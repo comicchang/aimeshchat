@@ -164,6 +164,8 @@ def _dispatch_mailbox_direct(args: list[str], mailbox_root: str | None = None) -
         s.add_argument("--reply-to", default="")
         s.add_argument("--run-id", default="")
         s.add_argument("--request-id", default="")
+        s.add_argument("--msg-id", default=None)
+        s.add_argument("--attachment", action="append", default=[])
 
         pk = sub.add_parser("peek")
         pk.add_argument("--session", required=True)
@@ -220,10 +222,22 @@ def _dispatch_mailbox_direct(args: list[str], mailbox_root: str | None = None) -
         if cmd == "session-init":
             out = store.session_init(ns.session, ns.manager, ns.agents.split(","))
         elif cmd == "send":
+            from codeagent.mailbox.protocol import AttachmentRef
+            attachments: list[AttachmentRef] = []
+            for item in ns.attachment:
+                try:
+                    d = json.loads(item)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"--attachment is not valid JSON: {e}") from e
+                if not isinstance(d, dict):
+                    raise ValueError(f"--attachment must be a JSON object")
+                attachments.append(AttachmentRef.from_dict(d))
             out = store.send(
                 ns.session, ns.from_worker, ns.to,
                 ns.subject, ns.body, ns.kind,
                 ns.reply_to, ns.run_id, ns.request_id,
+                attachments=attachments or None,
+                msg_id=getattr(ns, 'msg_id', None),
             )
         elif cmd == "peek":
             import json as _json

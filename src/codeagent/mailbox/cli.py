@@ -9,8 +9,25 @@ import json
 import sys
 from pathlib import Path
 
-from codeagent.mailbox.protocol import VALID_KINDS, VALID_STATES
+from codeagent.mailbox.protocol import VALID_KINDS, VALID_STATES, AttachmentRef
 from codeagent.mailbox.store import MailboxStore
+
+
+def _parse_attachment_args(raw: list[str]) -> list[AttachmentRef]:
+    """Parse repeatable ``--attachment`` JSON strings into AttachmentRef list.
+
+    Raises ``ValueError`` with a clear message on malformed input.
+    """
+    refs: list[AttachmentRef] = []
+    for item in raw:
+        try:
+            d = json.loads(item)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"--attachment is not valid JSON: {e}") from e
+        if not isinstance(d, dict):
+            raise ValueError(f"--attachment must be a JSON object, got {type(d).__name__}")
+        refs.append(AttachmentRef.from_dict(d))
+    return refs
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -34,6 +51,15 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--reply-to", default="")
     s.add_argument("--run-id", default="")
     s.add_argument("--request-id", default="")
+    s.add_argument("--msg-id", default=None, help="caller-provided msg_id for idempotent send")
+    s.add_argument(
+        "--attachment", action="append", default=[],
+        help=(
+            'JSON object with artifact_id, source_host, remote_root, '
+            'relative_path, size, sha256 (required); media_type (optional). '
+            'Repeat for multiple attachments.'
+        ),
+    )
 
     # peek
     pk = sub.add_parser("peek")
@@ -115,10 +141,13 @@ def main(argv: list[str] | None = None) -> None:
         if args.cmd == "session-init":
             print(store.session_init(args.session, args.manager, args.agents.split(",")))
         elif args.cmd == "send":
+            attachments = _parse_attachment_args(args.attachment)
             print(store.send(
                 args.session, args.from_worker, args.to,
                 args.subject, args.body, args.kind,
                 args.reply_to, args.run_id, args.request_id,
+                attachments=attachments or None,
+                msg_id=args.msg_id,
             ))
         elif args.cmd == "peek":
             result = store.peek(args.session, args.agent, args.max_messages, args.max_subject)

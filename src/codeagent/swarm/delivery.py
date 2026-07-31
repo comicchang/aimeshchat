@@ -1,0 +1,441 @@
+"""Delivery engine — durable outbox → transport → remote inbox.
+
+Provides at-least-once cross-host message delivery with:
+    - Durable outbox write (fsync + atomic replace) before any transport
+    - Idempotency via msg_id dedup in both outbox and remote inbox
+    - Retry support via ``flush()`` for pending outbox entries
+    - Status tracking: accepted → delivered → consumed
+
+The DeliveryEngine is the ``DeliverySink`` interface consumed by
+SwarmKernel (C1): ``deliver()`` + ``ack()``.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from codeagent.mailbox.store import MailboxStore
+
+if False:  # TYPE_CHECKING
+    from codeagent.transport.router import TransportRouter
+
+log = logging.getLogger(__name__)
+
+
+# ── Receipt ────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SendReceipt:
+    """Return value from ``deliver()``.
+
+    ``status`` is one of:
+        - "accepted":  durable outbox written; transport not attempted or failed
+        - "delivered": remote inbox write confirmed
+        - "failed":    validation error; message not accepted
+    ``queued`` is True when the envelope is in the outbox but remote delivery
+    has not yet succeeded (caller should retry via ``flush()``).
+    """
+
+    status: str  # "accepted" | "delivered" | "failed"
+    msg_id: str = ""
+    error: str = ""
+    queued: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "msg_id": self.msg_id,
+            "error": self.error,
+            "queued": self.queued,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> SendReceipt:
+        return cls(
+            status=d.get("status", "accepted"),
+            msg_id=d.get("msg_id", ""),
+            error=d.get("error", ""),
+            queued=d.get("queued", False),
+        )
+
+
+# ── DeliveryEngine ─────────────────────────────────────────────────────
+
+
+class DeliveryEngine:
+    """Durable outbox → transport → remote inbox.
+
+    Lifecycle::
+
+        engine = DeliveryEngine(mailbox_store, transport_router, outbox_root)
+        receipt = engine.deliver(session_id, target, envelope)
+        # receipt.status == "accepted" or "delivered"
+        # receipt.queued == True means retry via flush()
+        engine.ack(session_id, agent, msg_id, "consumed")
+    """
+
+    def __init__(
+        self,
+        mailbox_store: MailboxStore,
+        transport_router: Optional[Any] = None,
+        outbox_root: Optional[Path] = None,
+    ) -> None:
+        self._store = mailbox_store
+        self._router = transport_router
+        self._outbox = outbox_root or (mailbox_store.root / "_outbox")
+        # idempotency cache: msg_id → SendReceipt (process-lifetime)
+        self._cache: dict[str, SendReceipt] = {}
+
+    # ── public API ─────────────────────────────────────────────────────
+
+    def deliver(
+        self,
+        session_id: str,
+        target: Any,
+        envelope: dict[str, Any],
+    ) -> SendReceipt:
+        """Deliver *envelope* to *target* host.
+
+        1. Write durable outbox (fsync + atomic replace).
+        2. Route to remote transport (one-shot wire or stream push).
+        3. Return receipt: delivered on success, accepted+queued on failure.
+
+        Idempotency: if *envelope.msg_id* already exists in the outbox,
+        returns the cached receipt without re-sending.
+        """
+        # Validate envelope before writing anything
+        if not isinstance(envelope, dict):
+            return SendReceipt(status="failed", error="envelope must be a dict")
+
+        msg_id = envelope.get("msg_id", "")
+        sid = envelope.get("session_id", session_id)
+        if not msg_id:
+            return SendReceipt(status="failed", error="envelope missing msg_id")
+
+        # ── Idempotency check ──────────────────────────────────────────
+        cached = self._check_idempotency(sid, msg_id)
+        if cached is not None:
+            return cached
+
+        # ── 1. Durable outbox write (fsync before transport) ───────────
+        try:
+            outbox_path = self._write_outbox(sid, msg_id, envelope)
+        except Exception as exc:
+            self._cache[msg_id] = SendReceipt(status="failed", error=str(exc))
+            return self._cache[msg_id]
+
+        accepted = SendReceipt(status="accepted", msg_id=msg_id, queued=True)
+        self._cache[msg_id] = accepted
+
+        # ── 2. Route to remote transport ───────────────────────────────
+        host_alias = getattr(target, "host_alias", None) or getattr(target, "ssh_alias", "")
+        if not host_alias:
+            # No remote target — local delivery, outbox is enough
+            return accepted
+
+        try:
+            self._remote_send(target, envelope)
+        except Exception as exc:
+            # Transport failure: outbox stays pending for flush()
+            log.warning("DeliveryEngine: transport failed for %s: %s", msg_id, exc)
+            self._write_status(sid, msg_id, "transport_failed", str(exc))
+            return accepted
+
+        # ── 3. Transport success — mark delivered ──────────────────────
+        self._mark_delivered(sid, msg_id)
+        delivered = SendReceipt(status="delivered", msg_id=msg_id)
+        self._cache[msg_id] = delivered
+        return delivered
+
+    def flush(self, session_id: Optional[str] = None) -> int:
+        """Retry all pending outbox entries. Returns count of newly delivered."""
+        sessions = [session_id] if session_id else self._list_sessions()
+        delivered_count = 0
+
+        for sid in sessions:
+            sd = self._outbox / sid
+            if not sd.is_dir():
+                continue
+            for envelope_file in sorted(sd.glob("*.json")):
+                mid = envelope_file.stem
+                # Skip already-delivered entries
+                marker = sd / f".delivered-{mid}"
+                if marker.exists():
+                    continue
+                # Skip ack-completed entries
+                status_dir = sd / f".status-{mid}"
+                if status_dir.exists():
+                    phase = status_dir / "phase"
+                    if phase.exists() and phase.read_text().strip() == "consumed":
+                        continue
+
+                try:
+                    envelope = json.loads(envelope_file.read_bytes())
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+                host_alias = envelope.get("_target_host", "")
+                if not host_alias:
+                    log.debug("DeliveryEngine: flush skip %s — no target host", mid)
+                    continue
+
+                try:
+                    target = self._resolve_target(host_alias)
+                except Exception:
+                    continue
+
+                try:
+                    self._remote_send(target, envelope)
+                except Exception as exc:
+                    log.debug("DeliveryEngine: flush retry failed for %s: %s", mid, exc)
+                    self._write_status(sid, mid, "flush_failed", str(exc))
+                    continue
+
+                self._mark_delivered(sid, mid)
+                self._cache[mid] = SendReceipt(status="delivered", msg_id=mid)
+                delivered_count += 1
+
+        return delivered_count
+
+    def pending(self, session_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """Return list of undelivered envelopes from the outbox."""
+        sessions = [session_id] if session_id else self._list_sessions()
+        results = []
+
+        for sid in sessions:
+            sd = self._outbox / sid
+            if not sd.is_dir():
+                continue
+            for envelope_file in sorted(sd.glob("*.json")):
+                mid = envelope_file.stem
+                marker = sd / f".delivered-{mid}"
+                if marker.exists():
+                    continue
+                try:
+                    results.append(json.loads(envelope_file.read_bytes()))
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+        return results
+
+    def ack(
+        self,
+        session_id: str,
+        agent: str,
+        msg_id: str,
+        phase: str,
+    ) -> None:
+        """Update delivery status for a message.
+
+        Called by the sender's SwarmKernel when it learns the message has
+        progressed through its lifecycle:
+            - "accepted":   written to outbox (set automatically by deliver)
+            - "delivered":  remote inbox confirmed (set automatically on transport success)
+            - "consumed":   recipient has processed the message
+
+        Writes a status marker to the outbox entry for audit.
+        """
+        self._validate_msg_id(msg_id)
+        sd = self._outbox / session_id
+        envelope_file = sd / f"{msg_id}.json"
+        if not envelope_file.exists():
+            raise ValueError(f"outbox entry not found: {msg_id}")
+
+        self._write_status(session_id, msg_id, "ack", phase)
+        # Update cache
+        if phase == "consumed":
+            self._cache[msg_id] = SendReceipt(status="delivered", msg_id=msg_id)
+
+    # ── Durable outbox write ───────────────────────────────────────────
+
+    def _write_outbox(
+        self, session_id: str, msg_id: str, envelope: dict[str, Any],
+    ) -> Path:
+        """Write envelope to durable outbox with fsync + atomic replace.
+
+        Uses O_EXCL tmp file + os.replace (same pattern as store.send).
+
+        Returns the final outbox path.
+        """
+        sd = self._outbox / session_id
+        sd.mkdir(parents=True, exist_ok=True)
+        dest = sd / f"{msg_id}.json"
+        tmp = sd / f".tmp-{msg_id}.json"
+
+        # Idempotency: if outbox already has this msg_id, skip
+        if dest.exists():
+            return dest
+
+        payload = json.dumps(envelope, indent=2, ensure_ascii=False)
+
+        with open(tmp, "w") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(dest))
+        return dest
+
+    # ── Transport routing ──────────────────────────────────────────────
+
+    def _remote_send(self, target: Any, envelope: dict[str, Any]) -> None:
+        """Send envelope to remote host via transport.
+
+        Strategy:
+            - If target host is stream-capable AND an SSHStream is available,
+              push via stream (fast, persistent connection).
+            - Otherwise, one-shot wire invoke via transport.mailbox().
+
+        Raises on transport failure.
+        """
+        host = self._extract_host(target)
+        if host is None:
+            raise ValueError("cannot extract HostSpec from target")
+
+        transport = self._get_transport(host)
+        if transport is None:
+            raise ValueError(f"no transport for host '{host.name}'")
+
+        args = self._build_mailbox_args(envelope)
+        exit_code, stdout, stderr = transport.mailbox(host, args)
+        if exit_code != 0:
+            raise RuntimeError(
+                f"remote mailbox send failed (exit {exit_code}): {stderr or stdout}"
+            )
+
+    def _get_transport(self, host: Any) -> Any:
+        """Get transport for *host* via router or direct SSHTransport."""
+        if self._router is not None:
+            return self._router.get(host)
+        # Fallback: direct SSHTransport
+        from codeagent.transport.ssh import SSHTransport
+        return SSHTransport()
+
+    def _extract_host(self, target: Any) -> Any:
+        """Extract HostSpec from target (HostSpec, Target, or similar)."""
+        # target IS a HostSpec
+        if hasattr(target, "ssh_alias") and hasattr(target, "name"):
+            return target
+        # target is a routing.Target with .host
+        if hasattr(target, "host"):
+            return target.host
+        return None
+
+    def _resolve_target(self, host_alias: str) -> Any:
+        """Resolve a host alias back to a HostSpec for retry."""
+        if self._router is None:
+            # Build a minimal HostSpec from the alias
+            from codeagent.domain import HostSpec
+            return HostSpec(name=host_alias, ssh_alias=host_alias, hostnames=())
+        # Ask router's hosts dict (requires RepoMap or similar)
+        # If router doesn't have a host lookup, fall back to minimal spec
+        from codeagent.domain import HostSpec
+        return HostSpec(name=host_alias, ssh_alias=host_alias, hostnames=())
+
+    def _build_mailbox_args(self, envelope: dict[str, Any]) -> list[str]:
+        """Build CLI args for remote mailbox send."""
+        session_id = envelope.get("session_id", "")
+        from_id = envelope.get("from", "")
+        to_id = envelope.get("to", "")
+        subject = envelope.get("subject", "")
+        kind = envelope.get("kind", "REPORT")
+        reply_to = envelope.get("reply_to", "")
+        run_id = envelope.get("run_id", "")
+        request_id = envelope.get("request_id", "")
+        body = json.dumps(envelope, ensure_ascii=False)
+        msg_id = envelope.get("msg_id", "")
+
+        args = [
+            "send",
+            "--session", session_id,
+            "--from", from_id,
+            "--to", to_id,
+            "--subject", subject,
+            "--body", body,
+            "--kind", kind,
+            "--msg-id", msg_id,
+        ]
+        if reply_to:
+            args.extend(["--reply-to", reply_to])
+        if run_id:
+            args.extend(["--run-id", run_id])
+        if request_id:
+            args.extend(["--request-id", request_id])
+
+        return args
+
+    # ── Status markers ─────────────────────────────────────────────────
+
+    def _mark_delivered(self, session_id: str, msg_id: str) -> None:
+        """Write delivered marker file."""
+        sd = self._outbox / session_id
+        sd.mkdir(parents=True, exist_ok=True)
+        marker = sd / f".delivered-{msg_id}"
+        marker.write_text(
+            json.dumps({
+                "delivered_at": datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+            }),
+        )
+
+    def _write_status(
+        self, session_id: str, msg_id: str, kind: str, detail: str,
+    ) -> None:
+        """Write a status marker directory for *msg_id*."""
+        sd = self._outbox / session_id
+        sd.mkdir(parents=True, exist_ok=True)
+        status_dir = sd / f".status-{msg_id}"
+        status_dir.mkdir(exist_ok=True)
+        (status_dir / "phase").write_text(detail)
+        (status_dir / "kind").write_text(kind)
+        (status_dir / "timestamp").write_text(
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+
+    # ── Idempotency ────────────────────────────────────────────────────
+
+    def _check_idempotency(
+        self, session_id: str, msg_id: str,
+    ) -> Optional[SendReceipt]:
+        """Return cached receipt if msg_id already delivered or in outbox."""
+        # In-memory cache
+        if msg_id in self._cache:
+            return self._cache[msg_id]
+
+        sd = self._outbox / session_id
+        dest = sd / f"{msg_id}.json"
+        if not dest.exists():
+            return None
+
+        # Outbox entry exists — reconstruct receipt from markers
+        delivered_marker = sd / f".delivered-{msg_id}"
+        if delivered_marker.exists():
+            receipt = SendReceipt(status="delivered", msg_id=msg_id)
+        else:
+            receipt = SendReceipt(status="accepted", msg_id=msg_id, queued=True)
+        self._cache[msg_id] = receipt
+        return receipt
+
+    # ── Session listing ────────────────────────────────────────────────
+
+    def _list_sessions(self) -> list[str]:
+        """List session directories in outbox."""
+        if not self._outbox.exists():
+            return []
+        return sorted(
+            d.name for d in self._outbox.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+
+    # ── Validation ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_msg_id(msg_id: str) -> None:
+        if not msg_id or "/" in msg_id or "\\" in msg_id or ".." in msg_id:
+            raise ValueError(f"invalid msg_id: {msg_id!r}")

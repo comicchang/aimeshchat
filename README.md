@@ -250,6 +250,11 @@ codeagent mailbox session-init --session s1 --manager mgr --agents w1,w2
 # Send message
 codeagent mailbox send --session s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "..."
 
+# Send with attachments (repeat --attachment for multiple)
+codeagent mailbox send --session s1 --from mgr --to w1 --kind TASK \
+  --subject "results ready" --body "see attached" \
+  --attachment '{"artifact_id":"art-1","source_host":"worker-1","remote_root":"/tmp/artifacts","relative_path":"out/result.json","size":1024,"sha256":"'$(printf 'a%.0s' {1..64})'"}'
+
 # Broadcast to every roster member except the sender
 codeagent mailbox send --session s1 --from mgr --to '*' --kind NOTICE --subject "standby" --body "..."
 
@@ -275,7 +280,32 @@ session-wide log independent of per-recipient archives — a broadcast appends
 exactly one record for the whole swarm. Messages may carry `attachments`
 (list of artifact references: artifact_id, source_host, remote_root,
 relative_path, size, sha256, media_type), validated on send.
+
+Attachments are specified via repeatable `--attachment` flags, each taking
+a JSON object:
+
+```bash
+codeagent mailbox send --session s1 --from mgr --to w1 --kind EVIDENCE \
+  --subject "output" --body "attached" \
+  --attachment '{"artifact_id":"art-1","source_host":"worker-1","remote_root":"/tmp/art","relative_path":"out/res.json","size":1024,"sha256":"'$(printf 'a%.0s' {1..64})'"}' \
+  --attachment '{"artifact_id":"art-2","source_host":"worker-1","remote_root":"/tmp/art","relative_path":"out/log.txt","size":512,"sha256":"'$(printf 'b%.0s' {1..64})'","media_type":"text/plain"}'
 ```
+
+The full set of attachment fields (all required except `media_type`, which
+defaults to `application/octet-stream`):
+
+| Field           | Description                                      |
+|-----------------|--------------------------------------------------|
+| artifact_id     | Unique artifact identifier                       |
+| source_host     | Host alias where the artifact lives              |
+| remote_root     | Absolute directory root on the remote host       |
+| relative_path   | Path relative to remote_root (no traversal)      |
+| size            | File size in bytes (non-negative integer)        |
+| sha256          | 64-char lowercase hex SHA-256 digest             |
+| media_type      | MIME type (default: application/octet-stream)    |
+
+Consumers pull artifacts via `codeagent.artifact.pull_artifact` over the
+existing SSH ControlMaster.
 
 ### Cross-Host
 

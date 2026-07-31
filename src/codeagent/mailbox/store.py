@@ -120,6 +120,7 @@ class MailboxStore:
         subject: str, body: str, kind: str = "REPORT",
         reply_to: str = "", run_id: str = "", request_id: str = "",
         attachments: Optional[list] = None,
+        msg_id: Optional[str] = None,
     ) -> str:
         """Deliver a message. ``to_id == "*"`` broadcasts to every roster
         member except the sender (same msg_id, one envelope per inbox).
@@ -170,12 +171,22 @@ class MailboxStore:
         if isinstance(body, str) and len(body.encode("utf-8")) > MAX_MAILBOX_BODY:
             raise ValueError(f"body exceeds {MAX_MAILBOX_BODY}-byte limit")
 
-        msg_id = gen_msg_id(from_id)
-        while any(
-            (self.agent_subdir(session_id, rid, "inbox") / f"{msg_id}.json").exists()
-            for rid in recipients
-        ):
+        if msg_id is not None:
+            self._validate_msg_id(msg_id)
+            # Idempotency: reject if msg_id already exists in any recipient inbox or history
+            hd = sd / "history"
+            if any(
+                (self.agent_subdir(session_id, rid, "inbox") / f"{msg_id}.json").exists()
+                for rid in recipients
+            ) or (hd / f"{msg_id}.json").exists():
+                raise ValueError(f"msg_id already exists: {msg_id}")
+        else:
             msg_id = gen_msg_id(from_id)
+            while any(
+                (self.agent_subdir(session_id, rid, "inbox") / f"{msg_id}.json").exists()
+                for rid in recipients
+            ):
+                msg_id = gen_msg_id(from_id)
 
         msg = Message(
             session_id=session_id, from_id=from_id, to_id=to_id,
