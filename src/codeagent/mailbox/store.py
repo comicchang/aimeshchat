@@ -123,12 +123,13 @@ class MailboxStore:
 
         # Validate sender and recipient are in roster
         meta = self.read_session(session_id)
-        if meta:
-            roster = {meta.get("manager", "")} | set(meta.get("agents", []))
-            if from_id not in roster:
-                raise ValueError(f"sender not in roster: {from_id}")
-            if to_id not in roster:
-                raise ValueError(f"recipient not in roster: {to_id}")
+        if meta is None:
+            raise ValueError(f"session metadata not found or corrupt: {session_id}")
+        roster = {meta.get("manager", "")} | set(meta.get("agents", []))
+        if from_id not in roster:
+            raise ValueError(f"sender not in roster: {from_id}")
+        if to_id not in roster:
+            raise ValueError(f"recipient not in roster: {to_id}")
 
         inbox = self.agent_subdir(session_id, to_id, "inbox")
         if not inbox.exists():
