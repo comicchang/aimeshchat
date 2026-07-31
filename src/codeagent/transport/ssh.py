@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 _SSH_ERROR_PATTERNS = (
     "Connection refused",
     "Connection timed out",
+    "Operation timed out",  # macOS OpenSSH wording for a connect timeout
     "Connection reset by peer",
     "No route to host",
     "Network is unreachable",
