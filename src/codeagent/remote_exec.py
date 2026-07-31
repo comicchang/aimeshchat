@@ -434,13 +434,29 @@ def _poll_streams(subs: list[_StreamSubscription]) -> None:
             sub.last_heartbeat = now
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Main loop — read requests from stdin, write responses to stdout.
 
     Supports both one-shot and long-lived serve modes.  When a ``stream``
     command is received the subscription is registered and the loop
     continues to poll for mailbox events between stdin reads.
+
+    ``--help`` / ``--version`` are handled for dotai setup entrypoint
+    verification (the wire protocol itself is JSONL over stdin).
     """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--help" in argv or "-h" in argv:
+        print(
+            "usage: codeagent-remote-exec [--version]\n\n"
+            "Remote execution helper — reads JSONL requests from stdin, "
+            "writes JSONL responses to stdout (wire protocol).\n"
+            "Commands over stdin: ping, capabilities, run, mailbox, stream."
+        )
+        return
+    if "--version" in argv:
+        print(f"codeagent-remote-exec {__version__}")
+        return
+
     _send({"type": "ready", "wire_version": WIRE_VERSION, "package_version": __version__})
 
     active_subs: list[_StreamSubscription] = []

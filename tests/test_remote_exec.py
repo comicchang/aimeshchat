@@ -334,3 +334,23 @@ class TestMainLoop:
 
     def test_supported_commands(self):
         assert SUPPORTED_COMMANDS == {"run", "ping", "capabilities", "mailbox", "stream"}
+
+    def test_main_help_exits_immediately(self, capsys):
+        """--help must not hang the JSONL loop (dotai entrypoint check)."""
+        main(["--help"])
+        out = capsys.readouterr().out
+        assert "usage: codeagent-remote-exec" in out
+
+    def test_main_version_exits_immediately(self, capsys):
+        """--version prints package version without entering the loop."""
+        main(["--version"])
+        out = capsys.readouterr().out
+        assert out.strip().startswith("codeagent-remote-exec")
+
+    def test_main_no_args_sends_ready(self, monkeypatch, capsys):
+        """Wire mode (no argv) still emits the ready banner."""
+        sent: list[dict] = []
+        monkeypatch.setattr("codeagent.remote_exec._send", sent.append)
+        monkeypatch.setattr("codeagent.remote_exec.sys.stdin", io.StringIO(""))
+        main([])
+        assert any(m.get("type") == "ready" for m in sent)
