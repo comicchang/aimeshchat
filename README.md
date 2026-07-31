@@ -92,7 +92,7 @@ Location (searched in order):
       "fallback_ssh_alias": ""
     },
     "build-box": {
-      "ssh_alias": "build-box.internal",
+      "ssh_alias": "build-box.example.com",
       "hostnames": ["build-box"],
       "description": "CI/build machine",
       "transport": "ssh",
@@ -334,6 +334,6 @@ were previously maintained at **[comicchang/tmux-agent-skills](https://github.co
 
 ## License
 
-Enlightened Public License (EnPL-1.0) — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
 
-Custom license, NOT OSI-approved. Non-players and Enlightened faction players are welcome. Resistance and Machina are excluded.
+Formerly EnPL-1.0. The Enlightened Public License is preserved at [LICENSE-EnPL-1.0.md](LICENSE-EnPL-1.0.md) for historical/theme reasons.

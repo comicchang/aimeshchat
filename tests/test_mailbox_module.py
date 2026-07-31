@@ -211,13 +211,21 @@ class TestResolveRoot:
         from codeagent.mailbox.store import resolve_root
 
         monkeypatch.delenv("MAILBOX_ROOT", raising=False)
-        assert resolve_root() == Path.home() / "Dropbox" / "logseq" / "pages" / "mi-docs" / ".mailbox"
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        assert resolve_root() == Path.home() / ".local" / "share" / "codeagent" / "mailbox"
 
     def test_env_override(self, tmp_path, monkeypatch):
         from codeagent.mailbox.store import resolve_root
 
         monkeypatch.setenv("MAILBOX_ROOT", str(tmp_path))
         assert resolve_root() == tmp_path
+
+    def test_xdg_data_home_override(self, tmp_path, monkeypatch):
+        from codeagent.mailbox.store import resolve_root
+
+        monkeypatch.delenv("MAILBOX_ROOT", raising=False)
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+        assert resolve_root() == tmp_path / "codeagent" / "mailbox"
 
 
 # ── TestReadSession ──────────────────────────────────────────────────────

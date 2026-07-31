@@ -6,11 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "codeagent"
 version = "0.1.0"
 description = "Multi-host code agent orchestration with SSH, session persistence, routing, and mailbox IPC"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = []
 
-[project.optional-dependencies]
-test = ["pytest-asyncio>=0.21"]
 
 [project.scripts]
 codeagent = "codeagent.cli:main"
@@ -26,4 +25,3 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "--cov=codeagent --cov-report=term-missing --cov-fail-under=85"
-asyncio_mode = "auto"

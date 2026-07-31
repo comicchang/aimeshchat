@@ -434,6 +434,13 @@ class TestLoadRepoMapErrors:
         with pytest.raises(FileNotFoundError):
             load_repo_map(tmp_path / "nope.json")
 
+    def test_env_var_missing_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CODEAGENT_REPO_MAP pointing to non-existent file raises FileNotFoundError."""
+        missing = str(tmp_path / "does-not-exist.json")
+        monkeypatch.setenv("CODEAGENT_REPO_MAP", missing)
+        with pytest.raises(FileNotFoundError, match="CODEAGENT_REPO_MAP"):
+            load_repo_map()
+
     def test_malformed_json(self, tmp_path: Path) -> None:
         """Invalid JSON raises json.JSONDecodeError."""
         bad = tmp_path / "bad.json"

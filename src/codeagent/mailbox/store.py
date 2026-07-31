@@ -28,8 +28,8 @@ def resolve_root(root: Optional[Path] = None) -> Path:
     env = os.environ.get("MAILBOX_ROOT")
     if env:
         return Path(env)
-    # Default matches original tmux-agent-skills/tools/mailbox
-    return Path.home() / "Dropbox" / "logseq" / "pages" / "mi-docs" / ".mailbox"
+    xdg = os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+    return Path(xdg) / "codeagent" / "mailbox"
 
 
 def gen_msg_id(sender: str) -> str:

@@ -76,6 +76,7 @@ class TestHandlePing:
         assert msg["wire_version"] == WIRE_VERSION
         assert msg["hostname"]
         assert "run" in msg["capabilities"]
+        assert "mailbox" in msg["capabilities"]
 
 
 class TestHandleCapabilities:
@@ -146,25 +147,95 @@ class TestHandleRun:
 
 
 class TestHandleMailbox:
-    def test_mailbox_result(self, capsys):
-        with (
-            patch("codeagent.mailbox.cli.main", return_value=None) as mb_main,
-        ):
-            _handle_mailbox({"args": ["status"]})
+    """_handle_mailbox: direct MailboxStore dispatch (primary path)."""
+
+    def test_direct_status_dispatch(self, capsys):
+        """status subcommand dispatches to MailboxStore.write_status directly."""
+        with patch(
+            "codeagent.remote_exec._dispatch_mailbox_direct",
+            return_value=("status: IDLE", "", 0),
+        ) as dm:
+            _handle_mailbox({"args": ["status", "--session", "s1", "--agent", "a1", "--state", "IDLE"]})
+        dm.assert_called_once()
+        msg = json.loads(capsys.readouterr().out)
+        assert msg["type"] == "mailbox_result"
+        assert msg["exit_code"] == 0
+        assert msg["stdout"] == "status: IDLE"
+        assert msg["stderr"] == ""
+
+    def test_direct_send_dispatch(self, capsys):
+        """send subcommand dispatches to MailboxStore.send directly."""
+        with patch(
+            "codeagent.remote_exec._dispatch_mailbox_direct",
+            return_value=("sent → a1/inbox/id.json", "", 0),
+        ) as dm:
+            _handle_mailbox({"args": ["send", "--session", "s1", "--from", "m1", "--to", "a1",
+                                   "--subject", "hi", "--body", "hello"]})
+        dm.assert_called_once()
         msg = json.loads(capsys.readouterr().out)
         assert msg["type"] == "mailbox_result"
         assert msg["exit_code"] == 0
 
-    def test_mailbox_args_must_be_list(self, capsys):
+    def test_direct_peek_dispatch(self, capsys):
+        """peek subcommand dispatches to MailboxStore.peek directly."""
+        peek_result = json.dumps({"pending": 2, "messages": []})
+        with patch(
+            "codeagent.remote_exec._dispatch_mailbox_direct",
+            return_value=(peek_result, "", 0),
+        ):
+            _handle_mailbox({"args": ["peek", "--session", "s1", "--agent", "a1"]})
+        msg = json.loads(capsys.readouterr().out)
+        assert msg["type"] == "mailbox_result"
+        assert json.loads(msg["stdout"]) == {"pending": 2, "messages": []}
+
+    def test_direct_read_dispatch(self, capsys):
+        """read subcommand dispatches to MailboxStore.read directly."""
+        with patch(
+            "codeagent.remote_exec._dispatch_mailbox_direct",
+            return_value=("FROM: w1  KIND: REPORT\nSUBJECT: s\nBODY: b", "", 0),
+        ):
+            _handle_mailbox({"args": ["read", "--session", "s1", "--agent", "a1", "--owner", "o1"]})
+        msg = json.loads(capsys.readouterr().out)
+        assert msg["type"] == "mailbox_result"
+        assert "FROM: w1" in msg["stdout"]
+
+    def test_direct_clear_dispatch(self, capsys):
+        """clear subcommand dispatches to MailboxStore.clear directly."""
+        with patch(
+            "codeagent.remote_exec._dispatch_mailbox_direct",
+            return_value=("cleared 5", "", 0),
+        ):
+            _handle_mailbox({"args": ["clear", "--session", "s1", "--agent", "a1"]})
+        msg = json.loads(capsys.readouterr().out)
+        assert msg["type"] == "mailbox_result"
+        assert msg["stdout"] == "cleared 5"
+
+    def test_direct_error_returns_stderr(self, capsys):
+        """ValueError from MailboxStore propagates as stderr + exit_code=1."""
+        with patch(
+            "codeagent.remote_exec._dispatch_mailbox_direct",
+            return_value=("", "session not found: s1\n", 1),
+        ):
+            _handle_mailbox({"args": ["send"]})
+        msg = json.loads(capsys.readouterr().out)
+        assert msg["type"] == "mailbox_result"
+        assert msg["exit_code"] == 1
+        assert "session not found: s1" in msg["stderr"]
+
+    def test_args_must_be_list(self, capsys):
         _handle_mailbox({"args": "nope"})
         msg = json.loads(capsys.readouterr().out)
         assert msg["type"] == "error"
         assert "must be a list" in msg["message"]
 
     def test_mailbox_root_validated(self, capsys):
-        with patch("codeagent.mailbox.cli.main", return_value=None) as mb_main:
-            _handle_mailbox({"args": ["x"], "mailbox_root": "/tmp/ok-root"})
-        assert mb_main.call_args[0][0][:2] == ["--mailbox-root", "/tmp/ok-root"]
+        """Validated mailbox_root is forwarded to dispatch."""
+        with patch(
+            "codeagent.remote_exec._dispatch_mailbox_direct",
+            return_value=("ok", "", 0),
+        ) as dm:
+            _handle_mailbox({"args": ["stats"], "mailbox_root": "/tmp/ok-root"})
+        dm.assert_called_once_with(["stats"], "/tmp/ok-root")
 
     def test_mailbox_root_rejected_when_unsafe(self, capsys):
         _handle_mailbox({"args": ["x"], "mailbox_root": "relative/path"})
@@ -172,31 +243,48 @@ class TestHandleMailbox:
         assert msg["type"] == "error"
         assert "invalid mailbox_root" in msg["message"]
 
-    def test_mailbox_cli_exception_reported(self, capsys):
-        def _boom(argv):
-            raise RuntimeError("mailbox exploded")
-
-        with patch("codeagent.mailbox.cli.main", side_effect=_boom):
-            _handle_mailbox({"args": ["x"]})
+    def test_fallback_to_cli_on_direct_failure(self, capsys):
+        """Falls back to CLI when direct dispatch raises an unexpected exception."""
+        with (
+            patch(
+                "codeagent.remote_exec._dispatch_mailbox_direct",
+                side_effect=RuntimeError("direct path boom"),
+            ),
+            patch("codeagent.mailbox.cli.main", return_value=None),
+        ):
+            _handle_mailbox({"args": ["peek"]})
         msg = json.loads(capsys.readouterr().out)
         assert msg["type"] == "mailbox_result"
-        assert msg["exit_code"] == 1
-        assert "mailbox exploded" in msg["stderr"]
+        assert msg["exit_code"] == 0
 
-    def test_mailbox_system_exit_code(self, capsys):
+    def test_fallback_to_cli_on_system_exit(self, capsys):
+        """Falls back to CLI when direct dispatch raises SystemExit."""
         def _exit42(argv):
             raise SystemExit(42)
 
-        with patch("codeagent.mailbox.cli.main", side_effect=_exit42):
+        with (
+            patch(
+                "codeagent.remote_exec._dispatch_mailbox_direct",
+                side_effect=SystemExit(42),
+            ),
+            patch("codeagent.mailbox.cli.main", side_effect=_exit42),
+        ):
             _handle_mailbox({"args": ["x"]})
         msg = json.loads(capsys.readouterr().out)
         assert msg["type"] == "mailbox_result"
         assert msg["exit_code"] == 42
 
-    def test_mailbox_system_exit_message_is_wire_valid_failure(self, capsys):
-        with patch(
-            "codeagent.mailbox.cli.main",
-            side_effect=SystemExit("session not found: s1"),
+    def test_fallback_preserves_response_shape(self, capsys):
+        """CLI fallback still produces the standard mailbox_result wire shape."""
+        def _exit_msg(argv):
+            raise SystemExit("session not found: s1")
+
+        with (
+            patch(
+                "codeagent.remote_exec._dispatch_mailbox_direct",
+                side_effect=Exception("unexpected"),
+            ),
+            patch("codeagent.mailbox.cli.main", side_effect=_exit_msg),
         ):
             _handle_mailbox({"args": ["send"]})
 
@@ -225,7 +313,8 @@ class TestMainLoop:
 
         with (
             patch("codeagent.remote_exec.GoWrapperRunner", return_value=runner),
-            patch("codeagent.mailbox.cli.main", return_value=None),
+            patch("codeagent.remote_exec._dispatch_mailbox_direct",
+                  return_value=("ok", "", 0)),
         ):
             main()
 
@@ -244,4 +333,4 @@ class TestMainLoop:
         assert "command" in errors[2]["message"]
 
     def test_supported_commands(self):
-        assert SUPPORTED_COMMANDS == {"run", "ping", "capabilities", "mailbox", "mailbox-daemon"}
+        assert SUPPORTED_COMMANDS == {"run", "ping", "capabilities", "mailbox"}

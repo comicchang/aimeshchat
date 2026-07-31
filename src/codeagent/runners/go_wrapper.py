@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -41,7 +42,11 @@ class GoWrapperRunner(BaseRunner):
     def __init__(self, config: Optional[RunnerConfig] = None) -> None:
         super().__init__(config)
         if not self.config.binary:
-            self.config.binary = _DEFAULT_BINARY
+            env_bin = os.environ.get("CODEAGENT_WRAPPER_BIN")
+            if env_bin:
+                self.config.binary = env_bin
+            else:
+                self.config.binary = shutil.which("codeagent-wrapper") or _DEFAULT_BINARY
 
     # ------------------------------------------------------------------
     # BaseRunner contract

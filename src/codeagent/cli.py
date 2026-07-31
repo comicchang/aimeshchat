@@ -109,14 +109,6 @@ def _build_parser() -> argparse.ArgumentParser:
     mbox_p.add_argument("mailbox_args", nargs=argparse.REMAINDER, help="Arguments passed to mailbox CLI")
     mbox_p.add_argument("--host", help="Target host (omit for local)")
     mbox_p.add_argument("--mailbox-root", help="Override MAILBOX_ROOT")
-    mbox_p.add_argument(
-        "--transport", default="auto", choices=["auto", "tcp", "file"],
-        help="Mailbox transport: auto (daemon if running, else file), tcp (require daemon), file (direct)",
-    )
-
-    # mailbox-daemon
-    md_p = sub.add_parser("mailbox-daemon", help="TCP mailbox daemon management")
-    md_p.add_argument("daemon_args", nargs=argparse.REMAINDER, help="Arguments passed to daemon CLI")
 
     art_p = sub.add_parser("artifact", help="Pull and verify remote artifacts")
     art_sub = art_p.add_subparsers(dest="art_cmd")
@@ -475,22 +467,6 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
 
     if not host:
         # No remote host specified — local mailbox operations.
-        # Try daemon first for tcp/auto, then fall back to direct file access.
-        transport = getattr(args, "transport", "auto")
-        if transport in ("tcp", "auto"):
-            from codeagent.tcp.cli import _probe_daemon
-            if _probe_daemon("127.0.0.1", 5555) is not None:
-                from codeagent.tcp.cli import send_to_daemon
-                exit_code, out, err = send_to_daemon(mailbox_args, mailbox_root)
-                if out:
-                    print(out, end="")
-                if err:
-                    print(err, end="", file=sys.stderr)
-                return exit_code
-            if transport == "tcp":
-                print("error: daemon not running (transport=tcp)", file=sys.stderr)
-                return 1
-        # File mode (or auto fallback): direct Python call
         from codeagent.mailbox.cli import main as mailbox_main
         if mailbox_root:
             mailbox_args = ["--mailbox-root", mailbox_root] + mailbox_args
@@ -505,31 +481,7 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
             sys.stdout, sys.stderr = old_stdout, old_stderr
         return 0
 
-    # Remote host specified — transport determines connection method.
-    transport = getattr(args, "transport", "auto")
-
-    # tcp mode: always use daemon socket
-    if transport == "tcp":
-        from codeagent.tcp.cli import send_to_daemon
-        exit_code, out, err = send_to_daemon(mailbox_args, mailbox_root)
-        if out:
-            print(out, end="")
-        if err:
-            print(err, end="", file=sys.stderr)
-        return exit_code
-
-    # auto mode: try daemon first, fall back to SSH
-    if transport == "auto":
-        from codeagent.tcp.cli import _probe_daemon, send_to_daemon
-        if _probe_daemon("127.0.0.1", 5555) is not None:
-            exit_code, out, err = send_to_daemon(mailbox_args, mailbox_root)
-            if out:
-                print(out, end="")
-            if err:
-                print(err, end="", file=sys.stderr)
-            return exit_code
-        # Fall through to SSH
-
+    # Remote host specified — SSH wire transport.
     # file mode (or auto fallback): SSH transport
     from codeagent.config.repo_map import load_repo_map
     from codeagent.domain import HostSpec, resolve_is_local
@@ -572,15 +524,6 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
     if stderr:
         print(stderr, end="", file=sys.stderr)
     return exit_code
-
-
-def _cmd_mailbox_daemon(args: argparse.Namespace) -> int:
-    """Dispatch mailbox-daemon subcommand to the TCP daemon CLI."""
-    from codeagent.tcp.cli import main as daemon_main
-    try:
-        return daemon_main(args.daemon_args or None)
-    except SystemExit as e:
-        return e.code or 0
 
 
 def _cmd_artifact(args: argparse.Namespace) -> int:
@@ -636,7 +579,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         "sessions": _cmd_sessions,
         "ssh": _cmd_ssh,
         "mailbox": _cmd_mailbox,
-        "mailbox-daemon": _cmd_mailbox_daemon,
         "artifact": _cmd_artifact,
     }
     # args.command is guaranteed to be one of the registered subcommands:

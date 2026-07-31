@@ -44,6 +44,38 @@ class TestGoWrapperRunner:
     def _runner(self, **config_kw) -> GoWrapperRunner:
         return GoWrapperRunner(config=RunnerConfig(**config_kw))
 
+    # -- binary resolution ------------------------------------------------
+
+    def test_binary_from_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CODEAGENT_WRAPPER_BIN", "/custom/wrapper")
+        monkeypatch.delenv("MAILBOX_ROOT", raising=False)
+        r = GoWrapperRunner()
+        assert r.config.binary == "/custom/wrapper"
+
+    def test_binary_from_which(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CODEAGENT_WRAPPER_BIN", raising=False)
+        monkeypatch.setattr(
+            "codeagent.runners.go_wrapper.shutil.which",
+            lambda x: "/usr/local/bin/codeagent-wrapper" if x == "codeagent-wrapper" else None,
+        )
+        r = GoWrapperRunner()
+        assert r.config.binary == "/usr/local/bin/codeagent-wrapper"
+
+    def test_binary_fallback_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CODEAGENT_WRAPPER_BIN", raising=False)
+        monkeypatch.setattr(
+            "codeagent.runners.go_wrapper.shutil.which",
+            lambda x: None,
+        )
+        r = GoWrapperRunner()
+        assert r.config.binary.endswith("codeagent-wrapper")
+        assert "~" not in r.config.binary  # must be expanded
+
+    def test_explicit_binary_overrides_all(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CODEAGENT_WRAPPER_BIN", "/should/not/use")
+        r = self._runner(binary="/explicit/bin")
+        assert r.config.binary == "/explicit/bin"
+
     # -- _build_cmd -------------------------------------------------------
 
     def test_basic_cmd(self, tmp_path: Path) -> None:

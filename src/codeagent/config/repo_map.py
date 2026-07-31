@@ -20,7 +20,12 @@ def _default_repo_map_path() -> Path:
     """Find repo-map.json: env var > XDG config > ~/.codeagent > dotai profiles."""
     env = os.environ.get("CODEAGENT_REPO_MAP")
     if env:
-        return Path(env)
+        p = Path(env)
+        if not p.is_file():
+            raise FileNotFoundError(
+                f"CODEAGENT_REPO_MAP points to non-existent file: {env}"
+            )
+        return p
     candidates = [
         Path.home() / ".config" / "codeagent" / "repo-map.json",
         Path.home() / ".codeagent" / "repo-map.json",
