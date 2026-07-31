@@ -138,8 +138,30 @@ class DeliveryEngine:
         # ── 2. Route to remote transport ───────────────────────────────
         host_alias = getattr(target, "host_alias", None) or getattr(target, "ssh_alias", "")
         if not host_alias:
-            # No remote target — local delivery, outbox is enough
-            return accepted
+            # Local delivery: write straight to the recipient inbox
+            # (durable + idempotent via msg_id).  The outbox entry above
+            # guarantees no loss if this write fails mid-way.
+            try:
+                self._store.send(
+                    session_id=sid,
+                    from_id=envelope.get("from", ""),
+                    to_id=envelope.get("to", target if isinstance(target, str) else ""),
+                    subject=envelope.get("subject", ""),
+                    body=envelope.get("body", ""),
+                    kind=envelope.get("kind", "TASK"),
+                    reply_to=envelope.get("reply_to", ""),
+                    run_id=envelope.get("run_id", ""),
+                    request_id=envelope.get("request_id", ""),
+                    msg_id=msg_id,
+                )
+            except Exception as exc:
+                log.warning("DeliveryEngine: local inbox write failed: %s", exc)
+                self._write_status(sid, msg_id, "local_delivery_failed", str(exc))
+                return accepted
+            self._mark_delivered(sid, msg_id)
+            delivered = SendReceipt(status="delivered", msg_id=msg_id)
+            self._cache[msg_id] = delivered
+            return delivered
 
         try:
             self._remote_send(target, envelope)

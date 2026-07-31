@@ -99,6 +99,73 @@ class SwarmKernel:
         # Optional receiver for push-mode delivery (D2).
         self._receiver: Any = None
 
+        # Restore persisted sessions so each CLI invocation (new process,
+        # new kernel) sees sessions created by earlier invocations.
+        self._load_persisted_sessions()
+
+    def _load_persisted_sessions(self) -> None:
+        """Rebuild in-memory sessions from session.json / swarm-meta.json.
+
+        The CLI runs one subcommand per process; without this, a fresh
+        kernel has an empty ``_sessions`` dict and ``register``/``direct``
+        fail with "session not found" right after ``create-session``.
+        """
+        try:
+            root = self._store.root
+            if not root.is_dir():
+                return
+            for session_dir in sorted(root.iterdir()):
+                if not session_dir.is_dir():
+                    continue
+                session_file = session_dir / "session.json"
+                if not session_file.exists():
+                    continue
+                try:
+                    data = json.loads(session_file.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    continue
+                sid = data.get("session_id") or session_dir.name
+                manager = data.get("manager", "")
+                agents = data.get("agents", [])
+                members = sorted(set(agents) | ({manager} if manager else set()))
+
+                acl = ACL(
+                    authority=manager,
+                    allowed_senders=list(members),
+                    room_members=list(members),
+                    policy="open",
+                )
+                meta_file = session_dir / "swarm-meta.json"
+                try:
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    acl_data = meta.get("acl", {})
+                    acl = ACL(
+                        authority=acl_data.get("authority", manager),
+                        allowed_senders=acl_data.get("allowed_senders", members),
+                        room_members=acl_data.get("room_members", members),
+                        policy=acl_data.get("policy", "open"),
+                    )
+                    chans = {}
+                    for cid, cdata in (meta.get("channels") or {}).items():
+                        chans[cid] = Channel(
+                            channel_id=cdata.get("channel_id", cid),
+                            members=list(cdata.get("members", [])),
+                        )
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    chans = {}
+
+                self._sessions[sid] = Session(
+                    session_id=sid,
+                    manager_id=manager,
+                    roster=Roster(members=members),
+                    acl=acl,
+                    created_at=data.get("created_at", ""),
+                )
+                self._channels[sid] = chans
+                self._subscriptions[sid] = {}
+        except OSError:
+            pass
+
     # ── Session lifecycle ──────────────────────────────────────────────
 
     def create_session(
@@ -221,7 +288,33 @@ class SwarmKernel:
             acl=acl,
         )
         self._channels.setdefault(session_id, {})[channel_id] = channel
+        self._persist_channels(session_id)
         return channel
+
+    def _persist_channels(self, session_id: str) -> None:
+        """Persist channels into swarm-meta.json so later CLI processes see them."""
+        try:
+            meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
+            meta = {}
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                pass
+            channels = {}
+            for cid, ch in self._channels.get(session_id, {}).items():
+                channels[cid] = {
+                    "channel_id": ch.channel_id,
+                    "members": list(ch.members),
+                }
+            meta["channels"] = channels
+            tmp = meta_path.parent / ".tmp-swarm-meta.json"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(meta_path))
+        except OSError:
+            pass
 
     # ── ACL checks ─────────────────────────────────────────────────────
 

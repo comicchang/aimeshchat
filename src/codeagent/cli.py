@@ -173,6 +173,12 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     ch_p.add_argument("--body", required=True)
     ch_p.add_argument("--attachment", action="append", default=[])
 
+    # create-channel
+    cc_p = swarm_sub.add_parser("create-channel", help="Create a named channel within a session")
+    cc_p.add_argument("session_id")
+    cc_p.add_argument("channel_id", help="Channel identifier")
+    cc_p.add_argument("--members", required=True, help="Comma-separated channel member agent IDs")
+
     # broadcast
     bc_p = swarm_sub.add_parser("broadcast", help="Broadcast to all session members")
     bc_p.add_argument("session_id")
@@ -285,6 +291,8 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             return _swarm_direct(kernel, args)
         elif cmd == "channel":
             return _swarm_channel(kernel, args)
+        elif cmd == "create-channel":
+            return _swarm_create_channel(kernel, args)
         elif cmd == "broadcast":
             return _swarm_broadcast(kernel, args)
         elif cmd == "notice":
@@ -328,6 +336,16 @@ def _swarm_register(kernel: SwarmKernel, args: argparse.Namespace) -> int:
         "session_id": reg.session_id,
         "host_alias": reg.location.host_alias,
         "backend": reg.location.backend,
+    }, indent=2))
+    return 0
+
+
+def _swarm_create_channel(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    members = [m.strip() for m in args.members.split(",") if m.strip()]
+    ch = kernel.create_channel(args.session_id, args.channel_id, members)
+    print(json.dumps({
+        "channel_id": ch.channel_id,
+        "members": list(ch.members),
     }, indent=2))
     return 0
 

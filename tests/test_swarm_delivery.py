@@ -641,7 +641,11 @@ class TestEdgeCases:
     def test_no_host_alias_skips_transport(
         self, store: MailboxStore, outbox_root: Path,
     ) -> None:
-        """Target with no host_alias → accepted (outbox-only, no transport)."""
+        """Target with no host_alias → local delivery: inbox write, delivered.
+
+        Regression: this used to return accepted with outbox-only (never
+        reaching the recipient inbox). Now writes straight to inbox.
+        """
         _init_session(store)
         envelope = _make_envelope()
 
@@ -651,8 +655,12 @@ class TestEdgeCases:
 
         engine = DeliveryEngine(mailbox_store=store, outbox_root=outbox_root)
         receipt = engine.deliver("s1", NoAlias(), envelope)
-        assert receipt.status == "accepted"
-        assert receipt.queued is True
+        assert receipt.status == "delivered"
+        assert receipt.queued is False
+        # Message actually reached the recipient inbox
+        inbox = store.agent_subdir("s1", envelope["to"], "inbox")
+        msgs = store.list_messages(inbox)
+        assert len(msgs) == 1
 
     def test_flush_with_consumed_entries_skips(
         self, store: MailboxStore, outbox_root: Path,
