@@ -1,6 +1,7 @@
 """CLI facade — unified entry point for all codeagent commands."""
 from __future__ import annotations
 
+from codeagent.artifact import ArtifactDescriptor, pull_artifact, verify_artifact, validate_descriptor
 import argparse
 import dataclasses
 
@@ -105,8 +106,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # mailbox
     mbox_p = sub.add_parser("mailbox", help="Cross-host mailbox operations")
-    mbox_p.add_argument("mailbox_args", nargs=argparse.REMAINDER, help="Arguments passed to mailbox CLI")
-    mbox_p.add_argument("--host", help="Target host (omit for local)")
+    # artifact
+    art_p = sub.add_parser("artifact", help="Pull and verify remote artifacts")
+    art_sub = art_p.add_subparsers(dest="art_cmd")
+
+    pull_p = art_sub.add_parser("pull", help="Pull an artifact from a remote host")
+    pull_p.add_argument("--host", required=True, help="SSH alias for remote host")
+    pull_p.add_argument("--artifact-id", required=True, help="Artifact identifier")
+    pull_p.add_argument("--remote-root", default="/tmp/codeagent-artifacts", help="Remote artifact root directory")
+    pull_p.add_argument("--relative-path", required=True, help="Relative path within remote root")
+    pull_p.add_argument("--size", type=int, required=True, help="Expected file size in bytes")
+    pull_p.add_argument("--sha256", required=True, help="Expected SHA-256 hex digest")
+    pull_p.add_argument("--media-type", default="application/octet-stream", help="MIME media type")
+    pull_p.add_argument("--dest", required=True, help="Local destination file path")
+
+    verify_p = art_sub.add_parser("verify", help="Verify a local artifact")
+    verify_p.add_argument("--file", required=True, help="Path to local file")
+    verify_p.add_argument("--sha256", required=True, help="Expected SHA-256 hex digest")
+    verify_p.add_argument("--size", type=int, required=True, help="Expected file size in bytes")
+
+    return p
     mbox_p.add_argument("--mailbox-root", help="Override MAILBOX_ROOT")
 
     return p

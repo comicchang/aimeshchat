@@ -6,8 +6,7 @@
 所有命令使用 `--session` + `--agent`（不再用 `--worker`）。
 
 ```bash
-# 先验证 ID
-python3 scripts/tmux_worker.py mailbox-roster --config workers.toml
+# 先验证 ID（roster 校验已内建于 mailbox send，失败即停止）
 
 # Manager → Worker 正式 TASK（直写目标 inbox）
 mailbox send \

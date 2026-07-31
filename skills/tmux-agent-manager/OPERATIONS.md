@@ -21,12 +21,11 @@ Syncthing 同步共享根。所有参与者直接写**收件人** inbox。`~/.dr
 `processing/` 提供竞态保护：Agent 通过 `mailbox read` 自动声明消息（inbox→processing，按 owner+lease），处理后 `mailbox finalize` 验证 owner 并归档（processing→archive）；`mailbox release` 放回 inbox。Manager 监控 `processing/` 计数诊断卡住任务。`mailbox recover-stale` 将过期 processing（300s lease）自动恢复到 inbox，用于崩溃恢复。
 
 ```bash
-scripts/tmux_worker.py validate --config workers.toml
-scripts/tmux_worker.py register --config workers.toml
-scripts/tmux_worker.py mailbox-roster --config workers.toml
+# Roster 校验已内建于 mailbox send：发送时自动校验 sender/recipient 在 session roster 中
+# 不需要单独的 validate/register/mailbox-roster 命令
 ```
 
-注册失败、收件人不在 roster 或 `.mailbox/<session>/<agent>/inbox` 不存在时停止发送，禁止自行创建一个"看起来正确"的 worker id。
+收件人不在 roster 或 `.mailbox/<session>/<agent>/inbox` 不存在时停止发送，禁止自行创建一个“看起来正确”的 worker id。
 
 ## 2. 启动链
 
@@ -39,8 +38,8 @@ scripts/tmux_worker.py mailbox-roster --config workers.toml
 5. Worker 初始化后写 `.mailbox/<session>/<agent>/status.json` 为 `IDLE`；这才是 v2 可调度快照。
 
 ```bash
-scripts/tmux_worker.py launch --worker <id> --config workers.toml --timeout 120
-scripts/tmux_worker.py init --worker <id> --config workers.toml --timeout 60 --attempts 2
+# Worker 启动由 dotai/omp 管理，不在本仓 CLI 范围
+# INIT 通过 mailbox send 完成（roster 自动校验）
 ```
 
 INIT 的旧 ACK 文件可以作为兼容诊断，但 Manager 不得用 terminal 文本补认 ready，也不得用 capture-pane 判断 IDLE/BUSY。
@@ -165,7 +164,7 @@ Manager 不把 status DONE 当作 artifact 已验证；必须 read REPORT、验�
 
 ### Missing recipient / sync failure
 
-先 `mailbox-roster`，再确认目标 inbox 已同步。发送失败不 fallback 到相似 worker 或手写目录。Worker 无法写 status/REPORT 时保存 artifact，并使用短 send-keys 通知 `MAILBOX_SYNC_FAILED`，随后停止扩展。
+先确认目标 inbox 已同步。mailbox send 会自动校验 roster，失败即停止。发送失败不 fallback 到相似 worker 或手写目录。Worker 无法写 status/REPORT 时保存 artifact，并使用短 send-keys 通知 `MAILBOX_SYNC_FAILED`，随后停止扩展。
 
 ### Crash recovery
 
@@ -180,7 +179,7 @@ Worker 不遵守 v2（手写 JSON、未 poll、未维护 status）时先轻量 `
 ## 9. 预防清单
 
 - CLI 原子写入；永远不手写 mailbox/status JSON。
-- `mailbox-roster` 验证收件人；不猜、不 swap。
+- `mailbox send` 自动校验 roster；不猜、不 swap。
 - formal TASK 走 mailbox send；send-keys 只 wake/steering。
 - Worker/Manager 都按边界轮询；不用 capture-pane 判断状态。
 - 不覆盖消息；纠正发新消息 + `reply_to`。

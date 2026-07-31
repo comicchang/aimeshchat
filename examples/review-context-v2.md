@@ -77,6 +77,21 @@
 2. 文档是否完整？有没有遗漏或过时的引用？
 3. 与行业最佳实践的对比
 4. 跨主机 mailbox 的架构设计是否正确？
+5. **SSH artifact 传输**：通过已有 SSH ControlMaster 选择性拉取文件
+
+## SSH artifact 传输方案
+
+用户希望通过 SSH 实现文件传输（类似 rsync）。Oracle 建议：
+- Worker 发 artifact descriptor（artifact_id, path, size, sha256, media_type）
+- Manager 通过已有 SSH ControlMaster pull（SFTP/SCP）
+- 不走 mailbox JSONL（1 MiB 限制）
+- 不走 relay PTY（用独立 forward）
+- 控制面和数据面分离
+
+## 事实更正
+
+- LICENSE: EnPL-1.0（自定义，非 OSI，已从 EPL-1.0 改名）
+- coordination/mailbox_bridge.py: 已在 Round 7 删除
 
 ## 请检视
 
