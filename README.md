@@ -10,24 +10,48 @@ Unified CLI for executing AI code agents across local and remote machines, with 
 - **SSH transport**: Independent ControlMaster per host, no global ControlPersist changes
 - **Session persistence**: SQLite-backed registry, auto-resume by namespace key
 - **Topic routing**: repo-map.json maps topics to host/path, with local detection
-- **Remote helper**: `codeagent-remote-exec` console entrypoint, deployed via `dotai setup`
+- **Remote helper**: `codeagent-remote-exec` console entrypoint, installed per host via `uv tool install`
 - **Mailbox IPC**: session-based direct-inbox for agent-to-agent communication (local + cross-host via SSH)
 - **Wire protocol**: JSONL over SSH stdin/stdout, no shell quoting issues
 - **Swarm IPC**: IRC-style kernel with session/roster/ACL/routing, delivery engine with durable outbox, real-time receiver (watch + stream modes), artifact transport
 
 ## Installation
 
+Requirements: Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or pip).
+No runtime dependencies beyond the standard library.
+
+### From source (recommended)
+
 ```bash
+git clone https://github.com/comicchang/codeagent-py
 cd codeagent-py
-uv sync
-uv run codeagent --version
+uv sync                      # dev environment (tests, linters)
+uv tool install . --force    # install all 5 entrypoints to ~/.local/bin
 ```
 
-Or install as CLI tool:
+### Via pip
 
 ```bash
-uv tool install .
+# In a virtualenv (PEP 668 systems block system-wide installs)
+python3 -m venv .venv && source .venv/bin/activate
+pip install git+https://github.com/comicchang/codeagent-py
 ```
+
+### What gets installed
+
+| Entrypoint | Purpose |
+|------------|---------|
+| `codeagent` | Main CLI: run / route / sessions / ssh / mailbox / artifact / swarm |
+| `codeagent-remote-exec` | Remote helper: JSONL wire protocol over SSH stdin/stdout |
+| `mailbox` | Standalone mailbox CLI (session-inbox CRUD) |
+| `mailbox-hook` | Peek-only inbox notification |
+| `mailbox-health` | Read-only mailbox diagnostics |
+
+`uv tool install` places them in `~/.local/bin` — ensure that directory is on your
+`PATH` (most shells do this by default).  Remote hosts are reached over SSH;
+`codeagent-remote-exec` is auto-discovered there (the transport prepends
+`$HOME/.local/bin` to the remote PATH, and honors `shell_prefix` in
+`repo-map.json` when set).
 
 ## Quick Start
 
@@ -242,15 +266,22 @@ Socket path: `$XDG_RUNTIME_DIR/codeagent/ssh/<host-hash>.sock`
 
 ## Remote Deployment
 
-Remote hosts need `codeagent-remote-exec` on PATH. Deploy via dotai setup:
+Remote hosts only need `codeagent-remote-exec` on PATH.  Install it on each
+machine the same way as locally (no agent-side daemon, no shared filesystem):
 
 ```bash
-# On each remote machine (part of dotai setup):
-dotai setup
+# On each remote machine:
+git clone https://github.com/comicchang/codeagent-py
+cd codeagent-py
+uv tool install . --force
+codeagent --version        # verify the CLI
+codeagent-remote-exec --help   # verify the remote helper
 ```
 
-This installs `codeagent` and `codeagent-remote-exec` via `uv tool install` from the
-cloned codeagent-py repo. No manual pip install needed.
+That is the whole deployment: five console entrypoints via `uv tool install`,
+no manual pip steps.  Optional per-host configuration (topic routing, relay
+login, shell prefix) lives in `~/.config/codeagent/repo-map.json` — see
+`examples/repo-map.json`.
 
 ## Swarm IPC
 
