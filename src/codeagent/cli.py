@@ -478,51 +478,26 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
         mailbox_main(mailbox_args)
         return 0
 
-    # Remote via SSH — use wire protocol (base64 over stdin, no shell quoting)
+    # Remote via SSH — use wire protocol over stdin JSONL (same pattern as _run_ssh_wire)
+    from codeagent.transport.ssh import _run_ssh_mailbox
+    from codeagent.wire.protocol import make_mailbox_request
+
     cm = ControlMaster(host_spec.ssh_alias)
     if not cm.is_alive():
-        cm.start()
+        cm.create()
 
-    import base64
-    from codeagent.wire.protocol import encode_line
+    req = make_mailbox_request(
+        args=mailbox_args,
+        mailbox_root=mailbox_root or "",
+    )
+    ssh_cmd = cm.ssh_cmd("codeagent-remote-exec")
 
-    # Build mailbox request as JSON wire message
-    request = {
-        "wire_version": 1,
-        "command": "mailbox",
-        "args": mailbox_args,
-    }
-    payload = encode_line(request)
-    wire_b64 = base64.b64encode(payload).decode("ascii")
-
-    # Remote: printf b64 | base64 -d | codeagent-remote-exec
-    remote_cmd = f"printf '%s' {wire_b64} | base64 -d | codeagent-remote-exec"
-    if mailbox_root:
-        remote_cmd = f"MAILBOX_ROOT={mailbox_root} {remote_cmd}"
-    ssh_cmd = cm.ssh_cmd("sh", "-c", remote_cmd)
-
-    r = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=60)
-    # Parse wire response from stdout
-    if r.stdout:
-        for line in r.stdout.strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-                if msg.get("type") == "mailbox_result":
-                    if msg.get("stdout"):
-                        print(msg["stdout"], end="")
-                    if msg.get("stderr"):
-                        print(msg["stderr"], end="", file=sys.stderr)
-                    return msg.get("exit_code", 0)
-                elif msg.get("type") == "ready":
-                    continue
-            except json.JSONDecodeError:
-                print(line)
-    if r.stderr:
-        print(r.stderr, end="", file=sys.stderr)
-    return r.returncode
+    exit_code, stdout, stderr = _run_ssh_mailbox(ssh_cmd, req, timeout=60)
+    if stdout:
+        print(stdout, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
+    return exit_code
 
 
 def main(argv: Optional[list[str]] = None) -> int:

@@ -299,6 +299,30 @@ uv run pytest tests/ -v    # Run all tests
 uv run codeagent --version # Verify CLI
 ```
 
+## ACKNOWLEDGEMENTS
+
+### codeagent-wrapper / myclaude
+
+This project builds on **[stellarlinkco/myclaude](https://github.com/stellarlinkco/myclaude)**,
+the Go-based `codeagent-wrapper` binary distributed as an npm package.
+
+- **What we use**: `GoWrapperRunner` (`src/codeagent/runners/go_wrapper.py`) wraps the Go
+  `codeagent-wrapper` binary to execute AI code agents through a unified interface.
+- **Why Python**: The Go wrapper is the stable agent execution layer — `codeagent-py` adds
+  SSH multi-host transport, SQLite session persistence, topic-based routing, and mailbox-based
+  agent IPC on top.
+- **Conventions**: `.codeagent/` config directory, `~/.codeagent/models.json` agent presets,
+  and namespace key format originate from the myclaude ecosystem.
+
+### tmux-agent-skills (archived)
+
+The v3 session-based direct-inbox mailbox protocol, standalone CLI, and manager/worker skills
+were previously maintained at **[comicchang/tmux-agent-skills](https://github.com/comicchang/tmux-agent-skills)**
+(now archived). The protocol lives on in `src/codeagent/mailbox/` and
+`skills/tmux-agent-manager/`, `skills/tmux-agent-worker/`.
+
 ## License
 
-MIT
+Enlightened Public License (EPL-1.0) — see [LICENSE](LICENSE).
+
+Non-players and Enlightened faction players are welcome. Resistance and Machina are excluded.

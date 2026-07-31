@@ -115,12 +115,21 @@ def _handle_run(req: dict) -> None:
 
 
 def _handle_mailbox(req: dict) -> None:
-    """Execute mailbox subcommand locally on the remote host."""
+    """Execute mailbox subcommand locally on the remote host.
+
+    Reads ``mailbox_root`` from the wire request and sets ``MAILBOX_ROOT``
+    in the subprocess environment before invoking the mailbox CLI.
+    """
     import io
     args = req.get("args", [])
     if not isinstance(args, list):
         _send({"type": "error", "message": "mailbox 'args' must be a list"})
         return
+
+    # Propagate mailbox_root from wire request to child process environment
+    mailbox_root = req.get("mailbox_root", "")
+    if mailbox_root and isinstance(mailbox_root, str):
+        os.environ["MAILBOX_ROOT"] = mailbox_root
 
     # Capture stdout/stderr from mailbox CLI
     old_stdout, old_stderr = sys.stdout, sys.stderr

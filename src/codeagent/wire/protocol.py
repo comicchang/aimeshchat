@@ -33,14 +33,16 @@ MSG_RESULT = "result"
 MSG_ERROR = "error"
 MSG_PONG = "pong"
 MSG_CAPABILITIES = "capabilities"
+MSG_MAILBOX_RESULT = "mailbox_result"
 
-TERMINAL_TYPES = frozenset({MSG_RESULT, MSG_ERROR})
-LIFECYCLE_TYPES = frozenset({MSG_READY, MSG_ACCEPTED, MSG_SESSION, MSG_RESULT, MSG_ERROR})
+TERMINAL_TYPES = frozenset({MSG_RESULT, MSG_ERROR, MSG_MAILBOX_RESULT})
+LIFECYCLE_TYPES = frozenset({MSG_READY, MSG_ACCEPTED, MSG_SESSION, MSG_RESULT, MSG_ERROR, MSG_MAILBOX_RESULT})
 
 # ── command constants ───────────────────────────────────────────────────
 CMD_RUN = "run"
 CMD_PING = "ping"
 CMD_CAPABILITIES = "capabilities"
+CMD_MAILBOX = "mailbox"
 
 
 @dataclass(frozen=True)
@@ -154,6 +156,7 @@ _REQUEST_REQUIRED: dict[str, dict[str, type]] = {
     CMD_RUN:          {"task": str, "workdir": str, "timeout": int},
     CMD_PING:         {},
     CMD_CAPABILITIES: {},
+    CMD_MAILBOX:      {"args": list},
 }
 
 
@@ -267,6 +270,22 @@ def make_capabilities_request() -> dict[str, Any]:
     """Build a capabilities request."""
     return {"wire_version": WIRE_VERSION, "command": CMD_CAPABILITIES}
 
+def make_mailbox_request(
+    *,
+    args: list[str],
+    mailbox_root: str = "",
+    wire_version: int = WIRE_VERSION,
+) -> dict[str, Any]:
+    """Build a mailbox wire request."""
+    req: dict[str, Any] = {
+        "wire_version": wire_version,
+        "command": CMD_MAILBOX,
+        "args": args,
+    }
+    if mailbox_root:
+        req["mailbox_root"] = mailbox_root
+    return req
+
 
 # ── message factories (remote side) ─────────────────────────────────────
 
@@ -292,6 +311,15 @@ def make_result(*, stdout: str = "", stderr: str = "", exit_code: int = 0) -> di
 
 def make_error(message: str) -> dict[str, Any]:
     return {"type": MSG_ERROR, "message": message}
+
+def make_mailbox_result(
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    exit_code: int = 0,
+) -> dict[str, Any]:
+    """Build a mailbox_result response."""
+    return {"type": MSG_MAILBOX_RESULT, "stdout": stdout, "stderr": stderr, "exit_code": exit_code}
 
 
 def make_pong(*, wire_version: int = WIRE_VERSION, hostname: str = "", capabilities: list[str] | None = None) -> dict[str, Any]:

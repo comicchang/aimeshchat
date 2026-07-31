@@ -18,6 +18,7 @@ from codeagent.transport.control_master import ControlMaster, list_sockets, stop
 from codeagent.wire.protocol import (
     MSG_ACCEPTED,
     MSG_ERROR,
+    MSG_MAILBOX_RESULT,
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
@@ -357,6 +358,75 @@ def _run_ssh_wire(
         host=host_name,
         workdir=workdir,
     )
+
+
+def _run_ssh_mailbox(
+    ssh_cmd: list[str],
+    request: dict,
+    *,
+    timeout: int = 60,
+) -> tuple[int, str, str]:
+    """Run a mailbox wire request over SSH. Returns (exit_code, stdout, stderr).
+
+    Follows the same stdin-JSONL pattern as ``_run_ssh_wire``, but parses
+    ``mailbox_result`` response messages instead of ``result``.
+    """
+    payload = encode_line(request)
+
+    try:
+        proc = subprocess.Popen(
+            ssh_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise TransportError(f"ssh binary not found: {ssh_cmd[0]}") from exc
+
+    result_stdout = ""
+    result_stderr = ""
+    exit_code = -1
+
+    try:
+        stdout, stderr = proc.communicate(input=payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise TransportError(f"SSH mailbox execution timed out after {timeout}s")
+    except Exception:
+        proc.kill()
+        proc.wait()
+        raise
+
+    stdout_str = stdout.decode("utf-8", errors="replace") if stdout else ""
+
+    for raw_line in stdout_str.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            msg = decode_line(raw_line)
+        except ValueError:
+            continue
+
+        if msg.type == MSG_READY:
+            continue
+        if msg.type == MSG_MAILBOX_RESULT:
+            result_stdout = msg.payload.get("stdout", "")
+            result_stderr = msg.payload.get("stderr", "")
+            exit_code = msg.payload.get("exit_code", 0)
+        elif msg.type == MSG_ERROR:
+            result_stderr = msg.message
+            exit_code = 1
+
+    # Fallback: use SSH stderr if no structured result
+    if exit_code == -1 and not result_stderr:
+        ssh_stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
+        if ssh_stderr:
+            result_stderr = ssh_stderr
+        exit_code = 0
+
+    return exit_code, result_stdout, result_stderr
 
 
 def _is_ssh_error(stderr: str) -> bool:

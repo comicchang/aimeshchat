@@ -25,20 +25,21 @@ def _run_local(args: list[str], mailbox_root: Optional[str] = None) -> tuple[int
 
 
 def _run_remote(host: HostSpec, args: list[str], mailbox_root: Optional[str] = None) -> tuple[int, str, str]:
-    """Run mailbox CLI on remote host via SSH."""
+    """Run mailbox CLI on remote host via SSH wire protocol."""
     from codeagent.transport.control_master import ControlMaster
+    from codeagent.transport.ssh import _run_ssh_mailbox
+    from codeagent.wire.protocol import make_mailbox_request
+
     cm = ControlMaster(host.ssh_alias)
     if not cm.is_alive():
-        cm.start()
+        cm.create()
 
-    cmd_parts = ["mailbox"] + args
-    remote_cmd = " ".join(cmd_parts)
-    if mailbox_root:
-        remote_cmd = f"MAILBOX_ROOT={mailbox_root} {remote_cmd}"
-
-    ssh_cmd = cm.ssh_cmd("sh", "-c", remote_cmd)
-    r = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=60)
-    return r.returncode, r.stdout, r.stderr
+    req = make_mailbox_request(
+        args=args,
+        mailbox_root=mailbox_root or "",
+    )
+    ssh_cmd = cm.ssh_cmd("codeagent-remote-exec")
+    return _run_ssh_mailbox(ssh_cmd, req, timeout=60)
 
 
 def run_mailbox(

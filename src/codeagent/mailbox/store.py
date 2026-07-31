@@ -10,6 +10,7 @@ from typing import Optional
 
 from codeagent.mailbox.protocol import (
     LEASE_TIMEOUT_S,
+    VALID_KINDS,
     VALID_STATES,
     Message,
     StatusSnapshot,
@@ -24,7 +25,8 @@ def resolve_root(root: Optional[Path] = None) -> Path:
     env = os.environ.get("MAILBOX_ROOT")
     if env:
         return Path(env)
-    return Path.home() / ".local" / "state" / "codeagent" / "mailbox"
+    # Default matches original tmux-agent-skills/tools/mailbox
+    return Path.home() / "Dropbox" / "logseq" / "pages" / "mi-docs" / ".mailbox"
 
 
 def gen_msg_id(sender: str) -> str:
@@ -105,7 +107,7 @@ class MailboxStore:
         inbox = self.agent_subdir(session_id, to_id, "inbox")
         if not inbox.exists():
             raise ValueError(f"agent not in session: {to_id}")
-        if kind not in VALID_STATES and kind not in ("TASK", "REPORT", "PROGRESS", "EVIDENCE", "QUESTION", "RESPONSE", "NOTICE"):
+        if kind not in VALID_KINDS:
             raise ValueError(f"invalid kind: {kind}")
 
         msg_id = gen_msg_id(from_id)
@@ -209,7 +211,13 @@ class MailboxStore:
 
     # ── Finalize ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _validate_msg_id(msg_id: str) -> None:
+        if "/" in msg_id or "\\" in msg_id or ".." in msg_id:
+            raise ValueError(f"invalid msg_id: {msg_id}")
+
     def finalize(self, session_id: str, agent_id: str, msg_id: str, owner: str) -> str:
+        self._validate_msg_id(msg_id)
         processing = self.agent_subdir(session_id, agent_id, "processing")
         archive = self.agent_subdir(session_id, agent_id, "archive")
         target = processing / f"{msg_id}.json"
@@ -236,6 +244,7 @@ class MailboxStore:
     # ── Release ────────────────────────────────────────────────────────
 
     def release(self, session_id: str, agent_id: str, msg_id: str, owner: str) -> str:
+        self._validate_msg_id(msg_id)
         inbox = self.agent_subdir(session_id, agent_id, "inbox")
         processing = self.agent_subdir(session_id, agent_id, "processing")
         target = processing / f"{msg_id}.json"
@@ -334,3 +343,35 @@ class MailboxStore:
         if prune_stale:
             self.recover_stale(session_id, agent_id)
         return f"cleared {total}"
+
+    # ── Check (legacy) ─────────────────────────────────────────────────
+
+    def check(self, session_id: str, agent_id: str, max_messages: int = 0) -> list[dict]:
+        """Legacy: validate + archive from inbox only (no processing/ awareness)."""
+        inbox = self.agent_subdir(session_id, agent_id, "inbox")
+        archive = self.agent_subdir(session_id, agent_id, "archive")
+        corrupt_dir = self.agent_subdir(session_id, agent_id, "_corrupt")
+
+        files = self.list_messages(inbox)
+        if not files:
+            return []
+
+        results = []
+        limit = max_messages or len(files)
+        for entry in files[:limit]:
+            filename = entry.name
+            try:
+                msg = json.loads(entry.read_bytes())
+                ok, reason = validate_message(msg, expected_agent=agent_id, filename=filename)
+                if not ok:
+                    raise ValueError(reason)
+            except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+                corrupt_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(str(entry), str(corrupt_dir / filename))
+                continue
+
+            archive.mkdir(parents=True, exist_ok=True)
+            os.replace(str(entry), str(archive / filename))
+            results.append(msg)
+
+        return results

@@ -1,8 +1,12 @@
-"""mailbox-health — connectivity diagnostics for mailbox protocol."""
+"""mailbox-health — connectivity diagnostics for mailbox protocol.
+
+Read-only diagnostics. Never modifies status or mailbox state.
+"""
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +14,7 @@ from codeagent.mailbox.store import MailboxStore
 
 
 def diagnose(store: MailboxStore, session_id: str, agent_id: str) -> dict:
-    """Run 8 connectivity checks."""
+    """Run 8 read-only connectivity checks."""
     checks = {}
 
     # 1. Root exists
@@ -28,30 +32,37 @@ def diagnose(store: MailboxStore, session_id: str, agent_id: str) -> dict:
     inbox = store.agent_subdir(session_id, agent_id, "inbox")
     checks["inbox_readable"] = inbox.is_dir()
 
-    # 5. Status writable
-    try:
-        store.write_status(session_id, agent_id, "IDLE", "health check", "")
-        checks["status_writable"] = True
-    except Exception:
-        checks["status_writable"] = False
-
-    # 6. Status readable
+    # 5. Status readable (read-only — never writes)
     status = store.read_status(session_id, agent_id)
     checks["status_readable"] = status is not None
+    if status:
+        checks["status_state"] = status.state
 
-    # 7. Peek works
+    # 6. Peek works
     try:
         result = store.peek(session_id, agent_id)
         checks["peek_works"] = isinstance(result, dict)
     except Exception:
         checks["peek_works"] = False
 
+    # 7. Processing dir writable (probe file, then clean up)
+    processing = store.agent_subdir(session_id, agent_id, "processing")
+    probe_file = processing / ".health-probe"
+    try:
+        processing.mkdir(parents=True, exist_ok=True)
+        probe_file.write_text("probe")
+        probe_file.unlink(missing_ok=True)
+        checks["processing_writable"] = True
+    except Exception:
+        checks["processing_writable"] = False
+
     # 8. Identity file (if set)
-    import os
     identity_file = os.environ.get("OMP_MAILBOX_IDENTITY_FILE", "")
     if identity_file:
         checks["identity_file_set"] = True
-        checks["identity_file_writable"] = Path(identity_file).parent.is_dir()
+        p = Path(identity_file)
+        checks["identity_file_exists"] = p.exists()
+        checks["identity_file_writable"] = p.parent.is_dir()
     else:
         checks["identity_file_set"] = False
         checks["identity_file_writable"] = None
@@ -60,7 +71,7 @@ def diagnose(store: MailboxStore, session_id: str, agent_id: str) -> dict:
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="mailbox-health — connectivity diagnostics")
+    p = argparse.ArgumentParser(description="mailbox-health — read-only connectivity diagnostics")
     p.add_argument("--session", required=True)
     p.add_argument("--agent", required=True)
     p.add_argument("--json", action="store_true", dest="as_json")
@@ -69,10 +80,16 @@ def main(argv: list[str] | None = None) -> None:
     store = MailboxStore()
     result = diagnose(store, args.session, args.agent)
 
+    # Compute all_ok before branching
+    skip_keys = {"identity_file_writable", "status_state"}
+    all_ok = all(
+        v for k, v in result.items()
+        if k not in skip_keys and v is not None
+    )
+
     if args.as_json:
         json.dump(result, sys.stdout, indent=2)
     else:
-        all_ok = all(v for k, v in result.items() if k != "identity_file_writable" or v is not None)
         for k, v in result.items():
             status = "✓" if v else "✗" if v is False else "—"
             print(f"  {status} {k}: {v}")

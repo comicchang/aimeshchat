@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from codeagent.mailbox.protocol import VALID_KINDS, VALID_STATES
 from codeagent.mailbox.store import MailboxStore
@@ -86,8 +87,19 @@ def main(argv: list[str] | None = None) -> None:
     ss.add_argument("--session", required=True)
     ss.add_argument("--agent", required=True)
 
+    # check (legacy)
+    ck = sub.add_parser("check")
+    ck.add_argument("--session", required=True)
+    ck.add_argument("--agent", required=True)
+    ck.add_argument("--json", action="store_true")
+    ck.add_argument("--max-messages", type=int, default=0)
+
+    # Global options
+    p.add_argument("--mailbox-root", help="Override MAILBOX_ROOT")
+
     args = p.parse_args(argv)
-    store = MailboxStore()
+    root = Path(args.mailbox_root) if args.mailbox_root else None
+    store = MailboxStore(root=root)
 
     try:
         if args.cmd == "session-init":
@@ -123,6 +135,16 @@ def main(argv: list[str] | None = None) -> None:
         elif args.cmd == "stats":
             for d, c in store.stats(args.session, args.agent).items():
                 print(f"{d}: {c}")
+        elif args.cmd == "check":
+            results = store.check(args.session, args.agent, args.max_messages)
+            for msg in results:
+                if args.json:
+                    print(json.dumps(msg, ensure_ascii=False))
+                else:
+                    print(f"FROM: {msg['from']}  KIND: {msg.get('kind', '?')}")
+                    print(f"SUBJECT: {msg['subject']}")
+                    print(f"BODY: {msg['body']}")
+                    print("---")
         else:
             p.print_help()
     except ValueError as e:
