@@ -208,20 +208,21 @@ class RelayTransport(Transport):
 
                         # Try to parse as wire protocol JSON
                         try:
-                            msg = json.loads(line)
-                            msg_type = msg.get("type", "")
+                            msg = decode_line(line)
+                            msg_type = msg.type
+                            payload = msg.payload
 
                             if msg_type == MSG_SESSION:
-                                session_id = msg.get("id")
+                                session_id = payload.get("id")
                             elif msg_type == MSG_RESULT:
-                                stdout_chunks.append(msg.get("stdout", ""))
-                                exit_code = msg.get("exit_code", 0)
+                                stdout_chunks.append(payload.get("stdout", ""))
+                                exit_code = payload.get("exit_code", 0)
                             elif msg_type == MSG_ERROR:
-                                stderr_chunks.append(msg.get("message", ""))
-                                exit_code = msg.get("exit_code", 1)
+                                stderr_chunks.append(payload.get("message", ""))
+                                exit_code = payload.get("exit_code", 1)
                             elif msg_type == MSG_READY:
                                 # Check wire version compatibility
-                                remote_ver = msg.get("wire_version", 0)
+                                remote_ver = payload.get("wire_version", 0)
                                 if remote_ver != WIRE_VERSION:
                                     stderr_chunks.append(
                                         f"wire version mismatch: remote={remote_ver}, local={WIRE_VERSION}"

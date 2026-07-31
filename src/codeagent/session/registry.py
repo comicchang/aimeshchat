@@ -62,20 +62,13 @@ _COLUMNS = (
 )
 
 
-def _row_to_record(row: tuple) -> SessionRecord:
-    return SessionRecord(
-        key=row[0],
-        session_id=row[1],
-        backend=row[2],
-        host=row[3],
-        workdir=row[4],
-        agent=row[5],
-        model=row[6],
-        topic=row[7],
-        status=row[8],
-        created_at=row[9],
-        updated_at=row[10],
-    )
+def _row_to_record(row) -> SessionRecord:
+    """Convert a sqlite3.Row or tuple to SessionRecord."""
+    if hasattr(row, 'keys'):
+        # sqlite3.Row — access by column name
+        return SessionRecord(**{col: row[col] for col in _COLUMNS})
+    # Fallback for tuple rows (shouldn't happen with row_factory set)
+    return SessionRecord(**dict(zip(_COLUMNS, row)))
 
 
 class SessionRegistry:
@@ -104,6 +97,7 @@ class SessionRegistry:
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         conn = sqlite3.connect(str(self._db_path), timeout=5)
+        conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=3000")

@@ -11,13 +11,9 @@ from pathlib import Path
 from typing import Final
 
 from codeagent.domain import HostSpec, RepoEntry, RepoMap, TopicSpec
+from codeagent.util.paths import expand_path
 
 VALID_TRANSPORTS: Final[frozenset[str]] = frozenset({"ssh", "relay-login"})
-
-
-def expand_path(raw: str) -> str:
-    """Expand ~ and environment variables in a path string."""
-    return os.path.expanduser(os.path.expandvars(raw))
 
 
 def _default_repo_map_path() -> Path:
