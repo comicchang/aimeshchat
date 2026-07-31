@@ -17,56 +17,53 @@ Unified CLI for executing AI code agents across local and remote machines, with 
 
 ## Installation
 
-Requirements: Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or pip).
-No runtime dependencies beyond the standard library.
+Requirements: Python 3.11+ and [uv](https://docs.astral.sh/uv/).
+Zero runtime dependencies (stdlib only).
 
-### From source (recommended)
-
-```bash
-git clone https://github.com/comicchang/codeagent-py
-cd codeagent-py
-uv sync                      # dev environment (tests, linters)
-uv tool install . --force    # install all 5 entrypoints to ~/.local/bin
-```
-
-### Via pip
+### One command
 
 ```bash
-# In a virtualenv (PEP 668 systems block system-wide installs)
-python3 -m venv .venv && source .venv/bin/activate
-pip install git+https://github.com/comicchang/codeagent-py
+uv tool install "git+https://github.com/comicchang/codeagent-py"
 ```
 
-### What gets installed
+Installs 5 entrypoints to `~/.local/bin` (ensure it's on your `PATH`).
+Only **two** matter: `codeagent` (the CLI) and `codeagent-remote-exec`
+(the remote helper, auto-discovered over SSH on each host).
+`mailbox` / `mailbox-hook` / `mailbox-health` are compatibility shims.
 
-| Entrypoint | Purpose |
-|------------|---------|
-| `codeagent` | Main CLI: run / route / sessions / ssh / mailbox / artifact / swarm |
-| `codeagent-remote-exec` | Remote helper: JSONL wire protocol over SSH stdin/stdout |
-| `mailbox` | Standalone mailbox CLI (session-inbox CRUD) |
-| `mailbox-hook` | Peek-only inbox notification |
-| `mailbox-health` | Read-only mailbox diagnostics |
+Remote hosts need the same single command (that's the whole deployment —
+no daemon, no shared filesystem, no service).
 
-`uv tool install` places them in `~/.local/bin` — ensure that directory is on your
-`PATH` (most shells do this by default).  Remote hosts are reached over SSH;
-`codeagent-remote-exec` is auto-discovered there (the transport prepends
-`$HOME/.local/bin` to the remote PATH, and honors `shell_prefix` in
-`repo-map.json` when set).
-
-## Quick Start
+### Alternatives
 
 ```bash
-# 1. Create config directories
-mkdir -p ~/.config/codeagent ~/.codeagent
-
-# 2. Copy example configs (see below)
-cp examples/repo-map.json ~/.config/codeagent/
-cp examples/models.json ~/.codeagent/
-
-# 3. Verify
-codeagent route list
-codeagent ssh status
+pip install "git+https://github.com/comicchang/codeagent-py"  # in a venv (PEP 668)
+# or from source: git clone → uv tool install . --force
 ```
+
+## Quick Start (agent chat, zero config)
+
+No config files needed — a swarm session is pure CLI:
+
+```bash
+# 1. Start a session with 2 agents (manager + worker)
+codeagent swarm create-session s1 --manager mgr --members w1
+codeagent swarm register s1 --agent w1 --host __local__
+
+# 2. Talk
+codeagent swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body "hello w1"
+codeagent swarm poll s1 --agent w1            # w1 reads its inbox
+
+# 3. Broadcast / channel / notice / real-time watch
+codeagent swarm broadcast s1 --from mgr --kind NOTICE --subject sync --body "everyone"
+codeagent swarm watch s1 --agent w1 --interval 2   # live feed
+```
+
+Cross-host: register the worker with its SSH host instead of `__local__`
+(`--host dev-server`) — delivery goes over SSH automatically, same commands.
+
+Optional: topic routing (`repo-map.json`) and model config (`models.json`)
+are only needed for `codeagent run`/`route` — see `examples/`.
 
 ## Usage
 
