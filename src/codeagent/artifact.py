@@ -129,7 +129,10 @@ def pull_artifact(
             f"{proc.stderr.strip() or 'exit code ' + str(proc.returncode)}"
         )
 
-    log.info("artifact pulled: %s → %s (%d bytes)", desc.artifact_id, dest, desc.size)
+    log.info("artifact pulled: %s → %s", desc.artifact_id, dest)
+
+    # Verify integrity after pull
+    verify_artifact(dest, desc.sha256, desc.size)
     return dest
 
 
