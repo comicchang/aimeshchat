@@ -233,7 +233,7 @@ class RelayTransport(Transport):
                             else:
                                 # Non-wire output (relay UI, QR codes, etc.) → stderr
                                 stderr_chunks.append(line)
-                        except (json.JSONDecodeError, AttributeError):
+                        except (ValueError, AttributeError):
                             # Non-JSON output → likely relay UI → stderr
                             stderr_chunks.append(line)
 

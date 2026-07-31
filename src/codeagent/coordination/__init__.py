@@ -8,5 +8,3 @@ dotai setup installs tmux-agent-skills separately when tmux-agent skills
 are enabled.
 """
 from __future__ import annotations
-
-__version__ = "0.1.0"
