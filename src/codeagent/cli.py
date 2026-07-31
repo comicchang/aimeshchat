@@ -7,6 +7,8 @@ import dataclasses
 from codeagent import __version__
 import json
 import logging
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -99,6 +101,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ssh_sub.add_parser("status")
     stop_p = ssh_sub.add_parser("stop")
     stop_p.add_argument("hosts", nargs="*")
+
+    # mailbox
+    mbox_p = sub.add_parser("mailbox", help="Cross-host mailbox operations")
+    mbox_p.add_argument("mailbox_args", nargs=argparse.REMAINDER, help="Arguments passed to mailbox CLI")
+    mbox_p.add_argument("--host", help="Target host (omit for local)")
+    mbox_p.add_argument("--mailbox-root", help="Override MAILBOX_ROOT")
 
     return p
 
@@ -407,6 +415,116 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mailbox(args: argparse.Namespace) -> int:
+    """Dispatch mailbox command to local or remote host."""
+    raw_args = args.mailbox_args
+    if not raw_args:
+        from codeagent.mailbox.cli import main as mailbox_main
+        mailbox_main(["--help"])
+        return 0
+
+    # Extract --host from mailbox_args (argparse REMAINDER swallows it)
+    mailbox_args = []
+    host = getattr(args, "host", None)
+    mailbox_root = getattr(args, "mailbox_root", None)
+    i = 0
+    while i < len(raw_args):
+        if raw_args[i] == "--host" and i + 1 < len(raw_args):
+            host = host or raw_args[i + 1]
+            i += 2
+        elif raw_args[i].startswith("--host="):
+            host = host or raw_args[i].split("=", 1)[1]
+            i += 1
+        elif raw_args[i] == "--mailbox-root" and i + 1 < len(raw_args):
+            mailbox_root = mailbox_root or raw_args[i + 1]
+            i += 2
+        elif raw_args[i].startswith("--mailbox-root="):
+            mailbox_root = mailbox_root or raw_args[i].split("=", 1)[1]
+            i += 1
+        else:
+            mailbox_args.append(raw_args[i])
+            i += 1
+
+    if not host:
+        # Local: direct Python call
+        from codeagent.mailbox.cli import main as mailbox_main
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        try:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            mailbox_main(mailbox_args)
+        except SystemExit as e:
+            return e.code or 0
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+        return 0
+
+    # Remote: SSH transport
+    from codeagent.config.repo_map import load_repo_map
+    from codeagent.domain import HostSpec, resolve_is_local
+    from codeagent.transport.control_master import ControlMaster
+
+    try:
+        repo_map = load_repo_map()
+        host_spec = repo_map.hosts.get(host)
+    except FileNotFoundError:
+        host_spec = None
+
+    if host_spec is None:
+        host_spec = HostSpec(name=host, ssh_alias=host, hostnames=(host,), description="ad-hoc host")
+
+    if resolve_is_local(host_spec):
+        from codeagent.mailbox.cli import main as mailbox_main
+        mailbox_main(mailbox_args)
+        return 0
+
+    # Remote via SSH — use wire protocol (base64 over stdin, no shell quoting)
+    cm = ControlMaster(host_spec.ssh_alias)
+    if not cm.is_alive():
+        cm.start()
+
+    import base64
+    from codeagent.wire.protocol import encode_line
+
+    # Build mailbox request as JSON wire message
+    request = {
+        "wire_version": 1,
+        "command": "mailbox",
+        "args": mailbox_args,
+    }
+    payload = encode_line(request)
+    wire_b64 = base64.b64encode(payload).decode("ascii")
+
+    # Remote: printf b64 | base64 -d | codeagent-remote-exec
+    remote_cmd = f"printf '%s' {wire_b64} | base64 -d | codeagent-remote-exec"
+    if mailbox_root:
+        remote_cmd = f"MAILBOX_ROOT={mailbox_root} {remote_cmd}"
+    ssh_cmd = cm.ssh_cmd("sh", "-c", remote_cmd)
+
+    r = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=60)
+    # Parse wire response from stdout
+    if r.stdout:
+        for line in r.stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+                if msg.get("type") == "mailbox_result":
+                    if msg.get("stdout"):
+                        print(msg["stdout"], end="")
+                    if msg.get("stderr"):
+                        print(msg["stderr"], end="", file=sys.stderr)
+                    return msg.get("exit_code", 0)
+                elif msg.get("type") == "ready":
+                    continue
+            except json.JSONDecodeError:
+                print(line)
+    if r.stderr:
+        print(r.stderr, end="", file=sys.stderr)
+    return r.returncode
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -420,6 +538,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "route": _cmd_route,
         "sessions": _cmd_sessions,
         "ssh": _cmd_ssh,
+        "mailbox": _cmd_mailbox,
     }
     handler = handlers.get(args.command)
     if handler is None:

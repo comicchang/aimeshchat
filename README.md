@@ -11,6 +11,7 @@ Unified CLI for executing AI code agents across local and remote machines, with 
 - **Session persistence**: SQLite-backed registry, auto-resume by namespace key
 - **Topic routing**: repo-map.json maps topics to host/path, with local detection
 - **Remote helper**: `codeagent-remote-exec` console entrypoint, deployed via `dotai setup`
+- **Mailbox IPC**: session-based direct-inbox for agent-to-agent communication (local + cross-host via SSH)
 - **Wire protocol**: JSONL over SSH stdin/stdout, no shell quoting issues
 
 ## Installation
@@ -236,6 +237,50 @@ dotai setup
 
 This installs `codeagent` and `codeagent-remote-exec` via `uv tool install` from the
 cloned codeagent-py repo. No manual pip install needed.
+
+## Mailbox (Agent IPC)
+
+`codeagent mailbox` provides cross-host agent-to-agent communication using
+the session-based direct-inbox protocol:
+
+```bash
+# Session management
+codeagent mailbox session-init --session s1 --manager mgr --agents w1,w2
+
+# Send message
+codeagent mailbox send --session s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "..."
+
+# Peek inbox
+codeagent mailbox peek --session s1 --agent w1
+
+# Read (inbox→processing)
+codeagent mailbox read --session s1 --agent w1 --owner w1
+
+# Finalize (processing→archive)
+codeagent mailbox finalize --session s1 --agent w1 --msg-id <id> --owner w1
+
+# Status update
+codeagent mailbox status --session s1 --agent w1 --state BUSY --current-task "working"
+```
+
+### Cross-Host
+
+Add `--host <host>` to execute on a remote host via SSH:
+
+```bash
+codeagent mailbox send --session s1 --from mgr --to w1 --kind TASK ... --host dev-server
+codeagent mailbox peek --session s1 --agent w1 --host dev-server
+```
+
+### Standalone CLI
+
+The `mailbox`, `mailbox-hook`, and `mailbox-health` commands remain available:
+
+```bash
+mailbox send --session s1 --from mgr --to w1 ...
+mailbox-hook s1 w1
+mailbox-health --session s1 --agent w1
+```
 
 ## Relationship to code-route
 

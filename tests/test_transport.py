@@ -1018,8 +1018,8 @@ class TestRelayTransport:
 
         host = HostSpec(
             name="test",
-            ssh_alias="clouddev-user.android.xiaomi.com",
-            hostnames=("clouddev-user.android.xiaomi.com",),
+            ssh_alias="dev.example.com",
+            hostnames=("dev.example.com",),
             description="test relay host",
         )
         request = _make_run_request(
@@ -1049,6 +1049,6 @@ class TestRelayTransport:
         cmd = captured_argv[2]
         assert "source" in cmd
         assert "relay-login" in cmd
-        assert "clouddev-user.android.xiaomi.com" in cmd
+        assert "dev.example.com" in cmd
         assert "base64 -d" in cmd
         assert "codeagent-remote-exec" in cmd

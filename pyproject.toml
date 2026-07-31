@@ -5,13 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "codeagent"
 version = "0.1.0"
-description = "Multi-host code agent orchestration with SSH, session persistence, and routing"
+description = "Multi-host code agent orchestration with SSH, session persistence, routing, and mailbox IPC"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
 codeagent = "codeagent.cli:main"
 codeagent-remote-exec = "codeagent.remote_exec:main"
+mailbox = "codeagent.mailbox.cli:main"
+mailbox-hook = "codeagent.mailbox.hook:main"
+mailbox-health = "codeagent.mailbox.health:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

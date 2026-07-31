@@ -18,7 +18,7 @@ from codeagent.wire.protocol import decode_request
 
 WIRE_VERSION = 1
 MAX_LINE_LENGTH = 1_048_576  # 1 MiB
-SUPPORTED_COMMANDS = {"run", "ping", "capabilities"}
+SUPPORTED_COMMANDS = {"run", "ping", "capabilities", "mailbox"}
 
 
 def _read_request() -> dict | None:
@@ -114,6 +114,39 @@ def _handle_run(req: dict) -> None:
     })
 
 
+def _handle_mailbox(req: dict) -> None:
+    """Execute mailbox subcommand locally on the remote host."""
+    import io
+    args = req.get("args", [])
+    if not isinstance(args, list):
+        _send({"type": "error", "message": "mailbox 'args' must be a list"})
+        return
+
+    # Capture stdout/stderr from mailbox CLI
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    try:
+        sys.stdout = buf_out
+        sys.stderr = buf_err
+        from codeagent.mailbox.cli import main as mailbox_main
+        mailbox_main(args)
+        exit_code = 0
+    except SystemExit as e:
+        exit_code = e.code or 0
+    except Exception as e:
+        buf_err.write(f"error: {e}\n")
+        exit_code = 1
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+
+    _send({
+        "type": "mailbox_result",
+        "stdout": buf_out.getvalue(),
+        "stderr": buf_err.getvalue(),
+        "exit_code": exit_code,
+    })
+
+
 def main() -> None:
     """Main loop — read requests from stdin, write responses to stdout."""
     # Send ready signal
@@ -140,6 +173,8 @@ def main() -> None:
             _handle_capabilities(req)
         elif cmd == "run":
             _handle_run(req)
+        elif cmd == "mailbox":
+            _handle_mailbox(req)
         else:
             _send({"type": "error", "message": f"unknown command: {cmd}"})
 
