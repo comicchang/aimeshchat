@@ -70,6 +70,7 @@ class LocalTransport(Transport):
             skills=request.skills,
             session_id=session_id,
             skip_permissions=request.skip_permissions,
+            timeout=request.timeout,
         )
         return _run_wire(
             ["codeagent-remote-exec"],

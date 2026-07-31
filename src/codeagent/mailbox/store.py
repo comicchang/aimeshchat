@@ -100,6 +100,16 @@ class MailboxStore:
 
         return f"session {session_id} created: manager={manager_id}, agents={meta['agents']}"
 
+    def read_session(self, session_id: str) -> Optional[dict]:
+        """Read session.json metadata."""
+        session_file = self.session_dir(session_id) / "session.json"
+        try:
+            if not session_file.exists():
+                return None
+            return json.loads(session_file.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return None
+
     # ── Send ───────────────────────────────────────────────────────────
 
     def send(
@@ -110,6 +120,16 @@ class MailboxStore:
         sd = self.session_dir(session_id)
         if not sd.exists():
             raise ValueError(f"session not found: {session_id}")
+
+        # Validate sender and recipient are in roster
+        meta = self.read_session(session_id)
+        if meta:
+            roster = {meta.get("manager", "")} | set(meta.get("agents", []))
+            if from_id not in roster:
+                raise ValueError(f"sender not in roster: {from_id}")
+            if to_id not in roster:
+                raise ValueError(f"recipient not in roster: {to_id}")
+
         inbox = self.agent_subdir(session_id, to_id, "inbox")
         if not inbox.exists():
             raise ValueError(f"agent not in session: {to_id}")
@@ -193,23 +213,31 @@ class MailboxStore:
 
             processing.mkdir(parents=True, exist_ok=True)
             dest = processing / target.name
+            # Unique tmp claim to avoid concurrent collision
+            import random as _rand
+            nonce = _rand.randint(1000, 9999)
             claim_file = processing / f".claim-{target.stem}-{owner}.json"
-            tmp_claim = processing / f".tmp-claim-{target.stem}-{owner}.json"
+            tmp_claim = processing / f".tmp-claim-{target.stem}-{owner}-{nonce}.json"
 
             claim_meta = {
                 "owner": owner,
                 "claimed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "msg_id": target.stem,
             }
-            with open(tmp_claim, "w") as fc:
-                fc.write(json.dumps(claim_meta))
-                fc.flush()
-                os.fsync(fc.fileno())
-            os.replace(str(tmp_claim), str(claim_file))
+            try:
+                with open(tmp_claim, "x") as fc:  # O_EXCL: fail if exists
+                    fc.write(json.dumps(claim_meta))
+                    fc.flush()
+                    os.fsync(fc.fileno())
+            except FileExistsError:
+                tmp_claim.unlink(missing_ok=True)
+                continue
 
             try:
+                os.replace(str(tmp_claim), str(claim_file))
                 os.replace(str(target), str(dest))
             except OSError:
+                tmp_claim.unlink(missing_ok=True)
                 claim_file.unlink(missing_ok=True)
                 continue
 
@@ -328,22 +356,22 @@ class MailboxStore:
 
     def read_status(self, session_id: str, agent_id: str) -> Optional[StatusSnapshot]:
         status_file = self.agent_dir(session_id, agent_id) / "status.json"
-        if not status_file.exists():
-            return None
         try:
+            if not status_file.exists():
+                return None
             d = json.loads(status_file.read_bytes())
-            # Validate required fields
-            if not isinstance(d, dict):
-                return None
+            # Strict validation: exactly 5 required keys, all strings
             required = {"session_id", "state", "current_task", "last_conclusion", "updated_at"}
-            if not required.issubset(d.keys()):
+            if not isinstance(d, dict) or set(d.keys()) != required:
                 return None
-            if d.get("session_id") != session_id:
+            if not all(isinstance(d[k], str) for k in required):
                 return None
-            if d.get("state") not in VALID_STATES:
+            if d["state"] not in VALID_STATES:
+                return None
+            if d["session_id"] != session_id:
                 return None
             return StatusSnapshot.from_dict(d)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return None
 
     # ── Stats / Clear ──────────────────────────────────────────────────
@@ -353,17 +381,28 @@ class MailboxStore:
         return {d: len(self.list_messages(ad / d)) for d in ("inbox", "processing", "archive", "_corrupt")}
 
     def clear(self, session_id: str, agent_id: str, *, prune_stale: bool = False) -> str:
+        """Clear archive only. Use purge() for _corrupt."""
         ad = self.agent_dir(session_id, agent_id)
         total = 0
-        for sub in ("archive", "_corrupt"):
-            d = ad / sub
-            if d.exists():
-                for f in d.glob("*.json"):
-                    f.unlink()
-                    total += 1
+        d = ad / "archive"
+        if d.exists():
+            for f in d.glob("*.json"):
+                f.unlink()
+                total += 1
         if prune_stale:
             self.recover_stale(session_id, agent_id)
         return f"cleared {total}"
+
+    def purge(self, session_id: str, agent_id: str) -> str:
+        """Purge _corrupt (destructive — audit files are lost)."""
+        ad = self.agent_dir(session_id, agent_id)
+        total = 0
+        d = ad / "_corrupt"
+        if d.exists():
+            for f in d.glob("*.json"):
+                f.unlink()
+                total += 1
+        return f"purged {total}"
 
     # ── Check (legacy) ─────────────────────────────────────────────────
 

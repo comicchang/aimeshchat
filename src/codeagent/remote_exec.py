@@ -176,8 +176,8 @@ def main() -> None:
             continue
         version = req.get("wire_version", 0)
 
-        if version > WIRE_VERSION:
-            _send({"type": "error", "message": f"wire_version {version} > supported {WIRE_VERSION}"})
+        if version != WIRE_VERSION:
+            _send({"type": "error", "message": f"wire_version {version} != required {WIRE_VERSION}"})
             continue
 
         if cmd == "ping":

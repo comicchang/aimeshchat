@@ -95,7 +95,7 @@ mailbox send \
 
 - **Fresh Worker**：没有既有 session context，直接执行下方四步 INIT 握手。
 - **Restored Worker (`omp -c`)**：RESET prompt 必须先于正式 INIT TASK。先发送：`tmux send-keys -t <target> -l -- "RESET: forget ALL prior flat mailbox paths, dotai wrappers, relay/outbox/IPC logic, workers.toml assumptions, and mailbox-v2-* names. Re-read skill://tmux-agent-worker and skill://tmux-agent-manager. Use only standalone mailbox and session-based paths. Verify with ls .mailbox/<session-id>/<worker-id>/inbox/"`，再发送回车；远程没有本地 tmux 时经可用 runner 发送同一 prompt。收到确认或按可见 inbox 验证后，才执行正式 INIT send。
-- **Already-idle Worker**：若目标 `.mailbox/<session-id>/<worker-id>/status.json` 已存在且 `state=IDLE`，新的 INIT 是 **NO-OP**；不要重新发送/消费 INIT、不要要求重读 skill 或重写 IDLE，只执行 `mailbox peek --session <session-id> --agent <worker-id> [--json]`，并等待新的 TASK。
+- **Already-idle Worker**：若目标 `.mailbox/<session-id>/<worker-id>/status.json` 已存在且 `state=IDLE`，新的 INIT 是 **NO-OP**；不要重新发送/消费 INIT、不要要求重读 skill 或重写 IDLE，只执行 `mailbox peek --session <session-id> --agent <worker-id>`，并等待新的 TASK。
 
 
 1. **写入正式 INIT（a）**：Manager 用上面的 `mailbox send` 将 `kind=TASK`、`subject=INIT` 写入目标 Worker inbox；body 必须包含该 Worker 的实际 `session_id`、`worker_id`、role profile、artifact root 和兼容握手要求。

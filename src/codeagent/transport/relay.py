@@ -78,7 +78,7 @@ class RelayTransport(Transport):
         """Execute via relay-login with base64-encoded wire request."""
         # Build wire request
         wire_req = {
-            "wire_version": 1,
+            "wire_version": WIRE_VERSION,
             "command": "run",
             "task": request.task,
             "workdir": workdir,

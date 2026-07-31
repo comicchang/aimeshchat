@@ -119,7 +119,7 @@ class TestStore:
 
     def test_send_to_nonexistent(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        with pytest.raises(ValueError, match="not in session"):
+        with pytest.raises(ValueError, match="recipient not in roster"):
             store.send("s1", "mgr", "ghost", "s", "b")
 
     def test_send_empty_subject(self, store):

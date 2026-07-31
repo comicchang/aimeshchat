@@ -410,6 +410,12 @@ def _run_ssh_mailbox(
             continue
 
         if msg.type == MSG_READY:
+            remote_ver = msg.payload.get("wire_version", 0)
+            if remote_ver != WIRE_VERSION:
+                raise TransportError(
+                    f"wire version mismatch: remote={remote_ver}, local={WIRE_VERSION}. "
+                    f"Update codeagent-py on the remote host."
+                )
             continue
         if msg.type == MSG_MAILBOX_RESULT:
             result_stdout = msg.payload.get("stdout", "")

@@ -121,7 +121,7 @@ mailbox status --session <id> --agent <id> \
   --last-conclusion "previous task complete"
 ```
 
-文件固定五字段：`state`、`current_task`、`last_conclusion`、`updated_at`（`session_id` 由路径隐含）。state 仅允许 `IDLE/BUSY/DONE/BLOCKED`。Worker 在 TASK 开始写 BUSY，在 final REPORT 后写 DONE/BLOCKED。Manager 与 peer 只读，不修改。
+文件固定五字段：`session_id`、`state`、`current_task`、`last_conclusion`、`updated_at`。state 仅允许 `IDLE/BUSY/DONE/BLOCKED`。Worker 在 TASK 开始写 BUSY，在 final REPORT 后写 DONE/BLOCKED。Manager 与 peer 只读，不修改。
 
 Manager 监控循环：
 
