@@ -380,6 +380,27 @@ class DeliveryEngine:
             raise ValueError(f"no transport for host '{host.name}'")
 
         args = self._build_mailbox_args(envelope)
+        # Ensure the remote host has the session (sessions are per-host;
+        # two machines never share a mailbox filesystem). Idempotent:
+        # remote session-init errors on already-exists are ignored.
+        try:
+            init_args = [
+                "session-init",
+                "--session", envelope.get("session_id", ""),
+                "--manager", envelope.get("from", ""),
+                "--agents", envelope.get("to", ""),
+            ]
+            init_code, init_out, init_err = transport.mailbox(host, init_args)
+            if init_code != 0 and "already exists" not in (init_err or init_out or ""):
+                raise RuntimeError(
+                    f"remote session-init failed (exit {init_code}): {init_err or init_out}"
+                )
+        except Exception as exc:
+            if "already exists" in str(exc):
+                pass
+            else:
+                raise
+
         exit_code, stdout, stderr = transport.mailbox(host, args)
         if exit_code != 0:
             raise RuntimeError(

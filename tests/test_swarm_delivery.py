@@ -139,6 +139,9 @@ class TestDurableOutbox:
         call_count = {"n": 0}
 
         def mock_mailbox(host, args, **kw):
+            # _remote_send 先做幂等 session-init（同一次远程调用），不计入 send 次数
+            if "session-init" in args:
+                return 0, "session exists", ""
             call_count["n"] += 1
             return 0, "sent", ""
 
@@ -279,6 +282,9 @@ class TestTransportFailure:
         call_count = {"n": 0}
 
         def mock_mailbox(host, args, **kw):
+            # _remote_send 先做幂等 session-init（同一次远程调用），不计入 send 次数
+            if "session-init" in args:
+                return 0, "session exists", ""
             call_count["n"] += 1
             if call_count["n"] == 1:
                 raise RuntimeError("connection refused")
@@ -353,6 +359,9 @@ class TestIdempotency:
         mock_router = MagicMock()
         mock_transport = MagicMock()
         def counting_mailbox(host, args, **kw):
+            # _remote_send 先做幂等 session-init（同一次远程调用），不计入 send 次数
+            if "session-init" in args:
+                return 0, "session exists", ""
             call_count["n"] += 1
             return 0, "sent", ""
         mock_transport.mailbox = counting_mailbox
@@ -563,7 +572,7 @@ class TestStreamRouting:
 
         receipt = engine.deliver("s1", relay_host, envelope)
         assert receipt.status == "delivered"
-        mock_transport.mailbox.assert_called_once()
+        assert mock_transport.mailbox.call_count == 2  # session-init + send
         mock_router.get.assert_called_once_with(relay_host)
 
 
@@ -583,6 +592,9 @@ class TestNoFanout:
         mock_router = MagicMock()
         mock_transport = MagicMock()
         def counting_mailbox(host, args, **kw):
+            # _remote_send 先做幂等 session-init（同一次远程调用），不计入 send 次数
+            if "session-init" in args:
+                return 0, "session exists", ""
             call_count["n"] += 1
             return 0, "sent", ""
         mock_transport.mailbox = counting_mailbox
@@ -636,7 +648,7 @@ class TestEdgeCases:
 
             receipt = engine.deliver("s1", host_a, envelope)
             assert receipt.status == "delivered"
-            mock_ssh.mailbox.assert_called_once()
+            assert mock_ssh.mailbox.call_count == 2  # session-init + send
 
     def test_no_host_alias_skips_transport(
         self, store: MailboxStore, outbox_root: Path,
@@ -834,6 +846,9 @@ class TestE2ECrossHostDeliveryChain:
 
         def fake_mailbox(host, args, **kw):
             """Simulate remote transport: write to remote-w's inbox in the store."""
+            # _remote_send 先做幂等 session-init（同一次远程调用），不计入 send 次数
+            if "session-init" in args:
+                return 0, "session exists", ""
             call_count["n"] += 1
             for i, a in enumerate(args):
                 if a == "--body" and i + 1 < len(args):
@@ -896,7 +911,7 @@ class TestE2ECrossHostDeliveryChain:
 
         # ── 5. Assert: transport.mailbox called exactly once ───────────
         assert call_count["n"] == 1, "transport.mailbox must be called once (no fanout)"
-        mock_transport.mailbox.assert_called_once()
+        assert mock_transport.mailbox.call_count == 2  # session-init + send
 
         # ── 6. Assert: remote inbox has the message ────────────────────
         remote_inbox = store.agent_subdir("s1", "remote-w", "inbox")

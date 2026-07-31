@@ -151,6 +151,12 @@ class SwarmKernel:
                             channel_id=cdata.get("channel_id", cid),
                             members=list(cdata.get("members", [])),
                         )
+                    for aid, rdata in (meta.get("routing") or {}).items():
+                        self._routing[(sid, aid)] = AgentLocation(
+                            agent_id=rdata.get("agent_id", aid),
+                            host_alias=rdata.get("host_alias", ""),
+                            backend=rdata.get("backend", "cli"),
+                        )
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                     chans = {}
 
@@ -248,12 +254,15 @@ class SwarmKernel:
                  token: str = "") -> Registration:
         """Register an agent's location in the routing table.
 
-        The agent must be in the session's roster.
+        The agent must be in the session's roster.  The mapping is
+        persisted to swarm-meta.json so later CLI processes (one per
+        subcommand) resolve the host for cross-host delivery.
         """
         session = self._require_session(session_id)
         if location.agent_id not in session.roster:
             raise ValueError(f"agent not in roster: {location.agent_id}")
         self._routing[(session_id, location.agent_id)] = location
+        self._persist_routing(session_id)
         return Registration(
             agent_id=location.agent_id,
             session_id=session_id,
@@ -264,6 +273,34 @@ class SwarmKernel:
         """Remove an agent from the routing table."""
         self._require_session(session_id)
         self._routing.pop((session_id, agent_id), None)
+        self._persist_routing(session_id)
+
+    def _persist_routing(self, session_id: str) -> None:
+        """Persist the routing table into swarm-meta.json."""
+        try:
+            meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
+            meta = {}
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                pass
+            routing = {}
+            for (sid, aid), loc in self._routing.items():
+                if sid == session_id:
+                    routing[aid] = {
+                        "agent_id": loc.agent_id,
+                        "host_alias": loc.host_alias,
+                        "backend": loc.backend,
+                    }
+            meta["routing"] = routing
+            tmp = meta_path.parent / ".tmp-swarm-meta.json"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(meta_path))
+        except OSError:
+            pass
 
     # ── Channel management ─────────────────────────────────────────────
 

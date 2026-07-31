@@ -86,6 +86,20 @@ class TestCreateSession:
         receipt = k2.channel("s1", "mgr", "dev", _env())
         assert receipt.status == "delivered"
 
+    def test_second_kernel_restores_routing_from_disk(self, store):
+        """回归：register 的 host 映射跨进程持久化。
+        否则新 kernel 的 get_location 为空，DeliveryEngine 的
+        _resolve_agent_to_host 返回 None → 跨主机消息被误投本机。"""
+        k1 = SwarmKernel(store=store)
+        k1.create_session("s1", "mgr", ["w1"])
+        k1.register(AgentLocation("w1", "192.168.234.18", "cli"), "s1")
+
+        k2 = SwarmKernel(store=store)
+        loc = k2.get_location("s1", "w1")
+        assert loc is not None
+        assert loc.host_alias == "192.168.234.18"
+        assert loc.backend == "cli"
+
     def test_manager_always_in_roster(self, kernel):
         s = kernel.create_session("s1", "mgr", ["w1"])
         assert "mgr" in s.roster
