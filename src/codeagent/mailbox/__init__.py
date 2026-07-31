@@ -5,7 +5,9 @@ Modules:
     store:    Filesystem I/O (MailboxStore)
 """
 from codeagent.mailbox.protocol import (
+    BROADCAST_TO,
     AgentState,
+    AttachmentRef,
     Message,
     MessageKind,
     StatusSnapshot,
@@ -16,6 +18,8 @@ from codeagent.mailbox.store import MailboxStore, resolve_root
 
 __all__ = [
     "AgentState",
+    "AttachmentRef",
+    "BROADCAST_TO",
     "MailboxStore",
     "Message",
     "MessageKind",

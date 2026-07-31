@@ -10,10 +10,13 @@ from typing import Optional
 
 from codeagent.constants import LEASE_TIMEOUT_S, MAX_MAILBOX_BODY
 from codeagent.mailbox.protocol import (
+    BROADCAST_TO,
     VALID_KINDS,
     VALID_STATES,
+    AttachmentRef,
     Message,
     StatusSnapshot,
+    attachment_error,
     validate_agent_id,
     validate_message,
 )
@@ -116,31 +119,62 @@ class MailboxStore:
         self, session_id: str, from_id: str, to_id: str,
         subject: str, body: str, kind: str = "REPORT",
         reply_to: str = "", run_id: str = "", request_id: str = "",
+        attachments: Optional[list] = None,
     ) -> str:
+        """Deliver a message. ``to_id == "*"`` broadcasts to every roster
+        member except the sender (same msg_id, one envelope per inbox).
+        Every recipient is validated before any file is written, and a
+        single canonical history record is appended on success.
+        """
         sd = self.session_dir(session_id)
         if not sd.exists():
             raise ValueError(f"session not found: {session_id}")
 
-        # Validate sender and recipient are in roster
+        # Validate sender is in roster
         meta = self.read_session(session_id)
         if meta is None:
             raise ValueError(f"session metadata not found or corrupt: {session_id}")
         roster = {meta.get("manager", "")} | set(meta.get("agents", []))
         if from_id not in roster:
             raise ValueError(f"sender not in roster: {from_id}")
-        if to_id not in roster:
-            raise ValueError(f"recipient not in roster: {to_id}")
 
-        inbox = self.agent_subdir(session_id, to_id, "inbox")
-        if not inbox.exists():
-            raise ValueError(f"agent not in session: {to_id}")
+        # Validate attachment refs (independent of recipients)
+        refs: list[AttachmentRef] = []
+        if attachments is not None:
+            if not isinstance(attachments, list):
+                raise ValueError("attachments must be a list")
+            for att in attachments:
+                ad = att.to_dict() if isinstance(att, AttachmentRef) else att
+                if not isinstance(ad, dict):
+                    raise ValueError("invalid attachment: must be AttachmentRef or dict")
+                err = attachment_error(ad)
+                if err is not None:
+                    raise ValueError(f"invalid attachment: {err}")
+                refs.append(AttachmentRef.from_dict(ad))
+
+        # Resolve recipients; validate ALL of them before writing anything
+        if to_id == BROADCAST_TO:
+            is_broadcast = True
+            recipients = sorted(roster - {from_id})
+        else:
+            is_broadcast = False
+            recipients = [to_id]
+            if to_id not in roster:
+                raise ValueError(f"recipient not in roster: {to_id}")
+        for rid in recipients:
+            if not self.agent_subdir(session_id, rid, "inbox").exists():
+                raise ValueError(f"agent not in session: {rid}")
+
         if kind not in VALID_KINDS:
             raise ValueError(f"invalid kind: {kind}")
         if isinstance(body, str) and len(body.encode("utf-8")) > MAX_MAILBOX_BODY:
             raise ValueError(f"body exceeds {MAX_MAILBOX_BODY}-byte limit")
 
         msg_id = gen_msg_id(from_id)
-        while (inbox / f"{msg_id}.json").exists():
+        while any(
+            (self.agent_subdir(session_id, rid, "inbox") / f"{msg_id}.json").exists()
+            for rid in recipients
+        ):
             msg_id = gen_msg_id(from_id)
 
         msg = Message(
@@ -148,20 +182,116 @@ class MailboxStore:
             subject=subject, body=body, kind=kind, msg_id=msg_id,
             created_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             reply_to=reply_to, run_id=run_id, request_id=request_id,
+            attachments=refs,
         )
 
         ok, reason = validate_message(msg.to_dict(), session_id)
         if not ok:
             raise ValueError(f"send validation failed: {reason}")
 
-        dest = inbox / f"{msg_id}.json"
-        tmp = inbox / f".tmp-{msg_id}.json"
-        with open(tmp, "w") as f:
-            f.write(json.dumps(msg.to_dict(), indent=2, ensure_ascii=False))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(str(tmp), str(dest))
+        # All recipients validated — now write every envelope, then history
+        payload = msg.to_dict()
+        for rid in recipients:
+            inbox = self.agent_subdir(session_id, rid, "inbox")
+            dest = inbox / f"{msg_id}.json"
+            tmp = inbox / f".tmp-{msg_id}.json"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(payload, indent=2, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(dest))
+
+        self.append_history(session_id, payload)
+
+        if is_broadcast:
+            return f"broadcast → {len(recipients)} recipients"
         return f"sent → {to_id}/inbox/{msg_id}.json"
+
+    # ── Canonical history (append-only, shared across the session) ────
+
+    def history_dir(self, session_id: str) -> Path:
+        return self.session_dir(session_id) / "history"
+
+    def append_history(self, session_id: str, message: dict) -> str:
+        """Append one canonical history record.
+
+        Append-only: one file per msg_id, written via O_EXCL tmp + atomic
+        rename so a duplicate msg_id can never overwrite an existing record.
+        Independent of per-recipient archives — a broadcast appends exactly
+        one record for the whole swarm.
+        """
+        sd = self.session_dir(session_id)
+        if not sd.exists():
+            raise ValueError(f"session not found: {session_id}")
+        if not isinstance(message, dict):
+            raise ValueError("history message must be a dict")
+        ok, reason = validate_message(message, session_id)
+        if not ok:
+            raise ValueError(f"history validation failed: {reason}")
+        self._validate_msg_id(message["msg_id"])
+
+        hd = sd / "history"
+        hd.mkdir(parents=True, exist_ok=True)
+        dest = hd / f"{message['msg_id']}.json"
+        if dest.exists():
+            raise ValueError(f"history entry already exists: {message['msg_id']}")
+        tmp = hd / f".tmp-{message['msg_id']}.json"
+        try:
+            with open(tmp, "x") as f:  # O_EXCL: concurrent duplicate appends fail
+                f.write(json.dumps(message, indent=2, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+        except FileExistsError:
+            raise ValueError(f"history entry already exists: {message['msg_id']}")
+        os.replace(str(tmp), str(dest))
+        return f"history: {message['msg_id']}"
+
+    def read_history(
+        self, session_id: str,
+        since: Optional[str] = None,
+        before: Optional[str] = None,
+        limit: Optional[int] = None,
+        from_id: Optional[str] = None,
+        kind: Optional[str] = None,
+    ) -> list[dict]:
+        """Read canonical history, newest first.
+
+        Filters (all optional, combined with AND):
+          since  — only messages with created_at >= since
+          before — only messages with created_at < before
+          limit  — cap the number of returned records
+          from   — only messages from this sender
+          kind   — only messages of this kind
+        """
+        if kind is not None and kind not in VALID_KINDS:
+            raise ValueError(f"invalid kind: {kind}")
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be non-negative")
+
+        files = self.list_messages(self.history_dir(session_id))
+        out = []
+        for f in files:
+            try:
+                msg = json.loads(f.read_bytes())
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                continue
+            ok, reason = validate_message(msg, session_id, filename=f.name)
+            if not ok:
+                continue  # skip corrupt/foreign entries; history is append-only
+            if since is not None and msg["created_at"] < since:
+                continue
+            if before is not None and msg["created_at"] >= before:
+                continue
+            if from_id is not None and msg["from"] != from_id:
+                continue
+            if kind is not None and msg["kind"] != kind:
+                continue
+            out.append(msg)
+
+        out.sort(key=lambda m: (m["created_at"], m["msg_id"]), reverse=True)
+        if limit is not None:
+            out = out[:limit]
+        return out
 
     # ── Peek ───────────────────────────────────────────────────────────
 

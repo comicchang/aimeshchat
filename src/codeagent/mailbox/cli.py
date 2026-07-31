@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("send")
     s.add_argument("--session", required=True)
     s.add_argument("--from", required=True, dest="from_worker")
-    s.add_argument("--to", required=True)
+    s.add_argument("--to", required=True, help="recipient agent ID, or '*' to broadcast to all except the sender")
     s.add_argument("--subject", required=True)
     s.add_argument("--body", required=True)
     s.add_argument("--kind", default="REPORT", choices=sorted(VALID_KINDS))
@@ -87,6 +87,16 @@ def main(argv: list[str] | None = None) -> None:
     ss.add_argument("--session", required=True)
     ss.add_argument("--agent", required=True)
 
+    # history
+    hs = sub.add_parser("history", help="read canonical session history (newest first)")
+    hs.add_argument("--session", required=True)
+    hs.add_argument("--since", default=None, help="only messages with created_at >= this timestamp (ISO-8601)")
+    hs.add_argument("--before", default=None, help="only messages with created_at < this timestamp (ISO-8601)")
+    hs.add_argument("--limit", type=int, default=None)
+    hs.add_argument("--from", default=None, dest="from_worker", help="only messages from this sender")
+    hs.add_argument("--kind", default=None, choices=sorted(VALID_KINDS))
+    hs.add_argument("--json", action="store_true", help="output full JSON array")
+
     # check (legacy)
     ck = sub.add_parser("check")
     ck.add_argument("--session", required=True)
@@ -135,6 +145,20 @@ def main(argv: list[str] | None = None) -> None:
         elif args.cmd == "stats":
             for d, c in store.stats(args.session, args.agent).items():
                 print(f"{d}: {c}")
+        elif args.cmd == "history":
+            msgs = store.read_history(
+                args.session,
+                since=args.since, before=args.before, limit=args.limit,
+                from_id=args.from_worker, kind=args.kind,
+            )
+            if args.json:
+                json.dump(msgs, sys.stdout, ensure_ascii=False)
+            else:
+                for msg in msgs:
+                    print(f"FROM: {msg['from']}  KIND: {msg.get('kind', '?')}")
+                    print(f"SUBJECT: {msg['subject']}")
+                    print(f"BODY: {msg['body']}")
+                    print("---")
         elif args.cmd == "check":
             results = store.check(args.session, args.agent, args.max_messages)
             for msg in results:

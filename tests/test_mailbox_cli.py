@@ -72,6 +72,38 @@ class TestMailboxCli:
         assert "FROM: mgr" in out
         assert "SUBJECT: s" in out
 
+    def test_send_broadcast(self, store, capsys):
+        _run_cli(["session-init", "--session", "s1", "--manager", "mgr", "--agents", "w1,w2"], store, capsys)
+        capsys.readouterr()
+        _run_cli(
+            ["send", "--session", "s1", "--from", "mgr", "--to", "*",
+             "--subject", "hello", "--body", "world", "--kind", "NOTICE"],
+            store, capsys,
+        )
+        assert "broadcast → 2 recipients" in capsys.readouterr().out
+        for agent in ("w1", "w2"):
+            _run_cli(["peek", "--session", "s1", "--agent", agent], store, capsys)
+            peek = json.loads(capsys.readouterr().out)
+            assert peek["pending"] == 1
+            assert peek["messages"][0]["subject"] == "hello"
+
+    def test_history_cli(self, store, capsys):
+        _run_cli(["session-init", "--session", "s1", "--manager", "mgr", "--agents", "w1"], store, capsys)
+        capsys.readouterr()
+        _run_cli(
+            ["send", "--session", "s1", "--from", "mgr", "--to", "w1",
+             "--subject", "s", "--body", "b", "--kind", "TASK"],
+            store, capsys,
+        )
+        capsys.readouterr()
+        _run_cli(["history", "--session", "s1"], store, capsys)
+        out = capsys.readouterr().out
+        assert "SUBJECT: s" in out
+        _run_cli(["history", "--session", "s1", "--json", "--kind", "TASK"], store, capsys)
+        msgs = json.loads(capsys.readouterr().out)
+        assert len(msgs) == 1
+        assert msgs[0]["subject"] == "s"
+
     def test_release(self, store, capsys):
         _run_cli(["session-init", "--session", "s1", "--manager", "mgr", "--agents", "w1"], store, capsys)
         capsys.readouterr()

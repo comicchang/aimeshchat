@@ -250,6 +250,9 @@ codeagent mailbox session-init --session s1 --manager mgr --agents w1,w2
 # Send message
 codeagent mailbox send --session s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "..."
 
+# Broadcast to every roster member except the sender
+codeagent mailbox send --session s1 --from mgr --to '*' --kind NOTICE --subject "standby" --body "..."
+
 # Peek inbox
 codeagent mailbox peek --session s1 --agent w1
 
@@ -261,6 +264,17 @@ codeagent mailbox finalize --session s1 --agent w1 --msg-id <id> --owner w1
 
 # Status update
 codeagent mailbox status --session s1 --agent w1 --state BUSY --current-task "working"
+
+# Canonical history (newest first; filters: --since/--before/--limit/--from/--kind)
+codeagent mailbox history --session s1 --json --kind TASK --limit 10
+```
+
+Sends land in the recipient's per-agent archive on finalize; the canonical
+history (`<mailbox>/<session>/history/<msg_id>.json`) is an append-only,
+session-wide log independent of per-recipient archives — a broadcast appends
+exactly one record for the whole swarm. Messages may carry `attachments`
+(list of artifact references: artifact_id, source_host, remote_root,
+relative_path, size, sha256, media_type), validated on send.
 ```
 
 ### Cross-Host

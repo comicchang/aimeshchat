@@ -9,7 +9,13 @@ from unittest import mock
 import pytest
 
 from codeagent.constants import MAX_MAILBOX_BODY
-from codeagent.mailbox.protocol import Message, StatusSnapshot, validate_agent_id, validate_message
+from codeagent.mailbox.protocol import (
+    AttachmentRef,
+    Message,
+    StatusSnapshot,
+    validate_agent_id,
+    validate_message,
+)
 from codeagent.mailbox.store import MailboxStore
 
 
@@ -644,3 +650,243 @@ class TestConcurrentRead:
         # The message ended up in processing under its msg_id
         processing = store.agent_subdir("s1", "w1", "processing")
         assert (processing / f"{winners[0]['msg_id']}.json").exists()
+
+
+# ── TestBroadcast ────────────────────────────────────────────────────────
+
+
+class TestBroadcast:
+    def test_broadcast_normal(self, store):
+        store.session_init("s1", "mgr", ["w1", "w2", "w3"])
+        result = store.send("s1", "mgr", "*", "hi", "all", "NOTICE")
+        assert "broadcast → 3 recipients" in result
+        for aid in ("w1", "w2", "w3"):
+            peek = store.peek("s1", aid)
+            assert peek["pending"] == 1
+            assert peek["messages"][0]["subject"] == "hi"
+        # The sender does not receive a copy of its own broadcast
+        assert store.peek("s1", "mgr")["pending"] == 0
+
+    def test_broadcast_same_msg_id(self, store):
+        store.session_init("s1", "mgr", ["w1", "w2"])
+        store.send("s1", "mgr", "*", "hi", "all", "NOTICE")
+        msgs1 = store.list_messages(store.agent_subdir("s1", "w1", "inbox"))
+        msgs2 = store.list_messages(store.agent_subdir("s1", "w2", "inbox"))
+        assert len(msgs1) == len(msgs2) == 1
+        assert msgs1[0].stem == msgs2[0].stem
+
+    def test_broadcast_empty_roster(self, store):
+        store.session_init("s1", "mgr", [])
+        result = store.send("s1", "mgr", "*", "hi", "all", "NOTICE")
+        assert "broadcast → 0 recipients" in result
+
+    def test_broadcast_partial_failure_writes_nothing(self, store):
+        import shutil
+
+        store.session_init("s1", "mgr", ["w1", "w2"])
+        shutil.rmtree(store.agent_subdir("s1", "w2", "inbox"))
+        with pytest.raises(ValueError, match="agent not in session"):
+            store.send("s1", "mgr", "*", "hi", "all", "NOTICE")
+        # Every recipient is validated before anything is written
+        assert store.peek("s1", "w1")["pending"] == 0
+        assert store.read_history("s1") == []
+
+    def test_broadcast_from_worker(self, store):
+        store.session_init("s1", "mgr", ["w1", "w2"])
+        result = store.send("s1", "w1", "*", "hi", "all", "NOTICE")
+        assert "broadcast → 2 recipients" in result
+        assert store.peek("s1", "w1")["pending"] == 0  # sender excluded
+        assert store.peek("s1", "w2")["pending"] == 1
+        assert store.peek("s1", "mgr")["pending"] == 1
+
+    def test_broadcast_readable_by_recipients(self, store):
+        store.session_init("s1", "mgr", ["w1", "w2"])
+        store.send("s1", "mgr", "*", "hi", "all", "NOTICE")
+        msg = store.read("s1", "w2", "w2")
+        assert msg is not None
+        assert msg["to"] == "*"
+        assert msg["subject"] == "hi"
+
+
+# ── TestAttachments ──────────────────────────────────────────────────────
+
+
+class TestAttachments:
+    @staticmethod
+    def _ref(**over):
+        base = {
+            "artifact_id": "art-1", "source_host": "worker-1",
+            "remote_root": "/tmp/artifacts", "relative_path": "out/result.json",
+            "size": 42, "sha256": "a" * 64,
+        }
+        base.update(over)
+        return AttachmentRef(**base)
+
+    def test_send_with_attachments(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        refs = [
+            self._ref(),
+            AttachmentRef("art-2", "worker-1", "/tmp/a", "b/c.txt", 7, "b" * 64, "text/plain"),
+        ]
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", attachments=refs)
+        msg = store.read("s1", "w1", "w1")
+        atts = msg["attachments"]
+        assert len(atts) == 2
+        assert atts[0]["sha256"] == "a" * 64
+        assert atts[0]["media_type"] == "application/octet-stream"
+        assert atts[1]["relative_path"] == "b/c.txt"
+        assert atts[1]["media_type"] == "text/plain"
+
+    def test_broadcast_with_attachments(self, store):
+        store.session_init("s1", "mgr", ["w1", "w2"])
+        store.send("s1", "mgr", "*", "t", "b", "TASK", attachments=[self._ref()])
+        for aid in ("w1", "w2"):
+            msg = store.read("s1", aid, aid)
+            assert msg["attachments"][0]["artifact_id"] == "art-1"
+
+    def test_send_rejects_bad_sha256(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="sha256"):
+            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+                       attachments=[self._ref(sha256="xyz")])
+
+    def test_send_rejects_short_sha256(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="sha256"):
+            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+                       attachments=[self._ref(sha256="a" * 63)])
+
+    def test_send_rejects_negative_size(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="size"):
+            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+                       attachments=[self._ref(size=-1)])
+
+    def test_send_rejects_empty_artifact_id(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="artifact_id"):
+            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+                       attachments=[self._ref(artifact_id="")])
+
+    def test_send_rejects_path_traversal(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="relative_path"):
+            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+                       attachments=[self._ref(relative_path="../escape")])
+
+    def test_send_rejects_non_list(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="attachments must be a list"):
+            store.send("s1", "mgr", "w1", "t", "b", "TASK", attachments="nope")
+
+    def test_send_rejects_non_dict_item(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="attachment"):
+            store.send("s1", "mgr", "w1", "t", "b", "TASK", attachments=[42])
+
+    def test_attachment_ref_roundtrip(self):
+        r = self._ref()
+        assert AttachmentRef.from_dict(r.to_dict()) == r
+
+    def test_message_attachments_roundtrip(self):
+        m = Message("s1", "mgr", "w1", "s", "b", "TASK", "m1", "t1",
+                    attachments=[self._ref()])
+        m2 = Message.from_dict(m.to_dict())
+        assert m2.attachments == m.attachments
+
+    def test_validate_message_rejects_bad_attachments(self):
+        msg = {
+            "session_id": "s1", "from": "mgr", "to": "w1",
+            "subject": "hi", "body": "there", "kind": "TASK",
+            "msg_id": "mgr_123", "created_at": "2025-01-01T00:00:00Z",
+            "attachments": [{"artifact_id": "", "source_host": "h",
+                              "remote_root": "/r", "relative_path": "p",
+                              "size": 1, "sha256": "a" * 64}],
+        }
+        ok, reason = validate_message(msg)
+        assert not ok
+        assert "artifact_id" in reason
+
+    def test_validate_message_rejects_non_list_attachments(self):
+        msg = {
+            "session_id": "s1", "from": "mgr", "to": "w1",
+            "subject": "hi", "body": "there", "kind": "TASK",
+            "msg_id": "mgr_123", "created_at": "2025-01-01T00:00:00Z",
+            "attachments": "not-a-list",
+        }
+        ok, reason = validate_message(msg)
+        assert not ok
+        assert "attachments must be a list" in reason
+
+
+# ── TestHistory ──────────────────────────────────────────────────────────
+
+
+class TestHistory:
+    def test_send_appends_history(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        h = store.read_history("s1")
+        assert len(h) == 1
+        assert h[0]["subject"] == "t"
+        assert (store.history_dir("s1") / f"{h[0]['msg_id']}.json").exists()
+
+    def test_broadcast_single_history_entry(self, store):
+        store.session_init("s1", "mgr", ["w1", "w2", "w3"])
+        store.send("s1", "mgr", "*", "hi", "all", "NOTICE")
+        h = store.read_history("s1")
+        assert len(h) == 1
+        assert h[0]["to"] == "*"
+
+    def test_history_independent_of_archive(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        msg = store.read("s1", "w1", "w1")
+        store.finalize("s1", "w1", msg["msg_id"], "w1")
+        store.clear("s1", "w1")  # wipes the per-recipient archive only
+        assert store.read_history("s1")[0]["subject"] == "t"
+
+    def test_history_filters(self, store):
+        from datetime import datetime, timedelta, timezone
+
+        store.session_init("s1", "mgr", ["w1"])
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for i, kind in enumerate(["TASK", "PROGRESS", "TASK"]):
+            msg = Message("s1", "mgr", "w1", f"t{i}", "b", kind, f"m{i}",
+                          (base + timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            store.append_history("s1", msg.to_dict())
+        h = store.read_history("s1")
+        assert [m["subject"] for m in h] == ["t2", "t1", "t0"]  # newest first
+        assert [m["subject"] for m in store.read_history("s1", kind="TASK")] == ["t2", "t0"]
+        assert [m["subject"] for m in store.read_history("s1", since="2026-01-01T00:00:01Z")] == ["t2", "t1"]
+        assert [m["subject"] for m in store.read_history("s1", before="2026-01-01T00:00:01Z")] == ["t0"]
+        assert len(store.read_history("s1", from_id="mgr", limit=2)) == 2
+        assert store.read_history("s1", from_id="ghost") == []
+
+    def test_history_append_only(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        msg = Message("s1", "mgr", "w1", "t", "b", "TASK", "m1",
+                      "2026-01-01T00:00:00Z").to_dict()
+        store.append_history("s1", msg)
+        with pytest.raises(ValueError, match="already exists"):
+            store.append_history("s1", msg)
+
+    def test_history_session_not_found(self, store):
+        with pytest.raises(ValueError, match="session not found"):
+            store.append_history("nosuch", {"msg_id": "m1"})
+
+    def test_history_rejects_invalid_message(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="validation failed"):
+            store.append_history("s1", {"msg_id": "m1", "kind": "NOPE"})
+
+    def test_history_missing_dir_returns_empty(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        assert store.read_history("s1") == []
+
+    def test_history_skips_corrupt_entry(self, store):
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        hd = store.history_dir("s1")
+        (hd / "junk.json").write_text("{not json")
+        assert len(store.read_history("s1")) == 1
