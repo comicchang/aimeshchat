@@ -5,6 +5,7 @@ import argparse
 import dataclasses
 
 from codeagent import __version__
+from codeagent.domain import RepoMap
 import json
 import logging
 import os
@@ -477,6 +478,8 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
 
     if resolve_is_local(host_spec):
         from codeagent.mailbox.cli import main as mailbox_main
+        if mailbox_root:
+            mailbox_args = ["--mailbox-root", mailbox_root] + mailbox_args
         mailbox_main(mailbox_args)
         return 0
 

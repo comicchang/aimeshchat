@@ -31,6 +31,8 @@ from codeagent.wire.protocol import (
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
+    WIRE_VERSION,
+    decode_line,
 )
 
 log = logging.getLogger(__name__)
