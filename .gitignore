@@ -1,1 +1,10 @@
-__pycache__/\n*.pyc\n.venv/\n*.egg-info/\ndist/\nbuild/\n.pytest_cache/\n*.sqlite3\n*.lock\nuv.lock
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.sqlite3
+*.lock
+uv.lock
