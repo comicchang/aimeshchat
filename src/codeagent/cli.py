@@ -503,6 +503,7 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
         return 0
 
     # Remote via SSH — use wire protocol over stdin JSONL (same pattern as _run_ssh_wire)
+    from codeagent.constants import DEFAULT_MAILBOX_TIMEOUT
     from codeagent.transport.ssh import _run_ssh_mailbox
     from codeagent.wire.protocol import make_mailbox_request
 
@@ -516,7 +517,7 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
     )
     ssh_cmd = cm.ssh_cmd("codeagent-remote-exec")
 
-    exit_code, stdout, stderr = _run_ssh_mailbox(ssh_cmd, req, timeout=60)
+    exit_code, stdout, stderr = _run_ssh_mailbox(ssh_cmd, req, timeout=DEFAULT_MAILBOX_TIMEOUT)
     if stdout:
         print(stdout, end="")
     if stderr:

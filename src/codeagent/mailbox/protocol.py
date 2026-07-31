@@ -6,13 +6,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from codeagent.constants import LEASE_TIMEOUT_S
+
 # ── Constants ──────────────────────────────────────────────────────────
 
 VALID_KINDS = frozenset({"TASK", "REPORT", "PROGRESS", "EVIDENCE", "QUESTION", "RESPONSE", "NOTICE"})
 VALID_STATES = frozenset({"IDLE", "BUSY", "DONE", "BLOCKED"})
 REQUIRED_FIELDS = frozenset({"session_id", "from", "to", "subject", "body", "kind", "msg_id", "created_at"})
 OPTIONAL_FIELDS = frozenset({"reply_to", "run_id", "request_id"})
-LEASE_TIMEOUT_S = 300
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$")
 
 

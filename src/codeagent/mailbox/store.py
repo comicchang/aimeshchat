@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from codeagent.constants import LEASE_TIMEOUT_S
 from codeagent.mailbox.protocol import (
-    LEASE_TIMEOUT_S,
     VALID_KINDS,
     VALID_STATES,
     Message,

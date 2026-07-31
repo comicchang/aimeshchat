@@ -23,6 +23,7 @@ import sys
 import time
 from typing import Optional
 
+from codeagent.constants import DEFAULT_RELAY_TIMEOUT, MAX_LINE_LENGTH
 from codeagent.domain import HostSpec, RunRequest, RunResult
 from codeagent.transport.base import Transport, TransportError
 from codeagent.wire.protocol import (
@@ -37,8 +38,13 @@ from codeagent.wire.protocol import (
 
 log = logging.getLogger(__name__)
 
-_READY_TIMEOUT = 15
-_EXEC_TIMEOUT = 600
+# Hard cap on select-loop iterations — guards against a busy-loop that
+# never makes progress (infinite-loop protection).
+_MAX_PTY_ITERATIONS = 100_000
+
+# SIGTERM → SIGKILL grace period used when terminating the PTY child
+# after a timeout or parse abort (seconds).
+_TERM_GRACE_S = 5
 
 
 class RelayTransport(Transport):
@@ -111,14 +117,17 @@ class RelayTransport(Transport):
 
         return self._run_with_pty(argv, timeout=request.timeout)
 
-    def _run_with_pty(self, argv: list[str], timeout: int = _EXEC_TIMEOUT) -> RunResult:
+    def _run_with_pty(self, argv: list[str], timeout: int = DEFAULT_RELAY_TIMEOUT) -> RunResult:
         """Execute with PTY allocation for relay expect/QR code interaction.
 
         Adapted from code_route.py's _run_with_pty:
         - os.setsid() + TIOCSCTTY for controlling TTY
         - Bidirectional stdin↔PTY master forwarding (for QR/expect)
         - Wire JSON parsing with non-JSON forwarded to stderr
-        - os.killpg on timeout (kills entire process group)
+        - Bounded select loop: iteration cap + output buffer cap (no
+          infinite loops, no unbounded memory growth)
+        - Escalating termination on timeout: SIGTERM, brief wait, SIGKILL
+        - Parse state transition logging for diagnostics
         """
         stdout_chunks: list[str] = []
         stderr_chunks: list[str] = []
@@ -127,6 +136,32 @@ class RelayTransport(Transport):
         version_mismatch = False
         master_fd: Optional[int] = None
         slave_fd: Optional[int] = None
+        parse_state = "init"
+
+        def _set_state(new_state: str) -> None:
+            """Log parse-state transitions (diagnostics for PTY parsing)."""
+            nonlocal parse_state
+            if new_state != parse_state:
+                log.debug("relay pty parse state: %s -> %s", parse_state, new_state)
+                parse_state = new_state
+
+        def _terminate_group(grace: float = _TERM_GRACE_S) -> None:
+            """SIGTERM the child's process group, wait *grace* seconds, then
+            escalate to SIGKILL.  Bounded — never blocks indefinitely."""
+            for sig, wait_s in ((signal.SIGTERM, grace), (signal.SIGKILL, _TERM_GRACE_S)):
+                try:
+                    os.killpg(proc.pid, sig)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    proc.wait(timeout=wait_s)
+                    return
+                except subprocess.TimeoutExpired:
+                    continue
+            log.warning(
+                "relay pty process group %d did not exit after SIGTERM/SIGKILL",
+                proc.pid,
+            )
 
         try:
             master_fd, slave_fd = pty.openpty()
@@ -150,11 +185,18 @@ class RelayTransport(Transport):
                 close_fds=True,
                 preexec_fn=_preexec,
             )
-            os.close(slave_fd)
-            slave_fd = None
+            try:
+                os.close(slave_fd)
+            except OSError:
+                # Child owns the fd now — a failed close must not abort the run.
+                log.warning("relay pty: failed to close slave fd %d", slave_fd)
+            finally:
+                slave_fd = None
 
             deadline = time.time() + timeout
             buffer = ""
+            iterations = 0
+            abort_reason: Optional[str] = None
 
             # Get stdin fd for forwarding (QR/expect interaction)
             stdin_fd: Optional[int] = None
@@ -164,9 +206,39 @@ class RelayTransport(Transport):
             except (AttributeError, ValueError):
                 pass
 
+            _set_state("streaming")
             while time.time() < deadline:
+                # Infinite-loop guard: hard cap on select iterations.
+                if iterations >= _MAX_PTY_ITERATIONS:
+                    log.warning(
+                        "relay pty iteration cap (%d) reached after %d iterations",
+                        _MAX_PTY_ITERATIONS,
+                        iterations,
+                    )
+                    stderr_chunks.append(
+                        f"relay pty iteration cap reached after {iterations} iterations"
+                    )
+                    exit_code = -1
+                    abort_reason = "iteration-cap"
+                    _set_state("abort:iteration-cap")
+                    break
+                iterations += 1
+
                 remaining = deadline - time.time()
                 if remaining <= 0:
+                    break
+
+                # Memory guard: refuse to accumulate an unbounded buffer.
+                # Matches the wire protocol's own MAX_LINE_LENGTH limit.
+                if len(buffer) > MAX_LINE_LENGTH:
+                    log.warning(
+                        "relay pty output buffer exceeded %d bytes; aborting",
+                        MAX_LINE_LENGTH,
+                    )
+                    stderr_chunks.append("relay output buffer exceeded limit; aborting")
+                    exit_code = -1
+                    abort_reason = "buffer-overflow"
+                    _set_state("abort:buffer-overflow")
                     break
 
                 read_fds = [master_fd]
@@ -176,6 +248,9 @@ class RelayTransport(Transport):
                 try:
                     ready, _, _ = select.select(read_fds, [], [], min(remaining, 1.0))
                 except (ValueError, OSError):
+                    # Select failed — can no longer monitor the child.
+                    abort_reason = "select-error"
+                    _set_state("abort:select-error")
                     break
 
                 # Forward stdin → PTY master (for QR code / expect interaction)
@@ -186,21 +261,28 @@ class RelayTransport(Transport):
                             os.write(master_fd, chunk)
                         else:
                             stdin_fd = None  # stdin closed
+                            _set_state("stdin-closed")
                     except OSError:
                         stdin_fd = None
+                        _set_state("stdin-closed")
 
                 # Read PTY master output
                 if master_fd in ready:
                     try:
                         data = os.read(master_fd, 4096)
                     except OSError:
+                        abort_reason = "read-error"
+                        _set_state("abort:read-error")
                         break
 
                     if not data:
+                        # EOF on the PTY master — child closed its side.
+                        _set_state("eof")
                         break
 
                     text = data.decode("utf-8", errors="replace")
                     buffer += text
+                    _set_state("collecting")
 
                     # Process complete lines
                     while "\n" in buffer:
@@ -216,14 +298,17 @@ class RelayTransport(Transport):
                             payload = msg.payload
 
                             if msg_type == MSG_SESSION:
+                                _set_state("msg:session")
                                 session_id = payload.get("id")
                             elif msg_type == MSG_RESULT:
+                                _set_state("msg:result")
                                 if not version_mismatch:
                                     stdout_chunks.append(payload.get("stdout", ""))
                                     exit_code = payload.get("exit_code", 0)
                                 else:
                                     stderr_chunks.append("ignoring result after wire version mismatch")
                             elif msg_type == MSG_ERROR:
+                                _set_state("msg:error")
                                 stderr_chunks.append(payload.get("message", ""))
                                 exit_code = payload.get("exit_code", 1)
                             elif msg_type == MSG_READY:
@@ -235,29 +320,35 @@ class RelayTransport(Transport):
                                     )
                                     exit_code = 1
                                     version_mismatch = True
+                                _set_state("msg:ready")
                             elif msg_type == MSG_ACCEPTED:
+                                _set_state("msg:accepted")
                                 pass  # protocol handshake
                             else:
                                 # Non-wire output (relay UI, QR codes, etc.) → stderr
+                                _set_state("msg:other")
                                 stderr_chunks.append(line)
                         except (ValueError, AttributeError):
                             # Non-JSON output → likely relay UI → stderr
+                            _set_state("non-wire")
                             stderr_chunks.append(line)
 
-            # Timeout: kill entire process group
-            if time.time() >= deadline:
+            # ── post-loop termination ──────────────────────────────────
+            timed_out = time.time() >= deadline
+            if timed_out or abort_reason is not None:
+                if timed_out:
+                    stderr_chunks.append(f"timeout after {timeout}s")
+                    exit_code = -1
+                    _set_state("timeout")
+                # Escalating kill: SIGTERM → brief wait → SIGKILL.
+                _terminate_group()
+            else:
+                # Normal EOF — reap the child with a bounded wait.
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-                stderr_chunks.append(f"timeout after {timeout}s")
-                exit_code = -1
-
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
 
             # No wire result received — use process exit code or default to error
             if exit_code is None:

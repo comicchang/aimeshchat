@@ -11,6 +11,38 @@ from codeagent.domain import HostSpec, RepoEntry, RepoMap, TopicSpec
 
 
 # ---------------------------------------------------------------------------
+# Integration test gating
+# ---------------------------------------------------------------------------
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register the ``--run-integration`` flag."""
+    parser.addoption(
+        "--run-integration",
+        action="store_true",
+        default=False,
+        help="run integration tests (require a working localhost SSH setup)",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Mirror the flag into the environment for collection-time skips.
+
+    ``pytest.config`` was removed in pytest 7, so module-level
+    ``skipif`` markers cannot read CLI options at import time.  Mirroring
+    the option into an env var keeps ``tests/test_integration.py`` simple
+    and works on every pytest version.
+    """
+    os.environ["RUN_INTEGRATION"] = (
+        "1" if config.getoption("--run-integration", default=False) else "0"
+    )
+    config.addinivalue_line(
+        "markers",
+        "integration: integration tests gated on --run-integration",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Hosts
 # ---------------------------------------------------------------------------
 

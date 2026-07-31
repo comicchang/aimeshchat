@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from codeagent.constants import DEFAULT_EXEC_TIMEOUT
 from codeagent.domain import RunRequest, RunResult
 
 
@@ -16,7 +17,7 @@ class RunnerConfig:
     """Shared runner configuration."""
 
     binary: str = ""
-    timeout: int = 600
+    timeout: int = DEFAULT_EXEC_TIMEOUT
     output_dir: Optional[Path] = None
 
 

@@ -11,24 +11,33 @@ import os
 import sys
 
 from codeagent import __version__
+from codeagent.constants import DEFAULT_EXEC_TIMEOUT, MAX_LINE_LENGTH
 from codeagent.domain import RunRequest
 from codeagent.runners import GoWrapperRunner, OMPRunner
 from codeagent.runners.base import RunnerConfig
-from codeagent.wire.protocol import WIRE_VERSION, MAX_LINE_LENGTH, decode_request
+from codeagent.wire.protocol import WIRE_VERSION, decode_request
 
 SUPPORTED_COMMANDS = {"run", "ping", "capabilities", "mailbox"}
 
 
 def _read_request() -> dict | None:
-    """Read one JSON line from stdin, validate with decode_request."""
-    line = sys.stdin.readline()
-    if not line:
-        return None
-    try:
-        return decode_request(line)
-    except ValueError as e:
-        _send({"type": "error", "message": str(e)})
-        return None
+    """Read one JSON line from stdin, validate with decode_request.
+
+    Returns ``None`` only on end-of-input.  Malformed lines (bad JSON,
+    unknown commands, missing fields) produce an error response and are
+    skipped — one bad request must not kill the whole helper session.
+    """
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return None
+        if len(line) > MAX_LINE_LENGTH:
+            _send({"type": "error", "message": f"wire line exceeds {MAX_LINE_LENGTH} bytes"})
+            continue
+        try:
+            return decode_request(line)
+        except ValueError as e:
+            _send({"type": "error", "message": str(e)})
 
 
 def _send(obj: dict) -> None:
@@ -66,7 +75,7 @@ def _handle_run(req: dict) -> None:
     resume_session_id = req.get("resume_session_id")
     skip_permissions = req.get("skip_permissions", True)
     skills = req.get("skills")
-    timeout = req.get("timeout", 600)
+    timeout = req.get("timeout", DEFAULT_EXEC_TIMEOUT)
 
     _send({"type": "accepted", "wire_version": WIRE_VERSION})
 

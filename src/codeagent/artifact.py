@@ -15,13 +15,11 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from codeagent.constants import DEFAULT_PULL_TIMEOUT
 from codeagent.transport.base import TransportError
 from codeagent.transport.control_master import socket_path
 
 log = logging.getLogger(__name__)
-
-# ── how long to wait for an scp transfer (seconds) ────────────────────
-_PULL_TIMEOUT = 60
 
 
 @dataclass(frozen=True)
@@ -121,7 +119,7 @@ def pull_artifact(
     ]
 
     log.debug("artifact pull: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_PULL_TIMEOUT)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=DEFAULT_PULL_TIMEOUT)
 
     if proc.returncode != 0:
         raise TransportError(

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from codeagent.constants import DEFAULT_EXEC_TIMEOUT
+
 LOCAL_HOST_MARKER = "__local__"
 
 
@@ -95,7 +97,7 @@ class RunRequest:
     repo_index: int = 0
     host: Optional[str] = None
     raw: bool = False
-    timeout: int = 600
+    timeout: int = DEFAULT_EXEC_TIMEOUT
     resume_session_id: Optional[str] = None  # actual backend session ID for resume (passed by CLI from registry lookup)
 
 

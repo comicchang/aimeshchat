@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from codeagent.constants import DEFAULT_MAILBOX_TIMEOUT, DEFAULT_SSH_TIMEOUT
 from codeagent.domain import RunResult
 from codeagent.transport.base import Transport, TransportError
 from codeagent.transport.control_master import ControlMaster, list_sockets, stop_by_alias, stop_all
@@ -32,12 +33,6 @@ if TYPE_CHECKING:
     from codeagent.domain import HostSpec, RunRequest
 
 log = logging.getLogger(__name__)
-
-# How long to wait for the remote helper to print ``ready`` (seconds).
-_READY_TIMEOUT = 15
-
-# Default per-request timeout passed to the remote helper.
-_DEFAULT_TIMEOUT = 600
 
 # SSH error patterns that indicate a connection-level failure (exit 255).
 _SSH_ERROR_PATTERNS = (
@@ -268,7 +263,7 @@ def _run_ssh_wire(
     workdir: str,
     host_name: str,
     backend: str,
-    timeout: int = _DEFAULT_TIMEOUT,
+    timeout: int = DEFAULT_SSH_TIMEOUT,
 ) -> RunResult:
     """Run an SSH command that hosts ``codeagent.remote_exec`` and exchange
     a single JSONL request/response cycle.
@@ -364,7 +359,7 @@ def _run_ssh_mailbox(
     ssh_cmd: list[str],
     request: dict,
     *,
-    timeout: int = 60,
+    timeout: int = DEFAULT_MAILBOX_TIMEOUT,
 ) -> tuple[int, str, str]:
     """Run a mailbox wire request over SSH. Returns (exit_code, stdout, stderr).
 

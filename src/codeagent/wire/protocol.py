@@ -22,8 +22,9 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from codeagent.constants import DEFAULT_EXEC_TIMEOUT, MAX_LINE_LENGTH
+
 WIRE_VERSION = 1
-MAX_LINE_LENGTH = 1_048_576  # 1 MiB — reject absurdly large lines
 
 # ── message type constants ──────────────────────────────────────────────
 MSG_READY = "ready"
@@ -236,7 +237,7 @@ def make_request(
     skills: str | None = None,
     session_id: str | None = None,
     skip_permissions: bool = True,
-    timeout: int = 600,
+    timeout: int = DEFAULT_EXEC_TIMEOUT,
     wire_version: int = WIRE_VERSION,
 ) -> dict[str, Any]:
     """Build a request dict to send to the remote helper."""

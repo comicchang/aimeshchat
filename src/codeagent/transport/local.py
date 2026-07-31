@@ -5,6 +5,7 @@ import logging
 import subprocess
 from typing import TYPE_CHECKING
 
+from codeagent.constants import DEFAULT_EXEC_TIMEOUT
 from codeagent.domain import LOCAL_HOST_MARKER, RunResult
 from codeagent.transport.base import Transport, TransportError
 from codeagent.wire.protocol import (
@@ -23,9 +24,6 @@ if TYPE_CHECKING:
     from codeagent.domain import HostSpec, RunRequest
 
 log = logging.getLogger(__name__)
-
-# Default timeout for the remote exec helper to start (seconds).
-_STARTUP_TIMEOUT = 10
 
 
 class LocalTransport(Transport):
@@ -92,7 +90,7 @@ def _run_wire(
     workdir: str,
     host_name: str,
     backend: str,
-    timeout: int = 600,
+    timeout: int = DEFAULT_EXEC_TIMEOUT,
 ) -> RunResult:
     """Execute a remote-exec helper (local or over SSH) and collect the result.
 

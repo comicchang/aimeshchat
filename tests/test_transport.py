@@ -12,7 +12,7 @@ from codeagent.domain import HostSpec, RunRequest, RunResult
 from codeagent.transport.base import TransportError
 from codeagent.transport.control_master import ControlMaster, list_sockets, socket_path, stop_by_alias, stop_all
 from codeagent.transport.local import LocalTransport, _run_wire
-from codeagent.transport.ssh import SSHTransport, _run_ssh_wire, _is_ssh_error
+from codeagent.transport.ssh import SSHTransport, _run_ssh_mailbox, _run_ssh_wire, _is_ssh_error
 from codeagent.transport.relay import RelayTransport
 from codeagent.wire.protocol import (
     MSG_ACCEPTED,
@@ -983,6 +983,74 @@ class TestIsSSHError:
 
     def test_multiple_patterns(self):
         assert _is_ssh_error("Connection refused and also Host key verification failed") is True
+
+
+class TestRunSSHMailbox:
+    """Tests for the SSH mailbox wire-protocol runner."""
+
+    @patch("subprocess.Popen")
+    def test_success(self, mock_popen: MagicMock):
+        """mailbox_result is parsed into (exit_code, stdout, stderr)."""
+        mock_proc = MagicMock()
+        stdout = (
+            encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.1.0"})
+            + encode_line({"type": "mailbox_result", "stdout": "inbox: 1", "stderr": "", "exit_code": 0})
+        )
+        mock_proc.communicate.return_value = (stdout, b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        exit_code, out, err = _run_ssh_mailbox(["ssh", "host"], {"wire_version": 1, "command": "mailbox", "args": ["stats"]})
+        assert exit_code == 0
+        assert out == "inbox: 1"
+        assert err == ""
+
+    @patch("subprocess.Popen")
+    def test_error_message(self, mock_popen: MagicMock):
+        """MSG_ERROR propagates as exit 1 with the message on stderr."""
+        mock_proc = MagicMock()
+        stdout = encode_line({"type": "error", "message": "session not found: s1"})
+        mock_proc.communicate.return_value = (stdout, b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        exit_code, out, err = _run_ssh_mailbox(["ssh", "host"], {})
+        assert exit_code == 1
+        assert "session not found" in err
+
+    @patch("subprocess.Popen")
+    def test_timeout_raises(self, mock_popen: MagicMock):
+        """Timeout raises TransportError after killing the process."""
+        mock_proc = _mock_popen_timeout()
+        mock_popen.return_value = mock_proc
+        with pytest.raises(TransportError, match="timed out"):
+            _run_ssh_mailbox(["ssh", "host"], {}, timeout=1)
+        mock_proc.kill.assert_called()
+        mock_proc.wait.assert_called()
+
+    @patch("subprocess.Popen")
+    def test_no_structured_result_falls_back(self, mock_popen: MagicMock):
+        """SSH stderr + exit code used when no mailbox_result arrives."""
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (b"noise\n", b"ssh fatal\n")
+        mock_proc.returncode = 255
+        mock_popen.return_value = mock_proc
+
+        exit_code, out, err = _run_ssh_mailbox(["ssh", "host"], {})
+        assert exit_code == 255
+        assert "ssh fatal" in err
+
+    @patch("subprocess.Popen")
+    def test_version_mismatch_raises(self, mock_popen: MagicMock):
+        """Wrong remote wire version raises TransportError."""
+        mock_proc = MagicMock()
+        stdout = encode_line({"type": MSG_READY, "wire_version": 99, "package_version": "0.1.0"})
+        mock_proc.communicate.return_value = (stdout, b"")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        with pytest.raises(TransportError, match="wire version mismatch"):
+            _run_ssh_mailbox(["ssh", "host"], {})
 
 
 # ---------------------------------------------------------------------------
