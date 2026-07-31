@@ -299,6 +299,26 @@ class TestNotice:
         with pytest.raises(PermissionError, match="not in allowed_senders"):
             k.notice("s1", "w1", "system", _env())
 
+    def test_notice_topic_fanout_only_subscribers(self, store):
+        """notice --topic reaches only topic subscribers, not all room members."""
+        k = _make_kernel_with_session(store)
+        k.subscribe("s1", "w1", lambda m: None, topics=["deploy"])
+        # w2 has no topic subscription → should NOT receive the notice
+        k.notice("s1", "mgr", "deploy", _env())
+        inbox_w1 = store.list_messages(store.agent_subdir("s1", "w1", "inbox"))
+        inbox_w2 = store.list_messages(store.agent_subdir("s1", "w2", "inbox"))
+        assert len(inbox_w1) == 1
+        assert len(inbox_w2) == 0
+
+    def test_notice_topic_unknown_falls_back_to_room(self, store):
+        """Unknown topic falls back to session-wide notice."""
+        k = _make_kernel_with_session(store)
+        k.notice("s1", "mgr", "no-such-topic", _env())
+        inbox_w1 = store.list_messages(store.agent_subdir("s1", "w1", "inbox"))
+        inbox_w2 = store.list_messages(store.agent_subdir("s1", "w2", "inbox"))
+        assert len(inbox_w1) == 1
+        assert len(inbox_w2) == 1
+
 
 # ── send() dispatcher ──────────────────────────────────────────────────
 

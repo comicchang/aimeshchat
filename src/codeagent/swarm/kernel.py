@@ -33,6 +33,7 @@ from codeagent.swarm.model import (
     SendReceipt,
     Session,
     Subscription,
+    _iter_inbox_files,
 )
 
 
@@ -93,6 +94,8 @@ class SwarmKernel:
         self._channels: dict[str, dict[str, Channel]] = {}
         # session_id → { agent_id → list[Subscription] }
         self._subscriptions: dict[str, dict[str, list[Subscription]]] = {}
+        # Topic-based notice routing: session_id → { topic → set[agent_id] }
+        self._topic_subscriptions: dict[str, dict[str, set[str]]] = {}
         # Optional receiver for push-mode delivery (D2).
         self._receiver: Any = None
 
@@ -333,20 +336,30 @@ class SwarmKernel:
 
     def notice(self, session_id: str, sender: str, topic: str,
                envelope: Envelope, ttl: int = 0) -> SendReceipt:
-        """Send a notice to the session (room_members), with optional TTL."""
+        """Send a notice, fanning out to topic subscribers (or session).
+
+        If agents subscribed to *topic*, the notice goes only to them.
+        Otherwise it falls back to all room members (session-wide notice).
+        """
         session = self._require_session(session_id)
         self._check_notice(session, sender)
 
         msg_id = self._gen_msg_id()
         created_at = self._gen_created_at()
 
-        for member in session.acl.room_members:
-            if member == sender:
-                continue
+        # Topic-based fan-out: subscribers of this topic only.
+        topic_members = self._topic_subscriptions.get(session_id, {}).get(topic, set())
+        if topic_members:
+            targets = topic_members
+        else:
+            targets = set(session.acl.room_members)
+        targets.discard(sender)
+
+        for member in sorted(targets):
             self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
 
         return SendReceipt(msg_id=msg_id, status="delivered",
-                           session_id=session_id, target="notice")
+                           session_id=session_id, target=f"notice:{topic}")
 
     # ── Poll ───────────────────────────────────────────────────────────
 
@@ -360,9 +373,12 @@ class SwarmKernel:
         self._require_session(session_id)
 
         inbox = self._store.agent_subdir(session_id, agent_id, "inbox")
+
+        # Read all messages, filter by cursor.  Use the store's mtime-ordered
+        # listing so poll() order matches read()/ack() (oldest first) — a
+        # mismatch here made poll-then-ack select different messages.
         files = self._store.list_messages(inbox)
 
-        # Read all messages, filter by cursor
         messages: list[dict] = []
         for f in files:
             try:
@@ -418,12 +434,15 @@ class SwarmKernel:
         callback: Callable[[dict], None],
         channels: Optional[list[str]] = None,
         kinds: Optional[list[str]] = None,
+        topics: Optional[list[str]] = None,
     ) -> Subscription:
         """Register an in-memory callback for new messages.
 
         Callbacks fire on poll() — push simulation until D2 wires real push.
         When a SwarmReceiver is attached, the callback is also registered
         there for real-time push delivery.
+
+        *topics* registers the agent for topic-based notice fan-out.
         """
         self._require_session(session_id)
         sub = Subscription(
@@ -432,13 +451,17 @@ class SwarmKernel:
             callback=callback,
             channels=channels or [],
             kinds=kinds or [],
+            topics=topics or [],
         )
         self._subscriptions.setdefault(session_id, {}).setdefault(agent_id, []).append(sub)
+        # Topic-based routing registry (notice fan-out targets).
+        for topic in sub.topics:
+            self._topic_subscriptions.setdefault(session_id, {}).setdefault(topic, set()).add(agent_id)
         # Route to attached receiver for push-mode delivery (D2).
         if (
             self._receiver is not None
-            and session_id == self._receiver._session_id
-            and agent_id == self._receiver._agent_id
+            and session_id == self._receiver.session_id
+            and agent_id == self._receiver.agent_id
         ):
             self._receiver.subscribe(callback, channels, kinds)
         return sub

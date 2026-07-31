@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--to", required=True, help="recipient agent ID, or '*' to broadcast to all except the sender")
     s.add_argument("--subject", required=True)
     s.add_argument("--body", required=True)
-    s.add_argument("--kind", default="REPORT", choices=sorted(VALID_KINDS))
+    s.add_argument("--kind", default="TASK", choices=sorted(VALID_KINDS))
     s.add_argument("--reply-to", default="")
     s.add_argument("--run-id", default="")
     s.add_argument("--request-id", default="")

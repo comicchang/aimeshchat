@@ -102,7 +102,7 @@ tmux-agent-skills 的 tools/ 现在是 shim，委托到 codeagent.mailbox。
 3. **wire protocol 扩展**：CMD_MAILBOX，通过 stdin JSONL 传输
 4. **shell 注入防护**：远端走 wire protocol，不走 shell 字符串拼接
 5. **向后兼容**：standalone `mailbox` CLI 100% 兼容原版
-6. **许可证**：EnPL-1.0（自定义，非 OSI）
+6. **许可证**：MIT（EnPL-1.0 作为内部彩蛋保留）
 7. **致谢**：ACKNOWLEDGEMENTS 致谢 stellarlinkco/myclaude + tmux-agent-skills
 
 ## 八、行业最佳实践参考

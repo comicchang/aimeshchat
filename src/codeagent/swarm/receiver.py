@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from codeagent.mailbox.store import MailboxStore
-from codeagent.swarm.model import Subscription
+from codeagent.swarm.model import Subscription, _iter_inbox_files
 
 if False:  # TYPE_CHECKING
     from codeagent.swarm.kernel import SwarmKernel
@@ -98,6 +98,18 @@ class SwarmReceiver:
         self._watch_poll_interval: float = DEFAULT_WATCH_POLL_INTERVAL
         # Stat cache: filename → (mtime_ns, size) for detecting new/changed files.
         self._stat_cache: dict[str, tuple[int, int]] = {}
+
+    # ── Public accessors (kernel uses these instead of private attrs) ──
+
+    @property
+    def session_id(self) -> str:
+        """Swarm session this receiver belongs to."""
+        return self._session_id
+
+    @property
+    def agent_id(self) -> str:
+        """Agent whose inbox is being watched/streamed."""
+        return self._agent_id
 
     # ── Callback registration ──────────────────────────────────────────
 
@@ -332,13 +344,9 @@ class SwarmReceiver:
     def _scan_inbox(self) -> list[dict]:
         """Scan inbox for new or changed files. Returns list of message dicts."""
         inbox = self._store.agent_subdir(self._session_id, self._agent_id, "inbox")
-        if not inbox.exists():
-            return []
 
         new_msgs: list[dict] = []
-        for f in inbox.iterdir():
-            if not f.is_file() or f.suffix != ".json" or f.name.startswith("."):
-                continue
+        for f in _iter_inbox_files(inbox):
             try:
                 st = f.stat()
             except OSError:

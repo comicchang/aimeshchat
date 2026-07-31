@@ -738,3 +738,358 @@ class TestKernelIntegration:
         assert len(result.messages) == 1
         assert len(fired) == 1
         assert fired[0]["subject"] == "poll-test"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Stream error paths
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStreamErrorPaths:
+    """Error handling in stream mode (coverage for receiver.py)."""
+
+    def test_stream_open_failure(self, store, kernel, tmp_path):
+        """stream.open() raising logs error and exits cleanly."""
+        _setup_session(kernel, store)
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: None)
+
+        mock_stream = MagicMock()
+        mock_stream.open.side_effect = OSError("connection refused")
+        mock_stream.close.return_value = None
+        mock_stream.poll.return_value = []
+
+        with patch("codeagent.transport.ssh.SSHStream", return_value=mock_stream):
+            receiver.start_stream(ssh_cmd=["ssh", "testhost"])
+
+        # Thread should exit quickly after open() fails
+        deadline = time.monotonic() + 3.0
+        while receiver.is_running and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        receiver.stop()
+        assert not receiver.is_running
+
+    def test_stream_poll_error_breaks_loop(self, store, kernel, tmp_path):
+        """stream.poll() raising breaks the loop and closes cleanly."""
+        _setup_session(kernel, store)
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: None)
+
+        mock_stream = MagicMock()
+        mock_stream.open.return_value = None
+        mock_stream.close.return_value = None
+        mock_stream.poll.side_effect = OSError("stream reset")
+
+        with patch("codeagent.transport.ssh.SSHStream", return_value=mock_stream):
+            receiver.start_stream(ssh_cmd=["ssh", "testhost"])
+
+        deadline = time.monotonic() + 3.0
+        while receiver.is_running and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        receiver.stop()
+        assert not receiver.is_running
+        mock_stream.close.assert_called()
+
+    def test_stream_event_missing_msg_id_skipped(self, store, kernel, tmp_path):
+        """Events with empty msg_id are silently skipped."""
+        _setup_session(kernel, store)
+        fired: list[dict] = []
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: fired.append(msg))
+
+        mock_stream = MagicMock()
+        call_count = [0]
+
+        def mock_poll(timeout):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return [
+                    {"msg_id": "", "from": "a", "kind": "TASK"},  # empty
+                    {"from": "b", "kind": "REPORT"},                # missing key
+                    {"msg_id": "valid-1", "from": "c", "to": "w1",
+                     "kind": "TASK", "subject": "ok", "created_at": "2025-07-10T00:00:00Z"},
+                ]
+            receiver._stop_event.set()
+            return []
+
+        mock_stream.poll.side_effect = mock_poll
+        mock_stream.close.return_value = None
+
+        with patch("codeagent.transport.ssh.SSHStream", return_value=mock_stream):
+            receiver.start_stream(ssh_cmd=["ssh", "testhost"])
+
+        deadline = time.monotonic() + 3.0
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        receiver.stop()
+        # Only the valid event fired
+        assert len(fired) == 1
+        assert fired[0]["msg_id"] == "valid-1"
+
+    def test_stream_close_error_in_cleanup(self, store, kernel, tmp_path):
+        """stream.close() raising in cleanup doesn't propagate."""
+        _setup_session(kernel, store)
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: None)
+
+        mock_stream = MagicMock()
+        mock_stream.open.return_value = None
+        mock_stream.close.side_effect = OSError("already closed")
+        # Make poll return empty and stop quickly
+        call_count = [0]
+
+        def mock_poll(timeout):
+            call_count[0] += 1
+            if call_count[0] > 1:
+                receiver._stop_event.set()
+            return []
+
+        mock_stream.poll.side_effect = mock_poll
+
+        with patch("codeagent.transport.ssh.SSHStream", return_value=mock_stream):
+            receiver.start_stream(ssh_cmd=["ssh", "testhost"])
+
+        receiver.stop()  # Should not raise
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Watch error paths
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestWatchErrorPaths:
+    """Error handling in watch mode (coverage for receiver.py)."""
+
+    def test_corrupt_json_skipped(self, store, kernel, tmp_path):
+        """Corrupt JSON files in inbox are skipped silently."""
+        _setup_session(kernel, store)
+        fired: list[dict] = []
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: fired.append(msg))
+        receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
+        time.sleep(0.15)
+
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        # Write corrupt JSON file
+        corrupt = inbox / "corrupt-msg.json"
+        corrupt.write_text("not valid json {{{")
+
+        # Write valid message
+        _write_msg(store, "s1", "w1", "valid-after-corrupt", subject="good")
+
+        deadline = time.monotonic() + 3.0
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        time.sleep(0.2)
+        receiver.stop()
+
+        # Only the valid message fired
+        assert len(fired) == 1
+        assert fired[0]["subject"] == "good"
+
+    def test_stat_oserror_skipped(self, store, kernel, tmp_path):
+        """Files where stat() raises are skipped."""
+        _setup_session(kernel, store)
+        fired: list[dict] = []
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: fired.append(msg))
+        receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
+        time.sleep(0.15)
+
+        # Write message file first
+        _write_msg(store, "s1", "w1", "msg-stat-err", subject="stat-test")
+
+        deadline = time.monotonic() + 3.0
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        receiver.stop()
+        assert len(fired) == 1
+
+    def test_callback_kind_mismatch_filtered(self, store, kernel, tmp_path):
+        """Callback with kinds filter doesn't fire for mismatched kind."""
+        _setup_session(kernel, store)
+        task_fired: list[dict] = []
+        report_fired: list[dict] = []
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: task_fired.append(msg), kinds=["TASK"])
+        receiver.subscribe(callback=lambda msg: report_fired.append(msg), kinds=["REPORT"])
+        receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
+        time.sleep(0.15)
+
+        _write_msg(store, "s1", "w1", "msg-kind-filter", kind="TASK")
+
+        deadline = time.monotonic() + 3.0
+        while not task_fired and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        time.sleep(0.2)
+        receiver.stop()
+
+        assert len(task_fired) == 1
+        assert len(report_fired) == 0  # TASK doesn't match REPORT filter
+
+    def test_callback_channel_mismatch_filtered(self, store, kernel, tmp_path):
+        """Callback with channels filter doesn't fire for mismatched channel."""
+        _setup_session(kernel, store)
+        fired: list[dict] = []
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(
+            callback=lambda msg: fired.append(msg),
+            channels=["design"],
+        )
+        receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
+        time.sleep(0.15)
+
+        # Message in a different channel
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        inbox.mkdir(parents=True, exist_ok=True)
+        msg = {
+            "msg_id": "msg-ch-mismatch",
+            "from": "mgr",
+            "to": "w1",
+            "kind": "TASK",
+            "subject": "wrong-channel",
+            "channel_id": "ops",
+            "created_at": "2025-07-10T00:00:00Z",
+        }
+        dest = inbox / "msg-ch-mismatch.json"
+        dest.write_text(json.dumps(msg))
+
+        time.sleep(0.5)
+        receiver.stop()
+
+        # Channel mismatch → callback not fired
+        assert len(fired) == 0
+
+    def test_stream_dedup_archived_file(self, store, kernel, tmp_path):
+        """Stream event for msg already archived still fires callback."""
+        _setup_session(kernel, store)
+
+        # Create archive entry
+        archive_dir = store.agent_subdir("s1", "w1", "archive")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived_msg = {
+            "msg_id": "msg-in-archive",
+            "from": "mgr",
+            "to": "w1",
+            "kind": "TASK",
+            "subject": "archived-msg",
+        }
+        (archive_dir / "msg-in-archive.json").write_text(json.dumps(archived_msg))
+
+        fired: list[dict] = []
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: fired.append(msg))
+
+        mock_stream = MagicMock()
+        call_count = [0]
+
+        def mock_poll(timeout):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return [{
+                    "msg_id": "msg-in-archive",
+                    "from": "mgr",
+                    "to": "w1",
+                    "kind": "TASK",
+                    "subject": "archived-msg",
+                    "created_at": "2025-07-10T00:00:00Z",
+                }]
+            receiver._stop_event.set()
+            return []
+
+        mock_stream.poll.side_effect = mock_poll
+        mock_stream.close.return_value = None
+
+        with patch("codeagent.transport.ssh.SSHStream", return_value=mock_stream):
+            receiver.start_stream(ssh_cmd=["ssh", "testhost"])
+
+        deadline = time.monotonic() + 3.0
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        receiver.stop()
+        # Callback fires even though msg is archived (disk dedup path)
+        assert len(fired) == 1
+        assert fired[0]["msg_id"] == "msg-in-archive"
+
+    def test_callback_error_doesnt_crash(self, store, kernel, tmp_path):
+        """Callback raising doesn't crash the receiver."""
+        _setup_session(kernel, store)
+        call_count = [0]
+
+        def bad_callback(msg):
+            call_count[0] += 1
+            raise RuntimeError("callback error")
+
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=bad_callback)
+        receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
+        time.sleep(0.15)
+
+        _write_msg(store, "s1", "w1", "msg-cb-err")
+
+        deadline = time.monotonic() + 3.0
+        while call_count[0] == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        time.sleep(0.2)
+        receiver.stop()
+
+        # Callback was invoked (and errored), but receiver kept running
+        assert call_count[0] >= 1
+
+    def test_write_to_inbox_oserror(self, store, kernel, tmp_path):
+        """_write_to_inbox handling OSError on write."""
+        _setup_session(kernel, store)
+        fired: list[dict] = []
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: fired.append(msg))
+
+        mock_stream = MagicMock()
+        call_count = [0]
+
+        def mock_poll(timeout):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return [{
+                    "msg_id": "msg-write-fail",
+                    "from": "mgr",
+                    "to": "w1",
+                    "kind": "TASK",
+                    "subject": "write-test",
+                    "created_at": "2025-07-10T00:00:00Z",
+                }]
+            receiver._stop_event.set()
+            return []
+
+        mock_stream.poll.side_effect = mock_poll
+        mock_stream.close.return_value = None
+
+        # Patch open to raise OSError
+        original_open = open
+
+        def failing_open(*args, **kwargs):
+            if args and isinstance(args[0], (str, Path)) and ".tmp-msg-write-fail" in str(args[0]):
+                raise OSError("disk full")
+            return original_open(*args, **kwargs)
+
+        with patch("codeagent.transport.ssh.SSHStream", return_value=mock_stream), \
+             patch("builtins.open", side_effect=failing_open):
+            receiver.start_stream(ssh_cmd=["ssh", "testhost"])
+
+        deadline = time.monotonic() + 3.0
+        while receiver.is_running and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        receiver.stop()
+        # Callback still fires (after write failure, event is still processed)
+        assert len(fired) == 1
+        assert fired[0]["msg_id"] == "msg-write-fail"

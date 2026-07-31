@@ -5,6 +5,7 @@ Modules:
     kernel:  SwarmKernel — session/roster/ACL/routing, message delivery, poll/subscribe.
 """
 from codeagent.swarm.kernel import SwarmKernel
+from codeagent.swarm.delivery import DeliveryEngine
 from codeagent.swarm.receiver import SwarmReceiver
 from codeagent.swarm.model import (
     ACL,
@@ -19,6 +20,7 @@ from codeagent.swarm.model import (
     SendReceipt,
     Session,
     Subscription,
+    _iter_inbox_files,
 )
 
 __all__ = [
@@ -35,5 +37,7 @@ __all__ = [
     "Session",
     "Subscription",
     "SwarmKernel",
+    "DeliveryEngine",
     "SwarmReceiver",
+    "_iter_inbox_files",
 ]

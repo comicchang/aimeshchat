@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+import json
+from pathlib import Path
+from typing import Iterator
+
 from codeagent.mailbox.protocol import AttachmentRef
 
 
@@ -158,3 +162,26 @@ class Subscription:
     callback: object       # callable[[dict], None]
     channels: list[str] = field(default_factory=list)
     kinds: list[str] = field(default_factory=list)
+    topics: list[str] = field(default_factory=list)
+
+
+# ── Shared inbox scan helper ──────────────────────────────────────────
+
+
+def _iter_inbox_files(inbox: Path, skip_prefixes: tuple[str, ...] = (".sync-conflict-", ".tmp-")) -> Iterator[Path]:
+    """Yield non-hidden .json files in *inbox*, skipping *skip_prefixes*.
+
+    Used by both ``SwarmKernel.poll`` and ``SwarmReceiver._scan_inbox``
+    to avoid duplicating file-discovery logic.
+    """
+    if not inbox.is_dir():
+        return
+    for f in inbox.iterdir():
+        if not f.is_file() or f.suffix != ".json":
+            continue
+        name = f.name
+        if name.startswith("."):
+            continue
+        if any(name.startswith(pfx) for pfx in skip_prefixes):
+            continue
+        yield f

@@ -523,7 +523,7 @@ tmux split-window -v "codeagent swarm watch --session s1"
 
 ## 10. What NOT to Build
 
-1. **Real-time push** — Polling is fine. Tasks take minutes to hours; 5s latency is negligible.
+1. **Real-time push — implemented** (stream mode via SSHStream, ``receiver.py``). Polling remains the fallback for relay hosts without a persistent SSH stream.
 2. **TCP servers** — SSH ControlMaster already provides authenticated, encrypted channels.
 3. **Message broker** (RabbitMQ, Redis, NATS) — Overkill. Filesystem mailbox is persistent and concurrent.
 4. **HTTP/WebSocket API** — SSH is the transport. Adding HTTP adds TLS, auth, new attack surface.

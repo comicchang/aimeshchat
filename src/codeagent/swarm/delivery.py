@@ -91,6 +91,8 @@ class DeliveryEngine:
         self._outbox = outbox_root or (mailbox_store.root / "_outbox")
         # idempotency cache: msg_id → SendReceipt (process-lifetime)
         self._cache: dict[str, SendReceipt] = {}
+        # host cache for _resolve_target (alias → HostSpec)
+        self._host_cache: dict[str, Any] = {}
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -152,6 +154,60 @@ class DeliveryEngine:
         delivered = SendReceipt(status="delivered", msg_id=msg_id)
         self._cache[msg_id] = delivered
         return delivered
+
+    # ── DeliverySink bridge (SwarmKernel interface) ───────────────────
+
+    def deliver_sink(
+        self,
+        session_id: str,
+        target_agent: str,
+        envelope: Any,
+        msg_id: str,
+        created_at: str,
+        from_id: str,
+    ) -> None:
+        """Bridge to ``DeliverySink`` protocol used by SwarmKernel.
+
+        Converts the 6-param kernel call into a dict envelope and delegates
+        to ``deliver()``.  The *target_agent* is resolved via the host cache
+        (populated at wiring time or by ``cache_host``).
+        """
+        # Build dict envelope from Envelope object or pass through
+        if hasattr(envelope, 'subject'):
+            env_dict: dict[str, Any] = {
+                "session_id": session_id,
+                "from": from_id,
+                "to": target_agent,
+                "subject": envelope.subject,
+                "body": envelope.body,
+                "kind": getattr(envelope, 'kind', 'TASK'),
+                "reply_to": getattr(envelope, 'reply_to', ''),
+                "run_id": getattr(envelope, 'run_id', ''),
+                "request_id": getattr(envelope, 'request_id', ''),
+                "msg_id": msg_id,
+                "created_at": created_at,
+                "_target_agent": target_agent,
+            }
+        else:
+            env_dict = dict(envelope) if not isinstance(envelope, dict) else envelope
+            env_dict.setdefault("msg_id", msg_id)
+            env_dict.setdefault("created_at", created_at)
+            env_dict.setdefault("session_id", session_id)
+            env_dict.setdefault("from", from_id)
+            env_dict.setdefault("to", target_agent)
+            env_dict["_target_agent"] = target_agent
+
+        # Resolve target_agent → HostSpec via cache or store local target
+        host = self._host_cache.get(target_agent)
+        if host is not None:
+            self.deliver(session_id, host, env_dict)
+        else:
+            # No cached host — deliver locally (outbox write only)
+            self.deliver(session_id, target_agent, env_dict)
+
+    def cache_host(self, agent_id: str, host: Any) -> None:
+        """Register an agent_id → HostSpec mapping for sink resolution."""
+        self._host_cache[agent_id] = host
 
     def flush(self, session_id: Optional[str] = None) -> int:
         """Retry all pending outbox entries. Returns count of newly delivered."""
@@ -327,13 +383,15 @@ class DeliveryEngine:
         return None
 
     def _resolve_target(self, host_alias: str) -> Any:
-        """Resolve a host alias back to a HostSpec for retry."""
-        if self._router is None:
-            # Build a minimal HostSpec from the alias
-            from codeagent.domain import HostSpec
-            return HostSpec(name=host_alias, ssh_alias=host_alias, hostnames=())
-        # Ask router's hosts dict (requires RepoMap or similar)
-        # If router doesn't have a host lookup, fall back to minimal spec
+        """Resolve a host alias back to a HostSpec for retry.
+
+        Checks the host cache first (populated by ``cache_host`` or wiring),
+        then falls back to a minimal SSH HostSpec.
+        """
+        # Check host cache (populated at wiring time or by cache_host)
+        cached = self._host_cache.get(host_alias)
+        if cached is not None:
+            return cached
         from codeagent.domain import HostSpec
         return HostSpec(name=host_alias, ssh_alias=host_alias, hostnames=())
 
@@ -343,7 +401,7 @@ class DeliveryEngine:
         from_id = envelope.get("from", "")
         to_id = envelope.get("to", "")
         subject = envelope.get("subject", "")
-        kind = envelope.get("kind", "REPORT")
+        kind = envelope.get("kind", "TASK")
         reply_to = envelope.get("reply_to", "")
         run_id = envelope.get("run_id", "")
         request_id = envelope.get("request_id", "")

@@ -13,6 +13,8 @@ import pytest
 from codeagent.domain import HostSpec
 from codeagent.mailbox.store import MailboxStore
 from codeagent.swarm.delivery import DeliveryEngine, SendReceipt
+from codeagent.swarm.kernel import SwarmKernel
+from codeagent.swarm.model import AgentLocation, Envelope
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────
@@ -800,3 +802,143 @@ class TestIntegrationDeliveryStore:
         assert r.status == "delivered"
         assert len(sent_msg_ids) == 1
         assert sent_msg_ids[0] == mid
+
+
+# ── E2E: kernel → DeliveryEngine → transport → remote inbox ──────────
+
+
+class TestE2ECrossHostDeliveryChain:
+    """End-to-end: kernel.direct() → DeliveryEngine (outbox fsync)
+    → transport.mailbox() call → remote inbox → ack → finalize.
+
+    This test exercises the full cross-host delivery chain so that
+    the "zero import" failure mode (P0-1) cannot recur undetected.
+    """
+
+    def test_e2e_cross_host_delivery_chain(self, tmp_path: Path) -> None:
+        # ── 1. Setup: store, engine, kernel wired with engine sink ──────
+        store = MailboxStore(root=tmp_path)
+        outbox_root = tmp_path / "outbox"
+
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        call_count = {"n": 0}
+
+        def fake_mailbox(host, args, **kw):
+            """Simulate remote transport: write to remote-w's inbox in the store."""
+            call_count["n"] += 1
+            for i, a in enumerate(args):
+                if a == "--body" and i + 1 < len(args):
+                    body_json = json.loads(args[i + 1])
+                    mid = body_json.get("msg_id", "unknown")
+                    inbox_dir = store.agent_subdir("s1", "remote-w", "inbox")
+                    inbox_dir.mkdir(parents=True, exist_ok=True)
+                    msg_path = inbox_dir / f"{mid}.json"
+                    tmp_path_inner = inbox_dir / f".tmp-{mid}.json"
+                    tmp_path_inner.write_text(
+                        json.dumps(body_json, indent=2), encoding="utf-8"
+                    )
+                    os.replace(str(tmp_path_inner), str(msg_path))
+            return 0, "sent", ""
+
+        mock_transport.mailbox.side_effect = fake_mailbox
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+
+        class _EngineSink:
+            """Adapter: wraps engine.deliver_sink to match DeliverySink protocol."""
+            def deliver(self, session_id, target_agent, envelope, msg_id, created_at, from_id):
+                loc = kernel.get_location(session_id, target_agent)
+                if loc and loc.host_alias and loc.host_alias != "__local__":
+                    host = HostSpec(
+                        name=loc.host_alias,
+                        ssh_alias=loc.host_alias,
+                        hostnames=(loc.host_alias,),
+                    )
+                    engine.cache_host(target_agent, host)
+                engine.deliver_sink(session_id, target_agent, envelope, msg_id, created_at, from_id)
+
+        kernel = SwarmKernel(store=store, sink=_EngineSink())
+
+        # ── 2. Create session + register remote agent ──────────────────
+        kernel.create_session("s1", "mgr", ["remote-w"])
+        kernel.register(
+            AgentLocation(agent_id="remote-w", host_alias="yellow", backend="cli"),
+            "s1",
+        )
+
+        # ── 3. Send direct message ─────────────────────────────────────
+        env = Envelope(subject="deploy", body="run CI", kind="TASK")
+        receipt = kernel.direct("s1", "mgr", "remote-w", env)
+        assert receipt.status == "delivered"
+        msg_id = receipt.msg_id
+
+        # ── 4. Assert: outbox file exists (fsync durable write) ────────
+        outbox_file = outbox_root / "s1" / f"{msg_id}.json"
+        assert outbox_file.exists(), "outbox file must be written before transport"
+        outbox_data = json.loads(outbox_file.read_text(encoding="utf-8"))
+        assert outbox_data["kind"] == "TASK"
+        assert outbox_data["subject"] == "deploy"
+
+        # ── 5. Assert: transport.mailbox called exactly once ───────────
+        assert call_count["n"] == 1, "transport.mailbox must be called once (no fanout)"
+        mock_transport.mailbox.assert_called_once()
+
+        # ── 6. Assert: remote inbox has the message ────────────────────
+        remote_inbox = store.agent_subdir("s1", "remote-w", "inbox")
+        remote_files = store.list_messages(remote_inbox)
+        assert len(remote_files) == 1, "remote inbox must contain the delivered message"
+        remote_msg = json.loads(remote_files[0].read_bytes())
+        assert remote_msg["subject"] == "deploy"
+        assert remote_msg["from"] == "mgr"
+        assert remote_msg["to"] == "remote-w"
+
+        # ── 7. Assert: ack updates delivery status ─────────────────────
+        engine.ack("s1", "remote-w", msg_id, "consumed")
+        status_dir = outbox_root / "s1" / f".status-{msg_id}"
+        assert status_dir.exists()
+        assert (status_dir / "phase").read_text().strip() == "consumed"
+
+        # ── 8. Assert: claim + finalize archives the message ───────────
+        # store.read() moves inbox → processing (claim)
+        claimed = store.read("s1", "remote-w", owner="remote-w")
+        assert claimed is not None
+        assert claimed["subject"] == "deploy"
+        # store.finalize() moves processing → archive
+        store.finalize("s1", "remote-w", msg_id, owner="remote-w")
+        archive_dir = store.agent_subdir("s1", "remote-w", "archive")
+        archived = store.list_messages(archive_dir)
+        assert any(f.stem == msg_id for f in archived), "message must be archived after finalize"
+
+    def test_relay_host_round_trips_through_resolve_target(self, tmp_path: Path) -> None:
+        """relay-login HostSpec preserved via _resolve_target (P0-2 fix)."""
+        store = MailboxStore(root=tmp_path)
+        outbox_root = tmp_path / "outbox"
+
+        engine = DeliveryEngine(mailbox_store=store, outbox_root=outbox_root)
+
+        relay_host = HostSpec(
+            name="jump",
+            ssh_alias="jump",
+            hostnames=("jump",),
+            transport="relay-login",
+        )
+
+        # Pre-populate host cache as wiring would
+        engine.cache_host("relay-agent", relay_host)
+
+        # _resolve_target should return the cached relay host, not a plain SSH one
+        resolved = engine._resolve_target("relay-agent")
+        assert resolved.transport == "relay-login"
+        assert resolved.ssh_alias == "jump"
+
+        # Verify: an uncached host falls back to minimal SSH spec
+        fallback = engine._resolve_target("unknown-agent")
+        assert fallback.transport == "ssh"  # HostSpec default
+        assert fallback.ssh_alias == "unknown-agent"

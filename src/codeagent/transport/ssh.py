@@ -8,6 +8,7 @@ via the JSONL wire protocol over stdin/stdout.
 from __future__ import annotations
 
 import logging
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -257,7 +258,10 @@ class SSHTransport(Transport):
         # shell_prefix must be expanded on the REMOTE host, not locally.
         remote_exec = "codeagent-remote-exec"
         if host.shell_prefix:
-            remote_cmd_str = f"{host.shell_prefix}; {remote_exec}"
+            # shell_prefix is trusted config (repo-map.json, same trust domain
+            # as SSH aliases), but quote the fixed segment so a compromised
+            # prefix cannot smuggle extra commands via the appended part.
+            remote_cmd_str = f"{host.shell_prefix}; {shlex.quote(remote_exec)}"
             remote_cmd = ["sh", "-c", remote_cmd_str]
         else:
             remote_cmd = ["codeagent-remote-exec"]

@@ -30,6 +30,7 @@ from codeagent.transport.local import LocalTransport
 from codeagent.transport.router import TransportRouter
 from codeagent.transport.ssh import SSHTransport
 from codeagent.swarm.kernel import SwarmKernel, LocalDeliverySink
+from codeagent.swarm.delivery import DeliveryEngine
 from codeagent.swarm.model import Address, AddressKind, AgentLocation, Envelope
 from codeagent.mailbox.store import MailboxStore
 
@@ -218,9 +219,41 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
 
 
 def _get_swarm_kernel(store_root: Optional[Path] = None) -> tuple[SwarmKernel, MailboxStore]:
-    """Create a SwarmKernel with LocalDeliverySink for CLI use."""
+    """Create a SwarmKernel with DeliveryEngine sink for cross-host delivery.
+
+    When a transport router is available, uses DeliveryEngine as the sink
+    so that messages to remote targets are delivered via transport (SSH/relay)
+    with durable outbox write + retry.  Falls back to LocalDeliverySink for
+    pure-local usage.
+    """
+    from codeagent.swarm.model import AgentLocation
+
     store = MailboxStore(root=store_root)
-    kernel = SwarmKernel(store=store, sink=LocalDeliverySink(store))
+    router = _router
+
+    engine = DeliveryEngine(mailbox_store=store, transport_router=router)
+
+    def _resolve_agent_to_host(session_id: str, agent_id: str):
+        """Lookup agent's registered host from kernel routing table."""
+        loc = kernel.get_location(session_id, agent_id)
+        if loc and loc.host_alias and loc.host_alias != "__local__":
+            from codeagent.domain import HostSpec
+            host = HostSpec(
+                name=loc.host_alias,
+                ssh_alias=loc.host_alias,
+                hostnames=(loc.host_alias,),
+            )
+            engine.cache_host(agent_id, host)
+            return host
+        return None
+
+    class _EngineDeliverySink:
+        """Adapter: makes DeliveryEngine.deliver_sink callable via .deliver() protocol."""
+        def deliver(self, session_id, target_agent, envelope, msg_id, created_at, from_id):
+            _resolve_agent_to_host(session_id, target_agent)
+            engine.deliver_sink(session_id, target_agent, envelope, msg_id, created_at, from_id)
+
+    kernel = SwarmKernel(store=store, sink=_EngineDeliverySink())
     return kernel, store
 
 
@@ -356,11 +389,26 @@ def _swarm_poll(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 def _swarm_ack(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     # For consumed phase, first read the message (inbox → processing) to create
     # a claim file, then finalize (processing → archive).
+    #
+    # P0-3 fix: store.read() pops the EARLIEST message (mtime-ordered), so its
+    # msg_id may differ from the user-supplied --msg-id.  Use the actual msg_id
+    # from the read result to avoid losing the wrong message.  If they differ,
+    # release the message back to inbox and report the mismatch.
     if args.phase == "consumed":
         store = kernel._store
         msg = store.read(args.session_id, args.agent, owner=args.agent)
         if msg is None:
             print(f"error: no message to ack: {args.msg_id}", file=sys.stderr)
+            return 1
+        actual_id = msg.get("msg_id", "")
+        if actual_id != args.msg_id:
+            # Release the message back to inbox so it is not lost.
+            store.release(args.session_id, args.agent, actual_id, owner=args.agent)
+            print(
+                f"error: msg_id mismatch: requested={args.msg_id} "
+                f"actual={actual_id}. Message released back to inbox.",
+                file=sys.stderr,
+            )
             return 1
     status = kernel.ack(args.session_id, args.agent, args.msg_id, args.phase)
     print(json.dumps({"status": status}))

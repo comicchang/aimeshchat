@@ -90,7 +90,7 @@
 
 ## 事实更正
 
-- LICENSE: EnPL-1.0（自定义，非 OSI，已从 EPL-1.0 改名）
+- LICENSE: MIT（EnPL-1.0 作为内部彩蛋保留，已从 EPL-1.0 改名）
 - coordination/mailbox_bridge.py: 已在 Round 7 删除
 
 ## 请检视
