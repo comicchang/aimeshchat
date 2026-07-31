@@ -442,8 +442,10 @@ def main() -> None:
                 # Non-selectable stdin (e.g. io.StringIO in tests) —
                 # fall through to a blocking read below.
                 ready = True
-            if ready is False:
-                # No pending request — poll streams and continue
+            if not ready:
+                # select timeout ([]): no pending request — poll streams
+                # and continue.  (Degraded stdin sets ready=True so the
+                # blocking read below still runs.)
                 _poll_streams(active_subs)
                 continue
 

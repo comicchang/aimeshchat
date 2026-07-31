@@ -492,6 +492,83 @@ class TestServeModeStream:
         pongs = [m for m in sent if m.get("type") == "pong" and m.get("heartbeat")]
         assert len(pongs) == 1
 
+    def test_serve_polls_streams_on_select_timeout(self, tmp_path: Path):
+        """select timeout ([] on a real pipe) must poll streams, not block.
+
+        Regression: `if ready is False:` treated select's [] (timeout) as
+        False, so serve mode fell into a blocking stdin read and never
+        flushed mailbox events — real-time push silently broken.
+        """
+        import threading
+
+        from codeagent.mailbox.store import MailboxStore
+        from codeagent.remote_exec import main
+
+        r_fd, w_fd = os.pipe()
+        real_stdin = os.fdopen(r_fd, "r")
+        sent: list[dict[str, Any]] = []
+        store = MailboxStore(root=tmp_path)
+
+        try:
+            with (
+                patch("codeagent.remote_exec._send", side_effect=sent.append),
+                patch("codeagent.remote_exec.MailboxStore", return_value=store),
+                patch("codeagent.remote_exec.sys.stdin", real_stdin),
+                patch("codeagent.remote_exec.STREAM_HEARTBEAT_INTERVAL", 1.0),
+            ):
+                t = threading.Thread(target=main, daemon=True)
+                t.start()
+
+                # Register a stream subscription
+                os.write(w_fd, json.dumps({
+                    "wire_version": 1,
+                    "command": "stream",
+                    "session_id": "s1",
+                    "agent_id": "a1",
+                    "cursor": "0",
+                    "request_id": "r1",
+                }).encode() + b"\n")
+
+                # Wait for subscription registration + first select cycle
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if any(m.get("type") == "accepted" for m in sent):
+                        break
+                    time.sleep(0.05)
+
+                # Drop a new message into the inbox while the serve loop
+                # is blocked in select (real pipe, no further stdin input)
+                inbox = store.agent_subdir("s1", "a1", "inbox")
+                inbox.mkdir(parents=True, exist_ok=True)
+                msg = {
+                    "msg_id": "m1",
+                    "from": "alice",
+                    "to": "a1",
+                    "kind": "TASK",
+                    "subject": "hi",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+                (inbox / "m1.json").write_text(json.dumps(msg))
+
+                # Give the select-timeout → poll → emit cycle time to run
+                deadline = time.monotonic() + 4.0
+                while time.monotonic() < deadline:
+                    if any(m.get("type") == "stream_event" for m in sent):
+                        break
+                    time.sleep(0.1)
+
+                events = [m for m in sent if m.get("type") == "stream_event"]
+                assert len(events) == 1
+                assert events[0]["payload"]["msg_id"] == "m1"
+        finally:
+            os.close(w_fd)
+            try:
+                real_stdin.close()
+            except OSError:
+                pass
+            if "t" in locals():
+                t.join(timeout=5)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SSHStream — mock Popen tests
