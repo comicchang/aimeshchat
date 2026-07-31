@@ -582,10 +582,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         "mailbox": _cmd_mailbox,
         "artifact": _cmd_artifact,
     }
-    handler = handlers.get(args.command)
-    if handler is None:
-        parser.print_help()
-        return 1
+    # args.command is guaranteed to be one of the registered subcommands:
+    # argparse rejects unknown names, and ``None`` was handled above.
+    handler = handlers[args.command]
 
     try:
         return handler(args)

@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 13 — Final polish
+
+- **Coverage**: 603 tests, 96% overall. `transport.relay` raised from 82% to
+  100% with edge-path tests for the PTY select loop (preexec controlling-TTY
+  setup, slave-fd close failure, stdin probe/EOF/read-error handling, deadline
+  break, blank-line skip, unhandled wire types, reap timeout, kill-escalation
+  exhaustion, and cleanup-close failures).
+- **Dead code removed**: the unreachable `handler is None` fallback in
+  `cli.main` (argparse already restricts `args.command` to the registered
+  subcommands, and `None` is handled earlier).
+- **Test hygiene**: every `pytest.skip` / `@pytest.mark.skipif` now carries an
+  explicit `reason` string.
+
+### Round 12 — Robustness + integration
+
+- **Relay transport hardening** (`transport.relay`): bounded select loop with an
+  iteration cap, output-buffer cap, escalating SIGTERM→SIGKILL termination with
+  a grace period, and parse-state transition logging for diagnostics.
+- **Constants module** (`codeagent.constants`): centralized shared timeouts and
+  limits (`DEFAULT_RELAY_TIMEOUT`, `MAX_LINE_LENGTH`, termination grace).
+- **Integration suite**: 8 SSH error-path integration tests; integration tests
+  are gated behind `--run-integration` with explicit skip reasons when disabled.
+
 ### Added
 
 - Coverage gate raised from 75% to 85% (`--cov-fail-under=85`).

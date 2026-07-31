@@ -12,14 +12,20 @@ The PTY select-loop is exercised with **real** file descriptors so
 """
 from __future__ import annotations
 
+import base64
+import fcntl
+import json
 import os
 import pty
+import re
 import signal
 import subprocess
+import termios
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from codeagent.domain import HostSpec, RunRequest, RunResult
 from codeagent.transport.relay import RelayTransport
 
 _WIRE_OK = (
@@ -307,3 +313,384 @@ class TestRelayPty:
 
         assert result.returncode == 1
         assert "relay execution error" in result.stderr
+
+    def test_terminate_group_killpg_failure_and_exhausted(self, transport: RelayTransport):
+        """killpg failures are swallowed; exhausted escalation logs a warning."""
+        proc = _make_proc(
+            wait_side_effect=[
+                subprocess.TimeoutExpired("x", 5),
+                subprocess.TimeoutExpired("x", 5),
+            ]
+        )
+        chan = _PipeChannel()
+        try:
+            with (
+                chan.patch_openpty(),
+                patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+                patch(
+                    "codeagent.transport.relay.os.killpg",
+                    side_effect=ProcessLookupError("no such process"),
+                ) as killpg,
+                patch("codeagent.transport.relay.log") as m_log,
+            ):
+                result = transport._run_with_pty(["zsh", "-c", "true"], timeout=0.05)
+        finally:
+            chan.close_write()
+
+        assert result.returncode == -1
+        assert "timeout after 0.05s" in result.stderr
+        # Both escalation stages fired; each killpg miss was swallowed.
+        assert killpg.call_count == 2
+        m_log.warning.assert_called_once()
+
+    def test_preexec_sets_controlling_tty(self, transport: RelayTransport):
+        """The child preexec hook creates a session and claims the TTY."""
+        proc = _make_proc()
+        chan = _PipeChannel(_WIRE_OK)
+        ioctl_calls: list[tuple[int, int]] = []
+
+        def fake_popen(*args, **kwargs):
+            kwargs["preexec_fn"]()  # run in the simulated child context
+            ioctl_calls.extend(c.args for c in m_ioctl.call_args_list)
+            return proc
+
+        with (
+            chan.patch_openpty(),
+            patch("codeagent.transport.relay.subprocess.Popen", side_effect=fake_popen),
+            patch("codeagent.transport.relay.os.setsid") as m_setsid,
+            patch("fcntl.ioctl") as m_ioctl,
+            patch("codeagent.transport.relay.os.killpg") as killpg,
+        ):
+            result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        m_setsid.assert_called_once()
+        # TIOCSCTTY was claimed on a real slave fd.
+        assert len(ioctl_calls) == 1
+        assert ioctl_calls[0][1] == termios.TIOCSCTTY
+        killpg.assert_not_called()
+
+    def test_preexec_tolerates_ioctl_failure(self, transport: RelayTransport):
+        """A failed TIOCSCTTY claim must not abort the run."""
+        proc = _make_proc()
+        chan = _PipeChannel(_WIRE_OK)
+
+        def fake_popen(*args, **kwargs):
+            kwargs["preexec_fn"]()
+            return proc
+
+        with (
+            chan.patch_openpty(),
+            patch("codeagent.transport.relay.subprocess.Popen", side_effect=fake_popen),
+            patch("codeagent.transport.relay.os.setsid"),
+            patch("fcntl.ioctl", side_effect=OSError("EPERM: not a session leader")),
+            patch("codeagent.transport.relay.os.killpg") as killpg,
+        ):
+            result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        killpg.assert_not_called()
+
+    def test_slave_close_failure_tolerated(self, transport: RelayTransport):
+        """A failed close of the slave fd must not abort the run."""
+        proc = _make_proc()
+        slave_fd = os.open(os.devnull, os.O_RDONLY)
+        chan = _PipeChannel(_WIRE_OK)
+        real_close = os.close
+
+        def raising_close(fd):
+            if fd == slave_fd:
+                raise OSError("fd already closed")
+            return real_close(fd)
+
+        with (
+            patch("codeagent.transport.relay.pty.openpty", return_value=(chan.r_fd, slave_fd)),
+            patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+            patch("codeagent.transport.relay.os.close", side_effect=raising_close),
+            patch("codeagent.transport.relay.os.killpg") as killpg,
+        ):
+            result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        killpg.assert_not_called()
+
+    @pytest.mark.parametrize("failure", ["isatty", "fileno"])
+    def test_stdin_probe_failures_tolerated(self, transport: RelayTransport, failure: str):
+        """A broken stdin probe (no tty / closed stream) disables forwarding."""
+        proc = _make_proc()
+        chan = _PipeChannel(_WIRE_OK)
+
+        class _BrokenStdin:
+            def isatty(self) -> bool:
+                if failure == "isatty":
+                    raise AttributeError("no isatty")
+                return True
+
+            def fileno(self) -> int:
+                if failure == "fileno":
+                    raise ValueError("I/O operation on closed file")
+                return 0
+
+        with (
+            chan.patch_openpty(),
+            patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+            patch("codeagent.transport.relay.sys.stdin", _BrokenStdin()),
+            patch("codeagent.transport.relay.os.killpg") as killpg,
+        ):
+            result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        killpg.assert_not_called()
+
+    def test_loop_breaks_on_deadline(self, transport: RelayTransport):
+        """The remaining<=0 guard breaks out of the loop without a kill."""
+        proc = _make_proc(returncode=0)
+        chan = _PipeChannel()
+        try:
+            with (
+                chan.patch_openpty(),
+                patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+                # deadline=30, while-check passes, remaining hits 0 exactly,
+                # timed_out re-check returns False → normal reap.
+                patch("codeagent.transport.relay.time.time", side_effect=[0.0, 0.0, 30.0, 29.0]),
+                patch("codeagent.transport.relay.os.killpg") as killpg,
+            ):
+                result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+        finally:
+            chan.close_write()
+
+        assert result.returncode == 0
+        killpg.assert_not_called()
+
+    def test_stdin_eof_disables_forwarding(self, transport: RelayTransport):
+        """Reading EOF from stdin stops stdin forwarding."""
+        proc = _make_proc()
+        chan = _PipeChannel(_WIRE_OK)
+        stdin_r, stdin_w = os.pipe()
+        os.close(stdin_w)  # immediate EOF on the read end
+
+        class _FakeStdin:
+            def isatty(self) -> bool:
+                return True
+
+            def fileno(self) -> int:
+                return stdin_r
+
+        try:
+            with (
+                chan.patch_openpty(),
+                patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+                patch("codeagent.transport.relay.sys.stdin", _FakeStdin()),
+                patch("codeagent.transport.relay.os.write") as m_write,
+                patch("codeagent.transport.relay.os.killpg") as killpg,
+            ):
+                result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+        finally:
+            os.close(stdin_r)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        m_write.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_stdin_read_error_disables_forwarding(self, transport: RelayTransport):
+        """An OSError reading stdin disables forwarding without aborting."""
+        proc = _make_proc()
+        chan = _PipeChannel(_WIRE_OK)
+        stdin_master, stdin_slave = pty.openpty()
+        os.write(stdin_slave, b"y")  # make the master readable
+
+        class _FakeStdin:
+            def isatty(self) -> bool:
+                return True
+
+            def fileno(self) -> int:
+                return stdin_master
+
+        real_read = os.read
+
+        def failing_read(fd, n):
+            if fd == stdin_master:
+                raise OSError("stdin read failed")
+            return real_read(fd, n)
+
+        try:
+            with (
+                chan.patch_openpty(),
+                patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+                patch("codeagent.transport.relay.sys.stdin", _FakeStdin()),
+                patch("codeagent.transport.relay.os.read", side_effect=failing_read),
+                patch("codeagent.transport.relay.os.killpg") as killpg,
+            ):
+                result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+        finally:
+            os.close(stdin_master)
+            os.close(stdin_slave)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        killpg.assert_not_called()
+
+    def test_blank_lines_skipped(self, transport: RelayTransport):
+        """Blank lines in the stream are skipped without touching stderr."""
+        proc = _make_proc()
+        chan = _PipeChannel(b"\n\n" + _WIRE_OK)
+
+        with (
+            chan.patch_openpty(),
+            patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+            patch("codeagent.transport.relay.os.killpg") as killpg,
+        ):
+            result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        assert result.stderr == ""
+        killpg.assert_not_called()
+
+    def test_unhandled_wire_type_goes_to_stderr(self, transport: RelayTransport):
+        """Valid wire lines of unhandled types are surfaced on stderr."""
+        proc = _make_proc()
+        chan = _PipeChannel(b'{"type":"pong","wire_version":1}\n' + _WIRE_OK)
+
+        with (
+            chan.patch_openpty(),
+            patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+            patch("codeagent.transport.relay.os.killpg") as killpg,
+        ):
+            result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        assert "pong" in result.stderr
+        killpg.assert_not_called()
+
+    def test_reap_timeout_kills_child(self, transport: RelayTransport):
+        """If the child doesn't exit within the reap window, kill it."""
+        proc = _make_proc(
+            returncode=0,
+            wait_side_effect=[subprocess.TimeoutExpired("x", 5), None],
+        )
+        chan = _PipeChannel()
+        chan.close_write()  # immediate EOF → normal reap path
+
+        with (
+            chan.patch_openpty(),
+            patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+            patch("codeagent.transport.relay.os.killpg") as killpg,
+        ):
+            result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+
+        assert result.returncode == 0
+        proc.kill.assert_called_once()
+        killpg.assert_not_called()
+
+    def test_master_close_failure_tolerated(self, transport: RelayTransport):
+        """A failed close of the PTY master in cleanup is ignored."""
+        proc = _make_proc()
+        chan = _PipeChannel(_WIRE_OK)
+        real_close = os.close
+
+        def raising_close(fd):
+            if fd == chan.r_fd:
+                raise OSError("master close failed")
+            return real_close(fd)
+
+        with (
+            chan.patch_openpty(),
+            patch("codeagent.transport.relay.subprocess.Popen", return_value=proc),
+            patch("codeagent.transport.relay.os.close", side_effect=raising_close),
+            patch("codeagent.transport.relay.os.killpg") as killpg,
+        ):
+            result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+
+        assert result.returncode == 0
+        assert result.stdout == "ok"
+        killpg.assert_not_called()
+
+    def test_popen_failure_closes_slave_fd(self, transport: RelayTransport):
+        """Popen failure still cleans up the slave fd in the finally block."""
+        slave_fd = os.open(os.devnull, os.O_RDONLY)
+        chan = _PipeChannel()
+        real_close = os.close
+        try:
+
+            def raising_close(fd):
+                if fd == slave_fd:
+                    raise OSError("slave close failed")
+                return real_close(fd)
+
+            with (
+                patch("codeagent.transport.relay.pty.openpty", return_value=(chan.r_fd, slave_fd)),
+                patch("codeagent.transport.relay.subprocess.Popen", side_effect=OSError("zsh missing")),
+                patch("codeagent.transport.relay.os.close", side_effect=raising_close),
+            ):
+                result = transport._run_with_pty(["zsh", "-c", "true"], timeout=30)
+        finally:
+            chan.close_write()
+
+        assert result.returncode == 1
+        assert "relay execution error" in result.stderr
+
+
+class TestRelayTransportSurface:
+    """RelayTransport API surface: no-op lifecycle + optional execute fields."""
+
+    def test_lifecycle_noops(self, transport: RelayTransport):
+        """warm/check/stop are no-ops for the stateless relay transport."""
+        host = HostSpec(
+            name="r",
+            ssh_alias="r.example.com",
+            hostnames=("r.example.com",),
+        )
+        assert transport.warm(host) is None
+        assert transport.check(host) is False
+        assert transport.stop(host) is None
+
+    def test_execute_optional_fields(self, transport: RelayTransport):
+        """execute() encodes agent/model/resume_session_id and applies shell_prefix."""
+        host = HostSpec(
+            name="r",
+            ssh_alias="r.example.com",
+            hostnames=("r.example.com",),
+            shell_prefix="export K=1",
+        )
+        request = RunRequest(
+            task="deploy",
+            workdir="/srv/app",
+            backend="opencode",
+            agent="smol",
+            model="gpt-4o-mini",
+            skip_permissions=False,
+            timeout=90,
+        )
+        captured_argv = None
+
+        def mock_run_with_pty(argv, timeout=600):
+            nonlocal captured_argv
+            captured_argv = argv
+            return RunResult(returncode=0, stdout="", stderr="")
+
+        transport._run_with_pty = mock_run_with_pty
+
+        transport.execute(request, host, "/srv/app", session_id="sess-42")
+
+        cmd = captured_argv[2]
+        assert "export K=1" in cmd
+        assert "r.example.com" in cmd
+
+        m = re.search(r"([A-Za-z0-9+/=]{40,})", cmd)
+        assert m is not None, cmd
+        wire = json.loads(base64.b64decode(m.group(1)).decode("utf-8"))
+        assert wire["task"] == "deploy"
+        assert wire["workdir"] == "/srv/app"
+        assert wire["backend"] == "opencode"
+        assert wire["agent"] == "smol"
+        assert wire["model"] == "gpt-4o-mini"
+        assert wire["resume_session_id"] == "sess-42"
+        assert wire["skip_permissions"] is False
+        assert wire["timeout"] == 90
