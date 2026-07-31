@@ -106,7 +106,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # mailbox
     mbox_p = sub.add_parser("mailbox", help="Cross-host mailbox operations")
-    # artifact
+    mbox_p.add_argument("mailbox_args", nargs=argparse.REMAINDER, help="Arguments passed to mailbox CLI")
+    mbox_p.add_argument("--host", help="Target host (omit for local)")
+    mbox_p.add_argument("--mailbox-root", help="Override MAILBOX_ROOT")
+
     art_p = sub.add_parser("artifact", help="Pull and verify remote artifacts")
     art_sub = art_p.add_subparsers(dest="art_cmd")
 
@@ -124,9 +127,6 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_p.add_argument("--file", required=True, help="Path to local file")
     verify_p.add_argument("--sha256", required=True, help="Expected SHA-256 hex digest")
     verify_p.add_argument("--size", type=int, required=True, help="Expected file size in bytes")
-
-    return p
-    mbox_p.add_argument("--mailbox-root", help="Override MAILBOX_ROOT")
 
     return p
 
@@ -524,6 +524,47 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
     return exit_code
 
 
+
+
+def _cmd_artifact(args: argparse.Namespace) -> int:
+    """Pull artifacts from remote hosts via ControlMaster, or verify local files."""
+    if args.art_cmd == "pull":
+        desc = ArtifactDescriptor(
+            artifact_id=args.artifact_id,
+            relative_path=args.relative_path,
+            size=args.size,
+            sha256=args.sha256,
+            media_type=args.media_type,
+        )
+        try:
+            dest = pull_artifact(
+                host_alias=args.host,
+                remote_root=args.remote_root,
+                desc=desc,
+                dest=Path(args.dest),
+            )
+            print(f"pulled {desc.artifact_id} → {dest} ({desc.size} bytes)")
+            return 0
+        except (TransportError, ValueError, FileNotFoundError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    if args.art_cmd == "verify":
+        try:
+            verify_artifact(
+                path=Path(args.file),
+                expected_sha256=args.sha256,
+                expected_size=args.size,
+            )
+            print(f"verified {args.file}: ok ({args.size} bytes)")
+            return 0
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+    return 1
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -538,6 +579,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "sessions": _cmd_sessions,
         "ssh": _cmd_ssh,
         "mailbox": _cmd_mailbox,
+        "artifact": _cmd_artifact,
     }
     handler = handlers.get(args.command)
     if handler is None:
