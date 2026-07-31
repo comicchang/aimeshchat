@@ -16,13 +16,29 @@ from codeagent.wire.protocol import (
     MAX_LINE_LENGTH,
     WIRE_VERSION,
     WireMessage,
+    CMD_CAPABILITIES,
+    CMD_MAILBOX,
+    CMD_PING,
+    MSG_ACCEPTED,
+    MSG_CAPABILITIES,
+    MSG_ERROR,
+    MSG_MAILBOX_RESULT,
+    MSG_PONG,
+    MSG_READY,
+    MSG_RESULT,
+    MSG_SESSION,
     decode_line,
     decode_request,
     encode_line,
     encode_request,
     make_accepted,
+    make_capabilities,
+    make_capabilities_request,
     make_error,
+    make_mailbox_request,
+    make_mailbox_result,
     make_ping,
+    make_pong,
     make_ready,
     make_request,
     make_result,
@@ -668,3 +684,65 @@ class TestMakeRequest:
     def test_skills_omitted_when_empty(self):
         req = make_request(command="run", task="t", workdir="/w", timeout=10, skills="")
         assert "skills" not in req
+
+
+class TestWireFactories:
+    """Test all wire protocol factory functions."""
+
+    def test_make_ping(self):
+        req = make_ping()
+        assert req["command"] == CMD_PING
+        assert "wire_version" in req
+
+    def test_make_capabilities_request(self):
+        req = make_capabilities_request()
+        assert req["command"] == CMD_CAPABILITIES
+
+    def test_make_mailbox_request(self):
+        req = make_mailbox_request(args=["send", "--session", "s1"])
+        assert req["command"] == CMD_MAILBOX
+        assert req["args"] == ["send", "--session", "s1"]
+
+    def test_make_mailbox_request_with_root(self):
+        req = make_mailbox_request(args=["send"], mailbox_root="/tmp/test")
+        assert req["mailbox_root"] == "/tmp/test"
+
+    def test_make_ready(self):
+        msg = make_ready()
+        assert msg["type"] == MSG_READY
+        assert "wire_version" in msg
+        assert "package_version" in msg
+
+    def test_make_accepted(self):
+        msg = make_accepted()
+        assert msg["type"] == MSG_ACCEPTED
+
+    def test_make_session(self):
+        msg = make_session("test-id")
+        assert msg["type"] == MSG_SESSION
+        assert msg["id"] == "test-id"
+
+    def test_make_result(self):
+        msg = make_result(stdout="ok", exit_code=0)
+        assert msg["type"] == MSG_RESULT
+        assert msg["stdout"] == "ok"
+
+    def test_make_error(self):
+        msg = make_error("test error")
+        assert msg["type"] == MSG_ERROR
+        assert msg["message"] == "test error"
+
+    def test_make_pong(self):
+        msg = make_pong(hostname="test", capabilities=["run"])
+        assert msg["type"] == MSG_PONG
+        assert msg["hostname"] == "test"
+
+    def test_make_capabilities(self):
+        msg = make_capabilities(backends=["codex"], features=["resume"])
+        assert msg["type"] == MSG_CAPABILITIES
+        assert msg["backends"] == ["codex"]
+
+    def test_make_mailbox_result(self):
+        msg = make_mailbox_result(stdout="ok", stderr="", exit_code=0)
+        assert msg["type"] == MSG_MAILBOX_RESULT
+        assert msg["stdout"] == "ok"
