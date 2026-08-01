@@ -199,6 +199,9 @@ class TestTransportSuccess:
 
         # Outbox entry still exists (preserved for audit)
         assert (outbox_root / "s1" / f"{mid}.json").exists()
+        # P1-6: successful remote delivery appends canonical history
+        history = store.read_history("s1")
+        assert any(h.get("msg_id") == mid for h in history)
 
     def test_deliver_calls_transport_with_correct_args(
         self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
@@ -312,6 +315,9 @@ class TestTransportFailure:
         assert count == 1
         assert call_count["n"] == 2
         assert (sd / f".delivered-{mid}").exists()
+        # P1: successful flush retry must also append canonical history
+        history = store.read_history("s1")
+        assert any(h.get("msg_id") == mid for h in history)
 
     def test_flush_exception_in_mailbox(
         self, store: MailboxStore, outbox_root: Path,

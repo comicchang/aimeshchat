@@ -162,6 +162,27 @@ class TestStore:
         result = store.finalize("s1", "w1", msg["msg_id"], "w1")
         assert "finalized" in result
 
+    def test_finalize_from_inbox(self, store):
+        """finalize_from_inbox archives directly from inbox (swarm auto-ack)."""
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        # Message is still in inbox (no read() called)
+        peek = store.peek("s1", "w1")
+        msg_id = peek["messages"][0]["msg_id"]
+        result = store.finalize_from_inbox("s1", "w1", msg_id, "w1")
+        assert "finalized" in result
+        assert store.peek("s1", "w1")["pending"] == 0
+
+    def test_finalize_from_inbox_processing(self, store):
+        """finalize_from_inbox also archives messages already in processing."""
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        msg = store.read("s1", "w1", "w1")  # inbox → processing
+        assert msg is not None
+        result = store.finalize_from_inbox("s1", "w1", msg["msg_id"], "w1")
+        assert "finalized" in result
+        assert store.peek("s1", "w1")["pending"] == 0
+
     def test_release(self, store):
         store.session_init("s1", "mgr", ["w1"])
         store.send("s1", "mgr", "w1", "t", "b", "TASK")

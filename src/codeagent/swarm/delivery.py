@@ -94,6 +94,25 @@ class DeliveryEngine:
         # host cache for _resolve_target (alias → HostSpec)
         self._host_cache: dict[str, Any] = {}
 
+    @staticmethod
+    def _history_entry(envelope: dict[str, Any], msg_id: str) -> dict[str, str]:
+        """Build a canonical history record (full 8-field message schema).
+
+        Shared by deliver() and flush() so both successful paths append
+        identical records — a drift here would silently fail
+        append_history's validate_message and lose history.
+        """
+        return {
+            "session_id": envelope.get("session_id", ""),
+            "from": envelope.get("from", ""),
+            "to": envelope.get("to", ""),
+            "subject": envelope.get("subject", ""),
+            "body": envelope.get("body", ""),
+            "kind": envelope.get("kind", "TASK"),
+            "msg_id": msg_id,
+            "created_at": envelope.get("created_at", ""),
+        }
+
     # ── public API ─────────────────────────────────────────────────────
 
     def deliver(
@@ -177,16 +196,7 @@ class DeliveryEngine:
         # remote sends must append here or swarm cross-host fan-out leaves
         # no trace in history/.
         try:
-            self._store.append_history(sid, {
-                "session_id": sid,
-                "from": envelope.get("from", ""),
-                "to": envelope.get("to", ""),
-                "subject": envelope.get("subject", ""),
-                "kind": envelope.get("kind", "TASK"),
-                "msg_id": msg_id,
-                "created_at": envelope.get("created_at", ""),
-                "delivered_via": "remote",
-            })
+            self._store.append_history(sid, self._history_entry(envelope, msg_id))
         except Exception as exc:
             log.warning("DeliveryEngine: history append failed: %s", exc)
         delivered = SendReceipt(status="delivered", msg_id=msg_id)
@@ -292,6 +302,13 @@ class DeliveryEngine:
                     continue
 
                 self._mark_delivered(sid, mid)
+                # Parity with deliver(): a successful flush retry must also
+                # leave a canonical history record (it was missing on the
+                # failed first attempt).
+                try:
+                    self._store.append_history(sid, self._history_entry(envelope, mid))
+                except Exception as exc:
+                    log.warning("DeliveryEngine: flush history append failed: %s", exc)
                 self._cache[mid] = SendReceipt(status="delivered", msg_id=mid)
                 delivered_count += 1
 
