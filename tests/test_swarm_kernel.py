@@ -592,3 +592,58 @@ class TestAccessors:
     def test_get_location_missing(self, kernel):
         kernel.create_session("s1", "mgr", ["w1"])
         assert kernel.get_location("s1", "w1") is None
+
+
+# ── Receipt propagation ────────────────────────────────────────────────
+
+
+class TestReceiptPropagation:
+    def test_direct_returns_accepted_on_transport_failure(self, store):
+        """kernel.direct returns 'accepted' when sink returns accepted."""
+        k = _make_kernel_with_session(store)
+        from codeagent.swarm.delivery import SendReceipt as DSinkReceipt
+        mock_sink = MagicMock()
+        mock_sink.deliver.return_value = DSinkReceipt(
+            status="accepted", msg_id="m1", queued=True,
+        )
+        k._sink = mock_sink
+        receipt = k.direct("s1", "mgr", "w1", _env())
+        assert receipt.status == "accepted"
+        assert receipt.queued is True
+
+    def test_direct_returns_delivered_on_local_success(self, store):
+        """kernel.direct returns 'delivered' when sink returns delivered."""
+        k = _make_kernel_with_session(store)
+        receipt = k.direct("s1", "mgr", "w1", _env())
+        assert receipt.status == "delivered"
+        assert receipt.queued is False
+
+    def test_broadcast_per_recipient_distinct_statuses(self, store):
+        """broadcast returns per-recipient receipts with actual sink statuses."""
+        k = _make_kernel_with_session(store)
+        from codeagent.swarm.delivery import SendReceipt as DSinkReceipt
+        mock_sink = MagicMock()
+        mock_sink.deliver.side_effect = [
+            DSinkReceipt(status="accepted", msg_id="m1", queued=True),
+            DSinkReceipt(status="delivered", msg_id="m2"),
+        ]
+        k._sink = mock_sink
+        receipts = k.broadcast("s1", "mgr", _env())
+        assert len(receipts) == 2
+        statuses = {r.recipient: r.status for r in receipts}
+        assert statuses["w1"] == "accepted"
+        assert statuses["w2"] == "delivered"
+
+    def test_send_broadcast_uses_max_status(self, store):
+        """send() broadcast branch returns 'accepted' if any receipt is not 'delivered'."""
+        k = _make_kernel_with_session(store)
+        from codeagent.swarm.delivery import SendReceipt as DSinkReceipt
+        mock_sink = MagicMock()
+        mock_sink.deliver.side_effect = [
+            DSinkReceipt(status="accepted", msg_id="m1", queued=True),
+            DSinkReceipt(status="delivered", msg_id="m2"),
+        ]
+        k._sink = mock_sink
+        addr = Address(kind=AddressKind.BROADCAST)
+        receipt = k.send("s1", "mgr", addr, _env())
+        assert receipt.status == "accepted"

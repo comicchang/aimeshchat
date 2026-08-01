@@ -23,6 +23,7 @@ from codeagent.mailbox.protocol import (
 from codeagent.mailbox.store import MailboxStore
 
 log = logging.getLogger(__name__)
+from codeagent.swarm.delivery import SendReceipt as DeliverySendReceipt
 from codeagent.swarm.model import (
     ACL,
     Address,
@@ -47,7 +48,7 @@ from codeagent.swarm.model import (
 class DeliverySink(Protocol):
     """Anything that can deliver an envelope to an agent inbox."""
     def deliver(self, session_id: str, target_agent: str, envelope: Envelope,
-                msg_id: str, created_at: str, from_id: str) -> None: ...
+                msg_id: str, created_at: str, from_id: str) -> DeliverySendReceipt: ...
 
 
 class LocalDeliverySink:
@@ -57,7 +58,7 @@ class LocalDeliverySink:
         self._store = store
 
     def deliver(self, session_id: str, target_agent: str, envelope: Envelope,
-                msg_id: str, created_at: str, from_id: str) -> None:
+                msg_id: str, created_at: str, from_id: str) -> DeliverySendReceipt:
         # When target_agent is BROADCAST_TO, use store's built-in broadcast fan-out
         self._store.send(
             session_id=session_id,
@@ -71,6 +72,7 @@ class LocalDeliverySink:
             request_id=envelope.request_id,
             attachments=[a.to_dict() for a in envelope.attachments] if envelope.attachments else None,
         )
+        return DeliverySendReceipt(status="delivered", msg_id=msg_id)
 
 
 # ── SwarmKernel ────────────────────────────────────────────────────────
@@ -430,23 +432,38 @@ class SwarmKernel:
                     status="empty_roster",
                     session_id=session_id,
                 )
+            status = "delivered"
+            for dr in receipts:
+                if dr.status != "delivered":
+                    status = "accepted"
+                    break
             return SendReceipt(
                 msg_id=receipts[0].msg_id,
-                status="delivered",
+                status=status,
                 session_id=session_id,
             )
         elif target.kind == AddressKind.CHANNEL:
             receipts = self.channel(session_id, sender, target.channel_id, envelope)
+            status = "delivered"
+            for dr in receipts:
+                if dr.status != "delivered":
+                    status = "accepted"
+                    break
             return SendReceipt(
                 msg_id=receipts[0].msg_id if receipts else "",
-                status="delivered",
+                status=status,
                 session_id=session_id,
             )
         elif target.kind == AddressKind.NOTICE:
             receipts = self.notice(session_id, sender, target.topic, envelope)
+            status = "delivered"
+            for dr in receipts:
+                if dr.status != "delivered":
+                    status = "accepted"
+                    break
             return SendReceipt(
                 msg_id=receipts[0].msg_id if receipts else "",
-                status="delivered",
+                status=status,
                 session_id=session_id,
             )
         else:
@@ -461,9 +478,10 @@ class SwarmKernel:
         msg_id = self._gen_msg_id()
         created_at = self._gen_created_at()
 
-        self._sink.deliver(session_id, to_agent, envelope, msg_id, created_at, sender)
-        return SendReceipt(msg_id=msg_id, status="delivered",
-                           session_id=session_id, target=to_agent)
+        sink_receipt = self._sink.deliver(session_id, to_agent, envelope, msg_id, created_at, sender)
+        return SendReceipt(msg_id=msg_id, status=sink_receipt.status,
+                           session_id=session_id, target=to_agent,
+                           queued=getattr(sink_receipt, "queued", False))
 
     def broadcast(self, session_id: str, sender: str,
                   envelope: Envelope) -> list[DeliveryReceipt]:
@@ -484,9 +502,11 @@ class SwarmKernel:
         receipts = []
         for r in recipients:
             msg_id = self._gen_msg_id()
-            self._sink.deliver(session_id, r, envelope, msg_id, created_at, sender)
+            sink_receipt = self._sink.deliver(session_id, r, envelope, msg_id, created_at, sender)
             receipts.append(DeliveryReceipt(
-                msg_id=msg_id, recipient=r, status="delivered",
+                msg_id=msg_id, recipient=r,
+                status=sink_receipt.status,
+                error=getattr(sink_receipt, "error", ""),
             ))
         return receipts
 
@@ -507,9 +527,11 @@ class SwarmKernel:
             if member == sender:
                 continue
             msg_id = self._gen_msg_id()  # per-recipient: no delivery short-circuit
-            self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
+            sink_receipt = self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
             receipts.append(DeliveryReceipt(
-                msg_id=msg_id, recipient=member, status="delivered",
+                msg_id=msg_id, recipient=member,
+                status=sink_receipt.status,
+                error=getattr(sink_receipt, "error", ""),
             ))
         return receipts
 
@@ -536,9 +558,11 @@ class SwarmKernel:
         receipts = []
         for member in sorted(targets):
             msg_id = self._gen_msg_id()  # per-recipient: no delivery short-circuit
-            self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
+            sink_receipt = self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
             receipts.append(DeliveryReceipt(
-                msg_id=msg_id, recipient=member, status="delivered",
+                msg_id=msg_id, recipient=member,
+                status=sink_receipt.status,
+                error=getattr(sink_receipt, "error", ""),
             ))
         return receipts
 

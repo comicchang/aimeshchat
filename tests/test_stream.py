@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from codeagent.constants import (
-    STREAM_CURSOR_DEFAULT,
+    STREAM_CURSOR_INITIAL,
     STREAM_HEARTBEAT_INTERVAL,
     STREAM_RECONNECT_BASE,
     STREAM_RECONNECT_MAX,
@@ -236,7 +236,7 @@ class TestStreamConstantsExist:
         assert STREAM_HEARTBEAT_INTERVAL == 15
         assert STREAM_RECONNECT_MAX == 30
         assert STREAM_RECONNECT_BASE == 1
-        assert STREAM_CURSOR_DEFAULT == "0"
+        assert STREAM_CURSOR_INITIAL == "0"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -352,6 +352,7 @@ class TestServeModeStream:
             "subject": "Hello",
             "body": "World",
             "created_at": "2025-07-01T12:00:00Z",
+            "_cursor": "1719840000000/0",
         }
         (session_dir / "msg-001.json").write_text(json.dumps(msg, indent=2))
 
@@ -372,7 +373,7 @@ class TestServeModeStream:
         evt = events[0]
         assert evt["payload"]["msg_id"] == "msg-001"
         assert evt["payload"]["from"] == "alice"
-        assert evt["cursor"] == "2025-07-01T12:00:00Z"
+        assert evt["cursor"] == "1719840000000/0"
 
     def test_stream_cursor_advances(self, tmp_path: Path):
         """After polling, the cursor advances so same message isn't re-emitted."""
@@ -388,6 +389,7 @@ class TestServeModeStream:
             "subject": "Hello",
             "body": "World",
             "created_at": "2025-07-01T12:00:00Z",
+            "_cursor": "1719840000000/0",
         }
         (session_dir / "msg-001.json").write_text(json.dumps(msg, indent=2))
 
@@ -404,7 +406,7 @@ class TestServeModeStream:
                 _poll_streams([sub])
 
         # Cursor should have advanced
-        assert sub.cursor == "2025-07-01T12:00:00Z"
+        assert sub.cursor == "1719840000000/0"
 
         # Second poll should not emit the same message again
         sent2: list[dict] = []
@@ -429,6 +431,7 @@ class TestServeModeStream:
             "from": "alice", "to": "a1", "kind": "REPORT",
             "subject": "First", "body": "B1",
             "created_at": "2025-07-01T12:00:00Z",
+            "_cursor": "1719840000000/0",
         }
         (session_dir / "msg-001.json").write_text(json.dumps(msg1, indent=2))
 
@@ -446,14 +449,15 @@ class TestServeModeStream:
                 _poll_streams([sub])
 
         assert len([m for m in sent if m.get("type") == "stream_event"]) == 1
-        assert sub.cursor == "2025-07-01T12:00:00Z"
+        assert sub.cursor == "1719840000000/0"
 
-        # Add a new message with a later timestamp
+        # Add a new message with a later cursor
         msg2 = {
             "msg_id": "msg-002",
             "from": "bob", "to": "a1", "kind": "COMMAND",
             "subject": "Second", "body": "B2",
             "created_at": "2025-07-01T12:05:00Z",
+            "_cursor": "1719840300000/0",
         }
         (session_dir / "msg-002.json").write_text(json.dumps(msg2, indent=2))
 
@@ -546,7 +550,9 @@ class TestServeModeStream:
                     "to": "a1",
                     "kind": "TASK",
                     "subject": "hi",
+                    "body": "Hello World",
                     "created_at": "2026-01-01T00:00:00Z",
+                    "_cursor": "1735689600000/0",
                 }
                 (inbox / "m1.json").write_text(json.dumps(msg))
 
@@ -858,4 +864,219 @@ class TestSSHStream:
 
         # All backoffs should be <= reconnect_max
         for call in sleep_calls:
-            assert call 
+            assert call <= 0.05  # reconnect_max
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Opaque cursor — same-second delivery + full payload + persistence
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestOpaqueCursorDelivery:
+    """Opaque cursor ensures no same-second message loss."""
+
+    def test_100_same_second_messages_all_delivered(self, tmp_path: Path):
+        """100 messages with the same created_at ALL get unique cursors and are delivered."""
+        from codeagent.mailbox.store import MailboxStore
+        from codeagent.remote_exec import _poll_streams, _StreamSubscription
+
+        store = MailboxStore(root=tmp_path)
+        session_dir = tmp_path / "s1"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        agent_dir = session_dir / "a1" / "inbox"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write 100 messages with same created_at but unique cursors
+        for i in range(100):
+            cursor = store.advance_cursor("s1")
+            msg = {
+                "msg_id": f"msg-{i:03d}",
+                "from": "alice",
+                "to": "a1",
+                "kind": "REPORT",
+                "subject": f"msg {i}",
+                "body": f"body {i}",
+                "created_at": "2025-07-01T12:00:00Z",
+                "_cursor": cursor,
+            }
+            (agent_dir / f"msg-{i:03d}.json").write_text(json.dumps(msg, indent=2))
+
+        sub = _StreamSubscription(
+            request_id="r1", session_id="s1", agent_id="a1", cursor="0",
+        )
+
+        sent: list[dict] = []
+        with patch("codeagent.remote_exec._send", side_effect=sent.append):
+            with patch("codeagent.remote_exec.MailboxStore", return_value=store):
+                _poll_streams([sub])
+
+        events = [m for m in sent if m.get("type") == "stream_event"]
+        assert len(events) == 100
+
+        # All cursors are unique and already in sorted order (monotonic)
+        cursors = [e["cursor"] for e in events]
+        assert len(set(cursors)) == 100
+        assert cursors == sorted(cursors)
+
+    def test_stream_event_has_full_payload(self, tmp_path: Path):
+        """stream_event payload includes body, attachments, and all 8 required fields."""
+        from codeagent.mailbox.store import MailboxStore
+        from codeagent.remote_exec import _poll_streams, _StreamSubscription
+
+        store = MailboxStore(root=tmp_path)
+        session_dir = tmp_path / "s1"
+        agent_dir = session_dir / "a1" / "inbox"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+
+        cursor = store.advance_cursor("s1")
+        msg = {
+            "msg_id": "msg-001",
+            "from": "alice",
+            "to": "a1",
+            "kind": "REPORT",
+            "subject": "Hello",
+            "body": "Full body content here",
+            "created_at": "2025-07-01T12:00:00Z",
+            "reply_to": "msg-000",
+            "run_id": "run-123",
+            "request_id": "req-456",
+            "_cursor": cursor,
+            "attachments": [
+                {"ref": "file://artifacts/result.txt", "name": "result.txt", "mime": "text/plain", "size": 1234}
+            ],
+        }
+        (agent_dir / "msg-001.json").write_text(json.dumps(msg, indent=2))
+
+        sub = _StreamSubscription(
+            request_id="r1", session_id="s1", agent_id="a1", cursor="0",
+        )
+
+        sent: list[dict] = []
+        with patch("codeagent.remote_exec._send", side_effect=sent.append):
+            with patch("codeagent.remote_exec.MailboxStore", return_value=store):
+                _poll_streams([sub])
+
+        events = [m for m in sent if m.get("type") == "stream_event"]
+        assert len(events) == 1
+        evt = events[0]
+
+        # All 8 required fields present in payload
+        payload = evt["payload"]
+        assert payload["msg_id"] == "msg-001"
+        assert payload["from"] == "alice"
+        assert payload["to"] == "a1"
+        assert payload["kind"] == "REPORT"
+        assert payload["subject"] == "Hello"
+        assert payload["body"] == "Full body content here"
+        assert payload["created_at"] == "2025-07-01T12:00:00Z"
+        assert payload["reply_to"] == "msg-000"
+        assert payload["run_id"] == "run-123"
+        assert payload["request_id"] == "req-456"
+
+        # Attachments forwarded
+        assert "attachments" in payload
+        assert len(payload["attachments"]) == 1
+        assert payload["attachments"][0]["name"] == "result.txt"
+
+    def test_cursor_persists_across_restart(self, tmp_path: Path):
+        """Cursor persists in .stream-cursor file and survives 'restart'."""
+        from codeagent.mailbox.store import MailboxStore
+
+        store = MailboxStore(root=tmp_path)
+
+        # Create some cursor state
+        cursor1 = store.advance_cursor("s1")
+        cursor2 = store.advance_cursor("s1")
+        assert cursor1 != cursor2
+
+        # "Restart" — create a new store instance
+        store2 = MailboxStore(root=tmp_path)
+
+        # Read cursor — should see the latest value
+        cursor_read = store2.read_cursor("s1")
+        assert cursor_read == cursor2
+
+        # Advance again — should continue from where we left off
+        cursor3 = store2.advance_cursor("s1")
+        # cursor3 > cursor2 lexicographically
+        assert cursor3 > cursor2
+
+    def test_reconnect_with_cursor_resumes(self, tmp_path: Path):
+        """Reconnect with cursor resumes from last delivered message."""
+        from codeagent.mailbox.store import MailboxStore
+        from codeagent.remote_exec import _poll_streams, _StreamSubscription
+
+        store = MailboxStore(root=tmp_path)
+        agent_dir = tmp_path / "s1" / "a1" / "inbox"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write 5 messages with incrementing cursors
+        cursors = []
+        for i in range(5):
+            cursor = store.advance_cursor("s1")
+            cursors.append(cursor)
+            msg = {
+                "msg_id": f"msg-{i:03d}",
+                "from": "alice",
+                "to": "a1",
+                "kind": "REPORT",
+                "subject": f"msg {i}",
+                "body": f"body {i}",
+                "created_at": "2025-07-01T12:00:00Z",
+                "_cursor": cursor,
+            }
+            (agent_dir / f"msg-{i:03d}.json").write_text(json.dumps(msg, indent=2))
+
+        # First subscription: deliver messages 0-4
+        sub1 = _StreamSubscription(
+            request_id="r1", session_id="s1", agent_id="a1", cursor="0",
+        )
+
+        sent1: list[dict] = []
+        with patch("codeagent.remote_exec._send", side_effect=sent1.append):
+            with patch("codeagent.remote_exec.MailboxStore", return_value=store):
+                _poll_streams([sub1])
+
+        events1 = [m for m in sent1 if m.get("type") == "stream_event"]
+        assert len(events1) == 5
+        assert sub1.cursor == cursors[-1]
+
+        # Reconnect with cursor = last delivered cursor
+        sub2 = _StreamSubscription(
+            request_id="r1", session_id="s1", agent_id="a1",
+            cursor=sub1.cursor,  # resume from last delivered
+        )
+
+        sent2: list[dict] = []
+        with patch("codeagent.remote_exec._send", side_effect=sent2.append):
+            with patch("codeagent.remote_exec.MailboxStore", return_value=store):
+                _poll_streams([sub2])
+
+        # No new messages — should get 0 events
+        events2 = [m for m in sent2 if m.get("type") == "stream_event"]
+        assert len(events2) == 0
+
+        # Add message 6
+        cursor6 = store.advance_cursor("s1")
+        msg6 = {
+            "msg_id": "msg-005",
+            "from": "bob",
+            "to": "a1",
+            "kind": "COMMAND",
+            "subject": "new",
+            "body": "after reconnect",
+            "created_at": "2025-07-01T12:05:00Z",
+            "_cursor": cursor6,
+        }
+        (agent_dir / "msg-005.json").write_text(json.dumps(msg6, indent=2))
+
+        # Second reconnect poll: only msg-005 delivered
+        sent3: list[dict] = []
+        with patch("codeagent.remote_exec._send", side_effect=sent3.append):
+            with patch("codeagent.remote_exec.MailboxStore", return_value=store):
+                _poll_streams([sub2])
+
+        events3 = [m for m in sent3 if m.get("type") == "stream_event"]
+        assert len(events3) == 1
+        assert events3[0]["payload"]["msg_id"] == "msg-005"
+        assert events3[0]["payload"]["body"] == "after reconnect"

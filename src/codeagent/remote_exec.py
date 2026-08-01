@@ -19,7 +19,7 @@ from codeagent.constants import (
     DEFAULT_EXEC_TIMEOUT,
     MAX_LINE_LENGTH,
     STREAM_HEARTBEAT_INTERVAL,
-    STREAM_CURSOR_DEFAULT,
+    STREAM_CURSOR_INITIAL,
 )
 from codeagent.domain import RunRequest
 from codeagent.runners import GoWrapperRunner, OMPRunner
@@ -372,7 +372,7 @@ class _StreamSubscription:
     request_id: str
     session_id: str
     agent_id: str
-    cursor: str  # ISO timestamp of last delivered message, or "0"
+    cursor: str  # opaque server cursor ("epoch_ms/seq"), or STREAM_CURSOR_INITIAL
     last_heartbeat: float = field(default_factory=time.monotonic)
 
 
@@ -380,8 +380,9 @@ def _poll_streams(subs: list[_StreamSubscription]) -> None:
     """Poll mailbox stores for new messages and emit stream_event frames.
 
     For each subscription, checks the agent's inbox for messages with
-    ``created_at`` greater than the subscription's cursor.  Emits one
-    ``stream_event`` per new message and advances the cursor.
+    ``_cursor`` lexicographically greater than the subscription's cursor.
+    Emits one ``stream_event`` per new message with the full Message
+    payload and advances the cursor.
     """
     if not subs:
         return
@@ -398,28 +399,28 @@ def _poll_streams(subs: list[_StreamSubscription]) -> None:
                     msg = json.loads(f.read_bytes())
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                     continue
-                created = msg.get("created_at", "")
+                msg_cursor = msg.get('_cursor', '')
                 msg_id = msg.get("msg_id", f.stem)
-                # Skip messages we've already delivered
-                if sub.cursor != STREAM_CURSOR_DEFAULT and created <= sub.cursor:
+                # Skip messages we've already delivered (lexicographic)
+                if msg_cursor and msg_cursor <= sub.cursor:
                     continue
-                # Emit event
+                # Emit event with full Message payload
                 event = {
-                    "type": "stream_event",
-                    "request_id": sub.request_id,
-                    "session_id": sub.session_id,
-                    "cursor": created or msg_id,
-                    "payload": {
-                        "msg_id": msg_id,
-                        "from": msg.get("from", ""),
-                        "to": msg.get("to", ""),
-                        "kind": msg.get("kind", ""),
-                        "subject": msg.get("subject", ""),
-                        "created_at": created,
+                    'type': 'stream_event',
+                    'request_id': sub.request_id,
+                    'session_id': sub.session_id,
+                    'cursor': msg_cursor or msg_id,
+                    'payload': {
+                        k: msg.get(k, '')
+                        for k in ('msg_id', 'from', 'to', 'kind', 'subject',
+                                  'body', 'created_at', 'reply_to', 'run_id',
+                                  'request_id')
                     },
                 }
+                if msg.get('attachments'):
+                    event['payload']['attachments'] = msg['attachments']
                 _send(event)
-                sub.cursor = created or msg_id
+                sub.cursor = msg_cursor or msg_id
         except Exception:
             # Don't let one subscription's error kill the loop
             pass
@@ -505,7 +506,7 @@ def main(argv: list[str] | None = None) -> None:
             # Register a new stream subscription
             session_id = req.get("session_id", "")
             agent_id = req.get("agent_id", "")
-            cursor = req.get("cursor", STREAM_CURSOR_DEFAULT)
+            cursor = req.get("cursor", STREAM_CURSOR_INITIAL)
             request_id = req.get("request_id", "")
             if not session_id:
                 _send({"type": "error", "message": "stream requires session_id"})

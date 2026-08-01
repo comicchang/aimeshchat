@@ -27,5 +27,11 @@ MAX_MAILBOX_BODY = 100_000  # 100 KiB
 STREAM_HEARTBEAT_INTERVAL = 15  # seconds between heartbeat pings
 STREAM_RECONNECT_MAX = 30  # max reconnect backoff in seconds
 STREAM_RECONNECT_BASE = 1  # initial reconnect backoff in seconds
-STREAM_CURSOR_DEFAULT = "0"  # initial cursor value
+
+# ── opaque stream cursor ───────────────────────────────────────────────
+# Server-side monotonic arrival counter persisted per-session.
+# Format: "<epoch_ms>/<seq>" (seq = per-epoch 0-based counter).
+# Cursor file: <mailbox_root>/<session_id>/.stream-cursor
+STREAM_CURSOR_INITIAL = "0"
+STREAM_CURSOR_FILE = ".stream-cursor"
 

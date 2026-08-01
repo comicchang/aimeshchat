@@ -4,11 +4,12 @@ from __future__ import annotations
 import json
 import os
 import string
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from codeagent.constants import LEASE_TIMEOUT_S, MAX_MAILBOX_BODY
+from codeagent.constants import LEASE_TIMEOUT_S, MAX_MAILBOX_BODY, STREAM_CURSOR_FILE, STREAM_CURSOR_INITIAL
 from codeagent.mailbox.protocol import (
     BROADCAST_TO,
     VALID_KINDS,
@@ -202,6 +203,7 @@ class MailboxStore:
 
         # All recipients validated — now write every envelope, then history
         payload = msg.to_dict()
+        payload['_cursor'] = self.advance_cursor(session_id)
         for rid in recipients:
             inbox = self.agent_subdir(session_id, rid, "inbox")
             dest = inbox / f"{msg_id}.json"
@@ -217,6 +219,70 @@ class MailboxStore:
         if is_broadcast:
             return f"broadcast → {len(recipients)} recipients"
         return f"sent → {to_id}/inbox/{msg_id}.json"
+
+    # ── Stream cursor ─────────────────────────────────────────────────
+
+    def advance_cursor(self, session_id: str) -> str:
+        """Advance and return the opaque stream cursor for a session.
+
+        Reads ``<session_dir>/.stream-cursor`` JSON ``{'epoch_ms':N,'seq':N}``,
+        increments seq (bumps epoch_ms and resets seq if epoch_ms changed),
+        writes back atomically, returns ``"epoch_ms/seq"``.
+        """
+        sd = self.session_dir(session_id)
+        sd.mkdir(parents=True, exist_ok=True)
+        cursor_file = sd / STREAM_CURSOR_FILE
+
+        now_ms = int(time.time() * 1000)
+
+        # Read current cursor state
+        prev_epoch = 0
+        prev_seq = 0
+        if cursor_file.exists():
+            try:
+                data = json.loads(cursor_file.read_bytes())
+                prev_epoch = data.get('epoch_ms', 0)
+                prev_seq = data.get('seq', 0)
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                pass
+
+        # Advance: if same epoch, increment seq; otherwise reset to 0
+        if now_ms == prev_epoch:
+            new_seq = prev_seq + 1
+        else:
+            new_seq = 0
+
+        # Atomic replace with fsync
+        new_data = {'epoch_ms': now_ms, 'seq': new_seq}
+        tmp = sd / ".tmp-stream-cursor"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(new_data, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(cursor_file))
+
+        return f"{now_ms}/{new_seq}"
+
+    def read_cursor(self, session_id: str) -> str:
+        """Read the current opaque stream cursor for a session.
+
+        Returns the cursor string ``"epoch_ms/seq"``, or
+        :data:`~codeagent.constants.STREAM_CURSOR_INITIAL` if no cursor
+        file exists yet.
+        """
+        sd = self.session_dir(session_id)
+        cursor_file = sd / STREAM_CURSOR_FILE
+
+        if not cursor_file.exists():
+            return STREAM_CURSOR_INITIAL
+
+        try:
+            data = json.loads(cursor_file.read_bytes())
+            epoch_ms = data.get('epoch_ms', 0)
+            seq = data.get('seq', 0)
+            return f"{epoch_ms}/{seq}"
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return STREAM_CURSOR_INITIAL
 
     # ── Canonical history (append-only, shared across the session) ────
 

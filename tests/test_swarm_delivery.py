@@ -928,7 +928,7 @@ class TestE2ECrossHostDeliveryChain:
                         hostnames=(loc.host_alias,),
                     )
                     engine.cache_host(target_agent, host)
-                engine.deliver_sink(session_id, target_agent, envelope, msg_id, created_at, from_id)
+                return engine.deliver_sink(session_id, target_agent, envelope, msg_id, created_at, from_id)
 
         kernel = SwarmKernel(store=store, sink=_EngineSink())
 
@@ -1050,3 +1050,47 @@ class TestE2ECrossHostDeliveryChain:
         fallback = engine._resolve_target("unknown-agent")
         assert fallback.transport == "ssh"  # HostSpec default
         assert fallback.ssh_alias == "unknown-agent"
+
+
+# ── EngineDeliverySink receipt propagation ─────────────────────────────
+
+
+class TestEngineDeliverySinkReceipt:
+    def test_deliver_returns_receipt_local(self, store: MailboxStore, outbox_root: Path) -> None:
+        """EngineDeliverySink returns receipt with 'delivered' for local target."""
+        from codeagent.swarm.delivery import EngineDeliverySink
+
+        _init_session(store)
+        engine = DeliveryEngine(mailbox_store=store, outbox_root=outbox_root)
+        sink = EngineDeliverySink(engine=engine, kernel=None)
+        envelope = _make_envelope()
+        receipt = sink.deliver("s1", "w1", envelope, "mid-1", "2026-01-01T00:00:00Z", "mgr")
+        assert receipt.status == "delivered"
+        assert receipt.queued is False
+
+    def test_deliver_returns_receipt_transport_failure(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """EngineDeliverySink returns 'accepted' when transport fails."""
+        from codeagent.swarm.delivery import EngineDeliverySink
+
+        _init_session(store)
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.mailbox.side_effect = ConnectionError("refused")
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        sink = EngineDeliverySink(engine=engine, kernel=None)
+        engine.cache_host("remote-agent", host_a)
+        receipt = sink.deliver(
+            "s1", "remote-agent", _make_envelope(msg_id="mid-transport-fail"),
+            "mid-transport-fail", "2026-01-01T00:00:00Z", "mgr",
+        )
+        assert receipt.status == "accepted"
+        assert receipt.queued is True

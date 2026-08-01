@@ -213,7 +213,7 @@ class DeliveryEngine:
         msg_id: str,
         created_at: str,
         from_id: str,
-    ) -> None:
+    ) -> SendReceipt:
         """Bridge to ``DeliverySink`` protocol used by SwarmKernel.
 
         Converts the 6-param kernel call into a dict envelope and delegates
@@ -257,10 +257,10 @@ class DeliveryEngine:
             # flush() reads `_target_host` to re-send on retry — without it
             # every retry is silently skipped.
             env_dict["_target_host"] = getattr(host, "host_alias", "") or getattr(host, "ssh_alias", "")
-            self.deliver(session_id, host, env_dict)
+            return self.deliver(session_id, host, env_dict)
         else:
             # No cached host — deliver locally (outbox write only)
-            self.deliver(session_id, target_agent, env_dict)
+            return self.deliver(session_id, target_agent, env_dict)
 
     def cache_host(self, agent_id: str, host: Any) -> None:
         """Register an agent_id → HostSpec mapping for sink resolution."""
@@ -606,7 +606,7 @@ class EngineDeliverySink:
         self._kernel = kernel
 
     def deliver(self, session_id: str, target_agent: str, envelope: Any,
-                msg_id: str, created_at: str, from_id: str) -> None:
+                msg_id: str, created_at: str, from_id: str) -> SendReceipt:
         if self._kernel is not None:
             loc = self._kernel.get_location(session_id, target_agent)
             if loc and loc.host_alias and loc.host_alias != "__local__":
@@ -617,4 +617,4 @@ class EngineDeliverySink:
                     hostnames=(loc.host_alias,),
                 )
                 self._engine.cache_host(target_agent, host)
-        self._engine.deliver_sink(session_id, target_agent, envelope, msg_id, created_at, from_id)
+        return self._engine.deliver_sink(session_id, target_agent, envelope, msg_id, created_at, from_id)

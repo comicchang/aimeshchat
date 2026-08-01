@@ -127,6 +127,7 @@ class SendReceipt:
     status: str            # "accepted" | "delivered" | "consumed"
     session_id: str = ""
     target: str = ""
+    queued: bool = False   # True when durable-outbox written but transport pending
 
 
 @dataclass(frozen=True)

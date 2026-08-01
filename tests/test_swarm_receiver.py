@@ -1095,3 +1095,136 @@ class TestWatchErrorPaths:
         # Callback still fires (after write failure, event is still processed)
         assert len(fired) == 1
         assert fired[0]["msg_id"] == "msg-write-fail"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# P0-3: Callback failure safety — message must not be archived on error
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestCallbackFailureSafety:
+    """P0-3: callback raising or no match must NOT archive the message."""
+
+    def test_callback_raises_keeps_message_in_inbox(self, store, kernel, tmp_path):
+        """Callback raising RuntimeError → message stays in inbox, retryable."""
+        _setup_session(kernel, store)
+
+        def bad_callback(msg):
+            raise RuntimeError("boom")
+
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=bad_callback)
+        receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
+        time.sleep(0.15)
+
+        _write_msg(store, "s1", "w1", "msg-cb-raise", subject="should-stay")
+
+        # Wait for the watch cycle to process the message
+        deadline = time.monotonic() + 3.0
+        while True:
+            # Check if the message is still in inbox
+            inbox = store.agent_subdir("s1", "w1", "inbox")
+            if (inbox / "msg-cb-raise.json").exists():
+                # Check if it's been processed (stat cache updated)
+                # Give a bit more time for the callback to have fired
+                time.sleep(0.3)
+                break
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+
+        receiver.stop()
+
+        # Message must still be in inbox — NOT archived
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        archive = store.agent_subdir("s1", "w1", "archive")
+        assert (inbox / "msg-cb-raise.json").exists(), "message must stay in inbox after callback failure"
+        assert not (archive / "msg-cb-raise.json").exists(), "message must NOT be archived after callback failure"
+
+    def test_callback_success_archives_message(self, store, kernel, tmp_path):
+        """Callback succeeds → message finalized from inbox to archive."""
+        _setup_session(kernel, store)
+        fired: list[dict] = []
+
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: fired.append(msg))
+        receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
+        time.sleep(0.15)
+
+        _write_msg(store, "s1", "w1", "msg-cb-ok", subject="should-archive")
+
+        deadline = time.monotonic() + 3.0
+        while not fired and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        # Wait for ack to complete
+        time.sleep(0.3)
+        receiver.stop()
+
+        assert len(fired) == 1
+        # Message should be in archive (consumed)
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        archive = store.agent_subdir("s1", "w1", "archive")
+        assert not (inbox / "msg-cb-ok.json").exists(), "successful callback must archive the message"
+        assert (archive / "msg-cb-ok.json").exists(), "successful callback must move message to archive"
+
+    def test_no_callback_match_keeps_message_in_inbox(self, store, kernel, tmp_path):
+        """No callback matches filters → message NOT archived."""
+        _setup_session(kernel, store)
+
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        # Register callback with a kind filter that won't match
+        receiver.subscribe(callback=lambda msg: None, kinds=["REPORT"])
+        receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
+        time.sleep(0.15)
+
+        # Write a TASK message (doesn't match REPORT filter)
+        _write_msg(store, "s1", "w1", "msg-no-match", kind="TASK",
+                   subject="should-not-archive")
+
+        # Wait for watch cycle
+        deadline = time.monotonic() + 3.0
+        while True:
+            inbox = store.agent_subdir("s1", "w1", "inbox")
+            if (inbox / "msg-no-match.json").exists():
+                time.sleep(0.3)
+                break
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+
+        receiver.stop()
+
+        # Message stays in inbox — no callback matched
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        archive = store.agent_subdir("s1", "w1", "archive")
+        assert (inbox / "msg-no-match.json").exists(), "no-match must keep message in inbox"
+        assert not (archive / "msg-no-match.json").exists(), "no-match must NOT archive"
+
+    def test_stream_callback_failure_no_ack(self, store, kernel, tmp_path):
+        """Stream mode: callback failure → no ack, message remains."""
+        _setup_session(kernel, store)
+
+        def failing_cb(msg):
+            raise RuntimeError("stream boom")
+
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=failing_cb)
+
+        # Call _handle_stream_event directly (avoids needing SSHStream import
+        # which has a pre-existing broken import in constants.py).
+        event = {
+            "msg_id": "msg-stream-fail",
+            "from": "mgr",
+            "to": "w1",
+            "kind": "TASK",
+            "subject": "stream-cb-fail",
+            "created_at": "2025-07-10T00:00:00Z",
+        }
+        receiver._handle_stream_event(event)
+
+        # Message written to inbox but NOT archived (callback failed)
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        archive = store.agent_subdir("s1", "w1", "archive")
+        assert (inbox / "msg-stream-fail.json").exists(), "stream failure must keep message in inbox"
+        assert not (archive / "msg-stream-fail.json").exists(), "stream failure must NOT archive"

@@ -213,19 +213,26 @@ class SwarmReceiver:
         # inbox or processing or archive, skip writing.
         if self._is_msg_on_disk(msg_id):
             log.debug("SwarmReceiver: skipping already-stored msg_id=%s", msg_id)
-            self._fire_callbacks(event)
-            # Still ack so the message moves to consumed state
-            self._try_ack(msg_id)
+            success = self._fire_callbacks(event)
+            if success:
+                self._try_ack(msg_id)
+            else:
+                log.warning(
+                    "SwarmReceiver: msg_id=%s not acked — callback failure", msg_id,
+                )
             return
 
         # Write to local inbox
         self._write_to_inbox(event)
 
-        # Fire callbacks
-        self._fire_callbacks(event)
-
-        # Auto-ack consumed
-        self._try_ack(msg_id)
+        # Fire callbacks — only ack on success
+        success = self._fire_callbacks(event)
+        if success:
+            self._try_ack(msg_id)
+        else:
+            log.warning(
+                "SwarmReceiver: msg_id=%s not acked — callback failure", msg_id,
+            )
 
     def _write_to_inbox(self, event: dict[str, Any]) -> None:
         """Write a stream event as a message file in the local inbox."""
@@ -383,16 +390,28 @@ class SwarmReceiver:
         return new_msgs
 
     def _handle_watch_message(self, msg: dict) -> None:
-        """Process a message discovered by watch: fire callbacks, ack."""
-        self._fire_callbacks(msg)
-
+        """Process a message discovered by watch: fire callbacks, ack on success."""
+        success = self._fire_callbacks(msg)
         msg_id = msg.get("msg_id", "")
-        self._try_ack(msg_id)
+
+        if success:
+            self._try_ack(msg_id)
+        else:
+            log.warning(
+                "SwarmReceiver: msg_id=%s not acked — no callback matched or callback raised",
+                msg_id,
+            )
 
     # ── Callback dispatch ──────────────────────────────────────────────
 
-    def _fire_callbacks(self, msg: dict) -> None:
-        """Fire all registered callbacks whose filters match the message."""
+    def _fire_callbacks(self, msg: dict) -> bool:
+        """Fire all registered callbacks whose filters match the message.
+
+        Returns True if at least one callback matched and all succeeded.
+        Returns False if zero callbacks matched (filters excluded) or
+        any callback raised.
+        """
+        matched = 0
         for callback, channels, kinds in self._callbacks:
             # Apply channel filter
             if channels:
@@ -403,10 +422,13 @@ class SwarmReceiver:
             if kinds:
                 if msg.get("kind", "") not in kinds:
                     continue
+            matched += 1
             try:
                 callback(msg)
             except Exception:
                 log.exception("SwarmReceiver: callback error")
+                return False
+        return matched > 0
 
     # ── Control ────────────────────────────────────────────────────────
 

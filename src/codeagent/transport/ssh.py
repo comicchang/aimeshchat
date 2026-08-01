@@ -18,7 +18,7 @@ from codeagent.constants import (
     DEFAULT_EXEC_TIMEOUT,
     DEFAULT_MAILBOX_TIMEOUT,
     DEFAULT_SSH_TIMEOUT,
-    STREAM_CURSOR_DEFAULT,
+    STREAM_CURSOR_INITIAL,
     STREAM_HEARTBEAT_INTERVAL,
     STREAM_RECONNECT_BASE,
     STREAM_RECONNECT_MAX,
@@ -548,7 +548,7 @@ class SSHStream:
         self._session_id = ""
         self._agent_id = ""
         self._request_id = ""
-        self._cursor = STREAM_CURSOR_DEFAULT
+        self._cursor = STREAM_CURSOR_INITIAL
         self._timeout = DEFAULT_EXEC_TIMEOUT
 
         self._last_event_time: float = 0.0
@@ -562,7 +562,7 @@ class SSHStream:
         *,
         session_id: str,
         agent_id: str,
-        cursor: str = STREAM_CURSOR_DEFAULT,
+        cursor: str = STREAM_CURSOR_INITIAL,
         timeout: int = DEFAULT_EXEC_TIMEOUT,
     ) -> None:
         """Open the stream — spawn the SSH process and issue a stream request."""
