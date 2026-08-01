@@ -353,8 +353,9 @@ class TestPrivateBroadcastChannel:
     def test_channel_with_acl(self, kernel: SwarmKernel, store: MailboxStore) -> None:
         _setup_session(kernel)
         kernel.create_channel("s1", "secret-room", members=["mgr", "w1"])
-        receipt = kernel.channel("s1", "mgr", "secret-room", _env())
-        assert receipt.msg_id
+        receipts = kernel.channel("s1", "mgr", "secret-room", _env())
+        assert len(receipts) == 1
+        assert receipts[0].msg_id
         # w2 is not in the channel
         assert store.peek("s1", "w2")["pending"] == 0
         # w1 is in the channel

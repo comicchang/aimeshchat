@@ -167,7 +167,7 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     ch_p = swarm_sub.add_parser("channel", help="Send to a channel")
     ch_p.add_argument("session_id")
     ch_p.add_argument("channel_id", help="Channel identifier")
-    ch_p.add_argument("--to", dest="sender", required=True, help="Sender agent ID")
+    ch_p.add_argument("--from", dest="sender", required=True, help="Sender agent ID")
     ch_p.add_argument("--kind", default="TASK")
     ch_p.add_argument("--subject", default="")
     ch_p.add_argument("--body", required=True)
@@ -366,12 +366,9 @@ def _swarm_direct(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 def _swarm_channel(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     attachments = _parse_attachments(args.attachment) if args.attachment else []
     env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments)
-    receipt = kernel.channel(args.session_id, args.sender, args.channel_id, env)
-    print(json.dumps({
-        "msg_id": receipt.msg_id,
-        "status": receipt.status,
-        "target": receipt.target,
-    }, indent=2))
+    receipts = kernel.channel(args.session_id, args.sender, args.channel_id, env)
+    out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
+    print(json.dumps(out, indent=2))
     return 0
 
 
@@ -385,12 +382,9 @@ def _swarm_broadcast(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
 def _swarm_notice(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     env = Envelope(subject=args.subject, body=args.body, kind=args.kind)
-    receipt = kernel.notice(args.session_id, args.sender, args.topic, env, ttl=args.ttl)
-    print(json.dumps({
-        "msg_id": receipt.msg_id,
-        "status": receipt.status,
-        "target": receipt.target,
-    }, indent=2))
+    receipts = kernel.notice(args.session_id, args.sender, args.topic, env, ttl=args.ttl)
+    out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
+    print(json.dumps(out, indent=2))
     return 0
 
 

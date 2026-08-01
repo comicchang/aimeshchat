@@ -171,8 +171,24 @@ class DeliveryEngine:
             self._write_status(sid, msg_id, "transport_failed", str(exc))
             return accepted
 
-        # ── 3. Transport success — mark delivered ──────────────────────
+        # ── 3. Transport success — mark delivered + history ────────────
         self._mark_delivered(sid, msg_id)
+        # Canonical session history: local sends get it via store.send();
+        # remote sends must append here or swarm cross-host fan-out leaves
+        # no trace in history/.
+        try:
+            self._store.append_history(sid, {
+                "session_id": sid,
+                "from": envelope.get("from", ""),
+                "to": envelope.get("to", ""),
+                "subject": envelope.get("subject", ""),
+                "kind": envelope.get("kind", "TASK"),
+                "msg_id": msg_id,
+                "created_at": envelope.get("created_at", ""),
+                "delivered_via": "remote",
+            })
+        except Exception as exc:
+            log.warning("DeliveryEngine: history append failed: %s", exc)
         delivered = SendReceipt(status="delivered", msg_id=msg_id)
         self._cache[msg_id] = delivered
         return delivered

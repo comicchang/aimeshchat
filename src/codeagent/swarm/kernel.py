@@ -5,7 +5,9 @@ Does NOT own transport I/O — that is delegated to a DeliverySink.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Protocol
@@ -19,6 +21,8 @@ from codeagent.mailbox.protocol import (
     validate_message,
 )
 from codeagent.mailbox.store import MailboxStore
+
+log = logging.getLogger(__name__)
 from codeagent.swarm.model import (
     ACL,
     Address,
@@ -276,14 +280,8 @@ class SwarmKernel:
         self._persist_routing(session_id)
 
     def _persist_routing(self, session_id: str) -> None:
-        """Persist the routing table into swarm-meta.json."""
-        try:
-            meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
-            meta = {}
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-                pass
+        """Persist the routing table into swarm-meta.json (locked)."""
+        def _update(meta: dict) -> None:
             routing = {}
             for (sid, aid), loc in self._routing.items():
                 if sid == session_id:
@@ -293,14 +291,8 @@ class SwarmKernel:
                         "backend": loc.backend,
                     }
             meta["routing"] = routing
-            tmp = meta_path.parent / ".tmp-swarm-meta.json"
-            with open(tmp, "w") as f:
-                f.write(json.dumps(meta, indent=2, ensure_ascii=False))
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(str(tmp), str(meta_path))
-        except OSError:
-            pass
+
+        self._persist_meta(session_id, _update)
 
     # ── Channel management ─────────────────────────────────────────────
 
@@ -329,14 +321,8 @@ class SwarmKernel:
         return channel
 
     def _persist_channels(self, session_id: str) -> None:
-        """Persist channels into swarm-meta.json so later CLI processes see them."""
-        try:
-            meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
-            meta = {}
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-                pass
+        """Persist channels into swarm-meta.json (locked)."""
+        def _update(meta: dict) -> None:
             channels = {}
             for cid, ch in self._channels.get(session_id, {}).items():
                 channels[cid] = {
@@ -344,12 +330,52 @@ class SwarmKernel:
                     "members": list(ch.members),
                 }
             meta["channels"] = channels
+
+        self._persist_meta(session_id, _update)
+
+    def _persist_meta(self, session_id: str, update: Callable[[dict], None]) -> None:
+        """Locked read-modify-write of swarm-meta.json.
+
+        fcntl.lockf(LOCK_EX) around read→merge→write prevents concurrent
+        register()/create_channel() (parallel CLI processes, tmux windows,
+        OMP agents) from losing each other's updates.
+        """
+        try:
+            meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta = {}
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                pass
+            update(meta)
             tmp = meta_path.parent / ".tmp-swarm-meta.json"
-            with open(tmp, "w") as f:
-                f.write(json.dumps(meta, indent=2, ensure_ascii=False))
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(str(tmp), str(meta_path))
+            try:
+                with open(meta_path, "a+") as lock_fd:  # lock file itself
+                    fcntl.lockf(lock_fd, fcntl.LOCK_EX)
+                    try:
+                        # Re-read under lock in case another process wrote
+                        # between our first read and the lock acquisition.
+                        try:
+                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                            pass
+                        update(meta)
+                        with open(tmp, "w") as f:
+                            f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(str(tmp), str(meta_path))
+                    finally:
+                        fcntl.lockf(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                # Lock unsupported (some network FS) — fall back to the
+                # unlocked write; persistence stays best-effort.
+                with open(tmp, "w") as f:
+                    f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(str(tmp), str(meta_path))
         except OSError:
             pass
 
@@ -398,15 +424,31 @@ class SwarmKernel:
             return self.direct(session_id, sender, target.agent_id, envelope)
         elif target.kind == AddressKind.BROADCAST:
             receipts = self.broadcast(session_id, sender, envelope)
+            if not receipts:
+                return SendReceipt(
+                    msg_id="",
+                    status="empty_roster",
+                    session_id=session_id,
+                )
+            return SendReceipt(
+                msg_id=receipts[0].msg_id,
+                status="delivered",
+                session_id=session_id,
+            )
+        elif target.kind == AddressKind.CHANNEL:
+            receipts = self.channel(session_id, sender, target.channel_id, envelope)
             return SendReceipt(
                 msg_id=receipts[0].msg_id if receipts else "",
                 status="delivered",
                 session_id=session_id,
             )
-        elif target.kind == AddressKind.CHANNEL:
-            return self.channel(session_id, sender, target.channel_id, envelope)
         elif target.kind == AddressKind.NOTICE:
-            return self.notice(session_id, sender, target.topic, envelope)
+            receipts = self.notice(session_id, sender, target.topic, envelope)
+            return SendReceipt(
+                msg_id=receipts[0].msg_id if receipts else "",
+                status="delivered",
+                session_id=session_id,
+            )
         else:
             raise ValueError(f"unknown address kind: {target.kind}")
 
@@ -449,7 +491,7 @@ class SwarmKernel:
         return receipts
 
     def channel(self, session_id: str, sender: str, channel_id: str,
-                envelope: Envelope) -> SendReceipt:
+                envelope: Envelope) -> list[DeliveryReceipt]:
         """Send to a channel (fan out to channel members except sender)."""
         session = self._require_session(session_id)
         channels = self._channels.get(session_id, {})
@@ -460,17 +502,19 @@ class SwarmKernel:
 
         created_at = self._gen_created_at()
 
+        receipts = []
         for member in ch.members:
             if member == sender:
                 continue
             msg_id = self._gen_msg_id()  # per-recipient: no delivery short-circuit
             self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
-
-        return SendReceipt(msg_id=msg_id, status="delivered",
-                           session_id=session_id, target=f"#{channel_id}")
+            receipts.append(DeliveryReceipt(
+                msg_id=msg_id, recipient=member, status="delivered",
+            ))
+        return receipts
 
     def notice(self, session_id: str, sender: str, topic: str,
-               envelope: Envelope, ttl: int = 0) -> SendReceipt:
+               envelope: Envelope, ttl: int = 0) -> list[DeliveryReceipt]:
         """Send a notice, fanning out to topic subscribers (or session).
 
         If agents subscribed to *topic*, the notice goes only to them.
@@ -479,7 +523,6 @@ class SwarmKernel:
         session = self._require_session(session_id)
         self._check_notice(session, sender)
 
-        msg_id = self._gen_msg_id()
         created_at = self._gen_created_at()
 
         # Topic-based fan-out: subscribers of this topic only.
@@ -490,12 +533,14 @@ class SwarmKernel:
             targets = set(session.acl.room_members)
         targets.discard(sender)
 
+        receipts = []
         for member in sorted(targets):
             msg_id = self._gen_msg_id()  # per-recipient: no delivery short-circuit
             self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
-
-        return SendReceipt(msg_id=msg_id, status="delivered",
-                           session_id=session_id, target=f"notice:{topic}")
+            receipts.append(DeliveryReceipt(
+                msg_id=msg_id, recipient=member, status="delivered",
+            ))
+        return receipts
 
     # ── Poll ───────────────────────────────────────────────────────────
 

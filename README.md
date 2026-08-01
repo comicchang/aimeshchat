@@ -133,6 +133,10 @@ Location (searched in order):
 }
 ```
 
+> **`shell_prefix`** is passed as shell source to the remote host before
+> each command.  Treat it as trusted-config-only — any value is executed
+> verbatim on the target machine.
+
 ### Topic .repo-map.json
 
 Place in `{midocs_root}/<TopicName>/.repo-map.json`:
@@ -292,14 +296,17 @@ pluggable delivery (local mailbox or cross-host via `TransportRouter`) and real-
 codeagent swarm create-session s1 --manager mgr --members w1,w2
 
 # 2. Register agents (location = __local__ for co-located)
-codeagent swarm register s1 mgr   --host __local__
-codeagent swarm register s1 w1    --host __local__
+codeagent swarm register s1 --agent mgr --host __local__
+codeagent swarm register s1 --agent w1  --host __local__
 
 # 3. Send a direct message
 codeagent swarm direct s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "check src/"
 
-# 4. Poll inbox
-codeagent swarm poll s1 --agent w1
+# 4. Poll + ack lifecycle
+out=$(codeagent swarm poll s1 --agent w1)
+msg_id=$(echo "$out" | jq -r '.messages[0].msg_id')
+codeagent swarm ack s1 --agent w1 --msg-id "$msg_id" --phase consumed
+codeagent swarm ack s1 --agent w1 --msg-id "$msg_id" --phase done
 
 # 5. Watch for new messages (continuous)
 codeagent swarm watch s1 --agent mgr --interval 2

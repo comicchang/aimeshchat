@@ -134,8 +134,9 @@ def on_agent_message(
         return {"broadcast": True, "recipients": len(receipts)}
     elif to_id.startswith("#"):
         channel_id = to_id[1:]
-        receipt = kernel.channel(session_id, agent_id, channel_id, env)
-        return {"msg_id": receipt.msg_id, "status": receipt.status, "target": receipt.target}
+        receipts = kernel.channel(session_id, agent_id, channel_id, env)
+        return {"channel": True, "recipients": len(receipts),
+                "msg_ids": [r.msg_id for r in receipts]}
     else:
         receipt = kernel.direct(session_id, agent_id, to_id, env)
         return {"msg_id": receipt.msg_id, "status": receipt.status, "target": receipt.target}

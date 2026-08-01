@@ -83,8 +83,10 @@ class TestCreateSession:
         assert "dev" in channels
         assert set(channels["dev"].members) == {"mgr", "w1"}
         # 新 kernel 上 channel 可直接发送
-        receipt = k2.channel("s1", "mgr", "dev", _env())
-        assert receipt.status == "delivered"
+        receipts = k2.channel("s1", "mgr", "dev", _env())
+        assert len(receipts) == 1
+        assert receipts[0].status == "delivered"
+        assert receipts[0].recipient == "w1"
 
     def test_second_kernel_restores_routing_from_disk(self, store):
         """回归：register 的 host 映射跨进程持久化。
@@ -99,6 +101,32 @@ class TestCreateSession:
         assert loc is not None
         assert loc.host_alias == "192.168.234.18"
         assert loc.backend == "cli"
+
+    def test_concurrent_register_both_persist(self, store):
+        """回归：并发 register 到不同 agent 不得互相覆盖（P1-1 TOCTOU）。"""
+        import threading
+
+        k = SwarmKernel(store=store)
+        k.create_session("s1", "mgr", ["w1", "w2", "w3"])
+
+        def reg(agent: str, host: str) -> None:
+            k.register(AgentLocation(agent, host, "cli"), "s1")
+
+        threads = [
+            threading.Thread(target=reg, args=("w1", "host-a")),
+            threading.Thread(target=reg, args=("w2", "host-b")),
+            threading.Thread(target=reg, args=("w3", "host-c")),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # New kernel: all three registrations survived (no lost update)
+        k2 = SwarmKernel(store=store)
+        assert k2.get_location("s1", "w1").host_alias == "host-a"
+        assert k2.get_location("s1", "w2").host_alias == "host-b"
+        assert k2.get_location("s1", "w3").host_alias == "host-c"
 
     def test_manager_always_in_roster(self, kernel):
         s = kernel.create_session("s1", "mgr", ["w1"])
@@ -273,8 +301,10 @@ class TestChannel:
     def test_channel_delivers_to_members(self, store):
         k = _make_kernel_with_session(store)
         k.create_channel("s1", "dev", ["mgr", "w1"])
-        receipt = k.channel("s1", "mgr", "dev", _env())
-        assert receipt.status == "delivered"
+        receipts = k.channel("s1", "mgr", "dev", _env())
+        assert len(receipts) == 1
+        assert receipts[0].status == "delivered"
+        assert receipts[0].recipient == "w1"
         inbox_w1 = store.list_messages(store.agent_subdir("s1", "w1", "inbox"))
         assert len(inbox_w1) == 1
 
@@ -315,8 +345,9 @@ class TestChannel:
 class TestNotice:
     def test_notice_delivers_to_room(self, store):
         k = _make_kernel_with_session(store)
-        receipt = k.notice("s1", "mgr", "system", _env())
-        assert receipt.status == "delivered"
+        receipts = k.notice("s1", "mgr", "system", _env())
+        assert len(receipts) == 2  # w1 + w2
+        assert all(r.status == "delivered" for r in receipts)
         inbox_w1 = store.list_messages(store.agent_subdir("s1", "w1", "inbox"))
         inbox_w2 = store.list_messages(store.agent_subdir("s1", "w2", "inbox"))
         assert len(inbox_w1) == 1
@@ -330,8 +361,9 @@ class TestNotice:
 
     def test_notice_with_ttl(self, store):
         k = _make_kernel_with_session(store)
-        receipt = k.notice("s1", "mgr", "system", _env(), ttl=300)
-        assert receipt.status == "delivered"
+        receipts = k.notice("s1", "mgr", "system", _env(), ttl=300)
+        assert len(receipts) == 2
+        assert all(r.status == "delivered" for r in receipts)
 
     def test_notice_acl_denied(self, store):
         acl = ACL(authority="mgr", allowed_senders=["mgr"],

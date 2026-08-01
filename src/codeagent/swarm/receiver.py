@@ -267,13 +267,20 @@ class SwarmReceiver:
         return False
 
     def _try_ack(self, msg_id: str) -> None:
-        """Best-effort ack (consumed) for a message."""
+        """Best-effort ack (consumed) for a message.
+
+        Uses finalize_from_inbox directly since receiver writes messages
+        to inbox (not processing), so the normal two-phase read→processing→
+        finalize flow never runs for auto-consumption.
+        """
         if not msg_id:
             return
         try:
-            self._kernel.ack(self._session_id, self._agent_id, msg_id, "consumed")
+            self._store.finalize_from_inbox(
+                self._session_id, self._agent_id, msg_id, owner=self._agent_id,
+            )
         except Exception:
-            log.debug("SwarmReceiver: ack failed for msg_id=%s (may not be in processing)", msg_id)
+            log.debug("SwarmReceiver: ack failed for msg_id=%s", msg_id)
 
     # ── Watch mode (local filesystem polling) ──────────────────────────
 
@@ -335,11 +342,8 @@ class SwarmReceiver:
             except Exception:
                 log.exception("SwarmReceiver: watch scan error")
 
-            # Sleep in small increments so stop() is responsive
-            remaining = self._watch_poll_interval
-            while remaining > 0 and not self._stop_event.is_set():
-                time.sleep(min(remaining, _LOOP_TICK))
-                remaining -= _LOOP_TICK
+            # Wait on the stop event so stop() returns immediately
+            self._stop_event.wait(timeout=self._watch_poll_interval)
 
     def _scan_inbox(self) -> list[dict]:
         """Scan inbox for new or changed files. Returns list of message dicts."""

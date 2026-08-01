@@ -279,18 +279,19 @@ class TestChannel:
         kernel.create_channel("ch-s1", "dev", ["mgr", "w1"])
 
         rc, out, _ = _run(["swarm", "channel", "ch-s1", "dev",
-                           "--to", "mgr", "--kind", "TASK",
+                           "--from", "mgr", "--kind", "TASK",
                            "--subject", "channel msg", "--body", "in channel"])
         assert rc == 0
         data = _json_out(out)
-        assert data["msg_id"]
-        assert data["status"] == "delivered"
-        assert "dev" in data["target"]
+        assert isinstance(data, list) and len(data) == 1
+        assert data[0]["msg_id"]
+        assert data[0]["status"] == "delivered"
+        assert data[0]["recipient"] == "w1"
 
     def test_channel_not_found(self):
         _setup_full("ch-nf", "mgr", "w1")
         rc, _, err = _run(["swarm", "channel", "ch-nf", "ghost-ch",
-                           "--to", "mgr", "--body", "x"])
+                           "--from", "mgr", "--body", "x"])
         assert rc == 1
         assert "channel not found" in err
 
@@ -345,8 +346,9 @@ class TestNotice:
                            "--body", "maintenance at 3pm", "--ttl", "300"])
         assert rc == 0
         data = _json_out(out)
-        assert data["msg_id"]
-        assert data["status"] == "delivered"
+        assert isinstance(data, list) and len(data) == 2  # w1 + w2
+        assert all(d["status"] == "delivered" for d in data)
+        assert all(d["msg_id"] for d in data)
 
     def test_notice_acl_denial(self):
         """Agent not in allowed_senders cannot send notice."""
@@ -536,7 +538,7 @@ class TestSwarmEndToEnd:
         kernel.create_channel(sid, "dev", ["mgr", "w1", "w2"])
 
         rc, out, _ = _run(["swarm", "channel", sid, "dev",
-                           "--to", "mgr", "--kind", "TASK",
+                           "--from", "mgr", "--kind", "TASK",
                            "--subject", "channel-task", "--body", "build it"])
         assert rc == 0
 
@@ -669,8 +671,9 @@ class TestSwarmHooks:
             msg_dict={"to": "#dev", "kind": "TASK", "subject": "s", "body": "b"},
             store_root=tmp_path,
         )
-        assert result["status"] == "delivered"
-        assert "dev" in result["target"]
+        assert result["channel"] is True
+        assert result["recipients"] == 1  # w1 (mgr excluded)
+        assert len(result["msg_ids"]) == 1
         reset()
 
     def test_hooks_reset_works(self, tmp_path):

@@ -419,6 +419,32 @@ class MailboxStore:
         claim_file.unlink(missing_ok=True)
         return f"finalized → archive/{target.name}"
 
+    def finalize_from_inbox(self, session_id: str, agent_id: str, msg_id: str, owner: str) -> str:
+        """Finalize a message directly (no claim file required).
+
+        Used by SwarmReceiver for auto-consumption: the receiver writes
+        messages directly to inbox and acks immediately, so the normal
+        two-phase read→processing→finalize flow never runs.
+
+        Also handles messages already moved to processing/ by a prior
+        ``read()`` (two-phase consumers): archive from whichever location
+        the message is in.
+        """
+        self._validate_msg_id(msg_id)
+        inbox = self.agent_subdir(session_id, agent_id, "inbox")
+        processing = self.agent_subdir(session_id, agent_id, "processing")
+        archive = self.agent_subdir(session_id, agent_id, "archive")
+
+        src = inbox / f"{msg_id}.json"
+        if not src.exists():
+            src = processing / f"{msg_id}.json"
+        if not src.exists():
+            raise ValueError(f"msg not in inbox/ or processing/: {msg_id}")
+
+        archive.mkdir(parents=True, exist_ok=True)
+        os.replace(str(src), str(archive / src.name))
+        return f"finalized → archive/{src.name}"
+
     # ── Release ────────────────────────────────────────────────────────
 
     def release(self, session_id: str, agent_id: str, msg_id: str, owner: str) -> str:

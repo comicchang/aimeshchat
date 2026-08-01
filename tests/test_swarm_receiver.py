@@ -275,7 +275,7 @@ class TestStreamMode:
         assert fired[0]["subject"] == "stream-msg"
 
     def test_stream_writes_to_local_inbox(self, store, kernel, tmp_path):
-        """Stream events are written as JSON files in the local inbox."""
+        """Stream events are written then auto-archived (consumed)."""
         events = [{
             "msg_id": "msg-inbox-1",
             "from": "bob",
@@ -295,12 +295,12 @@ class TestStreamMode:
 
         receiver.stop()
 
-        # Verify file was written to inbox
+        # P0-1 fix: receiver auto-acks consumed → message archived, not
+        # stuck in inbox
         inbox = store.agent_subdir("s1", "w1", "inbox")
-        msg_file = inbox / "msg-inbox-1.json"
-        assert msg_file.exists()
-
-        written = json.loads(msg_file.read_bytes())
+        archive = store.agent_subdir("s1", "w1", "archive")
+        assert not (inbox / "msg-inbox-1.json").exists()
+        written = json.loads((archive / "msg-inbox-1.json").read_bytes())
         assert written["msg_id"] == "msg-inbox-1"
         assert written["from"] == "bob"
         assert written["body"] == "test body"
@@ -392,10 +392,12 @@ class TestStreamMode:
 
         # Callback still fires (message exists on disk)
         assert len(fired) == 1
-        # But the original file content is preserved
+        # P0-1 fix: auto-ack archives the pre-existing message (content
+        # preserved in archive, not overwritten)
         inbox = store.agent_subdir("s1", "w1", "inbox")
-        msg_file = inbox / "msg-existing.json"
-        written = json.loads(msg_file.read_bytes())
+        archive = store.agent_subdir("s1", "w1", "archive")
+        assert not (inbox / "msg-existing.json").exists()
+        written = json.loads((archive / "msg-existing.json").read_bytes())
         assert written["subject"] == "pre-existing"  # not overwritten
 
     def test_stream_multiple_events(self, store, kernel, tmp_path):
