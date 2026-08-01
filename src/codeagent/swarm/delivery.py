@@ -573,3 +573,36 @@ class DeliveryEngine:
     def _validate_msg_id(msg_id: str) -> None:
         if not msg_id or "/" in msg_id or "\\" in msg_id or ".." in msg_id:
             raise ValueError(f"invalid msg_id: {msg_id!r}")
+
+
+class EngineDeliverySink:
+    """DeliverySink adapter — makes DeliveryEngine callable via the kernel's
+    ``.deliver()`` protocol.
+
+    Resolves each target agent's registered host from the kernel routing
+    table (populating the engine's host cache) before delegating to
+    ``engine.deliver_sink()``, so cross-host messages go through transport
+    while ``__local__``/unregistered agents fall back to local delivery.
+    """
+
+    def __init__(self, engine: "DeliveryEngine", kernel: Any = None) -> None:
+        self._engine = engine
+        self._kernel = kernel
+
+    def set_kernel(self, kernel: Any) -> None:
+        """Late-bind the kernel once it exists (avoids forward-reference)."""
+        self._kernel = kernel
+
+    def deliver(self, session_id: str, target_agent: str, envelope: Any,
+                msg_id: str, created_at: str, from_id: str) -> None:
+        if self._kernel is not None:
+            loc = self._kernel.get_location(session_id, target_agent)
+            if loc and loc.host_alias and loc.host_alias != "__local__":
+                from codeagent.domain import HostSpec
+                host = HostSpec(
+                    name=loc.host_alias,
+                    ssh_alias=loc.host_alias,
+                    hostnames=(loc.host_alias,),
+                )
+                self._engine.cache_host(target_agent, host)
+        self._engine.deliver_sink(session_id, target_agent, envelope, msg_id, created_at, from_id)

@@ -232,34 +232,15 @@ def _get_swarm_kernel(store_root: Optional[Path] = None) -> tuple[SwarmKernel, M
     with durable outbox write + retry.  Falls back to LocalDeliverySink for
     pure-local usage.
     """
-    from codeagent.swarm.model import AgentLocation
+    from codeagent.swarm.delivery import DeliveryEngine, EngineDeliverySink
 
     store = MailboxStore(root=store_root)
     router = _router
 
     engine = DeliveryEngine(mailbox_store=store, transport_router=router)
-
-    def _resolve_agent_to_host(session_id: str, agent_id: str):
-        """Lookup agent's registered host from kernel routing table."""
-        loc = kernel.get_location(session_id, agent_id)
-        if loc and loc.host_alias and loc.host_alias != "__local__":
-            from codeagent.domain import HostSpec
-            host = HostSpec(
-                name=loc.host_alias,
-                ssh_alias=loc.host_alias,
-                hostnames=(loc.host_alias,),
-            )
-            engine.cache_host(agent_id, host)
-            return host
-        return None
-
-    class _EngineDeliverySink:
-        """Adapter: makes DeliveryEngine.deliver_sink callable via .deliver() protocol."""
-        def deliver(self, session_id, target_agent, envelope, msg_id, created_at, from_id):
-            _resolve_agent_to_host(session_id, target_agent)
-            engine.deliver_sink(session_id, target_agent, envelope, msg_id, created_at, from_id)
-
-    kernel = SwarmKernel(store=store, sink=_EngineDeliverySink())
+    sink = EngineDeliverySink(engine)
+    kernel = SwarmKernel(store=store, sink=sink)
+    sink.set_kernel(kernel)
     return kernel, store
 
 

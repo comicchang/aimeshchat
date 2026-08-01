@@ -441,6 +441,18 @@ class MailboxStore:
         if not src.exists():
             raise ValueError(f"msg not in inbox/ or processing/: {msg_id}")
 
+        # If another consumer holds an active claim on a message in
+        # processing/, it owns the finalize — skip to avoid double-archive
+        # races. Same-owner claims (the receiver itself two-phase-read it)
+        # are fine to finalize.
+        if src.parent == processing:
+            claims = sorted(processing.glob(f".claim-{msg_id}-*.json"))
+            foreign = [c for c in claims if owner not in c.name]
+            if foreign:
+                raise ValueError(
+                    f"msg {msg_id} has an active foreign claim; use finalize() instead"
+                )
+
         archive.mkdir(parents=True, exist_ok=True)
         os.replace(str(src), str(archive / src.name))
         return f"finalized → archive/{src.name}"
