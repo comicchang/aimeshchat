@@ -222,6 +222,7 @@ class DeliveryEngine:
         """
         # Build dict envelope from Envelope object or pass through
         if hasattr(envelope, 'subject'):
+            atts = getattr(envelope, 'attachments', None)
             env_dict: dict[str, Any] = {
                 "session_id": session_id,
                 "from": from_id,
@@ -236,6 +237,10 @@ class DeliveryEngine:
                 "created_at": created_at,
                 "_target_agent": target_agent,
             }
+            if atts:
+                env_dict["attachments"] = [
+                    a.to_dict() if hasattr(a, "to_dict") else a for a in atts
+                ]
         else:
             env_dict = dict(envelope) if not isinstance(envelope, dict) else envelope
             env_dict.setdefault("msg_id", msg_id)
@@ -248,6 +253,10 @@ class DeliveryEngine:
         # Resolve target_agent → HostSpec via cache or store local target
         host = self._host_cache.get(target_agent)
         if host is not None:
+            # Record the resolved host so the durable outbox entry keeps it:
+            # flush() reads `_target_host` to re-send on retry — without it
+            # every retry is silently skipped.
+            env_dict["_target_host"] = getattr(host, "host_alias", "") or getattr(host, "ssh_alias", "")
             self.deliver(session_id, host, env_dict)
         else:
             # No cached host — deliver locally (outbox write only)
@@ -481,7 +490,8 @@ class DeliveryEngine:
         reply_to = envelope.get("reply_to", "")
         run_id = envelope.get("run_id", "")
         request_id = envelope.get("request_id", "")
-        body = json.dumps(envelope, ensure_ascii=False)
+        body = envelope.get("body", "")
+        attachments = envelope.get("attachments") or []
         msg_id = envelope.get("msg_id", "")
 
         args = [
@@ -494,6 +504,8 @@ class DeliveryEngine:
             "--kind", kind,
             "--msg-id", msg_id,
         ]
+        for att in attachments:
+            args.extend(["--attachment", json.dumps(att, ensure_ascii=False)])
         if reply_to:
             args.extend(["--reply-to", reply_to])
         if run_id:

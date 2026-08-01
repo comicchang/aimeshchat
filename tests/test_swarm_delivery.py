@@ -235,6 +235,39 @@ class TestTransportSuccess:
         assert "--subject" in args
         assert "go" in args
         assert "--msg-id" in args
+        # P0: body must be the ACTUAL message body, not the serialized envelope
+        assert "--body" in args
+        assert args[args.index("--body") + 1] == envelope["body"]
+
+    def test_deliver_forwards_attachments(self, store, outbox_root, host_a):
+        """P0: cross-host sends carry AttachmentRefs via --attachment flags."""
+        _init_session(store)
+        envelope = _make_envelope()
+        envelope["attachments"] = [{
+            "artifact_id": "a1", "path": "out.png", "size": 3,
+            "sha256": "0" * 64, "media_type": "image/png",
+        }]
+
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.mailbox.return_value = (0, "ok", "")
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        engine.deliver("s1", host_a, envelope)
+
+        args = mock_transport.mailbox.call_args[0][1]
+        assert "--attachment" in args
+        att_idx = args.index("--attachment")
+        import json as _json
+        att = _json.loads(args[att_idx + 1])
+        assert att["artifact_id"] == "a1"
+        assert att["path"] == "out.png"
 
 
 # ── Transport failure → pending retained ────────────────────────────────
@@ -856,18 +889,22 @@ class TestE2ECrossHostDeliveryChain:
             if "session-init" in args:
                 return 0, "session exists", ""
             call_count["n"] += 1
+            msg: dict[str, str] = {}
             for i, a in enumerate(args):
-                if a == "--body" and i + 1 < len(args):
-                    body_json = json.loads(args[i + 1])
-                    mid = body_json.get("msg_id", "unknown")
-                    inbox_dir = store.agent_subdir("s1", "remote-w", "inbox")
-                    inbox_dir.mkdir(parents=True, exist_ok=True)
-                    msg_path = inbox_dir / f"{mid}.json"
-                    tmp_path_inner = inbox_dir / f".tmp-{mid}.json"
-                    tmp_path_inner.write_text(
-                        json.dumps(body_json, indent=2), encoding="utf-8"
-                    )
-                    os.replace(str(tmp_path_inner), str(msg_path))
+                if a.startswith("--") and i + 1 < len(args) and not args[i + 1].startswith("--"):
+                    msg[a[2:].replace("-", "_")] = args[i + 1]
+            mid = msg.get("msg_id", "")
+            if mid:
+                msg.setdefault("created_at", "2026-01-01T00:00:00Z")
+                msg.setdefault("session_id", "s1")
+                inbox_dir = store.agent_subdir("s1", "remote-w", "inbox")
+                inbox_dir.mkdir(parents=True, exist_ok=True)
+                msg_path = inbox_dir / f"{mid}.json"
+                tmp_path_inner = inbox_dir / f".tmp-{mid}.json"
+                tmp_path_inner.write_text(
+                    json.dumps(msg, indent=2), encoding="utf-8",
+                )
+                os.replace(str(tmp_path_inner), str(msg_path))
             return 0, "sent", ""
 
         mock_transport.mailbox.side_effect = fake_mailbox
@@ -944,6 +981,48 @@ class TestE2ECrossHostDeliveryChain:
         archive_dir = store.agent_subdir("s1", "remote-w", "archive")
         archived = store.list_messages(archive_dir)
         assert any(f.stem == msg_id for f in archived), "message must be archived after finalize"
+
+    def test_flush_retries_with_target_host_from_outbox(self, tmp_path: Path) -> None:
+        """P0: outbox entries written via EngineDeliverySink keep _target_host,
+        so flush() actually retries instead of silently skipping."""
+        store = MailboxStore(root=tmp_path)
+        outbox_root = tmp_path / "outbox"
+        _init_session(store)
+
+        # Simulate EngineDeliverySink path: host known, delivery fails
+        router = MagicMock()
+        transport = MagicMock()
+        calls = {"n": 0}
+
+        def flaky(host, args, **kw):
+            if "session-init" in args:
+                return 0, "ok", ""
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("network blip")
+            return 0, "sent", ""
+
+        transport.mailbox = flaky
+        router.get.return_value = transport
+        router.capabilities.return_value = {"mailbox"}
+        engine = DeliveryEngine(
+            mailbox_store=store, transport_router=router, outbox_root=outbox_root,
+        )
+
+        env = _make_envelope(msg_id="m_flush_host")
+        # EngineDeliverySink records the resolved host into the envelope
+        env["_target_host"] = "alpha"
+        env["_target_agent"] = "w2"
+
+        receipt = engine.deliver("s1", HostSpec("alpha", "alpha", ("alpha",)), env)
+        assert receipt.status == "accepted"  # first attempt failed
+        assert calls["n"] == 1
+
+        # flush must pick up _target_host from the outbox and retry
+        flushed = engine.flush("s1")
+        assert flushed == 1
+        assert calls["n"] == 2
+        assert (outbox_root / "s1" / ".delivered-m_flush_host").exists()
 
     def test_relay_host_round_trips_through_resolve_target(self, tmp_path: Path) -> None:
         """relay-login HostSpec preserved via _resolve_target (P0-2 fix)."""
