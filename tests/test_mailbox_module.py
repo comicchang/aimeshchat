@@ -109,9 +109,10 @@ class TestStore:
         assert (store.root / "s1" / "w1" / "inbox").is_dir()
 
     def test_session_init_duplicate(self, store):
+        """Idempotent: same roster → merged 0 agents, no error."""
         store.session_init("s1", "mgr", ["w1"])
-        with pytest.raises(ValueError, match="already exists"):
-            store.session_init("s1", "mgr", ["w1"])
+        result = store.session_init("s1", "mgr", ["w1"])
+        assert "merged 0 agents" in result
 
     def test_send_and_peek(self, store):
         store.session_init("s1", "mgr", ["w1"])
@@ -919,3 +920,38 @@ class TestHistory:
         hd = store.history_dir("s1")
         (hd / "junk.json").write_text("{not json")
         assert len(store.read_history("s1")) == 1
+
+
+# ── Idempotent session-init (B3T3) ────────────────────────────────────
+
+
+class TestSessionInitIdempotent:
+    """B3T3: session_init merges new agents, no duplicates."""
+
+    def test_session_init_merges_new_agents(self, store):
+        """Existing session + new roster → merges new agents with subdirs."""
+        store.session_init("s1", "mgr", ["w1", "w2"])
+        result = store.session_init("s1", "mgr", ["w2", "w3"])
+        assert "merged 1 agents" in result
+
+        # w3 subdirs should exist
+        assert (store.root / "s1" / "w3" / "inbox").is_dir()
+        assert (store.root / "s1" / "w3" / "processing").is_dir()
+
+        # session.json should contain merged roster
+        meta = store.read_session("s1")
+        assert meta is not None
+        assert sorted(meta["agents"]) == ["w1", "w2", "w3"]
+
+    def test_session_init_no_duplicate_agents(self, store):
+        """Repeated session_init same roster → merged 0, no duplicate agents."""
+        store.session_init("s1", "mgr", ["w1", "w2"])
+        result = store.session_init("s1", "mgr", ["w1", "w2"])
+        assert "merged 0 agents" in result
+
+        meta = store.read_session("s1")
+        assert meta is not None
+        assert sorted(meta["agents"]) == ["w1", "w2"]
+        # w1 and w2 subdirs still exist (not duplicated)
+        assert (store.root / "s1" / "w1" / "inbox").is_dir()
+        assert (store.root / "s1" / "w2" / "inbox").is_dir()

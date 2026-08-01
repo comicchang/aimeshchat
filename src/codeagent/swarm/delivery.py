@@ -93,6 +93,12 @@ class DeliveryEngine:
         self._cache: dict[str, SendReceipt] = {}
         # host cache for _resolve_target (alias → HostSpec)
         self._host_cache: dict[str, Any] = {}
+        # session-ensure cache: (session_id, host_alias) → True
+        self._ensured_sessions: set[tuple[str, str]] = set()
+        # full roster cache: session_id → sorted list of agent_ids
+        self._session_rosters: dict[str, list[str]] = {}
+        # capability cache: host_alias → set of capability strings
+        self._host_capabilities: dict[str, set[str]] = {}
 
     @staticmethod
     def _history_entry(envelope: dict[str, Any], msg_id: str) -> dict[str, str]:
@@ -266,6 +272,76 @@ class DeliveryEngine:
         """Register an agent_id → HostSpec mapping for sink resolution."""
         self._host_cache[agent_id] = host
 
+    def cache_roster(self, session_id: str, roster: list[str]) -> None:
+        """Store full roster for a session (called by kernel wiring or CLI)."""
+        self._session_rosters[session_id] = sorted(set(roster))
+
+    def _check_capability(self, host: Any) -> None:
+        """Fail-closed if host transport lacks 'mailbox' capability.
+
+        Caches capabilities per host_alias. Raises RuntimeError if
+        'mailbox' is missing — the message stays queued for flush().
+        """
+        if self._router is None:
+            return  # no router → cannot check; allow (local/dev mode)
+        host_alias = getattr(host, "ssh_alias", None) or getattr(host, "name", None) or ""
+        if not host_alias:
+            return
+
+        caps = self._host_capabilities.get(host_alias)
+        if caps is None:
+            try:
+                caps = self._router.capabilities(host)
+            except Exception:
+                caps = {"mailbox"}  # assume capable on check failure
+            self._host_capabilities[host_alias] = caps
+
+        if "mailbox" not in caps:
+            raise RuntimeError(
+                f"host '{host_alias}' transport lacks 'mailbox' capability"
+            )
+
+    def _ensure_remote_session(
+        self,
+        session_id: str,
+        host: Any,
+        manager: str,
+        roster: list[str],
+        transport: Any = None,
+    ) -> None:
+        """Ensure remote host has the session. Called once per (session, host).
+
+        Builds full roster list from ``roster`` (or envelope from/to as
+        degraded fallback).  Idempotent: 'already exists' is success.
+        Caches in ``_ensured_sessions`` so second message to same host
+        skips the remote call entirely.
+        """
+        host_alias = getattr(host, "ssh_alias", None) or getattr(host, "name", None) or ""
+        cache_key = (session_id, host_alias)
+        if cache_key in self._ensured_sessions:
+            return
+
+        if transport is None:
+            transport = self._get_transport(host)
+        if transport is None:
+            raise ValueError(f"no transport for host '{host_alias}'")
+
+        agents_csv = ",".join(sorted(set(roster)))
+        init_args = [
+            "session-init",
+            "--session", session_id,
+            "--manager", manager,
+            "--agents", agents_csv,
+        ]
+
+        init_code, init_out, init_err = transport.mailbox(host, init_args)
+        if init_code != 0 and "already exists" not in (init_err or init_out or ""):
+            raise RuntimeError(
+                f"remote session-init failed (exit {init_code}): {init_err or init_out}"
+            )
+
+        self._ensured_sessions.add(cache_key)
+
     def flush(self, session_id: Optional[str] = None) -> int:
         """Retry all pending outbox entries. Returns count of newly delivered."""
         sessions = [session_id] if session_id else self._list_sessions()
@@ -344,6 +420,21 @@ class DeliveryEngine:
 
         return results
 
+    def outbox_stats(self, session_id: Optional[str] = None) -> dict[str, int]:
+        """Return summary counts for the outbox.
+
+        Returns ``{'pending': N, 'delivered': M}`` where *N* is the number
+        of undelivered entries and *M* is the number of delivered markers.
+        """
+        pending_count = len(self.pending(session_id))
+        sessions = [session_id] if session_id else self._list_sessions()
+        delivered = 0
+        for sid in sessions:
+            sd = self._outbox / sid
+            if sd.is_dir():
+                delivered += len(list(sd.glob('.delivered-*')))
+        return {'pending': pending_count, 'delivered': delivered}
+
     def ack(
         self,
         session_id: str,
@@ -421,28 +512,20 @@ class DeliveryEngine:
         if transport is None:
             raise ValueError(f"no transport for host '{host.name}'")
 
-        args = self._build_mailbox_args(envelope)
-        # Ensure the remote host has the session (sessions are per-host;
-        # two machines never share a mailbox filesystem). Idempotent:
-        # remote session-init errors on already-exists are ignored.
-        try:
-            init_args = [
-                "session-init",
-                "--session", envelope.get("session_id", ""),
-                "--manager", envelope.get("from", ""),
-                "--agents", envelope.get("to", ""),
-            ]
-            init_code, init_out, init_err = transport.mailbox(host, init_args)
-            if init_code != 0 and "already exists" not in (init_err or init_out or ""):
-                raise RuntimeError(
-                    f"remote session-init failed (exit {init_code}): {init_err or init_out}"
-                )
-        except Exception as exc:
-            if "already exists" in str(exc):
-                pass
-            else:
-                raise
+        # ── Capability check (fail-closed) ────────────────────────────
+        self._check_capability(host)
 
+        # ── Ensure remote session (idempotent, cached) ───────────────
+        sid = envelope.get("session_id", "")
+        manager = envelope.get("from", "")
+        roster = self._session_rosters.get(sid)
+        if roster is None:
+            # Degraded: no cached roster — build from envelope from/to
+            roster = sorted({envelope.get("from", ""), envelope.get("to", "")})
+        self._ensure_remote_session(sid, host, manager, roster, transport)
+
+        # ── Send envelope ─────────────────────────────────────────────
+        args = self._build_mailbox_args(envelope)
         exit_code, stdout, stderr = transport.mailbox(host, args)
         if exit_code != 0:
             raise RuntimeError(

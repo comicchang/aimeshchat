@@ -223,6 +223,20 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     wt_p.add_argument("--interval", type=int, default=5, help="Poll interval in seconds")
     wt_p.add_argument("--iterations", type=int, default=0, help="Max iterations (0 = infinite)")
 
+    # outbox
+    ob_p = swarm_sub.add_parser("outbox", help="Outbox management")
+    ob_sub = ob_p.add_subparsers(dest="outbox_cmd")
+
+    ob_pending = ob_sub.add_parser("pending", help="List undelivered envelopes")
+    ob_pending.add_argument("--session", dest="session_id", help="Filter by session ID")
+    ob_pending.add_argument("--json", action="store_true", dest="json_output", help="JSON output")
+
+    ob_flush = ob_sub.add_parser("flush", help="Retry all pending envelopes")
+    ob_flush.add_argument("--session", dest="session_id", help="Filter by session ID")
+
+    ob_status = ob_sub.add_parser("status", help="Show outbox summary counts")
+    ob_status.add_argument("--session", dest="session_id", help="Filter by session ID")
+
 
 def _get_swarm_kernel(store_root: Optional[Path] = None) -> tuple[SwarmKernel, MailboxStore]:
     """Create a SwarmKernel with DeliveryEngine sink for cross-host delivery.
@@ -241,6 +255,16 @@ def _get_swarm_kernel(store_root: Optional[Path] = None) -> tuple[SwarmKernel, M
     sink = EngineDeliverySink(engine)
     kernel = SwarmKernel(store=store, sink=sink)
     sink.set_kernel(kernel)
+
+    # Opportunistic flush: retry pending outbox entries on startup.
+    # Failures are logged but don't prevent kernel creation.
+    try:
+        flushed = engine.flush()
+        if flushed:
+            log.info("_get_swarm_kernel: flushed %d pending outbox entries on startup", flushed)
+    except Exception as exc:
+        log.debug("_get_swarm_kernel: opportunistic flush failed: %s", exc)
+
     return kernel, store
 
 
@@ -286,6 +310,8 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             return _swarm_status(kernel, args)
         elif cmd == "watch":
             return _swarm_watch(kernel, args)
+        elif cmd == "outbox":
+            return _swarm_outbox(kernel, args)
         else:
             print(f"error: unknown swarm command: {cmd}", file=sys.stderr)
             return 1
@@ -434,6 +460,18 @@ def _swarm_status(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 def _swarm_watch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     """Poll loop — prints new messages at --interval seconds."""
     import time as _time
+
+    # Opportunistic flush: retry pending outbox entries before polling.
+    try:
+        sink = kernel._sink
+        engine = getattr(sink, "_engine", None)
+        if engine is not None:
+            flushed = engine.flush(session_id=args.session_id)
+            if flushed:
+                log.info("_swarm_watch: flushed %d pending outbox entries", flushed)
+    except Exception as exc:
+        log.debug("_swarm_watch: opportunistic flush failed: %s", exc)
+
     cursor = ""
     iteration = 0
     max_iter = args.iterations
@@ -447,6 +485,45 @@ def _swarm_watch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
             break
         _time.sleep(args.interval)
     return 0
+
+
+def _swarm_outbox(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    """Dispatch ``swarm outbox`` subcommands."""
+    cmd = args.outbox_cmd
+    if cmd is None:
+        print("error: specify an outbox subcommand (pending|flush|status)", file=sys.stderr)
+        return 1
+
+    sink = kernel._sink
+    engine = getattr(sink, "_engine", None)
+    if engine is None:
+        print("error: kernel has no DeliveryEngine sink; outbox commands require EngineDeliverySink", file=sys.stderr)
+        return 1
+
+    session_id = getattr(args, "session_id", None)
+
+    if cmd == "pending":
+        envelopes = engine.pending(session_id=session_id)
+        if getattr(args, "json_output", False):
+            out = [{k: e.get(k, "") for k in ("msg_id", "to", "kind")} for e in envelopes]
+            print(json.dumps(out, indent=2))
+        else:
+            for e in envelopes:
+                print(f"{e.get('msg_id', '?'):40s}  {e.get('to', '?'):20s}  {e.get('kind', '?')}")
+        return 0
+
+    if cmd == "flush":
+        flushed = engine.flush(session_id=session_id)
+        print(json.dumps({"flushed": flushed}))
+        return 0 if flushed > 0 else 1
+
+    if cmd == "status":
+        stats = engine.outbox_stats(session_id=session_id)
+        print(json.dumps(stats))
+        return 0
+
+    print(f"error: unknown outbox command: {cmd}", file=sys.stderr)
+    return 1
 
 
 def _execute(request: RunRequest, target: Target, registry: SessionRegistry, repo_map=None) -> RunResult:

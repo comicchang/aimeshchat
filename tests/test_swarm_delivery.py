@@ -1094,3 +1094,154 @@ class TestEngineDeliverySinkReceipt:
         )
         assert receipt.status == "accepted"
         assert receipt.queued is True
+
+
+# ── outbox_stats ──────────────────────────────────────────────────────
+
+
+class TestOutboxStats:
+    """DeliveryEngine.outbox_stats() returns pending/delivered counts."""
+
+    def test_empty_outbox(self, engine: DeliveryEngine) -> None:
+        stats = engine.outbox_stats()
+        assert stats == {"pending": 0, "delivered": 0}
+
+    def test_pending_and_delivered_counts(
+        self, engine: DeliveryEngine, outbox_root: Path,
+    ) -> None:
+        """Counts reflect actual outbox state."""
+        sd = outbox_root / "s1"
+        sd.mkdir(parents=True, exist_ok=True)
+
+        # Two pending envelopes (no .delivered marker)
+        (sd / "msg-1.json").write_text(json.dumps(_make_envelope(msg_id="msg-1")))
+        (sd / "msg-2.json").write_text(json.dumps(_make_envelope(msg_id="msg-2")))
+        # One delivered envelope
+        (sd / "msg-3.json").write_text(json.dumps(_make_envelope(msg_id="msg-3")))
+        (sd / ".delivered-msg-3").write_text("{}")
+
+        stats = engine.outbox_stats()
+        assert stats["pending"] == 2
+        assert stats["delivered"] == 1
+
+    def test_session_filter(self, engine: DeliveryEngine, outbox_root: Path) -> None:
+        """--session filter scopes counts to one session."""
+        for sid in ("s1", "s2"):
+            sd = outbox_root / sid
+            sd.mkdir(parents=True, exist_ok=True)
+            (sd / "m1.json").write_text(json.dumps(_make_envelope(msg_id="m1")))
+            (sd / ".delivered-m1").write_text("{}")
+
+        # s1 has 0 pending, 1 delivered; same for s2
+        stats = engine.outbox_stats(session_id="s1")
+        assert stats == {"pending": 0, "delivered": 1}
+
+    def test_no_sessions(self, engine: DeliveryEngine) -> None:
+        """No outbox dir at all."""
+        stats = engine.outbox_stats()
+        assert stats == {"pending": 0, "delivered": 0}
+
+
+# ── Session-ensure (B3T3) ─────────────────────────────────────────────
+
+
+class TestSessionEnsure:
+    """B3T3: _ensure_remote_session topology + idempotent session-init."""
+
+    def test_session_ensure_called_once_per_pair(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """Second message to same (session, host) skips remote session-init."""
+        _init_session(store)
+        env1 = _make_envelope(msg_id="m1")
+        env2 = _make_envelope(msg_id="m2", from_id="mgr", to_id="w1")
+
+        init_calls = {"n": 0}
+
+        def mock_mailbox(host, args, **kw):
+            if "session-init" in args:
+                init_calls["n"] += 1
+                return 0, "session s1 created", ""
+            return 0, "sent", ""
+
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.mailbox = mock_mailbox
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        engine.cache_roster("s1", ["w1", "w2", "mgr"])
+
+        r1 = engine.deliver("s1", host_a, env1)
+        assert r1.status == "delivered"
+        assert init_calls["n"] == 1
+
+        # Second message to same host — session-init should NOT be called
+        r2 = engine.deliver("s1", host_a, env2)
+        assert r2.status == "delivered"
+        assert init_calls["n"] == 1  # still 1
+
+    def test_session_ensure_full_roster(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """session-init carries full roster (all agents), not just target."""
+        _init_session(store)
+        envelope = _make_envelope()
+        captured_args: list[list[str]] = []
+
+        def mock_mailbox(host, args, **kw):
+            if "session-init" in args:
+                captured_args.append(list(args))
+                return 0, "ok", ""
+            return 0, "sent", ""
+
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.mailbox = mock_mailbox
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        engine.cache_roster("s1", ["w1", "w2", "mgr"])
+
+        engine.deliver("s1", host_a, envelope)
+
+        assert len(captured_args) == 1
+        args = captured_args[0]
+        agents_idx = args.index("--agents")
+        agents_csv = args[agents_idx + 1]
+        assert agents_csv == "mgr,w1,w2"  # full sorted roster
+
+    def test_capability_check_fails_closed(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """RuntimeError when remote host lacks 'mailbox' capability."""
+        _init_session(store)
+        envelope = _make_envelope()
+
+        mock_router = MagicMock()
+        mock_router.capabilities.return_value = {"stream"}  # no mailbox!
+        mock_transport = MagicMock()
+        mock_router.get.return_value = mock_transport
+
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+
+        # Capability check happens inside deliver → _remote_send → raises
+        # RuntimeError, caught by deliver() → accepted+queued
+        receipt = engine.deliver("s1", host_a, envelope)
+        # Transport failure → accepted+queued (outbox preserved)
+        assert receipt.status == "accepted"
+        assert receipt.queued is True

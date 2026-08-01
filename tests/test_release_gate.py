@@ -219,6 +219,7 @@ class TestDisconnectReplay:
 
         # Mock router that fails
         mock_router = MagicMock()
+        mock_router.capabilities.return_value = {"mailbox"}
         failing_transport = MagicMock()
         failing_transport.mailbox.side_effect = ConnectionError("SSH disconnected")
         mock_router.get.return_value = failing_transport
@@ -258,6 +259,7 @@ class TestDisconnectReplay:
 
         # Phase 1: fail
         mock_router = MagicMock()
+        mock_router.capabilities.return_value = {"mailbox"}
         failing = MagicMock()
         failing.mailbox.side_effect = ConnectionError("down")
         mock_router.get.return_value = failing

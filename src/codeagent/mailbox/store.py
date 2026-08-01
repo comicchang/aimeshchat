@@ -78,8 +78,38 @@ class MailboxStore:
             validate_agent_id(aid)
 
         sd = self.session_dir(session_id)
+
+        # ── Idempotent: merge new agents into existing session ────────
         if sd.exists():
-            raise ValueError(f"session already exists: {session_id}")
+            existing = self.read_session(session_id)
+            if existing is None:
+                raise ValueError(f"session dir exists but session.json missing: {session_id}")
+
+            old_agents = set(existing.get("agents", []))
+            new_agents = sorted(set(agent_ids))
+            merged = sorted(old_agents | set(new_agents))
+            added = sorted(set(new_agents) - old_agents)
+
+            if not added:
+                return f"session {session_id} ok (merged 0 agents)"
+
+            # Create subdirs for newly added agents only
+            for aid in added:
+                for sub in ("inbox", "processing", "archive", "_corrupt"):
+                    self.agent_subdir(session_id, aid, sub).mkdir(parents=True, exist_ok=True)
+
+            # Rewrite session.json with merged roster
+            existing["agents"] = merged
+            tmp = sd / ".tmp-session.json"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(existing, indent=2, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(sd / "session.json"))
+
+            return f"session {session_id} ok (merged {len(added)} agents)"
+
+        # ── Fresh creation ─────────────────────────────────────────────
         sd.mkdir(parents=True)
 
         meta = {
