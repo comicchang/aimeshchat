@@ -227,22 +227,16 @@ class SwarmKernel:
             [a for a in all_members if a != manager_id],
         )
 
-        # Store swarm-level metadata alongside session.json
-        meta = {
-            "acl": {
+        # Store swarm-level metadata alongside session.json (locked).
+        def _init_meta(meta: dict) -> None:
+            meta["acl"] = {
                 "authority": acl.authority,
                 "allowed_senders": acl.allowed_senders,
                 "room_members": acl.room_members,
                 "policy": acl.policy,
-            },
-        }
-        meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
-        tmp = meta_path.parent / ".tmp-swarm-meta.json"
-        with open(tmp, "w") as f:
-            f.write(json.dumps(meta, indent=2, ensure_ascii=False))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(str(tmp), str(meta_path))
+            }
+
+        self._persist_meta(session_id, _init_meta)
 
         self._sessions[session_id] = session
         self._channels[session_id] = {}
@@ -279,12 +273,21 @@ class SwarmKernel:
         """Remove an agent from the routing table."""
         self._require_session(session_id)
         self._routing.pop((session_id, agent_id), None)
-        self._persist_routing(session_id)
+        self._persist_routing(session_id, deleted={agent_id})
 
-    def _persist_routing(self, session_id: str) -> None:
-        """Persist the routing table into swarm-meta.json (locked)."""
+    def _persist_routing(self, session_id: str, deleted: Optional[set[str]] = None) -> None:
+        """Persist the routing table into swarm-meta.json (locked, merge).
+
+        Only entries for *session_id* are written; agents registered by
+        other kernels in other sessions are preserved on disk.  Entries
+        in *deleted* are explicitly removed from disk (unregister of THIS
+        kernel's own agent) — a stale entry must not linger for a fresh
+        kernel that loads from disk.
+        """
+        deleted = deleted or set()
+
         def _update(meta: dict) -> None:
-            routing = {}
+            routing = meta.get("routing", {})
             for (sid, aid), loc in self._routing.items():
                 if sid == session_id:
                     routing[aid] = {
@@ -292,6 +295,8 @@ class SwarmKernel:
                         "host_alias": loc.host_alias,
                         "backend": loc.backend,
                     }
+            for aid in deleted:
+                routing.pop(aid, None)
             meta["routing"] = routing
 
         self._persist_meta(session_id, _update)
@@ -323,9 +328,13 @@ class SwarmKernel:
         return channel
 
     def _persist_channels(self, session_id: str) -> None:
-        """Persist channels into swarm-meta.json (locked)."""
+        """Persist channels into swarm-meta.json (locked, merge).
+
+        Only channels for *session_id* are written; channels created by
+        other kernels in other sessions are preserved on disk.
+        """
         def _update(meta: dict) -> None:
-            channels = {}
+            channels = meta.get("channels", {})
             for cid, ch in self._channels.get(session_id, {}).items():
                 channels[cid] = {
                     "channel_id": ch.channel_id,
@@ -338,48 +347,36 @@ class SwarmKernel:
     def _persist_meta(self, session_id: str, update: Callable[[dict], None]) -> None:
         """Locked read-modify-write of swarm-meta.json.
 
-        fcntl.lockf(LOCK_EX) around read→merge→write prevents concurrent
-        register()/create_channel() (parallel CLI processes, tmux windows,
-        OMP agents) from losing each other's updates.
+        Uses a separate ``.swarm-meta.lock`` file (never replaced by
+        ``os.replace``) so the lock inode is stable across writers.
+        A unique tmp file per writer avoids shared-name collisions.
+
+        If the lock cannot be acquired the error propagates — fail-closed
+        rather than silently writing without exclusion.
         """
+        meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
+        lock_path = self._store.session_dir(session_id) / ".swarm-meta.lock"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+        lock_fd = open(lock_path, "a+")  # never os.replace'd — stable inode
         try:
-            meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
-            meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta = {}
+            fcntl.lockf(lock_fd, fcntl.LOCK_EX)
+            meta: dict = {}
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 pass
             update(meta)
-            tmp = meta_path.parent / ".tmp-swarm-meta.json"
-            try:
-                with open(meta_path, "a+") as lock_fd:  # lock file itself
-                    fcntl.lockf(lock_fd, fcntl.LOCK_EX)
-                    try:
-                        # Re-read under lock in case another process wrote
-                        # between our first read and the lock acquisition.
-                        try:
-                            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-                            pass
-                        update(meta)
-                        with open(tmp, "w") as f:
-                            f.write(json.dumps(meta, indent=2, ensure_ascii=False))
-                            f.flush()
-                            os.fsync(f.fileno())
-                        os.replace(str(tmp), str(meta_path))
-                    finally:
-                        fcntl.lockf(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                # Lock unsupported (some network FS) — fall back to the
-                # unlocked write; persistence stays best-effort.
-                with open(tmp, "w") as f:
-                    f.write(json.dumps(meta, indent=2, ensure_ascii=False))
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(str(tmp), str(meta_path))
-        except OSError:
-            pass
+            # Unique tmp name (pid + uuid) — no shared .tmp-swarm-meta collision
+            tmp = meta_path.parent / f".tmp-swarm-meta-{os.getpid()}-{uuid4().hex[:8]}.json"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(meta_path))  # only meta replaced; lock_fd stays on lock_path
+        finally:
+            fcntl.lockf(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     # ── ACL checks ─────────────────────────────────────────────────────
 
