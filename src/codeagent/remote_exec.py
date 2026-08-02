@@ -401,15 +401,22 @@ def _poll_streams(subs: list[_StreamSubscription]) -> None:
                     continue
                 msg_cursor = msg.get('_cursor', '')
                 msg_id = msg.get("msg_id", f.stem)
+                # Opaque cursor discipline: only messages carrying the
+                # server-generated _cursor participate in stream delivery.
+                # Legacy pre-0.2.0 messages (no _cursor) are skipped —
+                # mixing msg_id fallbacks with opaque cursors breaks the
+                # lexicographic ordering and can silently drop new mail.
+                if not msg_cursor:
+                    continue
                 # Skip messages we've already delivered (lexicographic)
-                if msg_cursor and msg_cursor <= sub.cursor:
+                if msg_cursor <= sub.cursor:
                     continue
                 # Emit event with full Message payload
                 event = {
                     'type': 'stream_event',
                     'request_id': sub.request_id,
                     'session_id': sub.session_id,
-                    'cursor': msg_cursor or msg_id,
+                    'cursor': msg_cursor,
                     'payload': {
                         k: msg.get(k, '')
                         for k in ('msg_id', 'from', 'to', 'kind', 'subject',
@@ -420,7 +427,7 @@ def _poll_streams(subs: list[_StreamSubscription]) -> None:
                 if msg.get('attachments'):
                     event['payload']['attachments'] = msg['attachments']
                 _send(event)
-                sub.cursor = msg_cursor or msg_id
+                sub.cursor = msg_cursor
         except Exception:
             # Don't let one subscription's error kill the loop
             pass

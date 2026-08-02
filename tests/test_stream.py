@@ -474,6 +474,49 @@ class TestServeModeStream:
         assert len(events2) == 1
         assert events2[0]["payload"]["msg_id"] == "msg-002"
 
+    def test_legacy_no_cursor_messages_skipped(self, tmp_path: Path):
+        """Pre-0.2.0 messages without _cursor must not corrupt stream ordering."""
+        from codeagent.mailbox.store import MailboxStore
+        from codeagent.remote_exec import _poll_streams, _StreamSubscription
+
+        store = MailboxStore(root=tmp_path)
+        store.session_init("s1", "mgr", ["a1"])
+        session_dir = store.session_dir("s1")
+        inbox = session_dir / "a1" / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        # Legacy message — no _cursor field
+        legacy = {
+            "msg_id": "legacy-001",
+            "from": "mgr", "to": "a1", "kind": "TASK",
+            "subject": "old", "body": "x",
+            "created_at": "2025-01-01T00:00:00Z",
+        }
+        (inbox / "legacy-001.json").write_text(json.dumps(legacy))
+        # New message with opaque cursor
+        new = {
+            "msg_id": "new-001",
+            "from": "mgr", "to": "a1", "kind": "TASK",
+            "subject": "fresh", "body": "y",
+            "created_at": "2025-07-01T12:00:00Z",
+            "_cursor": "1719840000000/0",
+        }
+        (inbox / "new-001.json").write_text(json.dumps(new))
+
+        sub = _StreamSubscription(
+            request_id="r1", session_id="s1", agent_id="a1", cursor="0",
+        )
+        sent: list[dict] = []
+        with patch("codeagent.remote_exec._send", side_effect=sent.append):
+            with patch("codeagent.remote_exec.MailboxStore") as MockStore:
+                MockStore.return_value = store
+                _poll_streams([sub])
+
+        events = [m for m in sent if m.get("type") == "stream_event"]
+        assert len(events) == 1  # only new-001, legacy skipped
+        assert events[0]["payload"]["msg_id"] == "new-001"
+        assert sub.cursor == "1719840000000/0"
+
     def test_stream_heartbeat_emitted(self):
         """Heartbeat pong is emitted when enough time has passed."""
         from codeagent.remote_exec import _poll_streams, _StreamSubscription
@@ -643,7 +686,7 @@ class TestSSHStream:
             "type": MSG_STREAM_EVENT,
             "request_id": "r1",
             "session_id": "s1",
-            "cursor": "2025-07-01T12:00:00Z",
+            "cursor": "1719840000000/1",
             "payload": {"msg_id": "m1", "from": "alice", "subject": "hello"},
         })
 
@@ -666,7 +709,7 @@ class TestSSHStream:
             assert len(events) == 1
             assert events[0]["msg_id"] == "m1"
             assert events[0]["from"] == "alice"
-            assert stream.cursor == "2025-07-01T12:00:00Z"
+            assert stream.cursor == "1719840000000/1"
 
             stream.close()
 
@@ -678,7 +721,7 @@ class TestSSHStream:
             "type": MSG_STREAM_EVENT,
             "request_id": "r1",
             "session_id": "s1",
-            "cursor": "tok1",
+            "cursor": "1719840000000/0",
             "payload": {"msg_id": "m1", "from": "alice"},
         })
         # Same event twice
@@ -709,12 +752,12 @@ class TestSSHStream:
         """After reconnect, stream re-issues with the last cursor."""
         from codeagent.transport.ssh import SSHStream
 
-        # First connection: sends event with cursor "tok1"
+        # First connection: sends event with cursor "1719840000000/0"
         event1 = encode_line({
             "type": MSG_STREAM_EVENT,
             "request_id": "r1",
             "session_id": "s1",
-            "cursor": "tok1",
+            "cursor": "1719840000000/0",
             "payload": {"msg_id": "m1", "from": "alice"},
         })
         ready1 = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
@@ -726,7 +769,7 @@ class TestSSHStream:
             "type": MSG_STREAM_EVENT,
             "request_id": "r1",
             "session_id": "s1",
-            "cursor": "tok2",
+            "cursor": "1719840000000/1",
             "payload": {"msg_id": "m2", "from": "bob"},
         })
         ready2 = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
@@ -775,7 +818,7 @@ class TestSSHStream:
             events1 = stream.poll(timeout=0.1)
             assert len(events1) == 1
             assert events1[0]["msg_id"] == "m1"
-            assert stream.cursor == "tok1"
+            assert stream.cursor == "1719840000000/0"
 
             # Simulate connection death: proc.poll() returns non-None
             # Force reconnect by calling poll again
@@ -783,12 +826,12 @@ class TestSSHStream:
             events2 = stream.poll(timeout=0.1)
             assert len(events2) == 1
             assert events2[0]["msg_id"] == "m2"
-            assert stream.cursor == "tok2"
+            assert stream.cursor == "1719840000000/1"
 
             # Verify the second connection received cursor resume
             stdin2_bytes = stdin2.getvalue()
             req = json.loads(stdin2_bytes)
-            assert req["cursor"] == "tok1"  # resumed from last cursor
+            assert req["cursor"] == "1719840000000/0"  # resumed from last cursor
 
             stream.close()
 

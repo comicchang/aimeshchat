@@ -632,7 +632,11 @@ class SSHStream:
                     continue
                 if msg_id:
                     self._seen_msg_ids.add(msg_id)
-                self._cursor = msg.cursor
+                # Only adopt opaque server cursors ("epoch_ms/seq"); legacy
+                # non-opaque cursors would corrupt the lexicographic resume
+                # ordering on reconnect.
+                if isinstance(msg.cursor, str) and "/" in msg.cursor:
+                    self._cursor = msg.cursor
                 events.append(payload)
 
         return events
