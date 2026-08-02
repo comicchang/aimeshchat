@@ -48,6 +48,11 @@ class BaseRunner(ABC):
 
         proc = None
         try:
+            env = None
+            extra_env = self._extra_env()
+            if extra_env:
+                env = os.environ.copy()
+                env.update(extra_env)
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -56,6 +61,7 @@ class BaseRunner(ABC):
                 text=True,
                 cwd=request.workdir or None,
                 start_new_session=True,
+                env=env,
             )
             stdout, stderr = proc.communicate(
                 input=request.task,
@@ -102,6 +108,14 @@ class BaseRunner(ABC):
 
         Return an empty list to signal a build error (e.g. missing binary).
         """
+
+    def _extra_env(self) -> Optional[dict[str, str]]:
+        """Extra environment variables for the subprocess, or None.
+
+        Subclasses override to inject identity/context (e.g. OMP mailbox
+        identity for the swarm plugin). Called only when non-empty.
+        """
+        return None
 
     @abstractmethod
     def _parse_output(

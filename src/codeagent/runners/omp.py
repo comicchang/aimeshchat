@@ -17,6 +17,7 @@ OMP JSONL output lines::
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import subprocess
@@ -29,6 +30,8 @@ from codeagent.hooks.swarm_hooks import on_agent_start, on_agent_stop
 
 from .base import BaseRunner, RunnerConfig
 
+LOG = logging.getLogger(__name__)
+
 _DEFAULT_BINARY = "omp"
 
 
@@ -39,6 +42,7 @@ class OMPRunner(BaseRunner):
         super().__init__(config)
         if not self.config.binary:
             self.config.binary = _DEFAULT_BINARY
+        self._identity_path: Optional[Path] = None
 
     # ------------------------------------------------------------------
     # BaseRunner contract
@@ -70,6 +74,41 @@ class OMPRunner(BaseRunner):
         cmd.append(f"@{self._prompt_file}")
 
         return cmd
+
+    def _extra_env(self) -> Optional[dict[str, str]]:
+        """Inject swarm mailbox identity for the OMP plugin (Oracle P1-3).
+
+        The plugin reads OMP_MAILBOX_SESSION_ID / OMP_MAILBOX_AGENT_ID at
+        startup from the OS env (inherited through the launcher). Identity
+        belongs to the launcher, NOT to the agent's reasoning — inject it
+        here so the plugin activates without the agent hand-writing an
+        identity file.
+        """
+        import secrets
+        import time as _time
+
+        swarm_sid = os.environ.get("SWARM_SESSION_ID")
+        if not swarm_sid:
+            return None
+
+        token = f"{int(_time.time())}_{secrets.token_hex(4)}"
+        identity_dir = Path.home() / ".omp" / "mailbox-identity"
+        identity_dir.mkdir(parents=True, exist_ok=True)
+        identity_path = identity_dir / f"{token}.json"
+        # Backward-compat identity file for plugins that still read it
+        identity_path.write_text(json.dumps({
+            "session_id": swarm_sid,
+            "worker_id": "manager" if self.config.binary.endswith("omp") and os.environ.get("OMP_WORKER_ID") == "manager" else "",
+        }))
+        self._identity_path = identity_path
+
+        return {
+            "SWARM_SESSION_ID": swarm_sid,
+            "OMP_MAILBOX_SESSION_ID": swarm_sid,
+            "OMP_MAILBOX_AGENT_ID": os.environ.get("OMP_WORKER_ID", ""),
+            "OMP_MAILBOX_IDENTITY_FILE": str(identity_path),
+            "MAILBOX_ROOT": os.environ.get("MAILBOX_ROOT", ""),
+        }
 
     def _parse_output(
         self, proc: subprocess.CompletedProcess[str], request: RunRequest
@@ -133,7 +172,7 @@ class OMPRunner(BaseRunner):
                 self._swarm_session_id = swarm_sid
                 self._swarm_agent_id = session_id
             except Exception:
-                pass  # hook errors are advisory, not fatal
+                LOG.warning("on_agent_start hook failed", exc_info=True)
 
         return result
 
@@ -163,8 +202,16 @@ class OMPRunner(BaseRunner):
             self._prompt_file = None
 
     def _cleanup(self) -> None:
-        """Clean up prompt temp file and unregister swarm agent."""
+        """Clean up prompt temp file, identity file, and unregister swarm agent."""
         self._cleanup_prompt_file()
+        # Remove the injected mailbox identity file (per-run, unique token)
+        identity_path = getattr(self, "_identity_path", None)
+        if identity_path:
+            try:
+                identity_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._identity_path = None
         # ── Swarm hook: unregister agent on stop ──────────────────────
         swarm_sid = getattr(self, "_swarm_session_id", None)
         swarm_aid = getattr(self, "_swarm_agent_id", None)
@@ -172,4 +219,4 @@ class OMPRunner(BaseRunner):
             try:
                 on_agent_stop(session_id=swarm_sid, agent_id=swarm_aid)
             except Exception:
-                pass  # hook errors are advisory, not fatal
+                LOG.warning("on_agent_stop hook failed", exc_info=True)

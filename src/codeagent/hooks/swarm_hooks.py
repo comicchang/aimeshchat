@@ -36,22 +36,36 @@ from codeagent.swarm.model import AgentLocation, Envelope
 # Module-level kernel instance (lazy singleton for OMP process lifetime)
 _kernel: Optional[SwarmKernel] = None
 _store: Optional[MailboxStore] = None
+_store_root: Optional[Path] = None  # track which store_root the kernel was built for
+_registered: set[tuple[str, str]] = set()  # (session_id, agent_id) pairs registered via on_agent_start
 
 
 def _get_kernel(store_root: Optional[Path] = None) -> tuple[SwarmKernel, MailboxStore]:
-    """Get or create the module-level kernel singleton."""
-    global _kernel, _store
+    """Get or create the module-level kernel singleton.
+
+    If *store_root* differs from the current one, the kernel is
+    recreated so that agents registered for a different store
+    don't silently share a stale backend.
+    """
+    global _kernel, _store, _store_root
+    if _kernel is not None and store_root != _store_root:
+        # Store root changed — must recreate to avoid stale singleton
+        _kernel = None
+        _store = None
     if _kernel is None:
         _store = MailboxStore(root=store_root)
         _kernel = SwarmKernel(store=_store, sink=LocalDeliverySink(_store))
+        _store_root = store_root
     return _kernel, _store
 
 
 def reset() -> None:
     """Reset the module-level kernel singleton (for testing)."""
-    global _kernel, _store
+    global _kernel, _store, _store_root, _registered
     _kernel = None
     _store = None
+    _store_root = None
+    _registered = set()
 
 
 def on_agent_start(
@@ -81,9 +95,11 @@ def on_agent_start(
     dict
         Registration info with agent_id, session_id, host_alias, backend.
     """
+    global _registered
     kernel, _ = _get_kernel(store_root)
     loc = AgentLocation(agent_id=agent_id, host_alias=host_alias, backend=backend)
     reg = kernel.register(loc, session_id)
+    _registered.add((session_id, agent_id))
     return {
         "agent_id": reg.agent_id,
         "session_id": reg.session_id,
@@ -161,8 +177,19 @@ def on_agent_stop(
     Returns
     -------
     dict
-        Confirmation with agent_id and session_id.
+        Confirmation with agent_id, session_id, and whether
+        an unregister actually happened.
     """
+    global _registered
+    pair = (session_id, agent_id)
+    if pair not in _registered:
+        return {
+            "unregistered": False,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "reason": "never registered",
+        }
     kernel, _ = _get_kernel(store_root)
     kernel.unregister(session_id, agent_id)
+    _registered.discard(pair)
     return {"unregistered": True, "agent_id": agent_id, "session_id": session_id}
