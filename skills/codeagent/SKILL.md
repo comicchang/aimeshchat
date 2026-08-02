@@ -7,6 +7,10 @@ requires:
 
 # codeagent — 多主机代码任务唯一入口
 
+> **编排协议**: `skill://tmux-agent/` — tmux-agent 编排协议（Manager/Worker 角色、INIT 握手、v2 direct inbox）
+> **部署模式**: `skill://tmux-agent/SKILL.md#deployment-modes` — Shared FS vs Remote Transport 决策树
+> **默认模式**: B (Remote Transport) — 无共享文件系统，跨主机通信走 SSH wire protocol
+
 ## 何时使用
 
 满足任一条件时使用 `codeagent route`：
@@ -58,7 +62,29 @@ codeagent sessions bind --key '<key>' --id '<backend-session-id>'
 codeagent ssh warm <host...>
 codeagent ssh status
 codeagent ssh stop <host...>
+
+# Mailbox（跨主机通信）
+codeagent mailbox send --session s1 --from manager --to w1 --kind TASK ... --host dev-server
+codeagent mailbox peek --session s1 --agent w1 [--host dev-server]
+codeagent mailbox read --session s1 --agent w1 --owner w1 [--host dev-server]
+
+# Swarm IPC（高级 IPC）
+codeagent swarm create-session s1 --manager mgr --members w1,w2
+codeagent swarm register s1 --agent w1 --host dev-server
+codeagent swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body "..."
+codeagent swarm poll s1 --agent w1
+codeagent swarm watch s1 --agent w1 --interval 2
 ```
+
+## Mailbox & Swarm
+
+`codeagent mailbox` 和 `codeagent swarm` 是跨主机通信的核心工具。详见 `skill://tmux-agent/` 编排协议。
+
+- `codeagent mailbox ... --host <alias>`: 跨主机 mailbox 操作（底层 SSH wire protocol）
+- `codeagent swarm ...`: 高级 IPC（session/roster/ACL/routing、delivery engine）
+- 本地 mailbox: 直接使用 `mailbox` CLI（PATH command）
+
+**部署模式默认值**: Remote Transport (Mode B)。如需使用 Shared FS (Mode A)，必须显式设置 `MAILBOX_ROOT=.mailbox`。详见 `skill://tmux-agent/SKILL.md#deployment-modes`。
 
 ## Session 规则
 

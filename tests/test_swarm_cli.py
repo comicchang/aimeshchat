@@ -918,12 +918,12 @@ class TestSkillReferences:
             "tmux-agent-worker/SKILL.md still references omp-mailbox-plugin"
 
     def test_manager_skill_mentions_swarm(self):
-        skill = Path(__file__).resolve().parent.parent / "skills" / "tmux-agent-manager" / "SKILL.md"
+        skill = Path(__file__).resolve().parent.parent / "skills" / "tmux-agent" / "SKILL.md"
         content = skill.read_text()
         assert "codeagent swarm" in content
 
     def test_worker_skill_mentions_swarm(self):
-        skill = Path(__file__).resolve().parent.parent / "skills" / "tmux-agent-worker" / "SKILL.md"
+        skill = Path(__file__).resolve().parent.parent / "skills" / "tmux-agent" / "protocol" / "mailbox.md"
         content = skill.read_text()
         assert "codeagent swarm" in content
 
