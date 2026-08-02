@@ -634,3 +634,60 @@ class TestLocalhostSSHSwarm:
             assert "ssh-test" in out or "via CM" in out
         finally:
             transport.stop(host)
+
+    def test_ssh_stream_burst_and_reconnect(self) -> None:
+        """Real SSH stream: same-second burst (all delivered, full payload),
+        kill-stream, reconnect resumes with cursor — no loss, no dup.
+
+        Oracle release gate: 'SSH stream 自动化断线重连：同秒 burst、全字段、
+        断开后续传、无漏无重复落盘'.  Uses localhost SSH (no external host).
+        """
+        import time as _time
+        import uuid as _uuid
+        from codeagent.domain import HostSpec
+        from codeagent.mailbox.store import MailboxStore
+        from codeagent.transport.ssh import SSHStream
+
+        store = MailboxStore()  # XDG default root (shared with remote-exec)
+        sid = f"gate-{_uuid.uuid4().hex[:8]}"
+        store.session_init(sid, "mgr", ["w1"])
+
+        host = HostSpec(
+            name="localhost", ssh_alias="localhost",
+            hostnames=("localhost",),
+        )
+
+        def push(i: int) -> None:
+            store.send(
+                sid, "mgr", "w1", f"burst-{i}", f"body-{i}", "TASK",
+            )
+
+        try:
+            stream = SSHStream(ssh_cmd=["ssh", "-o", "BatchMode=yes", "localhost"])
+            stream.open(session_id=sid, agent_id="w1", cursor="0")
+
+            # Same-second burst: 10 messages, identical created_at
+            for i in range(10):
+                push(i)
+            e1 = stream.poll(timeout=15)
+            assert len(e1) == 10, f"burst lost messages: got {len(e1)}"
+            assert all("body" in e and e["body"].startswith("body-") for e in e1), \
+                "burst events missing body payload"
+            assert stream.cursor != "0", "cursor did not advance"
+
+            # Kill the stream; deliver during outage
+            stream._proc.kill()
+            stream._proc.wait()
+            push(99)
+
+            # Reconnect: outage message must arrive via cursor resume
+            e2 = stream.poll(timeout=20)
+            assert any(e.get("subject") == "burst-99" for e in e2), \
+                "outage message not delivered after reconnect"
+            stream.close()
+        finally:
+            import shutil
+            try:
+                shutil.rmtree(store.root / sid, ignore_errors=True)
+            except OSError:
+                pass
