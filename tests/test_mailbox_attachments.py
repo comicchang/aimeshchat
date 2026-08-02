@@ -301,6 +301,14 @@ class TestAttachmentValidation:
             store.send("s1", "mgr", "w1", "t", "b", "TASK",
                        attachments=[AttachmentRef.from_dict(_ref(size=-1))])
 
+    def test_oversize_attachment_rejected(self, store):
+        """Attachment size beyond MAX_ATTACHMENT_SIZE is rejected."""
+        from codeagent.constants import MAX_ATTACHMENT_SIZE
+        store.session_init("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError, match="exceeds.*byte limit"):
+            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+                       attachments=[AttachmentRef.from_dict(_ref(size=MAX_ATTACHMENT_SIZE + 1))])
+
     def test_empty_artifact_id(self, store):
         store.session_init("s1", "mgr", ["w1"])
         with pytest.raises(ValueError, match="artifact_id"):

@@ -23,7 +23,12 @@ import sys
 import time
 from typing import Optional
 
-from codeagent.constants import DEFAULT_MAILBOX_TIMEOUT, DEFAULT_RELAY_TIMEOUT, MAX_LINE_LENGTH
+from codeagent.constants import (
+    DEFAULT_MAILBOX_TIMEOUT,
+    DEFAULT_RELAY_TIMEOUT,
+    MAX_LINE_LENGTH,
+    PTY_READ_CHUNK,
+)
 from codeagent.domain import HostSpec, RunRequest, RunResult
 from codeagent.transport.base import Transport, TransportError
 from codeagent.wire.protocol import (
@@ -290,7 +295,7 @@ class RelayTransport(Transport):
                 # Forward stdin → PTY master (for QR code / expect interaction)
                 if stdin_fd is not None and stdin_fd in ready:
                     try:
-                        chunk = os.read(stdin_fd, 4096)
+                        chunk = os.read(stdin_fd, PTY_READ_CHUNK)
                         if chunk:
                             os.write(master_fd, chunk)
                         else:
@@ -303,7 +308,7 @@ class RelayTransport(Transport):
                 # Read PTY master output
                 if master_fd in ready:
                     try:
-                        data = os.read(master_fd, 4096)
+                        data = os.read(master_fd, PTY_READ_CHUNK)
                     except OSError:
                         abort_reason = "read-error"
                         _set_state("abort:read-error")

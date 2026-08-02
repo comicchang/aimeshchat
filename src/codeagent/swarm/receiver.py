@@ -40,11 +40,9 @@ if False:  # TYPE_CHECKING
 
 log = logging.getLogger(__name__)
 
-# Default poll interval for watch mode (seconds).
-DEFAULT_WATCH_POLL_INTERVAL = 0.5
-
-# Maximum time to block in loop() per iteration (seconds).
-_LOOP_TICK = 0.25
+# Watch-mode scan interval and loop tick are centralized in
+# codeagent.constants (DEFAULT_WATCH_POLL_INTERVAL, LOOP_TICK).
+from codeagent.constants import DEFAULT_WATCH_POLL_INTERVAL, LOOP_TICK  # noqa: F401
 
 
 class SwarmReceiver:
@@ -184,7 +182,7 @@ class SwarmReceiver:
 
         while not self._stop_event.is_set():
             try:
-                events = self._stream.poll(timeout=_LOOP_TICK)
+                events = self._stream.poll(timeout=LOOP_TICK)
             except Exception:
                 log.exception("SwarmReceiver: stream poll error")
                 break

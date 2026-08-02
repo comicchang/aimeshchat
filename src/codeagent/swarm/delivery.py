@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from codeagent.constants import ISO_TIMESTAMP_FORMAT
 from codeagent.mailbox.store import MailboxStore
 
 if False:  # TYPE_CHECKING
@@ -607,9 +608,7 @@ class DeliveryEngine:
         marker = sd / f".delivered-{msg_id}"
         marker.write_text(
             json.dumps({
-                "delivered_at": datetime.now(timezone.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
+                "delivered_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
             }),
         )
 
@@ -624,7 +623,7 @@ class DeliveryEngine:
         (status_dir / "phase").write_text(detail)
         (status_dir / "kind").write_text(kind)
         (status_dir / "timestamp").write_text(
-            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
         )
 
     # ── Idempotency ────────────────────────────────────────────────────

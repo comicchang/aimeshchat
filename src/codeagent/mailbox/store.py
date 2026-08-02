@@ -9,7 +9,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from codeagent.constants import LEASE_TIMEOUT_S, MAX_MAILBOX_BODY, STREAM_CURSOR_FILE, STREAM_CURSOR_INITIAL
+from codeagent.constants import (
+    ISO_TIMESTAMP_FORMAT,
+    LEASE_TIMEOUT_S,
+    MAX_ATTACHMENT_SIZE,
+    MAX_MAILBOX_BODY,
+    MSG_ID_TIMESTAMP_FORMAT,
+    STREAM_CURSOR_FILE,
+    STREAM_CURSOR_INITIAL,
+)
 from codeagent.mailbox.protocol import (
     BROADCAST_TO,
     VALID_KINDS,
@@ -35,7 +43,7 @@ def resolve_root(root: Optional[Path] = None) -> Path:
 
 def gen_msg_id(sender: str) -> str:
     import random
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    ts = datetime.now(timezone.utc).strftime(MSG_ID_TIMESTAMP_FORMAT)
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
     return f"{sender}_{ts}_{suffix}"
 
@@ -117,7 +125,7 @@ class MailboxStore:
             "session_id": session_id,
             "manager": manager_id,
             "agents": sorted(set(agent_ids)),
-            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "created_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
         }
         tmp = sd / ".tmp-session.json"
         with open(tmp, "w") as f:
@@ -182,6 +190,10 @@ class MailboxStore:
                 err = attachment_error(ad)
                 if err is not None:
                     raise ValueError(f"invalid attachment: {err}")
+                if isinstance(ad.get("size"), int) and ad["size"] > MAX_ATTACHMENT_SIZE:
+                    raise ValueError(
+                        f"attachment exceeds {MAX_ATTACHMENT_SIZE}-byte limit: {ad.get('path', '?')}"
+                    )
                 refs.append(AttachmentRef.from_dict(ad))
 
         # Resolve recipients; validate ALL of them before writing anything
@@ -222,7 +234,7 @@ class MailboxStore:
         msg = Message(
             session_id=session_id, from_id=from_id, to_id=to_id,
             subject=subject, body=body, kind=kind, msg_id=msg_id,
-            created_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
             reply_to=reply_to, run_id=run_id, request_id=request_id,
             attachments=refs,
         )
@@ -461,7 +473,7 @@ class MailboxStore:
 
             claim_meta = {
                 "owner": owner,
-                "claimed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "claimed_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
                 "msg_id": target.stem,
             }
             try:
@@ -621,7 +633,7 @@ class MailboxStore:
         status = StatusSnapshot(
             session_id=session_id, state=state,
             current_task=current_task, last_conclusion=last_conclusion,
-            updated_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            updated_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
         )
         dest = ad / "status.json"
         tmp = ad / ".tmp-status.json"

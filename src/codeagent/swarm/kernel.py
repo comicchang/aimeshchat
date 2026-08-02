@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Protocol
 from uuid import uuid4
 
+from codeagent.constants import ISO_TIMESTAMP_FORMAT
 from codeagent.mailbox.protocol import (
     BROADCAST_TO,
     AttachmentRef,
@@ -219,7 +220,7 @@ class SwarmKernel:
             manager_id=manager_id,
             roster=Roster(members=all_members),
             acl=acl,
-            created_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
         )
 
         # Persist to filesystem via MailboxStore
@@ -412,7 +413,7 @@ class SwarmKernel:
         return str(uuid4())
 
     def _gen_created_at(self) -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT)
 
     def send(self, session_id: str, sender: str, target: Address,
              envelope: Envelope) -> SendReceipt:
