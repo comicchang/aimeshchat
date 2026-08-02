@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codeagent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-host code agent orchestration with SSH, session persistence, routing, and mailbox IPC"
 license = "MIT"
 requires-python = ">=3.10"

@@ -49,7 +49,7 @@ def _remote_exec_responds(ready: bool = True, session_id: str | None = None) -> 
     """Build a sequence of JSONL response lines from a remote exec helper."""
     lines: list[bytes] = []
     if ready:
-        lines.append(encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.1.0"}))
+        lines.append(encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"}))
     lines.append(encode_line({"type": MSG_ACCEPTED, "wire_version": 1}))
     if session_id:
         lines.append(encode_line({"type": MSG_SESSION, "id": session_id}))
@@ -630,7 +630,7 @@ class TestRunWire:
     def test_ready_message_skipped(self, mock_popen: MagicMock):
         """MSG_READY is handled gracefully (skipped)."""
         mock_proc = MagicMock()
-        ready = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.1.0"})
+        ready = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
         result_msg = encode_line({"type": MSG_RESULT, "stdout": "done", "stderr": "", "exit_code": 0})
         mock_proc.communicate.return_value = (ready + result_msg, b"")
         mock_proc.returncode = 0
@@ -851,7 +851,7 @@ class TestRunSSHWire:
     def test_ready_message_skipped(self, mock_popen: MagicMock):
         """MSG_READY is handled gracefully (skipped)."""
         mock_proc = MagicMock()
-        ready = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.1.0"})
+        ready = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
         result_msg = encode_line({"type": MSG_RESULT, "stdout": "done", "stderr": "", "exit_code": 0})
         mock_proc.communicate.return_value = (ready + result_msg, b"")
         mock_proc.returncode = 0
@@ -933,7 +933,7 @@ class TestRunSSHWire:
     def test_version_mismatch_raises(self, mock_popen: MagicMock):
         """Wrong remote wire version raises TransportError."""
         mock_proc = MagicMock()
-        stdout = encode_line({"type": MSG_READY, "wire_version": 99, "package_version": "0.1.0"})
+        stdout = encode_line({"type": MSG_READY, "wire_version": 99, "package_version": "0.2.0"})
         mock_proc.communicate.return_value = (stdout, b"")
         mock_proc.returncode = 0
         mock_popen.return_value = mock_proc
@@ -1402,7 +1402,7 @@ class TestRunSSHMailbox:
         """mailbox_result is parsed into (exit_code, stdout, stderr)."""
         mock_proc = MagicMock()
         stdout = (
-            encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.1.0"})
+            encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
             + encode_line({"type": "mailbox_result", "stdout": "inbox: 1", "stderr": "", "exit_code": 0})
         )
         mock_proc.communicate.return_value = (stdout, b"")
@@ -1453,7 +1453,7 @@ class TestRunSSHMailbox:
     def test_version_mismatch_raises(self, mock_popen: MagicMock):
         """Wrong remote wire version raises TransportError."""
         mock_proc = MagicMock()
-        stdout = encode_line({"type": MSG_READY, "wire_version": 99, "package_version": "0.1.0"})
+        stdout = encode_line({"type": MSG_READY, "wire_version": 99, "package_version": "0.2.0"})
         mock_proc.communicate.return_value = (stdout, b"")
         mock_proc.returncode = 0
         mock_popen.return_value = mock_proc

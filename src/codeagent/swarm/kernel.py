@@ -71,6 +71,7 @@ class LocalDeliverySink:
             run_id=envelope.run_id,
             request_id=envelope.request_id,
             attachments=[a.to_dict() for a in envelope.attachments] if envelope.attachments else None,
+            msg_id=msg_id,
         )
         return DeliverySendReceipt(status="delivered", msg_id=msg_id)
 

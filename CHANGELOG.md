@@ -35,6 +35,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Test coverage for error paths across `cli`, `transport.control_master`, and
   `mailbox.store` (100% on all three modules as of this release).
 
+## [0.2.0] — UNRELEASED
+
+Major release: Oracle NO-GO → 4 P0 + 9 P1 + 7 P2 fixed across 5 batches
+(B1–B5). Delivery receipts, stream cursor, callback safety, routing TOCTOU,
+outbox CLI, session-ensure, plugin identity, hooks lifecycle, tmux-agent skill
+merge, and deployment modes.
+
+### Fixed
+
+- **P0-1 Stream cursor monotonic** (B1-T2): opaque `epoch_ms/seq` cursor persisted to
+  `.stream-cursor`, compared lexicographically — same-second message loss
+  eliminated. Emits full `Message` payload (body, attachments, reply_to, run_id,
+  request_id). `SSHStream` uses `STREAM_CURSOR_INITIAL`.
+- **P0-2 Delivery receipt propagation** (B1-T1): `DeliverySink` contract returns
+  `SendReceipt` everywhere; `EngineDeliverySink`, `LocalDeliverySink` propagate
+  real status (`accepted`+`queued` on transport failure, `delivered` on local
+  success) instead of hardcoded 'delivered'. `SendReceipt.queued` added to model.
+- **P0-3 Callback failure safety** (B1-T3): receiver only acks on callback success;
+  `_fire_callbacks` returns `False` if zero matched or any raised — failed/uncalled
+  callbacks leave message in inbox for retry, never archive.
+- **P0-4 Routing TOCTOU** (B2-T1): `_persist_meta` locks a separate `.swarm-meta.lock`
+  (stable inode, no lock-invalidation race), reads/writes under lock, fail-closed
+  (no unlocked fallback). `_persist_routing`/`_persist_channels` merge entries per
+  session instead of full-overwrite. `unregister` explicitly deletes agent from disk.
+- **P1 Outbox silent permanent-queued** (B3-T1/T2): `swarm outbox flush` exits
+  non-zero when nothing flushed — no more silent permanent-queued with 'delivered'
+  display.
+- **P1 Flush retry appends history** (B3): flush retries append to message history
+  instead of overwriting.
+- **P1 Receiver ack archives** (B3): receiver ack properly archives processed
+  messages.
+- **P1 Channel/notice receipts** (B3): channel and notice delivery returns real
+  receipt status.
+- **P1 Session meta lock** (B3): session metadata writes use locked path.
+
+### Added
+
+- **Outbox CLI** (B3-T1/T2): `swarm outbox pending|flush|status` subcommands for
+  durable outbox management. `DeliveryEngine.outbox_stats()`.
+- **Opportunistic flush** (B3): `swarm watch` + kernel factory attempt flush on
+  startup (try/except, no crash when transport absent).
+- **Session-ensure full roster** (B3-T3): `_remote_send` now does capability check
+  (fail-closed, cached per host) → idempotent session-init with FULL roster (cached
+  per session+host pair) → send. `MailboxStore.session_init` merges new agents into
+  existing session (no duplicate agents).
+- **Capability check fail-closed** (B3-T3): `_check_capability(host)` fails closed on
+  transport errors, cached per host.
+- **Launcher-injected identity env** (B4-T2): `OMPRunner._extra_env()` injects
+  namespaced mailbox identity (`SWARM_SESSION_ID`, `OMP_MAILBOX_SESSION_ID`,
+  `OMP_MAILBOX_AGENT_ID`, `OMP_MAILBOX_IDENTITY_FILE`, `MAILBOX_ROOT`) into OMP
+  subprocess env via `BaseRunner._extra_env()` hook. Identity file (per-run token)
+  written before spawn, removed in cleanup.
+- **Plugin type gate** (B4): `scripts/check-plugin-types.sh` — typecheck + test gate
+  for omp-mailbox-plugin.
+- **Unified tmux-agent skill** (B5-T2): `skills/tmux-agent/` with progressive
+  disclosure — `SKILL.md` (role determination, shared invariants) +
+  `roles/{manager,worker}.md` + `protocol/mailbox.md`. Old `tmux-agent-manager/`
+  and `tmux-agent-worker/` become deprecation redirect stubs.
+- **Deployment modes documented** (B5-T3): Mode A Shared FS (Syncthing, explicit
+  `MAILBOX_ROOT=.mailbox`) vs Mode B Remote Transport (SSH/relay, default) with
+  decision tree; `operations/{local,remote}.md`.
+
+### Changed
+
+- **`bin/mailbox` removed from plugin** (B5): PATH canonical CLI (`mailbox`,
+  `mailbox-hook`, `mailbox-health`) replaces plugin-local bin stubs.
+- **`swarm_hooks` lifecycle fixed** (B4-T3): tracks `_registered` pairs + `_store_root`;
+  `on_agent_stop` no-ops safely when never registered, unregisters when it was;
+  `reset()` clears all. OMP `_parse_output`/`_cleanup` hook failures log WARNING
+  instead of silent pass.
+- **`LocalDeliverySink` preserves kernel `msg_id`** (B1): local delivery uses
+  kernel-assigned message ID, not sink-generated.
+- **`mailbox-hook`/`mailbox-health` status** (B5): read-only diagnostics and
+  peek-only notification hook — canonical entry points documented in skill protocol.
+
+### Security
+
+- **Dotai fail-closed plugin install** (B4): plugin install fails closed on
+  transport/setup errors — no silent partial installs.
+- **Registry-driven `node_modules` cleanup** (B5): dotai `components.json` registry
+  controls plugin installation and deprecation.
+- **Pinned codeagent install ref** (B5): standalone install guide references pinned
+  codeagent version, no dotai dependency.
+
+### Test
+
+- Concurrent routing tests (B2-T2): real subprocess concurrency — two processes
+  register different agents → both survive; register+create_channel cross-op;
+  unregister removes only own.
+- Identity injection tests (B4-T2): +4 tests for `_extra_env()` and identity file
+  lifecycle.
+- Hooks lifecycle tests (B4-T3): +6 tests for registration/unregistration/reset.
+- Outbox + session-ensure tests (B3): +5 tests.
+- 1016 tests passed, 10 skipped (as of Batch-5).
+
+---
+
+Source of truth: 7-batch execution plan (B1–B7). B1–B5 merged; B6 (version,
+README, changelog, dotai trigger) in progress; B7 (release gate, tag) pending.
+
 ## [0.1.0] — 2026-07-31
 
 Initial public release of `codeagent-py` — multi-host code agent orchestration.

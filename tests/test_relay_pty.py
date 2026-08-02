@@ -29,7 +29,7 @@ from codeagent.domain import HostSpec, RunRequest, RunResult
 from codeagent.transport.relay import RelayTransport
 
 _WIRE_OK = (
-    '{"type":"ready","wire_version":1,"package_version":"0.1.0"}\n'
+    '{"type":"ready","wire_version":1,"package_version":"0.2.0"}\n'
     '{"type":"accepted","wire_version":1}\n'
     '{"type":"session","id":"sess-9"}\n'
     '{"type":"result","stdout":"ok","stderr":"","exit_code":0}\n'
@@ -142,7 +142,7 @@ class TestRelayPty:
         """A wrong remote wire version discards the result and errors out."""
         proc = _make_proc()
         payload = (
-            b'{"type":"ready","wire_version":99,"package_version":"0.1.0"}\n'
+            b'{"type":"ready","wire_version":99,"package_version":"0.2.0"}\n'
             b'{"type":"result","stdout":"ok","stderr":"","exit_code":0}\n'
         )
         chan = _PipeChannel(payload)

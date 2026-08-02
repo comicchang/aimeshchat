@@ -569,6 +569,21 @@ class TestLocalDeliverySink:
         inbox = store.list_messages(store.agent_subdir("s1", "w1", "inbox"))
         assert len(inbox) == 1
 
+    def test_deliver_preserves_kernel_msg_id(self, store):
+        """P1-1: receipt msg_id must equal inbox file msg_id (not regenerated)."""
+        sink = LocalDeliverySink(store)
+        store.session_init("s1", "mgr", ["w1"])
+        env = Envelope(subject="s", body="b", kind="TASK")
+        kernel_msg_id = "kernel-supplied-123"
+        receipt = sink.deliver("s1", "w1", env, kernel_msg_id, "2025-01-01T00:00:00Z", "mgr")
+        # Receipt must echo the kernel-supplied id
+        assert receipt.msg_id == kernel_msg_id
+        # Inbox file must use the same id
+        inbox = store.list_messages(store.agent_subdir("s1", "w1", "inbox"))
+        assert len(inbox) == 1
+        file_msg_id = inbox[0].stem
+        assert file_msg_id == kernel_msg_id
+
 
 # ── get_session / get_location ─────────────────────────────────────────
 

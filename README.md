@@ -17,7 +17,7 @@ Unified CLI for executing AI code agents across local and remote machines, with 
 
 ## Installation
 
-Requirements: Python 3.11+ and [uv](https://docs.astral.sh/uv/).
+Requirements: Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 Zero runtime dependencies (stdlib only).
 
 ### One command
@@ -29,7 +29,8 @@ uv tool install "git+https://github.com/comicchang/codeagent-py"
 Installs 5 entrypoints to `~/.local/bin` (ensure it's on your `PATH`).
 Only **two** matter: `codeagent` (the CLI) and `codeagent-remote-exec`
 (the remote helper, auto-discovered over SSH on each host).
-`mailbox` / `mailbox-hook` / `mailbox-health` are compatibility shims.
+`mailbox` / `mailbox-hook` / `mailbox-health` are authoritative mailbox
+management entrypoints (not shims).
 
 Remote hosts need the same single command (that's the whole deployment —
 no daemon, no shared filesystem, no service).
@@ -54,9 +55,9 @@ codeagent swarm register s1 --agent w1 --host __local__
 codeagent swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body "hello w1"
 codeagent swarm poll s1 --agent w1            # w1 reads its inbox
 
-# 3. Broadcast / channel / notice / real-time watch
+# 3. Broadcast / channel / notice / poll
 codeagent swarm broadcast s1 --from mgr --kind NOTICE --subject sync --body "everyone"
-codeagent swarm watch s1 --agent w1 --interval 2   # live feed
+codeagent swarm watch s1 --agent w1 --interval 2   # polling loop
 ```
 
 Cross-host: register the worker with its SSH host instead of `__local__`
@@ -284,10 +285,24 @@ no manual pip steps.  Optional per-host configuration (topic routing, relay
 login, shell prefix) lives in `~/.config/codeagent/repo-map.json` — see
 `examples/repo-map.json`.
 
+### Upgrading
+
+To upgrade to a tagged release on all hosts:
+
+```bash
+# On each remote machine:
+uv tool install --force git+https://github.com/comicchang/codeagent-py@v0.2.0
+```
+
+The `--force` flag replaces the existing installation in-place. No daemon
+restart needed — the next invocation uses the new version.
+
 ## Swarm IPC
 
 IRC-style agent-to-agent communication via `SwarmKernel` — session/roster/ACL/routing with
-pluggable delivery (local mailbox or cross-host via `TransportRouter`) and real-time push.
+pluggable delivery (local mailbox or cross-host via `TransportRouter`).
+`watch` mode uses polling (configurable interval); `stream` mode uses real-time
+push over SSH (long-lived connection, no polling).
 
 ### Quick Start (localhost)
 
@@ -306,10 +321,15 @@ codeagent swarm direct s1 --from mgr --to w1 --kind TASK --subject "analyze" --b
 out=$(codeagent swarm poll s1 --agent w1)
 msg_id=$(echo "$out" | jq -r '.messages[0].msg_id')
 codeagent swarm ack s1 --agent w1 --msg-id "$msg_id" --phase consumed
-codeagent swarm ack s1 --agent w1 --msg-id "$msg_id" --phase done
+# --phase released returns the message to inbox for re-processing
 
-# 5. Watch for new messages (continuous)
+# 5. Watch for new messages (continuous, polling loop)
 codeagent swarm watch s1 --agent mgr --interval 2
+
+# 6. Durable outbox (cross-host delivery with retry)
+codeagent swarm outbox pending              # list undelivered envelopes
+codeagent swarm outbox flush                 # retry all pending envelopes
+codeagent swarm outbox status                # show outbox summary counts
 ```
 
 ### Mailbox CLI
@@ -399,6 +419,23 @@ mailbox-hook s1 w1
 mailbox-health --session s1 --agent w1
 ```
 
+### OMP Plugin Environment Variables
+
+When launching agents via `codeagent run` or the OMP runner, these env vars
+are injected so the mailbox plugin activates automatically:
+
+| Variable                    | Purpose                                                  |
+|-----------------------------|----------------------------------------------------------|
+| `OMP_MAILBOX_SESSION_ID`    | Swarm session ID (inherited from launcher)               |
+| `OMP_MAILBOX_AGENT_ID`      | Worker agent ID within the session                       |
+| `OMP_MAILBOX_IDENTITY_FILE` | Path to identity JSON (plugin polls this file to activate)|
+| `MAILBOX_ROOT`              | Mailbox filesystem root (optional override)              |
+| `SWARM_SESSION_ID`          | Alias for `OMP_MAILBOX_SESSION_ID`                       |
+
+The plugin reads `OMP_MAILBOX_IDENTITY_FILE` at startup; when valid JSON
+appears, it activates and begins polling its inbox. Identity belongs to the
+launcher, not to the agent's reasoning.
+
 ## Relationship to code-route
 
 `codeagent` replaces `code_route.py` as the routing/execution layer. The Go `codeagent-wrapper` binary is preserved as-is for codex/claude/gemini/opencode backends.
@@ -428,12 +465,16 @@ the Go-based `codeagent-wrapper` binary distributed as an npm package.
 - **Installation**: Wrapper is installed via `npx github:stellarlinkco/myclaude` (GitHub npm package, not public registry).
 - **License**: Upstream wrapper is AGPL-3.0. codeagent-py calls it as an independent subprocess.
 
-### tmux-agent-skills (archived)
+### tmux-agent-skills
 
 The v3 session-based direct-inbox mailbox protocol, standalone CLI, and manager/worker skills
 were previously maintained at **[comicchang/tmux-agent-skills](https://github.com/comicchang/tmux-agent-skills)**
 (now archived). The protocol lives on in `src/codeagent/mailbox/` and
 `skills/tmux-agent-manager/`, `skills/tmux-agent-worker/`.
+
+A unified `tmux-agent` skill (B5 era) merges manager and worker into a single
+skill with mode-based dispatch. Use `skill://tmux-agent-manager` for the
+manager profile and `skill://tmux-agent-worker` for the worker profile.
 
 ## License
 

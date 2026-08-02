@@ -74,7 +74,7 @@ class TestCLIHelp:
             main(["--version"])
         assert exc.value.code == 0
         out = capsys.readouterr().out
-        assert "0.1.0" in out
+        assert "0.2.0" in out
 
     def test_help(self, capsys):
         from codeagent.cli import main

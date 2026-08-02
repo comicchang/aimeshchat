@@ -594,7 +594,7 @@ class TestSSHStream:
         """Build a mock Popen with controllable stdout/stdin."""
         if response_lines is None:
             response_lines = [
-                encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.1.0"}),
+                encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.2.0"}),
                 encode_line({"type": MSG_ACCEPTED, "wire_version": WIRE_VERSION}),
             ]
 
@@ -637,7 +637,7 @@ class TestSSHStream:
         """poll() parses stream_event frames from stdout."""
         from codeagent.transport.ssh import SSHStream
 
-        ready_line = encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.1.0"})
+        ready_line = encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.2.0"})
         accepted_line = encode_line({"type": MSG_ACCEPTED, "wire_version": WIRE_VERSION})
         event_line = encode_line({
             "type": MSG_STREAM_EVENT,
@@ -682,7 +682,7 @@ class TestSSHStream:
             "payload": {"msg_id": "m1", "from": "alice"},
         })
         # Same event twice
-        ready_line = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.1.0"})
+        ready_line = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
         accepted_line = encode_line({"type": MSG_ACCEPTED, "wire_version": 1})
         stdout_io = io.BytesIO(ready_line + accepted_line + event_line + event_line)
         stdin_io = io.BytesIO()
@@ -717,7 +717,7 @@ class TestSSHStream:
             "cursor": "tok1",
             "payload": {"msg_id": "m1", "from": "alice"},
         })
-        ready1 = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.1.0"})
+        ready1 = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
         acc1 = encode_line({"type": MSG_ACCEPTED, "wire_version": 1})
         stdout1 = io.BytesIO(ready1 + acc1 + event1)
 
@@ -729,7 +729,7 @@ class TestSSHStream:
             "cursor": "tok2",
             "payload": {"msg_id": "m2", "from": "bob"},
         })
-        ready2 = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.1.0"})
+        ready2 = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
         acc2 = encode_line({"type": MSG_ACCEPTED, "wire_version": 1})
         stdout2 = io.BytesIO(ready2 + acc2 + event2)
 
