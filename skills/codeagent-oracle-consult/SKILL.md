@@ -75,6 +75,15 @@ OMP 的 parked agent 可被 `hub send` 唤醒并恢复完整会话——这是�
 - 注意：parked 实例进程常驻（registry 进程级，omp 重启后丢失）；多轮后
   释放或避免堆积；并发唤醒由 bus 串行处理
 
+### 路径 B 的可靠 Fallback（mailbox 轮询）
+
+OMP 17.2.4 的 omp-mailbox-plugin extension 加载有竞态缺陷（`--extension` 显式
+路径约 33% 成功率，自动发现 0%——详见 omp-mailbox-plugin/docs/）。依赖该插件
+的"外部消息触发唤醒"不可靠。**可靠 fallback：agent 主动轮询**——prompt 引导
+oracle 在等待期间定期 `codeagent mailbox peek --session <sid> --agent <id>`，
+有消息即 `read` + 处理 + `finalize`。此路径 100% 可用（不依赖 OMP extension
+管线），是真机验证过的唤醒方式（79140/后续会话均通过轮询完成处理）。
+
 ## 领域 preset 与 namespace
 
 建议 models.json 定义多个 oracle preset：
