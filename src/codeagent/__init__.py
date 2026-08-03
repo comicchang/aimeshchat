@@ -1,2 +1,4 @@
 """codeagent — multi-host code agent orchestration."""
-__version__ = "0.2.0"
+import importlib.metadata as _md
+
+__version__ = "0.2.2"  # keep in sync with pyproject.toml / git tag
