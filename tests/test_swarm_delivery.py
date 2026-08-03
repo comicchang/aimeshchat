@@ -762,6 +762,107 @@ class TestEdgeCases:
         count = engine.flush(session_id="s1")
         assert count == 0
 
+    def test_flush_local_target_writes_inbox(
+        self, store: MailboxStore, outbox_root: Path,
+    ) -> None:
+        """Bug B 回归：flush 对本机 target（resolve_is_local）直写本地 inbox，
+        不走 transport（避免 SSH 本机别名 No route + 10s 超时）。"""
+        _init_session(store, sid="s1")
+        envelope = _make_envelope(msg_id="m_localflush", to_id="w2")
+        envelope["_target_host"] = "mac"
+        sd = outbox_root / "s1"
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "m_localflush.json").write_text(json.dumps(envelope))
+
+        mock_router = MagicMock()
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        with patch("codeagent.domain.resolve_is_local", return_value=True):
+            count = engine.flush(session_id="s1")
+
+        assert count == 1
+        assert (sd / ".delivered-m_localflush").exists()
+        # inbox 收到消息（幂等 msg_id）
+        peek = store.peek("s1", "w2", 10, 200)
+        assert any(m["msg_id"] == "m_localflush" for m in peek["messages"])
+
+    def test_deliver_local_hostspec_writes_inbox(
+        self, store: MailboxStore, outbox_root: Path,
+    ) -> None:
+        """本机 HostSpec（resolve_is_local True）走 local delivery，
+        不调用 transport.mailbox。"""
+        _init_session(store, sid="s1")
+        mock_router = MagicMock()
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        local_host = HostSpec(name="mac", ssh_alias="OA-MIANYIN-MAC",
+                              hostnames=("OA-MIANYIN-MAC",))
+        envelope = _make_envelope(msg_id="m_localhost", to_id="w2")
+        with patch("codeagent.domain.resolve_is_local", return_value=True):
+            receipt = engine.deliver("s1", local_host, envelope)
+
+        assert receipt.status == "delivered"
+        mock_router.mailbox.assert_not_called()
+        peek = store.peek("s1", "w2", 10, 200)
+        assert any(m["msg_id"] == "m_localhost" for m in peek["messages"])
+
+    def test_ensure_session_roster_from_store(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """Bug C 回归：无进程内 roster 缓存时，_ensure_remote_session
+        从本地 store 读完整 roster + 真 manager（而非 envelope from/to）。"""
+        # store 里建完整 session（kernel 行为：roster 含 manager）
+        store.session_init("s1", "mgr", ["mgr", "w1", "w2", "w3"])
+        mock_router = MagicMock()
+        mock_router.capabilities.return_value = {"mailbox"}
+        # transport.mailbox 返回成功（session-init 已存在则 OK）
+        mock_router.get.return_value = MagicMock()
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        # 直接调 _remote_send：无缓存 roster，应读 store
+        envelope = _make_envelope(from_id="w1", to_id="w2", msg_id="m_roster")
+        transport = MagicMock()
+        transport.mailbox.return_value = (0, "ok", "")
+        with patch.object(engine, "_get_transport", return_value=transport):
+            engine._remote_send(host_a, envelope)
+
+        # 两次 mailbox 调用：session-init（全 roster）+ send
+        init_call = transport.mailbox.call_args_list[0]
+        init_args = init_call.args[1]
+        assert init_args[0] == "session-init"
+        agents_csv = init_args[init_args.index("--agents") + 1]
+        assert set(agents_csv.split(",")) == {"mgr", "w1", "w2", "w3"}
+        # manager 用 store 的权威值（mgr），不是 envelope 的 w1
+        assert init_args[init_args.index("--manager") + 1] == "mgr"
+
+    def test_resolve_target_reads_repo_map(
+        self, store: MailboxStore, outbox_root: Path,
+    ) -> None:
+        """_resolve_target 命中 repo-map：返回带 ssh_alias/shell_prefix 的 HostSpec。"""
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=MagicMock(),
+            outbox_root=outbox_root,
+        )
+        spec = HostSpec(name="yellow", ssh_alias="yellow",
+                        hostnames=("mcshyucs192159",),
+                        shell_prefix="export PATH=$HOME/.local/bin:$PATH")
+        fake_map = MagicMock()
+        fake_map.hosts.get.return_value = spec
+        with patch("codeagent.config.repo_map.load_repo_map", return_value=fake_map):
+            target = engine._resolve_target("yellow")
+        assert target.ssh_alias == "yellow"
+        assert "$HOME/.local/bin" in target.shell_prefix
+
 
 # ── store.send msg_id dedup ───────────────────────────────────────────
 
