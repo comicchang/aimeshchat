@@ -39,6 +39,7 @@ def main(argv: list[str] | None = None) -> None:
     si.add_argument("--session", required=True)
     si.add_argument("--manager", required=True)
     si.add_argument("--agents", required=True, help="comma-separated agent IDs")
+    si.add_argument("--acl", default=None, help="B4-Manifest: ACL JSON {authority,allowed_senders,room_members,policy} (optional)")
 
     # send
     s = sub.add_parser("send")
@@ -140,7 +141,8 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         if args.cmd == "session-init":
-            print(store.session_init(args.session, args.manager, args.agents.split(",")))
+            acl = json.loads(args.acl) if args.acl else None
+            print(store.session_init(args.session, args.manager, args.agents.split(","), acl=acl))
         elif args.cmd == "send":
             attachments = _parse_attachment_args(args.attachment)
             print(store.send(

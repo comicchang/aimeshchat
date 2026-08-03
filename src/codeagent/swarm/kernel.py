@@ -143,16 +143,30 @@ class SwarmKernel:
                     room_members=list(members),
                     policy="open",
                 )
+                # B4-Manifest: session.json 的 acl 是权威（ensure 同步副本）；
+                # swarm-meta.json 仅本机控制面（routing/channels）。远端 ensure
+                # 只写 session.json——远端 kernel 必须优先读它，否则 restricted
+                # policy 恢复 open。
+                session_acl = data.get("acl")
+                if isinstance(session_acl, dict):
+                    acl = ACL(
+                        authority=session_acl.get("authority", manager),
+                        allowed_senders=session_acl.get("allowed_senders", members),
+                        room_members=session_acl.get("room_members", members),
+                        policy=session_acl.get("policy", "open"),
+                    )
                 meta_file = session_dir / "swarm-meta.json"
                 try:
                     meta = json.loads(meta_file.read_text(encoding="utf-8"))
                     acl_data = meta.get("acl", {})
-                    acl = ACL(
-                        authority=acl_data.get("authority", manager),
-                        allowed_senders=acl_data.get("allowed_senders", members),
-                        room_members=acl_data.get("room_members", members),
-                        policy=acl_data.get("policy", "open"),
-                    )
+                    if acl_data and not session_acl:
+                        # 旧 session（无 session.json acl）回退 swarm-meta
+                        acl = ACL(
+                            authority=acl_data.get("authority", manager),
+                            allowed_senders=acl_data.get("allowed_senders", members),
+                            room_members=acl_data.get("room_members", members),
+                            policy=acl_data.get("policy", "open"),
+                        )
                     chans = {}
                     for cid, cdata in (meta.get("channels") or {}).items():
                         chans[cid] = Channel(
@@ -223,10 +237,17 @@ class SwarmKernel:
             created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
         )
 
-        # Persist to filesystem via MailboxStore
+        # Persist to filesystem via MailboxStore (ACL 权威入 session.json，
+        # 供远端 ensure 同步——swarm-meta.json 仅本地控制面)
         self._store.session_init(
             session_id, manager_id,
             [a for a in all_members if a != manager_id],
+            acl={
+                "authority": acl.authority,
+                "allowed_senders": acl.allowed_senders,
+                "room_members": acl.room_members,
+                "policy": acl.policy,
+            },
         )
 
         # Store swarm-level metadata alongside session.json (locked).

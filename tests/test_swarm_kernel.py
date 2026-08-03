@@ -71,6 +71,50 @@ class TestCreateSession:
         # ACL 也从 swarm-meta.json 恢复
         assert s.acl.authority == "mgr"
 
+    def test_acl_persisted_to_session_json_authority(self, store):
+        """B4-Manifest：create_session 的 ACL 权威写入 session.json（ensure
+        同步副本）；新 kernel 从 session.json 恢复 restricted policy。"""
+        k1 = SwarmKernel(store=store)
+        k1.create_session(
+            "s1", "mgr", ["w1", "w2"],
+            acl=ACL(
+                authority="mgr",
+                allowed_senders=["mgr", "w1"],
+                room_members=["mgr", "w1", "w2"],
+                policy="restricted",
+            ),
+        )
+        # session.json 有 acl 权威副本
+        meta = store.read_session("s1")
+        assert meta is not None
+        assert meta["acl"]["policy"] == "restricted"
+        assert meta["manifest_revision"] >= 1
+
+        # 新 kernel（模拟远端 ensure 后的本地加载）从 session.json 恢复 restricted
+        k2 = SwarmKernel(store=store)
+        s = k2.get_session("s1")
+        assert s.acl.policy == "restricted"
+        assert s.acl.authority == "mgr"
+        # restricted: 非白名单 sender 不能 direct
+        with pytest.raises(PermissionError):
+            k2.direct("s1", "w2", "w1", _env())
+
+    def test_session_init_acl_merge_bumps_revision(self, store):
+        """B4-Manifest：session_init 携带 acl 合并时 manifest_revision 递增。"""
+        store.session_init("s1", "mgr", ["w1"])
+        r1 = store.read_session("s1")
+        assert r1["manifest_revision"] == 1
+
+        store.session_init(
+            "s1", "mgr", ["w1", "w2"],
+            acl={"authority": "mgr", "allowed_senders": ["mgr"],
+                 "room_members": ["mgr", "w1", "w2"], "policy": "restricted"},
+        )
+        r2 = store.read_session("s1")
+        assert r2["manifest_revision"] == 2
+        assert r2["acl"]["policy"] == "restricted"
+        assert "w2" in r2["agents"]
+
     def test_second_kernel_restores_channel_from_disk(self, store):
         """回归：channel 跨进程持久化（create-channel 后新进程可见）。"""
         k1 = SwarmKernel(store=store)

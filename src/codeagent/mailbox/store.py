@@ -79,7 +79,10 @@ class MailboxStore:
 
     # ── Session ────────────────────────────────────────────────────────
 
-    def session_init(self, session_id: str, manager_id: str, agent_ids: list[str]) -> str:
+    def session_init(self, session_id: str, manager_id: str, agent_ids: list[str],
+                     acl: Optional[dict] = None) -> str:
+        """B4-Manifest: acl dict 可选——与 roster 一起持久化到 session.json
+        （权威副本），供远端 ensure 同步。每次写递增 manifest_revision。"""
         # Validate all IDs before creating anything
         validate_agent_id(session_id)
         validate_agent_id(manager_id)
@@ -99,16 +102,24 @@ class MailboxStore:
             merged = sorted(old_agents | set(new_agents))
             added = sorted(set(new_agents) - old_agents)
 
-            if not added:
+            # Manifest revision bumps on every control-plane write
+            revision = int(existing.get("manifest_revision", 0)) + 1
+
+            if not added and acl is None:
+                # Nothing new — still bump revision? No: no-op if nothing changed.
                 return f"session {session_id} ok (merged 0 agents)"
 
-            # Create subdirs for newly added agents only
-            for aid in added:
-                for sub in ("inbox", "processing", "archive", "_corrupt"):
-                    self.agent_subdir(session_id, aid, sub).mkdir(parents=True, exist_ok=True)
+            if added:
+                # Create subdirs for newly added agents only
+                for aid in added:
+                    for sub in ("inbox", "processing", "archive", "_corrupt"):
+                        self.agent_subdir(session_id, aid, sub).mkdir(parents=True, exist_ok=True)
 
-            # Rewrite session.json with merged roster
+            # Rewrite session.json with merged roster (+acl if provided)
             existing["agents"] = merged
+            existing["manifest_revision"] = revision
+            if acl is not None:
+                existing["acl"] = acl
             tmp = sd / ".tmp-session.json"
             with open(tmp, "w") as f:
                 f.write(json.dumps(existing, indent=2, ensure_ascii=False))
@@ -116,7 +127,9 @@ class MailboxStore:
                 os.fsync(f.fileno())
             os.replace(str(tmp), str(sd / "session.json"))
 
-            return f"session {session_id} ok (merged {len(added)} agents)"
+            if added:
+                return f"session {session_id} ok (merged {len(added)} agents)"
+            return f"session {session_id} ok (acl updated)"
 
         # ── Fresh creation ─────────────────────────────────────────────
         sd.mkdir(parents=True)
@@ -126,8 +139,11 @@ class MailboxStore:
             "session_id": session_id,
             "manager": manager_id,
             "agents": sorted(set(agent_ids)),
+            "manifest_revision": 1,
             "created_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
         }
+        if acl is not None:
+            meta["acl"] = acl
         tmp = sd / ".tmp-session.json"
         with open(tmp, "w") as f:
             f.write(json.dumps(meta, indent=2, ensure_ascii=False))

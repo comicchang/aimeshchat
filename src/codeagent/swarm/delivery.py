@@ -339,6 +339,12 @@ class DeliveryEngine:
             "--agents", agents_csv,
         ]
 
+        # B4-Manifest: 同步 ACL（权威副本在本地 session.json）——否则远端
+        # kernel 缺 swarm ACL，restricted policy 在远端恢复 open（控制面分裂）。
+        acl = self._local_session_acl(session_id)
+        if acl is not None:
+            init_args.extend(["--acl", json.dumps(acl, ensure_ascii=False)])
+
         init_code, init_out, init_err = transport.mailbox(host, init_args)
         if init_code != 0 and "already exists" not in (init_err or init_out or ""):
             raise RuntimeError(
@@ -346,6 +352,20 @@ class DeliveryEngine:
             )
 
         self._ensured_sessions.add(cache_key)
+
+    def _local_session_acl(self, session_id: str) -> Optional[dict]:
+        """Read the local session.json ACL (authority/policy/allowed_senders).
+
+        Returns None if the session has no persisted ACL (legacy sessions
+        created before B4-Manifest) — the caller then skips ACL sync.
+        """
+        try:
+            meta = self._store.read_session(session_id)
+        except Exception:
+            return None
+        if meta is None:
+            return None
+        return meta.get("acl")
 
     def flush(self, session_id: Optional[str] = None) -> int:
         """Retry all pending outbox entries. Returns count of newly delivered."""
