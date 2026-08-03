@@ -163,10 +163,16 @@ class DeliveryEngine:
 
         # ── 2. Route to remote transport ───────────────────────────────
         host_alias = getattr(target, "host_alias", None) or getattr(target, "ssh_alias", "")
-        if not host_alias:
+        from codeagent.domain import HostSpec, resolve_is_local
+        is_local_host = isinstance(target, HostSpec) and resolve_is_local(target)
+        if not host_alias or is_local_host:
             # Local delivery: write straight to the recipient inbox
             # (durable + idempotent via msg_id).  The outbox entry above
             # guarantees no loss if this write fails mid-way.
+            # is_local_host: a repo-map HostSpec whose hostnames match this
+            # machine (e.g. mac=OA-MIANYIN-MAC) must stay local — flushing
+            # such an entry through transport would SSH into the alias and
+            # fail with "Could not resolve hostname".
             try:
                 self._store.send(
                     session_id=sid,
@@ -380,6 +386,37 @@ class DeliveryEngine:
                 except Exception:
                     continue
 
+                from codeagent.domain import resolve_is_local
+                if resolve_is_local(target):
+                    # 本机 target（repo-map host 的 hostnames 匹配本机，如
+                    # mac=OA-MIANYIN-MAC）：直写本地 inbox，不走 transport
+                    # （SSH 到本机别名会 No route to host + 每条 10s 超时）。
+                    try:
+                        self._store.send(
+                            session_id=sid,
+                            from_id=envelope.get("from", ""),
+                            to_id=envelope.get("to", ""),
+                            subject=envelope.get("subject", ""),
+                            body=envelope.get("body", ""),
+                            kind=envelope.get("kind", "TASK"),
+                            reply_to=envelope.get("reply_to", ""),
+                            run_id=envelope.get("run_id", ""),
+                            request_id=envelope.get("request_id", ""),
+                            msg_id=mid,
+                        )
+                    except Exception as exc:
+                        log.debug("DeliveryEngine: flush local retry failed for %s: %s", mid, exc)
+                        self._write_status(sid, mid, "flush_failed", str(exc))
+                        continue
+                    self._mark_delivered(sid, mid)
+                    try:
+                        self._store.append_history(sid, self._history_entry(envelope, mid))
+                    except Exception as exc:
+                        log.warning("DeliveryEngine: flush history append failed: %s", exc)
+                    self._cache[mid] = SendReceipt(status="delivered", msg_id=mid)
+                    delivered_count += 1
+                    continue
+
                 try:
                     self._remote_send(target, envelope)
                 except Exception as exc:
@@ -555,12 +592,28 @@ class DeliveryEngine:
         """Resolve a host alias back to a HostSpec for retry.
 
         Checks the host cache first (populated by ``cache_host`` or wiring),
-        then falls back to a minimal SSH HostSpec.
+        then the repo-map (real ssh_alias + shell_prefix; a repo-map host
+        that is this machine is routed local by ``deliver()``), and finally
+        falls back to an ad-hoc HostSpec.
         """
         # Check host cache (populated at wiring time or by cache_host)
         cached = self._host_cache.get(host_alias)
         if cached is not None:
             return cached
+        try:
+            from codeagent.config.repo_map import load_repo_map
+            spec = load_repo_map().hosts.get(host_alias)
+            if spec is not None:
+                from codeagent.domain import HostSpec
+                return HostSpec(
+                    name=spec.name,
+                    ssh_alias=spec.ssh_alias,
+                    hostnames=spec.hostnames,
+                    shell_prefix=spec.shell_prefix,
+                    fallback_ssh_alias=spec.fallback_ssh_alias,
+                )
+        except Exception:
+            pass
         from codeagent.domain import HostSpec
         return HostSpec(name=host_alias, ssh_alias=host_alias, hostnames=())
 
@@ -692,11 +745,35 @@ class EngineDeliverySink:
         if self._kernel is not None:
             loc = self._kernel.get_location(session_id, target_agent)
             if loc and loc.host_alias and loc.host_alias != "__local__":
-                from codeagent.domain import HostSpec
-                host = HostSpec(
-                    name=loc.host_alias,
-                    ssh_alias=loc.host_alias,
-                    hostnames=(loc.host_alias,),
-                )
-                self._engine.cache_host(target_agent, host)
+                # Resolve the repo-map host: its ssh_alias/shell_prefix are the
+                # real transport targets, and a repo-map host that is this
+                # machine (e.g. mac=OA-MIANYIN-MAC) must stay LOCAL — caching
+                # it as remote makes delivery SSH into "mac" and fail.
+                from codeagent.config.repo_map import load_repo_map
+                from codeagent.domain import HostSpec, resolve_is_local
+                spec = None
+                try:
+                    spec = load_repo_map().hosts.get(loc.host_alias)
+                except Exception:
+                    spec = None
+                if spec is not None and resolve_is_local(spec):
+                    # 本机 host：不 cache 远程 HostSpec，deliver_sink 走 local 分支。
+                    pass
+                elif spec is not None:
+                    host = HostSpec(
+                        name=spec.name,
+                        ssh_alias=spec.ssh_alias,
+                        hostnames=spec.hostnames,
+                        shell_prefix=spec.shell_prefix,
+                        fallback_ssh_alias=spec.fallback_ssh_alias,
+                    )
+                    self._engine.cache_host(target_agent, host)
+                else:
+                    # ad-hoc host_alias（不在 repo-map）——保持原有行为。
+                    host = HostSpec(
+                        name=loc.host_alias,
+                        ssh_alias=loc.host_alias,
+                        hostnames=(loc.host_alias,),
+                    )
+                    self._engine.cache_host(target_agent, host)
         return self._engine.deliver_sink(session_id, target_agent, envelope, msg_id, created_at, from_id)
