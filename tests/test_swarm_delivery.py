@@ -1346,3 +1346,83 @@ class TestSessionEnsure:
         # Transport failure → accepted+queued (outbox preserved)
         assert receipt.status == "accepted"
         assert receipt.queued is True
+
+    def test_ensure_syncs_acl_from_session_json(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """B4-Manifest：session-init 携带 --acl（本地 session.json 权威副本），
+        远端 ensure 不再只复制 roster。"""
+        store.session_init(
+            "s1", "mgr", ["mgr", "w1", "w2"],
+            acl={"authority": "mgr", "allowed_senders": ["mgr"],
+                 "room_members": ["mgr", "w1", "w2"], "policy": "restricted"},
+        )
+        envelope = _make_envelope()
+        captured: list[list[str]] = []
+
+        def mock_mailbox(host, args, **kw):
+            if "session-init" in args:
+                captured.append(list(args))
+                return 0, "ok", ""
+            return 0, "sent", ""
+
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.mailbox = mock_mailbox
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        engine.deliver("s1", host_a, envelope)
+
+        assert len(captured) == 1
+        args = captured[0]
+        assert "--acl" in args
+        acl = json.loads(args[args.index("--acl") + 1])
+        assert acl["policy"] == "restricted"
+        assert acl["authority"] == "mgr"
+
+    def test_local_session_acl_none_for_legacy(
+        self, store: MailboxStore, outbox_root: Path,
+    ) -> None:
+        """B4-Manifest：无 acl 的旧 session → _local_session_acl 返回 None
+        （ensure 跳过 --acl，向后兼容）。"""
+        store.session_init("s1", "mgr", ["mgr", "w1"])
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=MagicMock(),
+            outbox_root=outbox_root,
+        )
+        assert engine._local_session_acl("s1") is None
+        assert engine._local_session_acl("ghost") is None
+
+    def test_flush_remote_success_marks_delivered(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """flush 的 remote 分支：transport 成功后 mark delivered + history。"""
+        _init_session(store, sid="s1")
+        envelope = _make_envelope(msg_id="m_remoteflush", to_id="w2")
+        envelope["_target_host"] = "alpha"
+        sd = outbox_root / "s1"
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "m_remoteflush.json").write_text(json.dumps(envelope))
+
+        mock_router = MagicMock()
+        mock_router.capabilities.return_value = {"mailbox"}
+        mock_transport = MagicMock()
+        mock_transport.mailbox.return_value = (0, "sent", "")
+        mock_router.get.return_value = mock_transport
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        with patch("codeagent.domain.resolve_is_local", return_value=False):
+            count = engine.flush(session_id="s1")
+
+        assert count == 1
+        assert (sd / ".delivered-m_remoteflush").exists()
+        mock_transport.mailbox.assert_called()
