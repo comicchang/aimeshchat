@@ -730,6 +730,34 @@ class TestTrace:
         with pytest.raises(ValueError):
             k.trace("s1", "ghost")
 
+    def test_trace_engine_state_from_outbox_markers(self, store, tmp_path):
+        """oracle-lite P2: EngineDeliverySink 路径——outbox 有 .delivered 标记 →
+        state=delivered；无标记 → state=unknown。此前零测试覆盖。"""
+        from codeagent.swarm.delivery import DeliveryEngine, EngineDeliverySink
+        from unittest.mock import MagicMock
+
+        outbox = tmp_path / "outbox"
+        engine = DeliveryEngine(mailbox_store=store, transport_router=MagicMock(),
+                                outbox_root=outbox)
+        k = SwarmKernel(store=store, sink=EngineDeliverySink(engine=engine, kernel=None))
+        k.create_session("s1", "mgr", ["w1"])
+        # 直接 store.send（写 inbox+history，trace_id 透传）——不经 kernel.direct
+        # 的 local 投递（那会写 .delivered 标记），构造"无标记"场景。
+        store.send("s1", "mgr", "w1", subject="t", body="b", trace_id="tr-e")
+
+        # 无标记（delivery 未成功）→ unknown
+        r = k.trace("s1", "tr-e")
+        assert r["leaf_count"] == 1
+        assert r["leaves"][0]["state"] == "unknown"
+
+        # 写 .delivered 标记 → delivered
+        sd = outbox / "s1"
+        sd.mkdir(parents=True, exist_ok=True)
+        mid = r["leaves"][0]["msg_id"]
+        (sd / f".delivered-{mid}").write_text("{}")
+        r2 = k.trace("s1", "tr-e")
+        assert r2["leaves"][0]["state"] == "delivered"
+
 
 # ── Agent Card (P2) ─────────────────────────────────────────────────────
 

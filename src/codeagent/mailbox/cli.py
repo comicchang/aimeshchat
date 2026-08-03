@@ -206,9 +206,14 @@ def main(argv: list[str] | None = None) -> None:
         else:
             p.print_help()
     except ValueError as e:
-        sys.exit(str(e))
+        # P2 (oracle-lite): terminal 错误用 exit 2（校验/roster/幂等冲突——
+        # 重试无意义），delivery 侧据此分类，不再只靠关键字匹配。
+        print(str(e), file=sys.stderr)
+        sys.exit(2)  # terminal
     except Exception as e:
-        sys.exit(f"error: {e}")
+        # exit 1 = retryable（未知/环境错误，重试可能成功）
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

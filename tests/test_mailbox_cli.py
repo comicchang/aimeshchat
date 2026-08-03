@@ -154,8 +154,9 @@ class TestMailboxCli:
         with pytest.raises(SystemExit) as exc:
             _run_cli(["send", "--session", "s1", "--from", "mgr", "--to", "w1",
                       "--subject", "s", "--body", "b"], store, capsys)
-        # sys.exit(str(e)) — the message is carried as the exit code.
-        assert exc.value.code == "session not found: s1"
+        # P2 (oracle-lite): ValueError（terminal）→ exit 2 + stderr 带 message
+        assert exc.value.code == 2
+        assert "session not found: s1" in capsys.readouterr().err
 
     def test_no_command_prints_help(self, store, capsys):
         _run_cli([], store, capsys)

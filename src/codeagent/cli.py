@@ -351,6 +351,12 @@ def _swarm_create_session(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     acl = None
     if args.policy != "open":
         allowed = [a.strip() for a in (args.allowed_senders or "").split(",") if a.strip()]
+        # P2 (oracle-lite): allowed_senders 必须是 roster 子集（early fail）
+        valid = set(members) | {args.manager}
+        invalid = [a for a in allowed if a not in valid]
+        if invalid:
+            print(f"error: --allowed-senders 含非 roster 成员: {invalid}", file=sys.stderr)
+            return 1
         from codeagent.swarm.model import ACL
         acl = ACL(
             authority=args.manager,
@@ -402,7 +408,9 @@ def _swarm_whoami(kernel: SwarmKernel, args: argparse.Namespace) -> int:
         "host_alias": loc.host_alias if loc else "",
         "backend": loc.backend if loc else "",
         "agent_card": cards.get(args.agent, {}),
-        "capabilities": sorted({"mailbox", "stream", "artifact"}),
+        # transport_capabilities: 硬编码 transport 层能力（与 agent_card 的
+        # 用户自定义 capabilities 字段区分——oracle-lite P2）
+        "transport_capabilities": sorted({"mailbox", "stream", "artifact"}),
     }, indent=2))
     return 0
 

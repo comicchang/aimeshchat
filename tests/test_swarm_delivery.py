@@ -1536,3 +1536,41 @@ class TestSessionEnsure:
         meta = json.loads((sd / ".status-m_backoff" / "meta.json").read_bytes())
         assert meta["attempt_count"] == 1
         assert meta["next_attempt_at"] > 0
+
+    def test_requeue_resets_meta_and_cleans_status(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """oracle-lite P1/P2: requeue 重置 meta（attempt_count=0/terminal=False）
+        + 清理死信目录残留的旧 status 目录（不再泄漏）。"""
+        _init_session(store, sid="s1")
+        envelope = _make_envelope(msg_id="m_req", to_id="w2")
+        envelope["_target_host"] = "alpha"
+        sd = outbox_root / "s1"
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "m_req.json").write_text(json.dumps(envelope))
+
+        def mock_mailbox(host, args, **kw):
+            raise RuntimeError("sender not in roster: ghost")
+
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.mailbox = mock_mailbox
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        with patch("codeagent.domain.resolve_is_local", return_value=False):
+            engine.flush(session_id="s1")  # terminal → dead-letter
+
+        assert engine.dead_letter_requeue("s1", "m_req") is True
+        # 死信目录不再残留 status 目录
+        dl = outbox_root.parent / "_dead_letter" / "s1"
+        assert not (dl / ".status-m_req").exists()
+        # meta 重置
+        meta = json.loads((sd / ".status-m_req" / "meta.json").read_bytes())
+        assert meta["attempt_count"] == 0
+        assert meta["terminal"] is False
+        assert "next_attempt_at" not in meta

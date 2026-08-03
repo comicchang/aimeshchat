@@ -729,8 +729,13 @@ class DeliveryEngine:
     def _is_terminal_error(exc: Exception) -> bool:
         """Classify delivery errors: terminal ones never succeed on retry
         (invalid roster/ACL/capability/idempotency conflict/validation).
+
+        Structured signal first: mailbox CLI exits 2 on ValueError (terminal),
+        1 on unknown (retryable). Keyword fallback covers pre-0.2.4 remotes.
         """
         msg = str(exc)
+        if "mailbox send failed (exit 2)" in msg:
+            return True
         markers = (
             "not in roster",
             "not in channel",
@@ -840,6 +845,7 @@ class DeliveryEngine:
 
     def dead_letter_requeue(self, session_id: str, msg_id: str) -> bool:
         """Move a dead-lettered entry back to pending (flush will retry)."""
+        import shutil
         dl = (self._outbox.parent / "_dead_letter") / session_id
         src = dl / f"{msg_id}.json"
         if not src.exists():
@@ -847,6 +853,10 @@ class DeliveryEngine:
         sd = self._outbox / session_id
         sd.mkdir(parents=True, exist_ok=True)
         os.replace(str(src), str(sd / f"{msg_id}.json"))
+        # P1 (oracle-lite): 清理死信目录残留的旧 status 目录（_dead_letter 曾
+        # move 它过去）——否则每次 requeue 泄漏一个目录。新 retry 从空 meta 开始。
+        shutil.rmtree(str(dl / f".status-{msg_id}"), ignore_errors=True)
+        (dl / f".dead-letter-reason-{msg_id}").unlink(missing_ok=True)
         # Clear attempt history so retry starts fresh (keep status dir? reset meta)
         status_dir = sd / f".status-{msg_id}"
         status_dir.mkdir(exist_ok=True)
@@ -858,7 +868,6 @@ class DeliveryEngine:
         meta["attempt_count"] = 0
         meta["terminal"] = False
         meta.pop("next_attempt_at", None)
-        (dl / f".dead-letter-reason-{msg_id}").unlink(missing_ok=True)
         meta_path.write_text(json.dumps(meta, indent=2))
         return True
 
