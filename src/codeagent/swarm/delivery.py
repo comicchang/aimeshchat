@@ -558,6 +558,19 @@ class DeliveryEngine:
         manager = envelope.get("from", "")
         roster = self._session_rosters.get(sid)
         if roster is None:
+            # 进程内缓存为空（CLI 每次新进程）：从本地 store 读 create-session
+            # 持久化的权威定义（完整 roster + manager）——degraded from/to
+            # fallback 会漏掉 roster 成员，导致远程 session 元数据残缺
+            # （后续 "sender not in roster" 误拒绝）。
+            meta = None
+            try:
+                meta = self._store.read_session(sid)
+            except Exception:
+                pass
+            if meta and meta.get("agents"):
+                roster = sorted(set(meta["agents"]))
+                manager = meta.get("manager") or manager
+        if roster is None:
             # Degraded: no cached roster — build from envelope from/to
             roster = sorted({envelope.get("from", ""), envelope.get("to", "")})
         self._ensure_remote_session(sid, host, manager, roster, transport)
