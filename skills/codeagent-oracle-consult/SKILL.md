@@ -33,6 +33,25 @@ Agent 主动咨询 → 需全部满足：
 - 同题换说法反复问
 - 用 full oracle 做 explore/格式审查
 
+## Session 复用纪律（同一任务多轮 Review）
+
+**同一任务的所有 review 轮次必须复用同一个 oracle session**（同一 session-key），
+让 oracle 持有完整上下文：已审内容、已否决方案、每轮演变的理由。多轮 review 的
+session-key **固定不变**（`<project>:oracle:<domain>:<topic>`），不随轮次递增。
+
+开新 session 仅限以下显式场景：
+- 用户明确要求"换一个 oracle / 重新 review"
+- 更换模型（不同 model 的 oracle preset，如 oracle → oracle-arch）
+- 议题完全变化（不同 topic，如从性能评审转向安全评审）
+
+轮次间不重发全部上下文，只发增量并指向已有结论：
+```
+上一轮你推荐方案 A（理由：...）。我落地时遇到 X（新证据），是否改变推荐？
+请只审查我新增的变更 Y（相对上一轮）。
+```
+
+多轮后上下文膨胀由 codeagent 侧 compaction 处理；不要因此新建 session。
+
 ## 领域 preset 与 namespace
 
 建议 models.json 定义多个 oracle preset：
