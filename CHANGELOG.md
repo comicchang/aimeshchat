@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v0.2.2 — B1/B2/B4 + P0 协议不变量（2026-08-03）
+
+- **B1** LocalTransport.mailbox() 统一本机投递路径（deliver/flush 不再 inline store.send）
+- **B2** trace_id 全链路（Envelope/Message/store/CLI/delivery/stream event），kernel 入口生成、不可变透传
+- **P0-a** store.send 幂等重放契约：identical payload 重放成功、conflicting 失败（crash 后 flush 不再永挂 pending）
+- **P0-b** opaque cursor：seq 零填充（SEQ_WIDTH=6）+ advance_cursor 跨进程 flock + _cursor_gt 数值比较（兼容旧无填充）
+- **B4-Manifest** ACL 权威入 session.json + manifest_revision + ensure 远端 --acl 同步（封堵控制面分裂）
+- 1028 tests, ~94% coverage
+
 ### Round 13 — Final polish
 
 - **Coverage**: 603 tests, 96% overall. `transport.relay` raised from 82% to
