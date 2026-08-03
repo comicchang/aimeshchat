@@ -71,6 +71,8 @@ class LocalDeliverySink:
             reply_to=envelope.reply_to,
             run_id=envelope.run_id,
             request_id=envelope.request_id,
+            trace_id=envelope.trace_id,
+            causation_id=envelope.causation_id,
             attachments=[a.to_dict() for a in envelope.attachments] if envelope.attachments else None,
             msg_id=msg_id,
         )
@@ -609,15 +611,16 @@ class SwarmKernel:
         if not msgs:
             raise ValueError(f"no messages with trace_id: {trace_id}")
 
-        # leaf 投递状态：查 engine outbox markers
-        engine = getattr(getattr(self._sink, "_engine", None), None)
+        # leaf 投递状态：有 engine（EngineDeliverySink）查 outbox markers；
+        # 无 engine（LocalDeliverySink 直写 inbox）→ history 存在即已投递。
+        engine = getattr(self._sink, "_engine", None)
         outbox_root = None
         if engine is not None:
             outbox_root = getattr(engine, "_outbox", None)
         leaves = []
         for m in sorted(msgs, key=lambda x: x.get("created_at", "")):
             mid = m.get("msg_id", "")
-            state = "unknown"
+            state = "delivered" if outbox_root is None else "unknown"
             if outbox_root is not None:
                 sd = outbox_root / session_id
                 if (sd / f".delivered-{mid}").exists():

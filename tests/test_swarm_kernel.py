@@ -706,3 +706,26 @@ class TestReceiptPropagation:
         addr = Address(kind=AddressKind.BROADCAST)
         receipt = k.send("s1", "mgr", addr, _env())
         assert receipt.status == "accepted"
+
+
+# ── Trace (Top4) ────────────────────────────────────────────────────────
+
+
+class TestTrace:
+    """Top4: kernel.trace 按 trace_id 聚合（fan-out 多 leaf + state）。"""
+
+    def test_trace_fanout_same_id(self, store):
+        k = SwarmKernel(store=store)
+        k.create_session("s1", "mgr", ["w1", "w2"])
+        k.direct("s1", "mgr", "w1", Envelope(subject="t1", body="b", trace_id="trace-x"))
+        k.direct("s1", "mgr", "w2", Envelope(subject="t2", body="b", trace_id="trace-x", causation_id="p1"))
+        r = k.trace("s1", "trace-x")
+        assert r["leaf_count"] == 2
+        assert all(l["state"] == "delivered" for l in r["leaves"])
+        assert any(l["causation_id"] == "p1" for l in r["leaves"])
+
+    def test_trace_missing_raises(self, store):
+        k = SwarmKernel(store=store)
+        k.create_session("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError):
+            k.trace("s1", "ghost")
