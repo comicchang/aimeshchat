@@ -1,6 +1,6 @@
 # Remote Deployment Mode (SSH / Relay / Swarm)
 
-> Protocol reference: `skill://tmux-agent/protocol/mailbox.md`
+> Protocol reference: `skill://agent-swarm/protocol/mailbox.md`
 
 ## Overview
 
@@ -40,7 +40,7 @@ Remote Workers must actively poll their inbox at task start, major phase boundar
 Remote Workers are started by the Manager but run on their own host. After launch:
 
 1. Worker sets `$OMP_SESSION_ID` and `$OMP_WORKER_ID`.
-2. Reads `skill://tmux-agent` (current protocol).
+2. Reads `skill://agent-swarm` (current protocol).
 3. Completes INIT handshake via mailbox.
 4. Runs `mailbox-health` gate check.
 5. Writes IDLE status.

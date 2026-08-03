@@ -1,6 +1,6 @@
 # Manager Role
 
-> This file is loaded ONLY when `$OMP_WORKER_ID == "manager"`. Protocol reference: `skill://tmux-agent/protocol/mailbox.md`
+> This file is loaded ONLY when `$OMP_WORKER_ID == "manager"`. Protocol reference: `skill://agent-swarm/protocol/mailbox.md`
 
 ## 1. Scope
 
@@ -10,7 +10,7 @@ This skill **only orchestrates** — no domain research, no evidence judgment. M
 
 Before dispatching or waiting for any Worker, Manager MUST initialize its own identity and notification path:
 
-1. Re-read `skill://tmux-agent` (the current protocol); do not rely on restored conversation context.
+1. Re-read `skill://agent-swarm` (the current protocol); do not rely on restored conversation context.
 2. Set session identity:
 
    ```bash
@@ -70,7 +70,7 @@ Manager must complete INIT for each Worker before dispatching tasks.
 - **Restored Worker (`omp -c`)** — RESET prompt must precede formal INIT TASK. Send via `tmux send-keys` (or available runner channel):
 
   ```bash
-  tmux send-keys -t <target> -l -- "RESET: forget ALL prior flat mailbox paths, dotai wrappers, relay/outbox/IPC logic, workers.toml assumptions, and mailbox-v2-* names. Re-read skill://tmux-agent for the CURRENT protocol. Use only standalone mailbox and session-based paths. Verify with ls .mailbox/<session-id>/<worker-id>/inbox/"
+  tmux send-keys -t <target> -l -- "RESET: forget ALL prior flat mailbox paths, dotai wrappers, relay/outbox/IPC logic, workers.toml assumptions, and mailbox-v2-* names. Re-read skill://agent-swarm for the CURRENT protocol. Use only standalone mailbox and session-based paths. Verify with ls .mailbox/<session-id>/<worker-id>/inbox/"
   tmux send-keys -t <target> C-m
   ```
 
@@ -85,7 +85,7 @@ Manager must complete INIT for each Worker before dispatching tasks.
 2. **Send check prompt (b)**: Immediately send a short prompt to the target pane. For local Workers with tmux:
 
    ```bash
-   tmux send-keys -t <target> -l -- "Registration: write {session_id, worker_id} to the launcher-injected \$OMP_MAILBOX_IDENTITY_FILE path, then check inbox with mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json. If restored with omp -c, first discard ALL prior state and re-read skill://tmux-agent."
+   tmux send-keys -t <target> -l -- "Registration: write {session_id, worker_id} to the launcher-injected \$OMP_MAILBOX_IDENTITY_FILE path, then check inbox with mailbox read --session <session-id> --agent <worker-id> --owner <worker-id> --json. If restored with omp -c, first discard ALL prior state and re-read skill://agent-swarm."
    tmux send-keys -t <target> C-m
    ```
 

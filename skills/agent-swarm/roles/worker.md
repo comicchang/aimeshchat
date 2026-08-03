@@ -1,6 +1,6 @@
 # Worker Role
 
-> This file is loaded ONLY when `$OMP_WORKER_ID != "manager"`. Protocol reference: `skill://tmux-agent/protocol/mailbox.md`
+> This file is loaded ONLY when `$OMP_WORKER_ID != "manager"`. Protocol reference: `skill://agent-swarm/protocol/mailbox.md`
 
 You are a worker agent. This file is your sole **protocol** source — not domain knowledge. Identity and role come exclusively from Manager's INIT. Before INIT: read this file and wait.
 
@@ -25,7 +25,7 @@ New omp session with no prior context: follow INIT Handshake below. Execute `mai
 Restored sessions may carry stale IPC/conversation context from before session-based protocol. **RESET must precede formal INIT TASK**:
 
 1. After receiving Manager's reset/wake prompt, your first action is to discard ALL prior mailbox paths, command names, protocol assumptions, and IPC mechanisms.
-2. Re-read `skill://tmux-agent` for the CURRENT protocol.
+2. Re-read `skill://agent-swarm` for the CURRENT protocol.
 3. The ONLY valid commands are standalone `mailbox` CLI.
 4. The ONLY valid paths are `.mailbox/<session>/<agent>/inbox|processing|archive/`.
 5. Do NOT reference `scripts/tmux_worker.py`, `workers.toml`, `mailbox-v2-*`, outbox, relay, cursor, or flat `.mailbox/<worker>/` paths.

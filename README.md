@@ -472,9 +472,10 @@ were previously maintained at **[comicchang/tmux-agent-skills](https://github.co
 (now archived). The protocol lives on in `src/codeagent/mailbox/` and
 `skills/tmux-agent-manager/`, `skills/tmux-agent-worker/`.
 
-A unified `tmux-agent` skill (B5 era) merges manager and worker into a single
-skill with mode-based dispatch. Use `skill://tmux-agent-manager` for the
-manager profile and `skill://tmux-agent-worker` for the worker profile.
+A unified `agent-swarm` skill (formerly `tmux-agent`, renamed in v0.2.x) merges
+manager and worker into a single skill with role-based dispatch. Use
+`skill://agent-swarm/roles/manager.md` for the manager profile and
+`skill://agent-swarm/roles/worker.md` for the worker profile.
 
 ## License
 

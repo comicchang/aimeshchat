@@ -1,6 +1,6 @@
 # Local Deployment Mode (Shared-fs / Syncthing)
 
-> Protocol reference: `skill://tmux-agent/protocol/mailbox.md`
+> Protocol reference: `skill://agent-swarm/protocol/mailbox.md`
 
 ## Overview
 

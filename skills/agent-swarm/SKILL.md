@@ -1,11 +1,11 @@
 ---
-name: tmux-agent
-description: Unified tmux-agent orchestration — manager dispatch or worker execution, determined by role. Progressive disclosure: loads only the relevant role file.
+name: agent-swarm
+description: Unified agent orchestration over the codeagent swarm/mailbox protocol — manager dispatch or worker execution, determined by role. Progressive disclosure: loads only the relevant role file.
 ---
 
-# tmux-agent — Unified Orchestration Protocol
+# agent-swarm — Unified Orchestration Protocol
 
-> Role-specific rules: `skill://tmux-agent/roles/manager.md` or `skill://tmux-agent/roles/worker.md` | Protocol reference: `skill://tmux-agent/protocol/mailbox.md`
+> Role-specific rules: `skill://agent-swarm/roles/manager.md` or `skill://agent-swarm/roles/worker.md` | Protocol reference: `skill://agent-swarm/protocol/mailbox.md`
 
 ## Role Determination
 
@@ -13,14 +13,14 @@ Read **one** role file based on your identity:
 
 | `$OMP_WORKER_ID` | Role | Load |
 |---|---|---|
-| `manager` | Manager | `skill://tmux-agent/roles/manager.md` |
-| anything else | Worker | `skill://tmux-agent/roles/worker.md` |
+| `manager` | Manager | `skill://agent-swarm/roles/manager.md` |
+| anything else | Worker | `skill://agent-swarm/roles/worker.md` |
 
 If `$OMP_WORKER_ID` is unset, you are a **Worker**. Do not load the other role file — progressive disclosure keeps protocol noise minimal.
 
 ## Shared Protocol Reference
 
-The canonical mailbox protocol (message schema, status.json contract, two-phase consumption, CLI commands, error handling) lives in `skill://tmux-agent/protocol/mailbox.md`. Both roles reference it; neither duplicates its content.
+The canonical mailbox protocol (message schema, status.json contract, two-phase consumption, CLI commands, error handling) lives in `skill://agent-swarm/protocol/mailbox.md`. Both roles reference it; neither duplicates its content.
 
 ## Deployment Modes
 
@@ -36,20 +36,20 @@ The canonical mailbox protocol (message schema, status.json contract, two-phase 
   ├─ 是 → Mode A: Shared FS
   │       - mailbox ops 是本地文件系统操作
   │       - transport 层不参与 mailbox 通信
-  │       - 操作指南: skill://tmux-agent/operations/local.md
+  │       - 操作指南: skill://agent-swarm/operations/local.md
   │
   └─ 否 → Mode B: Remote Transport (DEFAULT)
           - 无共享文件系统
           - mailbox 通过 SSH wire protocol 跨主机
           - codeagent mailbox ... --host <alias>
           - codeagent swarm ... 提供高级 IPC
-          - 操作指南: skill://tmux-agent/operations/remote.md
+          - 操作指南: skill://agent-swarm/operations/remote.md
 ```
 
 | Condition | Mode | MAILBOX_ROOT | Reference |
 |---|---|---|---|
-| 所有 agent 共享文件系统（Syncthing） | Mode A: Shared FS | 显式 `MAILBOX_ROOT=.mailbox` | `skill://tmux-agent/operations/local.md` |
-| 任何 agent 在无共享 FS 的远程主机 | Mode B: Remote Transport | 默认 `resolve_root()` | `skill://tmux-agent/operations/remote.md` |
+| 所有 agent 共享文件系统（Syncthing） | Mode A: Shared FS | 显式 `MAILBOX_ROOT=.mailbox` | `skill://agent-swarm/operations/local.md` |
+| 任何 agent 在无共享 FS 的远程主机 | Mode B: Remote Transport | 默认 `resolve_root()` | `skill://agent-swarm/operations/remote.md` |
 
 Determine mode from the session roster and workers.toml. If all agents share the mailbox root via Syncthing, use Mode A. If any agent is on a host without filesystem access to the mailbox root, use Mode B. Mixed sessions use Mode B for the remote agents and Mode A for the rest.
 
@@ -125,7 +125,7 @@ Legacy commands (`request`, `request-role`, `batch-request`, `event-emit`, `even
 
 ---
 
-- Manager rules: `skill://tmux-agent/roles/manager.md`
-- Worker rules: `skill://tmux-agent/roles/worker.md`
-- Protocol reference: `skill://tmux-agent/protocol/mailbox.md`
-- Deployment modes: `skill://tmux-agent/operations/local.md` / `skill://tmux-agent/operations/remote.md`
+- Manager rules: `skill://agent-swarm/roles/manager.md`
+- Worker rules: `skill://agent-swarm/roles/worker.md`
+- Protocol reference: `skill://agent-swarm/protocol/mailbox.md`
+- Deployment modes: `skill://agent-swarm/operations/local.md` / `skill://agent-swarm/operations/remote.md`
