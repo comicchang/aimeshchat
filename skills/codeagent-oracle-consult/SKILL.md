@@ -41,9 +41,20 @@ Agent 主动咨询 → 需全部满足：
 - 更换模型（不同 model 的 oracle preset，如 oracle → oracle-arch）
 - 议题完全变化（不同 topic，如从性能评审转向安全评审）
 
-### 复用路径（按运行环境选择，两者都保留）
+### 自动路径选择（无需人工判断）
 
-**路径 A — codeagent 持久 session（opencode/codex/claude 等所有 backend 通用）**
+**第 1 步 — 检测运行 harness**：本会话能否调用 `hub`/`task` 工具（peer messaging
+可用、能 spawn subagent）？
+- **能 → OMP harness，走路径 B**（默认）：oracle 系列已配置 `auto-exit: false`，
+  任务完成后 parked，可被 `hub send` 唤醒——会话上下文完整保留（含工具历史）。
+- **不能 → 非 OMP（opencode/codex/claude 等），走路径 A**：codeagent 持久
+  session-key 复用（所有 backend 通用）。
+
+**第 2 步 — 多轮 review 固定同一 oracle 实例**：路径 B 记录首轮 `task` 返回的
+`agent://<id>`，后续轮 `hub send` 到该 id；路径 A 固定同一 `--session-key`。
+不要每轮重新 spawn / 新 session。
+
+### 路径 A — codeagent 持久 session（非 OMP backend 通用）
 
 同任务固定同一 session-key（`<project>:oracle:<domain>:<topic>`），不随轮次递增。
 轮次间不重发全部上下文，只发增量并指向已有结论：
@@ -53,17 +64,16 @@ Agent 主动咨询 → 需全部满足：
 ```
 多轮后上下文膨胀由 codeagent 侧 compaction 处理；不要因此新建 session。
 
-**路径 B — OMP 原生 revive（仅 OMP harness 支持）**
+### 路径 B — OMP 原生 revive（默认，已验证）
 
-OMP 的 parked agent 可被 `hub send` 唤醒并恢复完整会话（含工具调用历史）——
-这是唯一 resume 原语（task 工具无 resume 参数）。使用条件：
-- oracle 系列 agent 定义 `auto-exit: false`（完成后保持 parked 而非 released）
+OMP 的 parked agent 可被 `hub send` 唤醒并恢复完整会话——这是唯一 resume 原语
+（task 工具无 resume 参数）。
 - 首轮：`task` spawn oracle，记下返回的 `agent://<id>`
 - 后续轮：`hub send` 到该 `<id>`，带增量问题；不要重新 task spawn
+- 已真实验证：第 1 轮回答后 agent parked，第 2 轮 `hub send` 唤醒后确认
+  能看到自己第 1 轮的答案（上下文完整保留）
 - 注意：parked 实例进程常驻（registry 进程级，omp 重启后丢失）；多轮后
   释放或避免堆积；并发唤醒由 bus 串行处理
-
-opencode/codex 等不支持 revive 的 backend 自动走路径 A。
 
 ## 领域 preset 与 namespace
 
