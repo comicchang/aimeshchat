@@ -68,13 +68,14 @@ class TestCLIHelp:
     """--version, --help, route --help all produce expected output."""
 
     def test_version(self, capsys):
+        from codeagent import __version__
         from codeagent.cli import main
 
         with pytest.raises(SystemExit) as exc:
             main(["--version"])
         assert exc.value.code == 0
         out = capsys.readouterr().out
-        assert "0.2.0" in out
+        assert __version__ in out
 
     def test_help(self, capsys):
         from codeagent.cli import main

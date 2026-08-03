@@ -215,6 +215,7 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     # status
     st_p = swarm_sub.add_parser("status", help="Show session status")
     st_p.add_argument("session_id")
+    st_p.add_argument("--trace", default="", help="Top4: 按 trace_id 聚合跨主机消息链")
 
     # watch
     wt_p = swarm_sub.add_parser("watch", help="Watch agent inbox (poll loop)")
@@ -236,6 +237,17 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
 
     ob_status = ob_sub.add_parser("status", help="Show outbox summary counts")
     ob_status.add_argument("--session", dest="session_id", help="Filter by session ID")
+
+    # Top3 dead-letter management
+    ob_dead = ob_sub.add_parser("dead", help="List dead-lettered envelopes")
+    ob_dead.add_argument("--session", dest="session_id", help="Filter by session ID")
+
+    ob_requeue = ob_sub.add_parser("requeue", help="Move a dead-lettered entry back to pending")
+    ob_requeue.add_argument("msg_id", help="Message ID to requeue")
+    ob_requeue.add_argument("--session", required=True, dest="session_id", help="Session ID")
+
+    ob_purge = ob_sub.add_parser("purge", help="Delete dead-lettered entries")
+    ob_purge.add_argument("--session", dest="session_id", help="Filter by session ID")
 
 
 def _get_swarm_kernel(store_root: Optional[Path] = None) -> tuple[SwarmKernel, MailboxStore]:
@@ -439,6 +451,15 @@ def _swarm_status(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     if session is None:
         print(f"error: session not found: {args.session_id}", file=sys.stderr)
         return 1
+    if args.trace:
+        # Top4: trace status —— 按 trace_id 聚合 canonical history
+        try:
+            result = kernel.trace(args.session_id, args.trace)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2))
+        return 0
     locations = {}
     for member in session.roster:
         loc = kernel.get_location(args.session_id, member)
@@ -520,6 +541,28 @@ def _swarm_outbox(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     if cmd == "status":
         stats = engine.outbox_stats(session_id=session_id)
         print(json.dumps(stats))
+        return 0
+
+    if cmd == "dead":
+        entries = engine.dead_letter_list(session_id=session_id)
+        if not entries:
+            print("(no dead-lettered messages)")
+            return 0
+        for e in entries:
+            print(f"{e['msg_id']:40s}  {e['to']:20s}  {e['reason']}")
+        return 0
+
+    if cmd == "requeue":
+        ok = engine.dead_letter_requeue(args.session_id, args.msg_id)
+        if not ok:
+            print(f"error: dead-letter entry not found: {args.msg_id}", file=sys.stderr)
+            return 1
+        print(json.dumps({"requeued": args.msg_id}))
+        return 0
+
+    if cmd == "purge":
+        removed = engine.dead_letter_purge(session_id=session_id)
+        print(json.dumps({"purged": removed}))
         return 0
 
     print(f"error: unknown outbox command: {cmd}", file=sys.stderr)

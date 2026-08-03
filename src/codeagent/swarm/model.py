@@ -61,6 +61,7 @@ class Envelope:
     run_id: str = ""
     request_id: str = ""
     trace_id: str = ""
+    causation_id: str = ""
 
 
 # ── Session / Roster / ACL ─────────────────────────────────────────────

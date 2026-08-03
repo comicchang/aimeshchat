@@ -28,8 +28,14 @@ class TransportRouter:
     def get(self, host: HostSpec, repo_map: RepoMap | None = None) -> Transport:
         """Return a Transport instance for *host*.
 
+        Top2 (oracle): 本机 host（hostnames 匹配当前主机）→ LocalTransport，
+        不再默认 SSH——否则 deliver/flush 会把本机当远程 SSH 到别名。
         For relay-login hosts, ``repo_map.relay_zsh`` must be set.
         """
+        from codeagent.domain import resolve_is_local
+
+        if resolve_is_local(host):
+            return LocalTransport()
         if host.transport == "relay-login":
             relay_zsh = getattr(repo_map, "relay_zsh", "") if repo_map else ""
             if not relay_zsh:

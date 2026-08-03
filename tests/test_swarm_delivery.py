@@ -337,6 +337,8 @@ class TestTransportFailure:
             transport_router=mock_router,
             outbox_root=outbox_root,
         )
+        # Top3: backoff 设为 0 —— 测试即时重试（生产默认 5s 指数退避）
+        engine._backoff_base_s = 0
 
         # First flush: fails
         count = engine.flush(session_id="s1")
@@ -1426,3 +1428,111 @@ class TestSessionEnsure:
         assert count == 1
         assert (sd / ".delivered-m_remoteflush").exists()
         mock_transport.mailbox.assert_called()
+
+    def test_dead_letter_terminal_error(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """Top3: terminal 错误（如 sender not in roster）→ 立即 dead-letter，
+        不再重试。"""
+        _init_session(store, sid="s1")
+        envelope = _make_envelope(msg_id="m_terminal", to_id="w2")
+        envelope["_target_host"] = "alpha"
+        sd = outbox_root / "s1"
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "m_terminal.json").write_text(json.dumps(envelope))
+
+        def mock_mailbox(host, args, **kw):
+            raise RuntimeError("sender not in roster: ghost")
+
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.mailbox = mock_mailbox
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        with patch("codeagent.domain.resolve_is_local", return_value=False):
+            count = engine.flush(session_id="s1")
+
+        assert count == 0
+        # Entry moved to dead_letter, no longer pending
+        assert not (sd / "m_terminal.json").exists()
+        dl = engine.dead_letter_list(session_id="s1")
+        assert any(e["msg_id"] == "m_terminal" for e in dl)
+        assert "terminal" in dl[0]["reason"]
+
+    def test_dead_letter_max_attempts(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """Top3: retryable 错误超 max_attempts → dead-letter + 指数退避跳过未到期。"""
+        _init_session(store, sid="s1")
+        envelope = _make_envelope(msg_id="m_exhaust", to_id="w2")
+        envelope["_target_host"] = "alpha"
+        sd = outbox_root / "s1"
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "m_exhaust.json").write_text(json.dumps(envelope))
+
+        def mock_mailbox(host, args, **kw):
+            raise RuntimeError("connection refused")
+
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.mailbox = mock_mailbox
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        engine._max_attempts = 3
+        engine._backoff_base_s = 0  # 即时重试（backoff 由 _attempt_due 单独测）
+
+        with patch("codeagent.domain.resolve_is_local", return_value=False):
+            for _ in range(4):  # 3 attempts → dead-letter on 3rd
+                engine.flush(session_id="s1")
+
+        assert not (sd / "m_exhaust.json").exists()
+        dl = engine.dead_letter_list(session_id="s1")
+        assert any(e["msg_id"] == "m_exhaust" for e in dl)
+        assert "max attempts" in dl[0]["reason"]
+
+        # requeue → 回到 pending
+        assert engine.dead_letter_requeue("s1", "m_exhaust") is True
+        assert (sd / "m_exhaust.json").exists()
+        assert engine.dead_letter_list(session_id="s1") == []
+
+    def test_backoff_skips_not_due(
+        self, store: MailboxStore, outbox_root: Path, host_a: HostSpec,
+    ) -> None:
+        """Top3: next_attempt_at 未到 → flush 跳过（指数退避）。"""
+        _init_session(store, sid="s1")
+        envelope = _make_envelope(msg_id="m_backoff", to_id="w2")
+        envelope["_target_host"] = "alpha"
+        sd = outbox_root / "s1"
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / "m_backoff.json").write_text(json.dumps(envelope))
+
+        def mock_mailbox(host, args, **kw):
+            raise RuntimeError("connection refused")
+
+        mock_router = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.mailbox = mock_mailbox
+        mock_router.get.return_value = mock_transport
+        mock_router.capabilities.return_value = {"mailbox"}
+        engine = DeliveryEngine(
+            mailbox_store=store,
+            transport_router=mock_router,
+            outbox_root=outbox_root,
+        )
+        with patch("codeagent.domain.resolve_is_local", return_value=False):
+            engine.flush(session_id="s1")  # attempt 1: fails, next_attempt = now+5s
+            engine.flush(session_id="s1")  # attempt 2: skipped (not due)
+
+        meta = json.loads((sd / ".status-m_backoff" / "meta.json").read_bytes())
+        assert meta["attempt_count"] == 1
+        assert meta["next_attempt_at"] > 0

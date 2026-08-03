@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,6 +91,9 @@ class DeliveryEngine:
         self._store = mailbox_store
         self._router = transport_router
         self._outbox = outbox_root or (mailbox_store.root / "_outbox")
+        # Top3 dead-letter: max attempts before a retryable entry is dead-lettered
+        self._max_attempts = 5
+        self._backoff_base_s = 5  # exponential: 5, 10, 20, 40, 80…
         # idempotency cache: msg_id → SendReceipt (process-lifetime)
         self._cache: dict[str, SendReceipt] = {}
         # host cache for _resolve_target (alias → HostSpec)
@@ -243,6 +247,7 @@ class DeliveryEngine:
                 "run_id": getattr(envelope, 'run_id', ''),
                 "request_id": getattr(envelope, 'request_id', ''),
                 "trace_id": getattr(envelope, 'trace_id', ''),
+                "causation_id": getattr(envelope, 'causation_id', ''),
                 "msg_id": msg_id,
                 "created_at": created_at,
                 "_target_agent": target_agent,
@@ -259,6 +264,7 @@ class DeliveryEngine:
             env_dict.setdefault("from", from_id)
             env_dict.setdefault("to", target_agent)
             env_dict.setdefault("trace_id", "")
+            env_dict.setdefault("causation_id", "")
             env_dict["_target_agent"] = target_agent
 
         # Resolve target_agent → HostSpec via cache or store local target
@@ -388,6 +394,9 @@ class DeliveryEngine:
                     phase = status_dir / "phase"
                     if phase.exists() and phase.read_text().strip() == "consumed":
                         continue
+                # Top3 backoff: skip entries whose retry is not due yet
+                if not self._attempt_due(sid, mid):
+                    continue
 
                 try:
                     envelope = json.loads(envelope_file.read_bytes())
@@ -422,7 +431,7 @@ class DeliveryEngine:
                             )
                     except Exception as exc:
                         log.debug("DeliveryEngine: flush local retry failed for %s: %s", mid, exc)
-                        self._write_status(sid, mid, "flush_failed", str(exc))
+                        self._handle_flush_failure(sid, mid, exc)
                         continue
                     self._mark_delivered(sid, mid)
                     try:
@@ -437,7 +446,7 @@ class DeliveryEngine:
                     self._remote_send(target, envelope)
                 except Exception as exc:
                     log.debug("DeliveryEngine: flush retry failed for %s: %s", mid, exc)
-                    self._write_status(sid, mid, "flush_failed", str(exc))
+                    self._handle_flush_failure(sid, mid, exc)
                     continue
 
                 self._mark_delivered(sid, mid)
@@ -681,6 +690,9 @@ class DeliveryEngine:
             args.extend(["--request-id", request_id])
         if trace_id:
             args.extend(["--trace-id", trace_id])
+        causation_id = envelope.get("causation_id", "")
+        if causation_id:
+            args.extend(["--causation-id", causation_id])
 
         return args
 
@@ -710,6 +722,198 @@ class DeliveryEngine:
         (status_dir / "timestamp").write_text(
             datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
         )
+
+    # ── Top3: retry state machine / dead-letter ────────────────────────
+
+    @staticmethod
+    def _is_terminal_error(exc: Exception) -> bool:
+        """Classify delivery errors: terminal ones never succeed on retry
+        (invalid roster/ACL/capability/idempotency conflict/validation).
+        """
+        msg = str(exc)
+        markers = (
+            "not in roster",
+            "not in channel",
+            "lacks 'mailbox' capability",
+            "different payload",
+            "invalid kind",
+            "body exceeds",
+            "invalid attachment",
+            "sender not in allowed_senders",
+        )
+        return any(m in msg for m in markers)
+
+    def _record_attempt(
+        self, session_id: str, msg_id: str, error: str, terminal: bool = False,
+    ) -> int:
+        """Record one delivery attempt in ``.status-<msg_id>/meta.json``.
+
+        Returns the (new) attempt count. On retryable failures, computes
+        ``next_attempt_at`` with exponential backoff (base 5s: 5,10,20,40,80)
+        so flush() skips entries that are not due yet.  Terminal failures are
+        marked so flush() dead-letters immediately.
+        """
+        sd = self._outbox / session_id
+        sd.mkdir(parents=True, exist_ok=True)
+        status_dir = sd / f".status-{msg_id}"
+        status_dir.mkdir(exist_ok=True)
+        meta_path = status_dir / "meta.json"
+        meta: dict[str, Any] = {}
+        try:
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            meta = {}
+        now = datetime.now(timezone.utc)
+        now_iso = now.strftime(ISO_TIMESTAMP_FORMAT)
+        attempt = int(meta.get("attempt_count", 0)) + 1
+        meta["attempt_count"] = attempt
+        meta.setdefault("first_accepted_at", now_iso)
+        meta["last_attempt_at"] = now_iso
+        meta["last_error"] = error[:500]
+        meta["terminal"] = terminal
+        if not terminal:
+            backoff = self._backoff_base_s * (2 ** (attempt - 1))
+            meta["next_attempt_at"] = (
+                now.timestamp() + backoff
+            )
+        tmp = status_dir / ".tmp-meta.json"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(meta_path))
+        return attempt
+
+    def _dead_letter(
+        self, session_id: str, msg_id: str, reason: str,
+    ) -> None:
+        """Atomically move a pending outbox entry (+ status) to dead_letter.
+
+        Keeps the envelope, error history and trace intact for
+        list/requeue/purge.  No sender notification is generated here —
+        dead-letter notices must never recurse (Top3).
+        """
+        sd = self._outbox / session_id
+        dl = (self._outbox.parent / "_dead_letter") / session_id
+        dl.mkdir(parents=True, exist_ok=True)
+        src = sd / f"{msg_id}.json"
+        if not src.exists():
+            return
+        os.replace(str(src), str(dl / f"{msg_id}.json"))
+        # Move status dir too (attempt history)
+        status_dir = sd / f".status-{msg_id}"
+        if status_dir.exists():
+            import shutil
+            shutil.move(str(status_dir), str(dl / f".status-{msg_id}"))
+        (dl / f".dead-letter-reason-{msg_id}").write_text(reason)
+
+    def dead_letter_list(self, session_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """List dead-lettered envelopes (message + reason + attempts)."""
+        root = self._outbox.parent / "_dead_letter"
+        sessions = [session_id] if session_id else (
+            sorted(d.name for d in root.iterdir() if d.is_dir()) if root.is_dir() else []
+        )
+        results: list[dict[str, Any]] = []
+        for sid in sessions:
+            dl = root / sid
+            if not dl.is_dir():
+                continue
+            for f in sorted(dl.glob("*.json")):
+                mid = f.stem
+                try:
+                    env = json.loads(f.read_bytes())
+                except (json.JSONDecodeError, OSError):
+                    env = {}
+                reason = ""
+                rp = dl / f".dead-letter-reason-{mid}"
+                if rp.exists():
+                    reason = rp.read_text(errors="replace")
+                results.append({
+                    "session_id": sid,
+                    "msg_id": mid,
+                    "to": env.get("to", ""),
+                    "subject": env.get("subject", ""),
+                    "reason": reason,
+                })
+        return results
+
+    def dead_letter_requeue(self, session_id: str, msg_id: str) -> bool:
+        """Move a dead-lettered entry back to pending (flush will retry)."""
+        dl = (self._outbox.parent / "_dead_letter") / session_id
+        src = dl / f"{msg_id}.json"
+        if not src.exists():
+            return False
+        sd = self._outbox / session_id
+        sd.mkdir(parents=True, exist_ok=True)
+        os.replace(str(src), str(sd / f"{msg_id}.json"))
+        # Clear attempt history so retry starts fresh (keep status dir? reset meta)
+        status_dir = sd / f".status-{msg_id}"
+        status_dir.mkdir(exist_ok=True)
+        meta_path = status_dir / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_bytes()) if meta_path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+        meta["attempt_count"] = 0
+        meta["terminal"] = False
+        meta.pop("next_attempt_at", None)
+        (dl / f".dead-letter-reason-{msg_id}").unlink(missing_ok=True)
+        meta_path.write_text(json.dumps(meta, indent=2))
+        return True
+
+    def dead_letter_purge(self, session_id: Optional[str] = None) -> int:
+        """Delete dead-lettered entries (session-scoped or all)."""
+        import shutil
+        root = self._outbox.parent / "_dead_letter"
+        sessions = [session_id] if session_id else (
+            sorted(d.name for d in root.iterdir() if d.is_dir()) if root.is_dir() else []
+        )
+        removed = 0
+        for sid in sessions:
+            dl = root / sid
+            if not dl.is_dir():
+                continue
+            for f in list(dl.glob("*")):
+                if f.is_file() or f.is_dir():
+                    if f.is_dir():
+                        shutil.rmtree(f, ignore_errors=True)
+                    else:
+                        f.unlink(missing_ok=True)
+                    removed += 1
+        return removed
+
+    def _attempt_due(self, session_id: str, msg_id: str) -> bool:
+        """Top3: True if the entry is due for a retry (backoff elapsed).
+        Entries without meta are due immediately."""
+        sd = self._outbox / session_id
+        meta_path = sd / f".status-{msg_id}" / "meta.json"
+        try:
+            if not meta_path.exists():
+                return True
+            meta = json.loads(meta_path.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return True
+        if meta.get("terminal"):
+            return False  # terminal entries never retry (flush dead-letters them)
+        nxt = meta.get("next_attempt_at")
+        if nxt is None:
+            return True
+        return time.time() >= float(nxt)
+
+    def _handle_flush_failure(
+        self, session_id: str, msg_id: str, exc: Exception,
+    ) -> None:
+        """Top3: record attempt, classify; dead-letter terminal or exhausted."""
+        terminal = self._is_terminal_error(exc)
+        attempt = self._record_attempt(
+            session_id, msg_id, str(exc), terminal=terminal,
+        )
+        if terminal:
+            self._dead_letter(session_id, msg_id, f"terminal: {exc}"[:300])
+            return
+        if attempt >= self._max_attempts:
+            self._dead_letter(session_id, msg_id, f"max attempts ({self._max_attempts}) exceeded: {exc}"[:300])
 
     # ── Idempotency ────────────────────────────────────────────────────
 

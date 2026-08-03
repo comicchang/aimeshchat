@@ -94,6 +94,7 @@ class Message:
     run_id: str = ""
     request_id: str = ""
     trace_id: str = ""
+    causation_id: str = ""
     attachments: list[AttachmentRef] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -115,6 +116,8 @@ class Message:
             d["request_id"] = self.request_id
         if self.trace_id:
             d["trace_id"] = self.trace_id
+        if self.causation_id:
+            d["causation_id"] = self.causation_id
         if self.attachments:
             d["attachments"] = [a.to_dict() for a in self.attachments]
         return d
@@ -134,6 +137,7 @@ class Message:
             run_id=d.get("run_id", ""),
             request_id=d.get("request_id", ""),
             trace_id=d.get("trace_id", ""),
+            causation_id=d.get("causation_id", ""),
             attachments=[AttachmentRef.from_dict(a) for a in d.get("attachments", []) if isinstance(a, dict)],
         )
 

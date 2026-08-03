@@ -596,6 +596,49 @@ class SwarmKernel:
             ))
         return receipts
 
+    def trace(self, session_id: str, trace_id: str) -> dict:
+        """Top4: 按 trace_id 聚合 canonical history —— 跨主机消息链 +
+        每 leaf 投递状态（delivered/consumed/无）。
+
+        trace_id 由 kernel 入口生成（direct/broadcast/channel/notice），
+        fan-out 各 msg_id 共用同一 trace；causation_id 表达转发关系。
+        """
+        self._require_session(session_id)
+        history = self._store.read_history(session_id)
+        msgs = [m for m in history if m.get("trace_id") == trace_id]
+        if not msgs:
+            raise ValueError(f"no messages with trace_id: {trace_id}")
+
+        # leaf 投递状态：查 engine outbox markers
+        engine = getattr(getattr(self._sink, "_engine", None), None)
+        outbox_root = None
+        if engine is not None:
+            outbox_root = getattr(engine, "_outbox", None)
+        leaves = []
+        for m in sorted(msgs, key=lambda x: x.get("created_at", "")):
+            mid = m.get("msg_id", "")
+            state = "unknown"
+            if outbox_root is not None:
+                sd = outbox_root / session_id
+                if (sd / f".delivered-{mid}").exists():
+                    state = "delivered"
+            leaves.append({
+                "msg_id": mid,
+                "from": m.get("from", ""),
+                "to": m.get("to", ""),
+                "subject": m.get("subject", ""),
+                "kind": m.get("kind", ""),
+                "causation_id": m.get("causation_id", ""),
+                "created_at": m.get("created_at", ""),
+                "state": state,
+            })
+        return {
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "leaf_count": len(leaves),
+            "leaves": leaves,
+        }
+
     # ── Poll ───────────────────────────────────────────────────────────
 
     def poll(self, session_id: str, agent_id: str,

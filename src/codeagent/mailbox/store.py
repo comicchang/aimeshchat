@@ -175,7 +175,7 @@ class MailboxStore:
         self, session_id: str, from_id: str, to_id: str,
         subject: str, body: str, kind: str = "REPORT",
         reply_to: str = "", run_id: str = "", request_id: str = "",
-        trace_id: str = "",
+        trace_id: str = "", causation_id: str = "",
         attachments: Optional[list] = None,
         msg_id: Optional[str] = None,
     ) -> str:
@@ -282,7 +282,7 @@ class MailboxStore:
             subject=subject, body=body, kind=kind, msg_id=msg_id,
             created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
             reply_to=reply_to, run_id=run_id, request_id=request_id,
-            trace_id=trace_id,
+            trace_id=trace_id, causation_id=causation_id,
             attachments=refs,
         )
 
