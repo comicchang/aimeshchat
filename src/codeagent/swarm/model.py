@@ -60,6 +60,7 @@ class Envelope:
     reply_to: str = ""
     run_id: str = ""
     request_id: str = ""
+    trace_id: str = ""
 
 
 # ── Session / Roster / ACL ─────────────────────────────────────────────

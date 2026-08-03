@@ -79,6 +79,40 @@ class LocalTransport(Transport):
             timeout=request.timeout,
         )
 
+    def mailbox(
+        self,
+        host: HostSpec,
+        args: list[str],
+        mailbox_root: str = "",
+        timeout: int = 30,
+    ) -> tuple[int, str, str]:
+        """Run mailbox CLI args locally; return (exit_code, stdout, stderr).
+
+        B1: 统一投递路径——本机 target 走 LocalTransport.mailbox()（内部复用
+        mailbox.cli.main，无 subprocess 开销），与远程 SSH transport 共用
+        同一 mailbox args 构造，消除 DeliveryEngine 里 inline store.send 的
+        重复逻辑。
+        """
+        import contextlib
+        import io
+
+        from codeagent.mailbox import cli as mailbox_cli
+
+        full_args: list[str] = list(args)
+        if mailbox_root:
+            full_args = ["--mailbox-root", mailbox_root] + full_args
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                mailbox_cli.main(full_args)
+            except SystemExit as exc:
+                code = exc.code or 0 if isinstance(exc.code, int) else 1
+            except Exception as exc:  # noqa: BLE001 — report any failure to caller
+                err.write(str(exc))
+                code = 1
+        return code, out.getvalue(), err.getvalue()
+
 
 # ── shared wire-protocol runner ─────────────────────────────────────────
 

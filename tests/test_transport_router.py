@@ -150,14 +150,21 @@ class TestRouterSupportsHelpers:
 class TestTransportMailboxBase:
     """Transport.mailbox() base class raises NotImplementedError."""
 
-    def test_local_transport_mailbox_raises(self):
-        """LocalTransport inherits base mailbox() which raises NotImplementedError."""
+    def test_local_transport_mailbox_executes_locally(self, tmp_path):
+        """B1: LocalTransport.mailbox 本地执行 mailbox CLI（不再 raise）。
+        通过 mailbox-root 指向 tmp，session-init 实际建目录。"""
         from codeagent.transport.local import LocalTransport
 
         transport = LocalTransport()
         host = _host(name="__local__", ssh_alias="__local__", hostnames=())
-        with pytest.raises(NotImplementedError, match="mailbox"):
-            transport.mailbox(host, ["stats", "--session", "s"])
+        code, out, err = transport.mailbox(
+            host,
+            ["session-init", "--session", "s1", "--manager", "mgr", "--agents", "w1"],
+            mailbox_root=str(tmp_path),
+        )
+        assert code == 0
+        assert "created" in out or "ok" in out, f"out={out!r} err={err!r}"
+        assert (tmp_path / "s1" / "session.json").exists()
 
 
 # ── SSHTransport.mailbox ────────────────────────────────────────────────

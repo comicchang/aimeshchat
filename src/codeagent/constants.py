@@ -40,8 +40,10 @@ LOOP_TICK = 0.25  # max block in receiver loop() per iteration
 
 # ── opaque stream cursor ───────────────────────────────────────────────
 # Server-side monotonic arrival counter persisted per-session.
-# Format: "<epoch_ms>/<seq>" (seq = per-epoch 0-based counter).
+# Format: "<epoch_ms>/<seq>" (seq = per-epoch 0-based counter, zero-padded
+# to SEQ_WIDTH so the cursor string stays lexicographically ordered).
 # Cursor file: <mailbox_root>/<session_id>/.stream-cursor
 STREAM_CURSOR_INITIAL = "0"
 STREAM_CURSOR_FILE = ".stream-cursor"
+SEQ_WIDTH = 6  # zero-pad width for the seq component (P0-b: "10" must sort after "9")
 

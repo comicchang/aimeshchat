@@ -15,6 +15,7 @@ from codeagent.constants import (
     MAX_ATTACHMENT_SIZE,
     MAX_MAILBOX_BODY,
     MSG_ID_TIMESTAMP_FORMAT,
+    SEQ_WIDTH,
     STREAM_CURSOR_FILE,
     STREAM_CURSOR_INITIAL,
 )
@@ -158,6 +159,7 @@ class MailboxStore:
         self, session_id: str, from_id: str, to_id: str,
         subject: str, body: str, kind: str = "REPORT",
         reply_to: str = "", run_id: str = "", request_id: str = "",
+        trace_id: str = "",
         attachments: Optional[list] = None,
         msg_id: Optional[str] = None,
     ) -> str:
@@ -216,13 +218,41 @@ class MailboxStore:
 
         if msg_id is not None:
             self._validate_msg_id(msg_id)
-            # Idempotency: reject if msg_id already exists in any recipient inbox or history
+            # P0-a idempotent replay: a message already written (inbox or
+            # history) is NOT an error per se — crash/response-loss after the
+            # inbox write but before the sender's .delivered marker makes
+            # flush() replay the same msg_id. Identical payload → replay
+            # succeeds (idempotent); conflicting payload → raise.
             hd = sd / "history"
-            if any(
-                (self.agent_subdir(session_id, rid, "inbox") / f"{msg_id}.json").exists()
-                for rid in recipients
-            ) or (hd / f"{msg_id}.json").exists():
-                raise ValueError(f"msg_id already exists: {msg_id}")
+            existing: Optional[dict] = None
+            for rid in recipients:
+                inbox = self.agent_subdir(session_id, rid, "inbox")
+                p = inbox / f"{msg_id}.json"
+                if p.exists():
+                    try:
+                        existing = json.loads(p.read_bytes())
+                    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                        existing = {}
+                    break
+            if existing is None:
+                hp = hd / f"{msg_id}.json"
+                if hp.exists():
+                    try:
+                        existing = json.loads(hp.read_bytes())
+                    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                        existing = {}
+            if existing is not None:
+                same = (
+                    existing.get("from") == from_id
+                    and existing.get("to") == to_id
+                    and existing.get("subject") == subject
+                    and existing.get("body") == body
+                    and existing.get("kind") == kind
+                )
+                if not same:
+                    raise ValueError(f"msg_id already exists with different payload: {msg_id}")
+                # Identical replay — already delivered; return success.
+                return f"sent → {to_id}/inbox/{msg_id}.json (idempotent replay)"
         else:
             msg_id = gen_msg_id(from_id)
             while any(
@@ -236,6 +266,7 @@ class MailboxStore:
             subject=subject, body=body, kind=kind, msg_id=msg_id,
             created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
             reply_to=reply_to, run_id=run_id, request_id=request_id,
+            trace_id=trace_id,
             attachments=refs,
         )
 
@@ -270,6 +301,12 @@ class MailboxStore:
         Reads ``<session_dir>/.stream-cursor`` JSON ``{'epoch_ms':N,'seq':N}``,
         increments seq (bumps epoch_ms and resets seq if epoch_ms changed),
         writes back atomically, returns ``"epoch_ms/seq"``.
+
+        B2/P0-b: seq is zero-padded to a fixed width (``SEQ_WIDTH``) so the
+        cursor stays lexicographically ordered within one epoch ("10" would
+        otherwise sort before "9"), and the read-modify-write is guarded by
+        a cross-process ``flock`` so concurrent senders cannot produce
+        duplicate seq values.
         """
         sd = self.session_dir(session_id)
         sd.mkdir(parents=True, exist_ok=True)
@@ -277,33 +314,48 @@ class MailboxStore:
 
         now_ms = int(time.time() * 1000)
 
-        # Read current cursor state
-        prev_epoch = 0
-        prev_seq = 0
-        if cursor_file.exists():
+        lock_fd = os.open(str(cursor_file), os.O_CREAT | os.O_RDWR)
+        try:
             try:
-                data = json.loads(cursor_file.read_bytes())
-                prev_epoch = data.get('epoch_ms', 0)
-                prev_seq = data.get('seq', 0)
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass  # non-POSIX / flock unavailable — degrade to atomic replace
+
+            # Read current cursor state (under lock)
+            prev_epoch = 0
+            prev_seq = 0
+            if cursor_file.exists():
+                try:
+                    data = json.loads(cursor_file.read_bytes())
+                    prev_epoch = data.get('epoch_ms', 0)
+                    prev_seq = data.get('seq', 0)
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    pass
+
+            # Advance: if same epoch, increment seq; otherwise reset to 0
+            if now_ms == prev_epoch:
+                new_seq = prev_seq + 1
+            else:
+                new_seq = 0
+
+            # Atomic replace with fsync
+            new_data = {'epoch_ms': now_ms, 'seq': new_seq}
+            tmp = sd / ".tmp-stream-cursor"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(new_data, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(cursor_file))
+        finally:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
                 pass
+            os.close(lock_fd)
 
-        # Advance: if same epoch, increment seq; otherwise reset to 0
-        if now_ms == prev_epoch:
-            new_seq = prev_seq + 1
-        else:
-            new_seq = 0
-
-        # Atomic replace with fsync
-        new_data = {'epoch_ms': now_ms, 'seq': new_seq}
-        tmp = sd / ".tmp-stream-cursor"
-        with open(tmp, "w") as f:
-            f.write(json.dumps(new_data, ensure_ascii=False))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(str(tmp), str(cursor_file))
-
-        return f"{now_ms}/{new_seq}"
+        return f"{now_ms}/{new_seq:0{SEQ_WIDTH}d}"
 
     def read_cursor(self, session_id: str) -> str:
         """Read the current opaque stream cursor for a session.
@@ -322,7 +374,7 @@ class MailboxStore:
             data = json.loads(cursor_file.read_bytes())
             epoch_ms = data.get('epoch_ms', 0)
             seq = data.get('seq', 0)
-            return f"{epoch_ms}/{seq}"
+            return f"{epoch_ms}/{seq:0{SEQ_WIDTH}d}"
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return STREAM_CURSOR_INITIAL
 

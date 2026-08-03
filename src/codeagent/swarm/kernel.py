@@ -412,6 +412,12 @@ class SwarmKernel:
     def _gen_msg_id(self) -> str:
         return str(uuid4())
 
+    def _ensure_trace_id(self, envelope: Envelope) -> None:
+        """B2: 每消息注入 trace_id（uuid4 hex）——跨主机追踪链路。
+        仅当调用方未显式设置时生成；同一 envelope 复用同一 trace。"""
+        if not envelope.trace_id:
+            envelope.trace_id = uuid4().hex
+
     def _gen_created_at(self) -> str:
         return datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT)
 
@@ -474,6 +480,7 @@ class SwarmKernel:
         session = self._require_session(session_id)
         self._check_direct(session, sender, to_agent)
 
+        self._ensure_trace_id(envelope)
         msg_id = self._gen_msg_id()
         created_at = self._gen_created_at()
 
@@ -495,6 +502,7 @@ class SwarmKernel:
         session = self._require_session(session_id)
         self._check_broadcast(session, sender)
 
+        self._ensure_trace_id(envelope)
         created_at = self._gen_created_at()
         recipients = session.roster.without(sender)
 
@@ -519,6 +527,7 @@ class SwarmKernel:
         ch = channels[channel_id]
         self._check_channel(session, ch, sender)
 
+        self._ensure_trace_id(envelope)
         created_at = self._gen_created_at()
 
         receipts = []
@@ -544,6 +553,7 @@ class SwarmKernel:
         session = self._require_session(session_id)
         self._check_notice(session, sender)
 
+        self._ensure_trace_id(envelope)
         created_at = self._gen_created_at()
 
         # Topic-based fan-out: subscribers of this topic only.

@@ -51,6 +51,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--reply-to", default="")
     s.add_argument("--run-id", default="")
     s.add_argument("--request-id", default="")
+    s.add_argument("--trace-id", default="", help="cross-host trace id (B2)")
     s.add_argument("--msg-id", default=None, help="caller-provided msg_id for idempotent send")
     s.add_argument(
         "--attachment", action="append", default=[],
@@ -146,6 +147,7 @@ def main(argv: list[str] | None = None) -> None:
                 args.session, args.from_worker, args.to,
                 args.subject, args.body, args.kind,
                 args.reply_to, args.run_id, args.request_id,
+                trace_id=args.trace_id,
                 attachments=attachments or None,
                 msg_id=args.msg_id,
             ))

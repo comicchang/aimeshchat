@@ -376,6 +376,25 @@ class _StreamSubscription:
     last_heartbeat: float = field(default_factory=time.monotonic)
 
 
+def _cursor_gt(a: str, b: str) -> bool:
+    """Numeric cursor comparison: ``a`` strictly after ``b``?
+
+    P0-b: cursors are "epoch_ms/seq" — comparing the strings directly breaks
+    when seq is unpadded ("epoch/10" sorts before "epoch/9") or when legacy
+    unpadded and new zero-padded cursors mix. Parse both into int tuples.
+    """
+    def _parse(cur: str) -> tuple[int, int]:
+        if not cur or cur == STREAM_CURSOR_INITIAL:
+            return (0, 0)
+        parts = cur.split("/", 1)
+        try:
+            return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+        except ValueError:
+            return (0, 0)
+
+    return _parse(a) > _parse(b)
+
+
 def _poll_streams(subs: list[_StreamSubscription]) -> None:
     """Poll mailbox stores for new messages and emit stream_event frames.
 
@@ -405,11 +424,15 @@ def _poll_streams(subs: list[_StreamSubscription]) -> None:
                 # server-generated _cursor participate in stream delivery.
                 # Legacy pre-0.2.0 messages (no _cursor) are skipped —
                 # mixing msg_id fallbacks with opaque cursors breaks the
-                # lexicographic ordering and can silently drop new mail.
+                # ordering and can silently drop new mail.
                 if not msg_cursor:
                     continue
-                # Skip messages we've already delivered (lexicographic)
-                if msg_cursor <= sub.cursor:
+                # P0-b: compare numerically, not lexicographically. The seq
+                # component is zero-padded now, but legacy cursors written
+                # before the padding ("epoch/10") would sort before
+                # "epoch/9" as strings — silent stream skip. Parse both
+                # sides into (epoch_ms, seq) ints.
+                if not _cursor_gt(msg_cursor, sub.cursor):
                     continue
                 # Emit event with full Message payload
                 event = {
@@ -426,6 +449,8 @@ def _poll_streams(subs: list[_StreamSubscription]) -> None:
                 }
                 if msg.get('attachments'):
                     event['payload']['attachments'] = msg['attachments']
+                if msg.get('trace_id'):
+                    event['payload']['trace_id'] = msg['trace_id']
                 _send(event)
                 sub.cursor = msg_cursor
         except Exception:

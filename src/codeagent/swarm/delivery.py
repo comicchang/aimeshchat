@@ -166,26 +166,22 @@ class DeliveryEngine:
         from codeagent.domain import HostSpec, resolve_is_local
         is_local_host = isinstance(target, HostSpec) and resolve_is_local(target)
         if not host_alias or is_local_host:
-            # Local delivery: write straight to the recipient inbox
-            # (durable + idempotent via msg_id).  The outbox entry above
-            # guarantees no loss if this write fails mid-way.
-            # is_local_host: a repo-map HostSpec whose hostnames match this
-            # machine (e.g. mac=OA-MIANYIN-MAC) must stay local — flushing
-            # such an entry through transport would SSH into the alias and
-            # fail with "Could not resolve hostname".
+            # Local delivery: 统一走 LocalTransport.mailbox()（内部复用
+            # mailbox.cli.main，与远程 SSH transport 共用同一 args 构造），
+            # 不再 inline store.send。durable outbox 保证不丢；msg_id 幂等。
+            # is_local_host: 本机 repo-map host（mac=OA-MIANYIN-MAC）必须
+            # 留在本地——经 transport 会 SSH 到别名而失败。
             try:
-                self._store.send(
-                    session_id=sid,
-                    from_id=envelope.get("from", ""),
-                    to_id=envelope.get("to", target if isinstance(target, str) else ""),
-                    subject=envelope.get("subject", ""),
-                    body=envelope.get("body", ""),
-                    kind=envelope.get("kind", "TASK"),
-                    reply_to=envelope.get("reply_to", ""),
-                    run_id=envelope.get("run_id", ""),
-                    request_id=envelope.get("request_id", ""),
-                    msg_id=msg_id,
+                from codeagent.transport.local import LocalTransport
+                local_host = HostSpec(name="__local__", ssh_alias="__local__", hostnames=())
+                local_args = self._build_mailbox_args({**envelope, "msg_id": msg_id})
+                code, out, err = LocalTransport().mailbox(
+                    local_host, local_args, mailbox_root=str(self._store.root)
                 )
+                if code != 0:
+                    raise RuntimeError(
+                        f"local mailbox send failed (exit {code}): {err or out}"
+                    )
             except Exception as exc:
                 log.warning("DeliveryEngine: local inbox write failed: %s", exc)
                 self._write_status(sid, msg_id, "local_delivery_failed", str(exc))
@@ -246,6 +242,7 @@ class DeliveryEngine:
                 "reply_to": getattr(envelope, 'reply_to', ''),
                 "run_id": getattr(envelope, 'run_id', ''),
                 "request_id": getattr(envelope, 'request_id', ''),
+                "trace_id": getattr(envelope, 'trace_id', ''),
                 "msg_id": msg_id,
                 "created_at": created_at,
                 "_target_agent": target_agent,
@@ -261,6 +258,7 @@ class DeliveryEngine:
             env_dict.setdefault("session_id", session_id)
             env_dict.setdefault("from", from_id)
             env_dict.setdefault("to", target_agent)
+            env_dict.setdefault("trace_id", "")
             env_dict["_target_agent"] = target_agent
 
         # Resolve target_agent → HostSpec via cache or store local target
@@ -386,24 +384,22 @@ class DeliveryEngine:
                 except Exception:
                     continue
 
-                from codeagent.domain import resolve_is_local
+                from codeagent.domain import HostSpec, resolve_is_local
                 if resolve_is_local(target):
                     # 本机 target（repo-map host 的 hostnames 匹配本机，如
-                    # mac=OA-MIANYIN-MAC）：直写本地 inbox，不走 transport
-                    # （SSH 到本机别名会 No route to host + 每条 10s 超时）。
+                    # mac=OA-MIANYIN-MAC）：统一走 LocalTransport.mailbox()
+                    # 直写本地 inbox（与 deliver() 同路径；msg_id 幂等）。
                     try:
-                        self._store.send(
-                            session_id=sid,
-                            from_id=envelope.get("from", ""),
-                            to_id=envelope.get("to", ""),
-                            subject=envelope.get("subject", ""),
-                            body=envelope.get("body", ""),
-                            kind=envelope.get("kind", "TASK"),
-                            reply_to=envelope.get("reply_to", ""),
-                            run_id=envelope.get("run_id", ""),
-                            request_id=envelope.get("request_id", ""),
-                            msg_id=mid,
+                        from codeagent.transport.local import LocalTransport
+                        local_host = HostSpec(name="__local__", ssh_alias="__local__", hostnames=())
+                        local_args = self._build_mailbox_args({**envelope, "msg_id": mid})
+                        code, out, err = LocalTransport().mailbox(
+                            local_host, local_args, mailbox_root=str(self._store.root)
                         )
+                        if code != 0:
+                            raise RuntimeError(
+                                f"local mailbox send failed (exit {code}): {err or out}"
+                            )
                     except Exception as exc:
                         log.debug("DeliveryEngine: flush local retry failed for %s: %s", mid, exc)
                         self._write_status(sid, mid, "flush_failed", str(exc))
@@ -643,6 +639,7 @@ class DeliveryEngine:
         body = envelope.get("body", "")
         attachments = envelope.get("attachments") or []
         msg_id = envelope.get("msg_id", "")
+        trace_id = envelope.get("trace_id", "")
 
         args = [
             "send",
@@ -662,6 +659,8 @@ class DeliveryEngine:
             args.extend(["--run-id", run_id])
         if request_id:
             args.extend(["--request-id", request_id])
+        if trace_id:
+            args.extend(["--trace-id", trace_id])
 
         return args
 
