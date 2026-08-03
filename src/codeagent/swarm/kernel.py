@@ -294,6 +294,45 @@ class SwarmKernel:
             location=location,
         )
 
+    def set_agent_card(self, session_id: str, agent_id: str,
+                       card: dict) -> None:
+        """P2 (oracle): 持久化 agent_card（每 agent 一张，与 ACL/权限解耦）。
+
+        card 字段：display_name/description/agent_version/capabilities[]。
+        纯 advertisement——不授予任何 ACL 权限。
+        """
+        if agent_id not in self._require_session(session_id).roster:
+            raise ValueError(f"agent not in roster: {agent_id}")
+        allowed = {"display_name", "description", "agent_version", "capabilities"}
+        clean = {k: v for k, v in card.items() if k in allowed}
+        if not clean:
+            raise ValueError("agent card must include at least one of "
+                             f"{sorted(allowed)}")
+        if isinstance(clean.get("capabilities"), list):
+            clean["capabilities"] = [
+                str(c)[:64] for c in clean["capabilities"][:32]
+            ]
+        for k in ("display_name", "description", "agent_version"):
+            if isinstance(clean.get(k), str):
+                clean[k] = clean[k][:256]
+
+        def _update(meta: dict) -> None:
+            cards = meta.setdefault("agent_cards", {})
+            cards[agent_id] = clean
+
+        self._persist_meta(session_id, _update)
+
+    def get_agent_cards(self, session_id: str) -> dict:
+        """P2: 读回本 session 的 agent_cards（swarm-meta.json）。"""
+        try:
+            meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
+            if not meta_path.exists():
+                return {}
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            return meta.get("agent_cards", {})
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return {}
+
     def unregister(self, session_id: str, agent_id: str) -> None:
         """Remove an agent from the routing table."""
         self._require_session(session_id)

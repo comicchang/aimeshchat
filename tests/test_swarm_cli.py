@@ -195,6 +195,30 @@ class TestCreateSession:
         assert rc == 1
         assert "invalid" in err.lower()
 
+    def test_create_session_restricted_policy(self):
+        """B4: --policy restricted --allowed-senders → ACL 持久化 + 非白名单
+        sender 被拒（跨进程——新 CLI 进程从 session.json 恢复 restricted）。"""
+        rc, out, _ = _run(["swarm", "create-session", "rst",
+                           "--manager", "mgr", "--members", "w1,w2",
+                           "--policy", "restricted",
+                           "--allowed-senders", "mgr,w1"])
+        assert rc == 0
+        data = _json_out(out)
+        assert data["acl"]["policy"] == "restricted"
+        assert data["acl"]["authority"] == "mgr"
+
+        # 跨进程：新 CLI 进程（新 kernel）从 session.json 恢复 restricted
+        rc, out, _ = _run(["swarm", "direct", "rst",
+                           "--from", "w2", "--to", "w1",
+                           "--subject", "x", "--body", "y"])
+        assert rc == 1  # w2 不在 allowed_senders
+
+        rc, out, _ = _run(["swarm", "direct", "rst",
+                           "--from", "w1", "--to", "w2",
+                           "--subject", "x", "--body", "y"])
+        assert rc == 0  # w1 在 allowed_senders
+        assert _json_out(out)["status"] == "delivered"
+
 
 # ── register ─────────────────────────────────────────────────────────────
 

@@ -145,6 +145,11 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     cs_p.add_argument("session_id", help="Session identifier")
     cs_p.add_argument("--manager", required=True, help="Manager agent ID")
     cs_p.add_argument("--members", required=True, help="Comma-separated member agent IDs")
+    cs_p.add_argument("--policy", default="open", choices=["open", "restricted"],
+                      help="B4: ACL policy (default open; restricted = authority-only broadcast)")
+    cs_p.add_argument("--allowed-senders", default="",
+                      help="B4: comma-separated allowed senders for restricted sessions "
+                           "(must be roster subset; manager always included)")
 
     # register
     reg_p = swarm_sub.add_parser("register", help="Register an agent in the routing table")
@@ -152,6 +157,13 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     reg_p.add_argument("--agent", required=True)
     reg_p.add_argument("--host", required=True, help="Host alias (or __local__)")
     reg_p.add_argument("--backend", default="cli", choices=["cli", "omp", "tmux"])
+    reg_p.add_argument("--card", default="",
+                       help="P2: agent_card JSON {display_name,description,agent_version,capabilities[]}")
+
+    # whoami
+    who_p = swarm_sub.add_parser("whoami", help="Show this agent's identity + agent card")
+    who_p.add_argument("session_id")
+    who_p.add_argument("--agent", required=True)
 
     # direct
     dir_p = swarm_sub.add_parser("direct", help="Send a direct message")
@@ -304,6 +316,8 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             return _swarm_create_session(kernel, args)
         elif cmd == "register":
             return _swarm_register(kernel, args)
+        elif cmd == "whoami":
+            return _swarm_whoami(kernel, args)
         elif cmd == "direct":
             return _swarm_direct(kernel, args)
         elif cmd == "channel":
@@ -334,11 +348,22 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
 
 def _swarm_create_session(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     members = [m.strip() for m in args.members.split(",") if m.strip()]
-    session = kernel.create_session(args.session_id, args.manager, members)
+    acl = None
+    if args.policy != "open":
+        allowed = [a.strip() for a in (args.allowed_senders or "").split(",") if a.strip()]
+        from codeagent.swarm.model import ACL
+        acl = ACL(
+            authority=args.manager,
+            allowed_senders=list(allowed) or [args.manager],
+            room_members=sorted(set(members) | {args.manager}),
+            policy=args.policy,
+        )
+    session = kernel.create_session(args.session_id, args.manager, members, acl=acl)
     print(json.dumps({
         "session_id": session.session_id,
         "manager_id": session.manager_id,
         "roster": list(session.roster),
+        "acl": {"authority": session.acl.authority, "policy": session.acl.policy},
     }, indent=2))
     return 0
 
@@ -350,11 +375,34 @@ def _swarm_register(kernel: SwarmKernel, args: argparse.Namespace) -> int:
         backend=args.backend,
     )
     reg = kernel.register(loc, args.session_id)
+    if args.card:
+        try:
+            card = json.loads(args.card)
+        except json.JSONDecodeError as exc:
+            print(f"error: invalid --card JSON: {exc}", file=sys.stderr)
+            return 1
+        kernel.set_agent_card(args.session_id, args.agent, card)
     print(json.dumps({
         "agent_id": reg.agent_id,
         "session_id": reg.session_id,
         "host_alias": reg.location.host_alias,
         "backend": reg.location.backend,
+    }, indent=2))
+    return 0
+
+
+def _swarm_whoami(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    """P2: 本机 agent 身份 + agent card（纯 advertisement，不授予权限）。"""
+    import socket as _socket
+    loc = kernel.get_location(args.session_id, args.agent)
+    cards = kernel.get_agent_cards(args.session_id)
+    print(json.dumps({
+        "agent_id": args.agent,
+        "hostname": _socket.gethostname(),
+        "host_alias": loc.host_alias if loc else "",
+        "backend": loc.backend if loc else "",
+        "agent_card": cards.get(args.agent, {}),
+        "capabilities": sorted({"mailbox", "stream", "artifact"}),
     }, indent=2))
     return 0
 

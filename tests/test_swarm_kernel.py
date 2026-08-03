@@ -729,3 +729,42 @@ class TestTrace:
         k.create_session("s1", "mgr", ["w1"])
         with pytest.raises(ValueError):
             k.trace("s1", "ghost")
+
+
+# ── Agent Card (P2) ─────────────────────────────────────────────────────
+
+
+class TestAgentCard:
+    """P2: agent_card 持久化 + 白名单字段 + 跨进程恢复。"""
+
+    def test_set_and_get_card(self, store):
+        k = SwarmKernel(store=store)
+        k.create_session("s1", "mgr", ["w1"])
+        k.set_agent_card("s1", "w1", {
+            "display_name": "worker-1",
+            "description": "build worker",
+            "agent_version": "0.2.3",
+            "capabilities": ["mailbox", "stream"],
+            "ignored_field": "dropped",
+        })
+        cards = k.get_agent_cards("s1")
+        assert cards["w1"]["display_name"] == "worker-1"
+        assert "ignored_field" not in cards["w1"]
+        assert cards["w1"]["capabilities"] == ["mailbox", "stream"]
+
+    def test_card_unknown_fields_rejected(self, store):
+        k = SwarmKernel(store=store)
+        k.create_session("s1", "mgr", ["w1"])
+        with pytest.raises(ValueError):
+            k.set_agent_card("s1", "w1", {"not_allowed": 1})
+        with pytest.raises(ValueError):
+            k.set_agent_card("s1", "ghost", {"display_name": "x"})
+
+    def test_card_persists_across_kernels(self, store):
+        k1 = SwarmKernel(store=store)
+        k1.create_session("s1", "mgr", ["w1"])
+        k1.set_agent_card("s1", "w1", {"display_name": "worker-1"})
+
+        k2 = SwarmKernel(store=store)
+        cards = k2.get_agent_cards("s1")
+        assert cards["w1"]["display_name"] == "worker-1"
