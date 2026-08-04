@@ -164,7 +164,7 @@ Park 期间 agent 保持 IDLE 且 archive 受保护（`mailbox clear` 会检查 
 ### 降级策略
 
 - **Hot revive**（同进程）：`hub send` 唤醒 parked agent，上下文完整保留
-- **Warm resume**（同 session-key）：`codeagent run --session-key <key> --resume`
+- **Warm resume**（同 session-key）：`codeagent run --session-key <key>`（默认自动 resume）
 - **Cold reconstruction**（新实例）：`build_cold_context(review_key)` 注入 snapshot
 
 ## 10. Error Handling
