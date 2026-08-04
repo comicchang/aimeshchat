@@ -101,9 +101,12 @@ class OMPRunner(BaseRunner):
         if not worker_id:
             worker_id = "worker"  # 缺省非空（调用方应显式设 OMP_WORKER_ID）
         # Backward-compat identity file for plugins that still read it
+        nonce = secrets.token_hex(8)
         identity_path.write_text(json.dumps({
             "session_id": swarm_sid,
             "worker_id": worker_id,
+            "owner_pid": os.getpid(),
+            "nonce": nonce,
         }))
         self._identity_path = identity_path
 
@@ -112,6 +115,7 @@ class OMPRunner(BaseRunner):
             "OMP_MAILBOX_SESSION_ID": swarm_sid,
             "OMP_MAILBOX_AGENT_ID": worker_id,
             "OMP_MAILBOX_IDENTITY_FILE": str(identity_path),
+            "OMP_MAILBOX_NONCE": nonce,
             "MAILBOX_ROOT": os.environ.get("MAILBOX_ROOT", ""),
         }
 
@@ -208,6 +212,19 @@ class OMPRunner(BaseRunner):
 
     def _cleanup(self) -> None:
         """Clean up prompt temp file, identity file, and unregister swarm agent."""
+        # ── Park lifecycle guard: skip cleanup if agent is HOT_PARKED ──
+        try:
+            from codeagent.park.registry import ParkRegistry
+            pr = ParkRegistry()
+            swarm_aid = getattr(self, "_swarm_agent_id", None)
+            if swarm_aid:
+                manifest = pr.lookup(swarm_aid)
+                if manifest is not None and manifest.lifecycle == "hot_parked":
+                    LOG.info("agent %s is HOT_PARKED, skipping identity cleanup", swarm_aid)
+                    return  # keep identity for revive
+        except Exception:
+            pass  # park module unavailable — fall through to normal cleanup
+
         self._cleanup_prompt_file()
         # Remove the injected mailbox identity file (per-run, unique token)
         identity_path = getattr(self, "_identity_path", None)

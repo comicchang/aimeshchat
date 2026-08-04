@@ -49,11 +49,41 @@ def gen_msg_id(sender: str) -> str:
     return f"{sender}_{ts}_{suffix}"
 
 
+class ParkLeaseActiveError(Exception):
+    """Cannot clear mailbox while a park lease is active."""
+
+
+try:
+    from codeagent.park.registry import ParkRegistry
+except ImportError:
+    ParkRegistry = None  # type: ignore[assignment,misc]
+
+
 class MailboxStore:
     """Filesystem-backed mailbox store."""
 
     def __init__(self, root: Optional[Path] = None):
         self.root = resolve_root(root)
+
+    # ── Park lease guard ────────────────────────────────────────────
+
+    @staticmethod
+    def _check_park_lease(session_id: str, agent_id: str) -> None:
+        """Raise ParkLeaseActiveError if any active park lease references this agent."""
+        if ParkRegistry is None:
+            return
+        try:
+            registry = ParkRegistry()
+            manifest = registry.lookup(agent_id)
+            if manifest is not None and manifest.lifecycle == "hot_parked":
+                raise ParkLeaseActiveError(
+                    f"active park lease for {agent_id} in session {session_id}"
+                )
+        except ParkLeaseActiveError:
+            raise
+        except Exception:
+            # Park registry unavailable or corrupt — don't block cleanup
+            pass
 
     def session_dir(self, session_id: str) -> Path:
         validate_agent_id(session_id)
@@ -740,6 +770,7 @@ class MailboxStore:
 
     def clear(self, session_id: str, agent_id: str, *, prune_stale: bool = False) -> str:
         """Clear archive only. Use purge() for _corrupt."""
+        self._check_park_lease(session_id, agent_id)
         ad = self.agent_dir(session_id, agent_id)
         total = 0
         d = ad / "archive"

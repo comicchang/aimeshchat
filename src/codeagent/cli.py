@@ -132,6 +132,26 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── swarm ───────────────────────────────────────────────────────────
     _build_swarm_parser(sub)
 
+    # ── park ────────────────────────────────────────────────────────────
+    park_p = sub.add_parser("park", help="Manage park instances (Hot→Warm→Cold revive)")
+    park_sub = park_p.add_subparsers(dest="park_cmd")
+
+    park_list_p = park_sub.add_parser("list", help="List park instances")
+    park_list_p.add_argument("--lifecycle", help="Filter by lifecycle (hot_parked/cold_resumable/released)")
+
+    park_info_p = park_sub.add_parser("info", help="Show park instance details")
+    park_info_p.add_argument("review_key", help="Review key")
+
+    park_revive_p = park_sub.add_parser("revive", help="Revive or spawn a park instance")
+    park_revive_p.add_argument("review_key", help="Review key")
+    park_revive_p.add_argument("--prompt", help="Incremental prompt for the revived instance")
+
+    park_release_p = park_sub.add_parser("release", help="Release a park instance")
+    park_release_p.add_argument("review_key", help="Review key")
+
+    park_sweep_p = park_sub.add_parser("sweep", help="Evict expired park instances")
+    park_sweep_p.add_argument("--dry-run", action="store_true", help="Preview without evicting")
+
     return p
 
 
@@ -1009,6 +1029,71 @@ def _cmd_mailbox(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _cmd_park(args: argparse.Namespace) -> int:
+    """Dispatch park subcommands."""
+    from codeagent.park.registry import ParkRegistry
+    from codeagent.park.router import park_revive
+    from codeagent.domain.park import Lifecycle
+
+    registry = ParkRegistry()
+    cmd = args.park_cmd
+
+    if cmd is None:
+        print("park: missing subcommand. Try: codeagent park list|info|revive|release|sweep")
+        return 1
+
+    if cmd == "list":
+        manifests = registry.list_active()
+        if args.lifecycle:
+            manifests = [m for m in manifests if m.lifecycle == Lifecycle(args.lifecycle)]
+        for m in manifests:
+            print(f"  {m.review_key}  lifecycle={m.lifecycle.value}  round={m.round}  agent={m.agent_type}")
+        if not manifests:
+            print("(no park instances)")
+
+    elif cmd == "info":
+        m = registry.lookup(args.review_key)
+        if m:
+            import json
+            print(json.dumps({
+                "review_key": m.review_key,
+                "lifecycle": m.lifecycle.value,
+                "agent_type": m.agent_type,
+                "model": m.model,
+                "backend_session_id": m.backend_session_id,
+                "peer_agent_id": m.peer_agent_id,
+                "round": m.round,
+                "created_at": m.created_at,
+                "last_activity_at": m.last_activity_at,
+                "soft_expires_at": m.soft_expires_at,
+            }, indent=2))
+        else:
+            print(f"(no instance for '{args.review_key}')")
+
+    elif cmd == "revive":
+        result = park_revive(args.review_key, args.prompt or "")
+        print(f"method={result.method} success={result.success}")
+        print(result.context[:500])
+
+    elif cmd == "release":
+        registry.release(args.review_key)
+        print(f"Released: {args.review_key}")
+
+    elif cmd == "sweep":
+        if args.dry_run:
+            from codeagent.park.constants import PARK_DEFAULTS
+            print(f"Dry run: would sweep expired instances (TTL={PARK_DEFAULTS['ttl_seconds']}s)")
+        else:
+            evicted = registry.sweep()
+            if evicted:
+                for k in evicted:
+                    print(f"Evicted: {k}")
+            else:
+                print("(no expired instances)")
+
+    return 0
+
+
 def _cmd_artifact(args: argparse.Namespace) -> int:
     """Pull artifacts from remote hosts via ControlMaster, or verify local files."""
     if args.art_cmd == "pull":
@@ -1064,6 +1149,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "mailbox": _cmd_mailbox,
         "artifact": _cmd_artifact,
         "swarm": _cmd_swarm,
+        "park": _cmd_park,
     }
     # args.command is guaranteed to be one of the registered subcommands:
     # argparse rejects unknown names, and ``None`` was handled above.

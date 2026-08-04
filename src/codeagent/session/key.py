@@ -34,6 +34,20 @@ def _normalize_workdir(path: str) -> str:
     return os.path.normpath(os.path.abspath(expanded))
 
 
+def compute_oracle_session_key(
+    project: str, domain: str, topic: str, model: str | None = None,
+) -> str:
+    """Oracle review key 格式: <project>:oracle:<domain>:<topic>[:<model_suffix>]
+
+    Model suffix 防止跨模型上下文复用。换模型时自动创建新 key。
+    """
+    base = f"{project}:oracle:{domain}:{topic}"
+    if model:
+        suffix = model.split("/")[-1].split()[-1].lower()
+        base = f"{base}:{suffix}"
+    return base
+
+
 def compute_session_key(request: RunRequest, target: Target) -> str:
     """Derive the deterministic session key from a run request and its routing target.
 

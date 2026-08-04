@@ -1,0 +1,29 @@
+[park]
+# Agent Park／复活机制默认配置（provisional）
+# 参考 docs/park-terminology.md
+
+# 每个 manager 最多 hot parked 实例数
+max_hot_parked = 3
+
+# 滑动 TTL（秒），无活动自动释放
+ttl_seconds = 3600
+
+# 硬上限（秒），超时强制释放
+hard_limit_seconds = 28800
+
+# 最大 review 轮次
+max_rounds = 5
+
+# 驱逐顺序：lru / fifo
+eviction_order = "lru"
+
+# 驱逐前是否生成 snapshot
+snapshot_on_evict = true
+
+# SQLite 数据库路径
+# 默认：~/.local/state/codeagent/park.sqlite3
+# db_path = ""
+
+# metrics 日志路径
+# 默认：~/.local/share/codeagent/park/metrics.jsonl
+# metrics_path = ""
