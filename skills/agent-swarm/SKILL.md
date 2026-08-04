@@ -93,6 +93,7 @@ These rules apply to **every** agent regardless of role:
 5. **No capture-pane** — do not use terminal text to infer agent state. Use status.json and inbox polling.
 6. **Two-phase consumption** — `mailbox read` (inbox→processing) → process → `mailbox finalize` (processing→archive). No shortcuts.
 7. **status.json is a snapshot** — five fields only. Full conclusions belong in REPORT messages and artifacts, not in status.
+8. **Lifecycle vs mailbox status 正交** — `mailbox status` 仅描述工作状态（IDLE/BUSY/DONE/BLOCKED）。Park 是独立的 lifecycle 概念（由 `codeagent park registry` 管理），不在 status.json 表达。Park 期间 agent 保持 IDLE 且 archive 受保护（禁止 `mailbox clear`）。
 
 ## Initialization Flow
 

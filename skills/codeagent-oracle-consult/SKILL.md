@@ -54,6 +54,21 @@ Agent 主动咨询 → 需全部满足：
 `agent://<id>`，后续轮 `hub send` 到该 id；路径 A 固定同一 `--session-key`。
 不要每轮重新 spawn / 新 session。
 
+### 降级策略（Hot→Warm→Cold）
+
+路径 B 的 hot revive（`hub send`）可能因进程重启/超时失败。降级层级：
+
+1. **Hot revive**（同进程）：`hub send` 到 parked agent，上下文完整保留
+2. **Warm resume**（同 session-key）：`codeagent run --session-key <key> --resume`
+   → 恢复 backend session。首个 turn 附加校验问题（"请列出你上一轮的 3 个要点"）
+3. **Cold reconstruction**（新实例 + curated snapshot）：`session-history-reader`
+   读取历史摘要 + artifact 引用注入新实例，首轮输出三段式结论：
+   - ① 仍成立的结论
+   - ② 需重新审查的结论
+   - ③ 因新证据废弃的结论
+
+每步降级显式报告用户。
+
 ### 路径 A — codeagent 持久 session（非 OMP backend 通用）
 
 同任务固定同一 session-key（`<project>:oracle:<domain>:<topic>`），不随轮次递增。
@@ -75,14 +90,15 @@ OMP 的 parked agent 可被 `hub send` 唤醒并恢复完整会话——这是�
 - 注意：parked 实例进程常驻（registry 进程级，omp 重启后丢失）；多轮后
   释放或避免堆积；并发唤醒由 bus 串行处理
 
-### 路径 B 的可靠 Fallback（mailbox 轮询）
+### 路径 B 的可靠 Fallback（park revive 冷启动）
 
-触发式唤醒（omp-mailbox-plugin 的 fs.watch → triggerTurn）在 OMP 下可用；但
-default export 执行 ≠ activate 完成（异步 poll identity + watcher 注册），且
-OMP 的裸 console 输出不进结构化日志（诊断勿用日志 grep）。**可靠 fallback：
-agent 主动轮询**——prompt 引导 oracle 在等待期间定期 `codeagent mailbox peek
---session <sid> --agent <id>`，有消息即 `read` + 处理 + `finalize`。此路径
-不依赖唤醒通知，是真机验证过的唤醒方式。
+触发式唤醒（hub send）在 OMP 同进程内可靠；但进程重启后 parked agent 丢失。
+**可靠 fallback：codeagent park revive**（Hot→Warm→Cold 决策树自动执行）：
+- 同进程：hot revive（hub send）
+- 同 session-key：warm resume（codeagent --resume）
+- 均失败：cold reconstruction（session-history-reader 读历史摘要 + 新实例注入）
+
+此路径不依赖 OMP 进程存活，是跨进程/跨主机的可靠唤醒方式。
 
 ## 领域 preset 与 namespace
 
