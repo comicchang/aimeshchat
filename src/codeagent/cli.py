@@ -149,6 +149,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
     park_release_p = park_sub.add_parser("release", help="Release a park instance")
     park_release_p.add_argument("review_key", help="Review key")
+    park_release_p.add_argument("--agent-type", help="Agent type (oracle/oracle-lite/etc)")
+    park_release_p.add_argument("--peer-id", help="OMP peer agent ID")
+    park_release_p.add_argument("--mailbox-id", help="Mailbox agent ID")
+    park_release_p.add_argument("--backend-id", help="Backend session ID")
+
+    park_acquire_p = park_sub.add_parser("acquire", help="Acquire a park instance")
+    park_acquire_p.add_argument("review_key", help="Review key")
+    park_acquire_p.add_argument("--agent-type", default="oracle", help="Agent type (oracle/oracle-lite/etc)")
+    park_acquire_p.add_argument("--peer-id", default="", help="OMP peer agent ID")
+    park_acquire_p.add_argument("--mailbox-id", default="", help="Mailbox agent ID")
+    park_acquire_p.add_argument("--backend-id", default="", help="Backend session ID")
+
+    park_renew_p = park_sub.add_parser("renew", help="Renew a park instance (update TTL)")
+    park_renew_p.add_argument("review_key", help="Review key")
 
     park_sweep_p = park_sub.add_parser("sweep", help="Evict expired park instances")
     park_sweep_p.add_argument("--dry-run", action="store_true", help="Preview without evicting")
@@ -1082,6 +1096,28 @@ def _cmd_park(args: argparse.Namespace) -> int:
         result = park_revive(args.review_key, args.prompt or "")
         print(f"method={result.method} success={result.success}")
         print(result.context[:500])
+
+    elif cmd == "acquire":
+        import time
+        m = ParkManifest(
+            review_key=args.review_key,
+            lifecycle=Lifecycle.HOT_PARKED,
+            agent_type=args.agent_type,
+            peer_agent_id=args.peer_id,
+            mailbox_agent_id=args.mailbox_id,
+            backend_session_id=args.backend_id,
+            created_at=time.time(),
+        )
+        ok = registry.acquire(args.review_key, m)
+        if ok:
+            print(f"Acquired: {args.review_key} (agent={args.agent_type})")
+        else:
+            print(f"Already exists: {args.review_key}")
+            return 1
+
+    elif cmd == "renew":
+        registry.renew(args.review_key)
+        print(f"Renewed: {args.review_key}")
 
     elif cmd == "release":
         registry.release(args.review_key)

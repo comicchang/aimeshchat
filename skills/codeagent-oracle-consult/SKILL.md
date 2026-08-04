@@ -33,6 +33,33 @@ Agent 主动咨询 → 需全部满足：
 - 同题换说法反复问
 - 用 full oracle 做 explore/格式审查
 
+## Park Registry 集成
+
+首轮 spawn oracle 后，必须调用 `codeagent park acquire` 写入 ParkRegistry，否则
+清理守卫/lease 守卫/TTL 管理都不生效。
+
+```bash
+# 首轮 spawn oracle 后执行
+codeagent park acquire "$REVIEW_KEY" \
+  --agent-type oracle \
+  --peer-id "$AGENT_ID" \
+  --mailbox-id "$MAILBOX_AGENT" \
+  --backend-id "$BACKEND_SESSION"
+```
+
+每轮 follow-up 后执行 renew（续租 TTL）：
+```bash
+codeagent park renew "$REVIEW_KEY"
+```
+
+用户说"结束 review"时执行 release：
+```bash
+codeagent park release "$REVIEW_KEY"
+```
+
+若 CLI 中 park 命令不可用（未安装 codeagent），则记录 review_key 和 agent_id 到
+会话上下文，由后续步骤手动调用。
+
 ## Session 复用纪律（同一任务多轮 Review）
 
 **同一任务的所有 review 轮次必须复用同一个 oracle session**，让 oracle 持有完整
