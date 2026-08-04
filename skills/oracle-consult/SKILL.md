@@ -47,6 +47,9 @@ Agent 主动咨询 → 需全部满足：
 
 ## 持久 Oracle 工作流（默认路径）
 
+> 自动检测运行环境选择路径：OMP harness 用 `task`/`hub send`，
+> 非 OMP 用 codeagent `--session-key`。详见 `persist-oracle` 技能。
+
 ### 首轮
 
 1. 收集项目上下文（见下方三步流程）
@@ -83,8 +86,9 @@ Agent 主动咨询 → 需全部满足：
 `hub send` 可能因进程重启失败。降级层级：
 
 1. **Hot revive**（同进程）：`hub send` 到 parked agent，上下文完整
-2. **Warm resume**（codeagent session-key）：`codeagent run --session-key <key> --resume`
+2. **Warm resume**（codeagent session-key）：`codeagent run --session-key <key>`（默认自动 resume）
 3. **Cold reconstruction**（新实例 + 历史摘要）：`session-history-reader` 读历史注入新实例
+   [PLACEHOLDER: session-history-reader skill 尚未实现，目前直接读 ~/.omp/agent/history.db SQLite]
 
 每步降级显式报告用户。
 
