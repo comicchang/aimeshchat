@@ -95,17 +95,22 @@ class OMPRunner(BaseRunner):
         identity_dir = Path.home() / ".omp" / "mailbox-identity"
         identity_dir.mkdir(parents=True, exist_ok=True)
         identity_path = identity_dir / f"{token}.json"
+        # Oracle 验证：identity 的 worker_id 必须非空——插件 readIdentityFile 拒绝
+        # 空 worker_id，activate 永不进入（现场 64/64 identity 曾为空）。
+        worker_id = os.environ.get("OMP_WORKER_ID", "")
+        if not worker_id:
+            worker_id = "worker"  # 缺省非空（调用方应显式设 OMP_WORKER_ID）
         # Backward-compat identity file for plugins that still read it
         identity_path.write_text(json.dumps({
             "session_id": swarm_sid,
-            "worker_id": "manager" if self.config.binary.endswith("omp") and os.environ.get("OMP_WORKER_ID") == "manager" else "",
+            "worker_id": worker_id,
         }))
         self._identity_path = identity_path
 
         return {
             "SWARM_SESSION_ID": swarm_sid,
             "OMP_MAILBOX_SESSION_ID": swarm_sid,
-            "OMP_MAILBOX_AGENT_ID": os.environ.get("OMP_WORKER_ID", ""),
+            "OMP_MAILBOX_AGENT_ID": worker_id,
             "OMP_MAILBOX_IDENTITY_FILE": str(identity_path),
             "MAILBOX_ROOT": os.environ.get("MAILBOX_ROOT", ""),
         }
