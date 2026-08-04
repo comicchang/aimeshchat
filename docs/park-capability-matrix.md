@@ -7,7 +7,7 @@
 | 项 | 结果 |
 |----|------|
 | 场景 | oracle task → 回答后 parked → hub send 唤醒 |
-| 状态 | ✅ 已验证（codeagent-oracle-consult skill 记录） |
+| 状态 | ✅ 已验证（oracle-consult skill 记录） |
 | 上下文完整 | ✅ Agent 确认能看到自己第 1 轮的答案 |
 | 失败条件 | peer 进程不存在 / generation 不匹配 |
 
