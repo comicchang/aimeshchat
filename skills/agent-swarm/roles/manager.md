@@ -176,7 +176,7 @@ Park 期间 agent 保持 IDLE 且 archive 受保护（`mailbox clear` 会检查 
 - **Missing recipient**: sending fails → re-verify workers.toml, session.json, inbox path. Never create misspelled directories.
 - **Crash recovery**: `mailbox recover-stale` returns expired processing (>300s lease) to inbox. Run on startup or when `stats` shows non-zero processing. Never move files manually.
 
-## 10. Prevention Rules
+## 11. Prevention Rules
 
 - **Never hand-write JSON** — use `mailbox send` and `mailbox status` only.
 - Validate `--to` against roster and target inbox owner before every send.
