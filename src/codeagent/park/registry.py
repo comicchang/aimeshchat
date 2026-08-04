@@ -64,9 +64,7 @@ class ParkRegistry:
 
     def acquire(self, review_key: str, manifest: ParkManifest) -> bool:
         """尝试 acquire 一个 park 实例。已存在则返回 False。"""
-        with self._lock(review_key) as lock:
-            if not lock:
-                return False
+        with self._lock(review_key):
             with self._connect() as conn:
                 row = conn.execute(
                     "SELECT 1 FROM park_leases WHERE key = ? AND lifecycle = 'hot_parked'",

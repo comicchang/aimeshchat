@@ -138,6 +138,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     park_list_p = park_sub.add_parser("list", help="List park instances")
     park_list_p.add_argument("--lifecycle", help="Filter by lifecycle (hot_parked/cold_resumable/released)")
+    park_list_p.add_argument("--all", action="store_true", help="Show all non-released instances (not just hot_parked)")
 
     park_info_p = park_sub.add_parser("info", help="Show park instance details")
     park_info_p.add_argument("review_key", help="Review key")
@@ -1043,7 +1044,14 @@ def _cmd_park(args: argparse.Namespace) -> int:
         return 1
 
     if cmd == "list":
-        manifests = registry.list_active()
+        if args.all:
+            with registry._connect() as conn:
+                rows = conn.execute(
+                    "SELECT manifest_json FROM park_leases WHERE lifecycle != 'released'"
+                ).fetchall()
+            manifests = [registry._dict_to_manifest(json.loads(r[0])) for r in rows]
+        else:
+            manifests = registry.list_active()
         if args.lifecycle:
             manifests = [m for m in manifests if m.lifecycle == Lifecycle(args.lifecycle)]
         for m in manifests:
