@@ -142,7 +142,32 @@ If Worker fails to follow v2 protocol (hand-written JSON, no polling, no status 
 3. Verify: status `BUSY→DONE|BLOCKED`, Manager receives schema-valid REPORT, Worker inbox/archive behavior correct.
 4. Only if lightweight fails: `/new` and restart. On recovery, check `_corrupt/`, archive, inbox, and status freshness first.
 
-## 9. Error Handling
+## 9. Park Lifecycle（Agent Park/复活机制）
+
+某些 Agent 类型（oracle/oracle-lite/oracle-opus/prometheus）配置了 `auto-exit: false`，
+任务完成后保持 parked 状态，可被 `hub send` 唤醒（上下文完整保留）。
+
+### Manager 职责
+
+Manager 是 park 生命周期的权威：
+- **首轮 spawn 后**：调用 `codeagent park acquire <review_key> --agent-type <type> --peer-id <id>`
+- **每轮 follow-up 后**：调用 `codeagent park renew <review_key>`（续租 TTL）
+- **用户说"结束 review"时**：调用 `codeagent park release <review_key>`
+- **定期间隔**：调用 `codeagent park sweep` 驱逐过期实例
+
+### 与 mailbox status 的正交关系
+
+`mailbox status` 仅描述工作状态（IDLE/BUSY/DONE/BLOCKED）。
+Park 是独立的 lifecycle 概念，由 `codeagent park registry` 管理，不在 status.json 表达。
+Park 期间 agent 保持 IDLE 且 archive 受保护（`mailbox clear` 会检查 ParkRegistry）。
+
+### 降级策略
+
+- **Hot revive**（同进程）：`hub send` 唤醒 parked agent，上下文完整保留
+- **Warm resume**（同 session-key）：`codeagent run --session-key <key> --resume`
+- **Cold reconstruction**（新实例）：`build_cold_context(review_key)` 注入 snapshot
+
+## 10. Error Handling
 
 - **Corrupt message**: `mailbox read` moves to `_corrupt/`. Record filename, notify sender to resend. Never edit the original JSON.
 - **Syncthing conflict**: `.sync-conflict-*` are never valid. Compare originals, request resend. Never rename to fake delivery.
