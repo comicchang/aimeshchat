@@ -1,6 +1,12 @@
 # tmux-agent-manager v2 Direct Inbox 速查
 > Manager → `skill://tmux-agent-manager/` | Worker → `skill://tmux-agent-worker/`
 
+> ⚠️ **DEPRECATED** — 本 skill（tmux-agent-manager）已被 `skill://agent-swarm/` 取代。
+> 协议内容迁移到 `skill://agent-swarm/protocol/mailbox.md`；命令入口统一为
+> `codeagent mailbox` / `codeagent swarm`（跨主机）+ `mailbox` CLI（本地）。
+> 唤醒：`omp-mailbox-plugin`（triggerTurn）+ agent 轮询 fallback，见
+> omp-mailbox-plugin 仓库 `CHEATSHEET.md`。以下为历史 v2 参考（保留供审计）。
+
 ## v2 Direct Inbox
 
 所有命令使用 `--session` + `--agent`（不再用 `--worker`）。

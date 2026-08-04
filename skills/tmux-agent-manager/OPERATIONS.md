@@ -1,5 +1,9 @@
 # tmux-agent-manager v3 — Operations
 
+> ⚠️ **DEPRECATED** — 已被 `skill://agent-swarm/` 取代（协议见 agent-swarm/protocol/mailbox.md；
+> 命令入口 `codeagent mailbox`/`swarm`；唤醒见 omp-mailbox-plugin CHEATSHEET.md）。
+> 以下为历史 v3 参考（保留供审计）。
+
 > 协议核心: `skill://tmux-agent-manager/` | Worker: `skill://tmux-agent-worker/` | 速查: `CHEATSHEET.md`
 
 ## 1. 配置与目录
