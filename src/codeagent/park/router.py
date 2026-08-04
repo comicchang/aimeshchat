@@ -25,7 +25,13 @@ class ReviveResult:
 
 
 def revive_or_spawn(review_key: str, prompt: str = "") -> ReviveResult:
-    """Hot→Warm→Cold 决策树。
+    """Hot→Warm→Cold 决策树（纯决策层，不执行操作）。
+
+    返回值是决策结果，实际执行由调用方（manager/CLI）负责：
+    - method="hot": 调用方应 `hub send` 到 manifest.peer_agent_id
+    - method="warm": 调用方应 `codeagent run --session-key <key> --resume`
+    - method="cold": 调用方应 spawn 新 agent + 注入 context（作为首轮 prompt）
+    - method="failed": 调用方应报告错误并走降级
 
     1. Hot revive: 同进程 hub send（由调用方执行，本函数返回 manifest）
     2. Warm resume: 同 session-key 恢复 backend session

@@ -74,8 +74,9 @@ class MailboxStore:
             return
         try:
             registry = ParkRegistry()
-            manifest = registry.lookup(agent_id)
-            if manifest is not None and manifest.lifecycle == "hot_parked":
+            from codeagent.domain.park import Lifecycle
+            manifest = registry.lookup_by_field("mailbox_agent_id", agent_id)
+            if manifest is not None and manifest.lifecycle == Lifecycle.HOT_PARKED:
                 raise ParkLeaseActiveError(
                     f"active park lease for {agent_id} in session {session_id}"
                 )

@@ -215,11 +215,12 @@ class OMPRunner(BaseRunner):
         # ── Park lifecycle guard: skip cleanup if agent is HOT_PARKED ──
         try:
             from codeagent.park.registry import ParkRegistry
+            from codeagent.domain.park import Lifecycle
             pr = ParkRegistry()
             swarm_aid = getattr(self, "_swarm_agent_id", None)
             if swarm_aid:
-                manifest = pr.lookup(swarm_aid)
-                if manifest is not None and manifest.lifecycle == "hot_parked":
+                manifest = pr.lookup_by_field("backend_session_id", swarm_aid)
+                if manifest is not None and manifest.lifecycle == Lifecycle.HOT_PARKED:
                     LOG.info("agent %s is HOT_PARKED, skipping identity cleanup", swarm_aid)
                     return  # keep identity for revive
         except Exception:
