@@ -1048,7 +1048,7 @@ def _cmd_park(args: argparse.Namespace) -> int:
     """Dispatch park subcommands."""
     from codeagent.park.registry import ParkRegistry
     from codeagent.park.router import park_revive
-    from codeagent.domain.park import Lifecycle
+    from codeagent.domain.park import Lifecycle, ParkManifest
 
     registry = ParkRegistry()
     cmd = args.park_cmd
