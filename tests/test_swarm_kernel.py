@@ -13,6 +13,7 @@ from codeagent.swarm.model import (
     AddressKind,
     AgentLocation,
     Envelope,
+    ReturnMode,
     Roster,
 )
 
@@ -918,3 +919,281 @@ class TestModePersistence:
         assert loc.execution_mode is None
         assert loc.mailbox_root == ""
         assert loc.return_mode is None
+
+
+# ── pull_remote ────────────────────────────────────────────────────────
+
+
+class TestPullRemote:
+    """pull_remote: find manager-pull agents on host, SSH mailbox read."""
+
+    def test_no_pull_agents_returns_empty(self, store):
+        k = _make_kernel_with_session(store)
+        # w1 registered with bidirectional, not manager-pull
+        k.register(
+            AgentLocation("w1", "host-a", "cli",
+                          return_mode=ReturnMode.BIDIRECTIONAL),
+            "s1",
+        )
+        assert k.pull_remote("s1", "host-a") == []
+
+    def test_no_agents_on_host_returns_empty(self, store):
+        k = _make_kernel_with_session(store)
+        k.register(
+            AgentLocation("w1", "host-a", "cli",
+                          return_mode=ReturnMode.MANAGER_PULL),
+            "s1",
+        )
+        assert k.pull_remote("s1", "host-b") == []
+
+    def test_session_not_found_raises(self, kernel):
+        with pytest.raises(ValueError, match="not found"):
+            kernel.pull_remote("ghost", "host-a")
+
+    def test_pulls_message_from_remote_host(self, store):
+        k = _make_kernel_with_session(store)
+        k.register(
+            AgentLocation("w1", "host-a", "cli",
+                          return_mode=ReturnMode.MANAGER_PULL),
+            "s1",
+        )
+        fake_msg = {
+            "msg_id": "remote-001",
+            "session_id": "s1",
+            "from": "w1",
+            "to": "manager",
+            "subject": "report",
+            "body": "done",
+            "kind": "REPORT",
+            "created_at": "2026-01-01T00:00:00Z",
+            "run_id": "run-1",
+            "request_id": "req-1",
+            "reply_to": "task-001",
+            "trace_id": "",
+            "causation_id": "",
+        }
+        import subprocess
+        from unittest.mock import patch
+
+        completed = MagicMock()
+        completed.returncode = 0
+        completed.stdout = __import__("json").dumps(fake_msg)
+        completed.stderr = ""
+        with patch("codeagent.swarm.kernel.subprocess.run", return_value=completed) as mock_run:
+            result = k.pull_remote("s1", "host-a")
+        assert len(result) == 1
+        assert result[0]["msg_id"] == "remote-001"
+        # Verify the SSH command structure
+        args = mock_run.call_args[0][0]
+        assert "mailbox" in args
+        assert "read" in args
+        assert "--host" in args
+        assert "host-a" in args
+
+    def test_pull_skips_failed_command(self, store):
+        k = _make_kernel_with_session(store)
+        k.register(
+            AgentLocation("w1", "host-a", "cli",
+                          return_mode=ReturnMode.MANAGER_PULL),
+            "s1",
+        )
+        import subprocess
+        from unittest.mock import patch
+
+        completed = MagicMock()
+        completed.returncode = 1
+        completed.stdout = ""
+        completed.stderr = "connection refused"
+        with patch("codeagent.swarm.kernel.subprocess.run", return_value=completed):
+            result = k.pull_remote("s1", "host-a")
+        assert result == []
+
+    def test_pull_handles_list_response(self, store):
+        k = _make_kernel_with_session(store)
+        k.register(
+            AgentLocation("w1", "host-a", "cli",
+                          return_mode=ReturnMode.MANAGER_PULL),
+            "s1",
+        )
+        from unittest.mock import patch
+
+        msg1 = {"msg_id": "m1", "session_id": "s1", "from": "w1", "to": "mgr",
+                "subject": "a", "body": "b", "kind": "REPORT", "created_at": "t1",
+                "run_id": "r1", "request_id": "req-1", "reply_to": "orig-1", "trace_id": "", "causation_id": ""}
+        msg2 = {"msg_id": "m2", "session_id": "s1", "from": "w1", "to": "mgr",
+                "subject": "c", "body": "d", "kind": "REPORT", "created_at": "t2",
+                "run_id": "r2", "request_id": "req-2", "reply_to": "orig-2", "trace_id": "", "causation_id": ""}
+        completed = MagicMock()
+        completed.returncode = 0
+        completed.stdout = __import__("json").dumps([msg1, msg2])
+        completed.stderr = ""
+        with patch("codeagent.swarm.kernel.subprocess.run", return_value=completed):
+            result = k.pull_remote("s1", "host-a")
+        assert len(result) == 2
+
+
+# ── ingest ─────────────────────────────────────────────────────────────
+
+
+class TestIngest:
+    """ingest: validate roster/ACL, append to history."""
+
+    def _valid_msg(self, msg_id="ingest-001", request_id="req-1"):
+        return {
+            "msg_id": msg_id,
+            "session_id": "s1",
+            "from": "w1",
+            "to": "mgr",
+            "subject": "result",
+            "body": "done",
+            "kind": "REPORT",
+            "created_at": "2026-01-01T00:00:00Z",
+            "run_id": "run-1",
+            "request_id": request_id,
+            "reply_to": "original-task-001",
+            "trace_id": "",
+            "causation_id": "",
+        }
+
+    def test_ingest_valid_message(self, store):
+        k = _make_kernel_with_session(store)
+        msg = self._valid_msg()
+        result = k.ingest("s1", [msg])
+        assert result == ["ingest-001"]
+        # Verify in history
+        history = store.read_history("s1")
+        assert len(history) == 1
+        assert history[0]["msg_id"] == "ingest-001"
+
+    def test_ingest_multiple_messages(self, store):
+        k = _make_kernel_with_session(store)
+        msgs = [self._valid_msg(f"m-{i}") for i in range(3)]
+        result = k.ingest("s1", msgs)
+        assert len(result) == 3
+        history = store.read_history("s1")
+        assert len(history) == 3
+
+    def test_ingest_skips_invalid_message(self, store):
+        k = _make_kernel_with_session(store)
+        bad_msg = {"msg_id": "bad"}  # missing required fields
+        result = k.ingest("s1", [bad_msg])
+        assert result == []
+        history = store.read_history("s1")
+        assert len(history) == 0
+
+    def test_ingest_skips_non_dict(self, store):
+        k = _make_kernel_with_session(store)
+        result = k.ingest("s1", ["not a dict", 42, None])
+        assert result == []
+
+    def test_ingest_skips_duplicate(self, store):
+        k = _make_kernel_with_session(store)
+        msg = self._valid_msg()
+        r1 = k.ingest("s1", [msg])
+        assert r1 == ["ingest-001"]
+        # Ingest same message again — duplicate msg_id
+        r2 = k.ingest("s1", [msg])
+        assert r2 == []  # skipped
+        history = store.read_history("s1")
+        assert len(history) == 1
+
+    def test_ingest_session_not_found(self, kernel):
+        with pytest.raises(ValueError, match="not found"):
+            kernel.ingest("ghost", [{}])
+
+    def test_ingest_persists_to_history_dir(self, store):
+        k = _make_kernel_with_session(store)
+        msg = self._valid_msg()
+        k.ingest("s1", [msg])
+        history_dir = store.session_dir("s1") / "history"
+        assert history_dir.exists()
+        assert (history_dir / "ingest-001.json").exists()
+
+
+# ── replay ─────────────────────────────────────────────────────────────
+
+
+class TestReplay:
+    """replay: filter history by request_id, return chronological."""
+
+    def _ingest_msgs(self, store, k, request_id, count=3):
+        """Helper: ingest count messages with the given request_id."""
+        msgs = []
+        for i in range(count):
+            msgs.append({
+                "msg_id": f"replay-{request_id}-{i:03d}",
+                "session_id": "s1",
+                "from": "w1",
+                "to": "mgr",
+                "subject": f"msg-{i}",
+                "body": f"body-{i}",
+                "kind": "REPORT",
+                "created_at": f"2026-01-01T00:00:{i:02d}Z",
+                "run_id": "run-1",
+                "request_id": request_id,
+                "reply_to": f"task-{i:03d}",
+                "trace_id": "",
+                "causation_id": "",
+            })
+        k.ingest("s1", msgs)
+
+    def test_replay_returns_matching_messages(self, store):
+        k = _make_kernel_with_session(store)
+        self._ingest_msgs(store, k, "req-1", 3)
+        self._ingest_msgs(store, k, "req-2", 2)
+        result = k.replay("s1", "req-1")
+        assert len(result) == 3
+        assert all(m["request_id"] == "req-1" for m in result)
+
+    def test_replay_chronological_order(self, store):
+        k = _make_kernel_with_session(store)
+        self._ingest_msgs(store, k, "req-1", 3)
+        result = k.replay("s1", "req-1")
+        timestamps = [m["created_at"] for m in result]
+        assert timestamps == sorted(timestamps)
+
+    def test_replay_empty_for_unknown_request(self, store):
+        k = _make_kernel_with_session(store)
+        self._ingest_msgs(store, k, "req-1", 3)
+        result = k.replay("s1", "nonexistent")
+        assert result == []
+
+    def test_replay_empty_history(self, store):
+        k = _make_kernel_with_session(store)
+        result = k.replay("s1", "req-1")
+        assert result == []
+
+    def test_replay_session_not_found(self, kernel):
+        with pytest.raises(ValueError, match="not found"):
+            kernel.replay("ghost", "req-1")
+
+    def test_replay_isolation_between_requests(self, store):
+        k = _make_kernel_with_session(store)
+        self._ingest_msgs(store, k, "req-a", 2)
+        self._ingest_msgs(store, k, "req-b", 4)
+        assert len(k.replay("s1", "req-a")) == 2
+        assert len(k.replay("s1", "req-b")) == 4
+
+    def test_replay_preserves_message_content(self, store):
+        k = _make_kernel_with_session(store)
+        msg = {
+            "msg_id": "content-check",
+            "session_id": "s1",
+            "from": "w1",
+            "to": "mgr",
+            "subject": "specific-subject",
+            "body": "specific-body",
+            "kind": "REPORT",
+            "created_at": "2026-06-15T12:00:00Z",
+            "run_id": "run-42",
+            "request_id": "req-42",
+            "reply_to": "task-001",
+            "trace_id": "trace-abc",
+            "causation_id": "",
+        }
+        k.ingest("s1", [msg])
+        result = k.replay("s1", "req-42")
+        assert len(result) == 1
+        assert result[0]["subject"] == "specific-subject"
+        assert result[0]["body"] == "specific-body"
+        assert result[0]["trace_id"] == "trace-abc"

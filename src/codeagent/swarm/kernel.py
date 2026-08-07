@@ -9,6 +9,7 @@ import fcntl
 import json
 import logging
 import os
+import subprocess
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Protocol
 from uuid import uuid4
@@ -850,3 +851,105 @@ class SwarmKernel:
 
     def get_location(self, session_id: str, agent_id: str) -> Optional[AgentLocation]:
         return self._routing.get((session_id, agent_id))
+
+    # ── Manager-pull: pull_remote / ingest / replay ─────────────────
+
+    def pull_remote(self, session_id: str, from_host: str) -> list[dict]:
+        """Pull messages from the Manager inbox on a remote worker host.
+
+        Finds agents registered with ``ReturnMode.MANAGER_PULL`` on
+        *from_host*, then SSHes to that host to read the Manager's
+        host-local inbox via ``codeagent mailbox read --host``.
+
+        Returns a list of claimed message dicts (may be empty).
+        """
+        session = self._require_session(session_id)
+
+        # Find manager-pull agents registered on from_host
+        pull_agents = [
+            aid for (sid, aid), loc in self._routing.items()
+            if sid == session_id
+            and loc.host_alias == from_host
+            and loc.return_mode == ReturnMode.MANAGER_PULL
+        ]
+        if not pull_agents:
+            return []
+
+        messages: list[dict] = []
+        for agent_id in pull_agents:
+            cmd = [
+                "codeagent", "mailbox", "read",
+                "--session", session_id,
+                "--agent", "manager",
+                "--owner", "manager",
+                "--host", from_host,
+                "--json",
+            ]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode != 0:
+                    log.warning(
+                        "pull_remote: mailbox read failed for agent=%s host=%s: %s",
+                        agent_id, from_host, result.stderr.strip(),
+                    )
+                    continue
+                raw = result.stdout.strip()
+                if not raw:
+                    continue
+                msg = json.loads(raw)
+                if isinstance(msg, dict):
+                    messages.append(msg)
+                elif isinstance(msg, list):
+                    messages.extend(msg)
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
+                log.warning(
+                    "pull_remote: error reading from agent=%s host=%s: %s",
+                    agent_id, from_host, exc,
+                )
+        return messages
+
+    def ingest(self, session_id: str, messages: list[dict]) -> list[str]:
+        """Validate and persist messages into canonical history.
+
+        Each message is validated against the session (roster/ACL via
+        ``validate_message``).  Valid messages are appended to the
+        session's canonical history (``history/<msg_id>.json``, O_EXCL
+        atomic).  Duplicates and invalid messages are silently skipped
+        with a warning log.
+
+        Returns the list of successfully persisted msg_ids.
+        """
+        self._require_session(session_id)
+        persisted: list[str] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                log.warning("ingest: skipping non-dict message: %s", type(msg).__name__)
+                continue
+            ok, reason = validate_message(msg, session_id)
+            if not ok:
+                log.warning("ingest: skipping invalid message: %s", reason)
+                continue
+            try:
+                self._store.append_history(session_id, msg)
+                persisted.append(msg["msg_id"])
+            except ValueError as exc:
+                # Duplicate msg_id or other store-level validation failure
+                log.warning("ingest: skipping message %s: %s",
+                            msg.get("msg_id", "?"), exc)
+        return persisted
+
+    def replay(self, session_id: str, request_id: str) -> list[dict]:
+        """Return history entries for *request_id* in chronological order.
+
+        Filters the canonical session history by ``request_id`` and
+        returns matching messages sorted oldest-first (``created_at``
+        ascending) so callers can reconstruct the request→response
+        timeline.
+        """
+        self._require_session(session_id)
+        history = self._store.read_history(session_id)
+        filtered = [m for m in history if m.get("request_id") == request_id]
+        filtered.sort(key=lambda m: (m.get("created_at", ""), m.get("msg_id", "")))
+        return filtered

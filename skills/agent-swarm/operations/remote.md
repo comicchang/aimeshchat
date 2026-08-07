@@ -478,3 +478,48 @@ codeagent mailbox finalize --session "$SID" --agent manager --msg-id <report-msg
 - **`local-omp-mcp` Worker (w-remote-analysis on H3)** bypasses the entire mailbox lifecycle — no `session-init`, no INIT, no REPORT. Tasks go via MCP tool calls.
 - **Host H1 and H2** each host two workers. Manager pulls once per host (mailbox returns one message at a time from the Manager inbox).
 - **No `send-keys`** at any point — all workers are remote; no shared tmux socket.
+
+## 9. Launcher Integration
+
+The Launcher is the programmatic entry point that bootstraps a remote session end-to-end: discover workers from the manifest, initialize each host, then run the manager-pull loop until completion.
+
+### Manifest → Host Discovery
+
+The launcher reads `SessionManifest` (`session.json`) to extract the full worker roster. Each entry carries `agent_id`, `host_alias`, `backend`, `execution_mode`, and `return_mode`. Workers are grouped by `host` for batched bootstrap. Only workers with `return_mode=manager-pull` participate in the pull loop; `direct` workers deliver REPORTs without host mediation.
+
+### Per-Host Bootstrap: session-init + INIT
+
+For each host, the launcher creates mailbox dirs then sends INIT to every `mailbox-worker`:
+
+```bash
+codeagent mailbox session-init --session "$SID" --manager manager \
+  --agents w-frontend,w-backend --host H1
+
+codeagent mailbox send --session "$SID" --from manager --to w-frontend \
+  --kind TASK --subject "INIT" --body '{"agent_id":"w-frontend","role":"..."}' --host H1
+
+# local-omp-mcp workers: launch omp-execd, no mailbox INIT
+ssh H2 "omp-execd --stdio --workspace /data/repo" &
+```
+
+The launcher polls `mailbox stats --host <H>` until each worker reports IDLE (archive > 0, inbox = 0) before dispatching tasks.
+
+### Manager-Pull Loop: pull_remote → ingest → replay
+
+Once workers are IDLE, the launcher enters a pull loop per `manager-pull` host. The kernel provides three methods:
+
+| Kernel method | CLI primitive | Purpose |
+|---|---|---|
+| `pull_remote(session_id, from_host)` | `mailbox read --host <H> --json` | Claim messages from Manager inbox on remote host |
+| `ingest(session_id, messages)` | *(file write)* | Validate + persist each msg to `<session>/history/<msg_id>.json` (O_EXCL, deduplicates) |
+| `replay(session_id, request_id)` | *(file read)* | Filter history by request_id, oldest-first |
+
+```bash
+# Pull: claim pending messages from remote Manager inbox
+codeagent mailbox read --session "$SID" --agent manager --owner manager --host H1 --json
+
+# Finalize after successful ingest
+codeagent mailbox finalize --session "$SID" --agent manager --msg-id <id> --owner manager --host H1
+```
+
+Each poll cycle: `pull_remote` per host → `ingest` all returned messages → `replay` to reconstruct ordered history for in-flight requests. **Loop exits** when all workers report `state=DONE` and no remote Manager inboxes have unprocessed messages.
