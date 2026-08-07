@@ -846,3 +846,144 @@ class MailboxStore:
             results.append(msg)
 
         return results
+
+
+# ── Request lifecycle ledger ────────────────────────────────────────────
+
+TERMINAL_STATES = frozenset({"DONE", "BLOCKED", "CANCELLED", "EXPIRED"})
+_NON_TERMINAL = frozenset({"DISPATCHED", "ACKED", "RUNNING"})
+
+
+class RequestLedger:
+    """Append-only per-request event ledger with terminal CAS.
+
+    Each ``(request_id, run_id)`` pair accumulates an event log in
+    ``<session_dir>/<agent_id>/events/<request_id>/events.jsonl``.
+    Exactly one terminal state (DONE, BLOCKED, CANCELLED, EXPIRED) may be
+    recorded — subsequent terminal writes are rejected (PROTOCOL_CONFLICT).
+    Non-terminal events are always appended.
+    """
+
+    def __init__(self, session_dir: Path, agent_id: str) -> None:
+        self._session_dir = session_dir
+        self._agent_id = agent_id
+
+    # -- internal paths ---------------------------------------------------
+
+    def _events_dir(self, request_id: str) -> Path:
+        """Directory holding the JSONL event log for *request_id*."""
+        return self._session_dir / self._agent_id / "events" / request_id
+
+    def _events_file(self, request_id: str) -> Path:
+        return self._events_dir(request_id) / "events.jsonl"
+
+    # -- public API -------------------------------------------------------
+
+    def record_event(
+        self, request_id: str, run_id: str, event: str, meta: dict
+    ) -> bool:
+        """Append *event* to the ledger for *(request_id, run_id)*.
+
+        Returns ``True`` when the event was appended.
+        Returns ``False`` (PROTOCOL_CONFLICT) when *event* is a terminal
+        state and a terminal has already been recorded for this pair.
+        Non-terminal events are **always** accepted.
+        """
+        if event in TERMINAL_STATES:
+            existing = self.get_terminal(request_id, run_id)
+            if existing is not None:
+                # CAS conflict — still append a PROTOCOL_CONFLICT marker
+                # so the ledger stays truly append-only, but signal failure.
+                self._append(request_id, run_id, "PROTOCOL_CONFLICT",
+                             {"frozen_event": event, "existing_terminal": existing})
+                return False
+
+        self._append(request_id, run_id, event, meta)
+        return True
+
+    def get_terminal(self, request_id: str, run_id: str) -> str | None:
+        """Return the first terminal state recorded, or ``None``."""
+        for entry in self._read_entries(request_id, run_id):
+            if entry["event"] in TERMINAL_STATES:
+                return entry["event"]
+        return None
+
+    def get_events(self, request_id: str, run_id: str) -> list[dict]:
+        """Return all events for *(request_id, run_id)*, newest last."""
+        return self._read_entries(request_id, run_id)
+
+    def find_stale(self, sla_seconds: int = 300) -> list[dict]:
+        """Return ACKED-but-not-terminal requests older than *sla_seconds*.
+
+        Each result dict contains at minimum ``request_id``, ``run_id``,
+        and ``acked_ts`` (the UNIX timestamp of the ACKED event).
+        """
+        now = time.time()
+        results: list[dict] = []
+        events_root = self._session_dir / self._agent_id / "events"
+        if not events_root.is_dir():
+            return results
+
+        for req_dir in sorted(events_root.iterdir()):
+            if not req_dir.is_dir():
+                continue
+            request_id = req_dir.name
+            entries = self._read_entries_all_runs(request_id)
+            for run_id, events in entries.items():
+                has_terminal = any(e["event"] in TERMINAL_STATES for e in events)
+                if has_terminal:
+                    continue
+                for e in events:
+                    if e["event"] == "ACKED" and (now - e["ts"]) > sla_seconds:
+                        results.append({
+                            "request_id": request_id,
+                            "run_id": run_id,
+                            "acked_ts": e["ts"],
+                        })
+                        break  # one entry per (request_id, run_id)
+        return results
+
+    # -- internals --------------------------------------------------------
+
+    def _append(self, request_id: str, run_id: str, event: str, meta: dict) -> None:
+        entry = {
+            "request_id": request_id,
+            "run_id": run_id,
+            "event": event,
+            "ts": time.time(),
+            "meta": meta,
+        }
+        d = self._events_dir(request_id)
+        d.mkdir(parents=True, exist_ok=True)
+        with open(self._events_file(request_id), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _read_entries(self, request_id: str, run_id: str) -> list[dict]:
+        """Read entries filtered to a specific run_id."""
+        return [
+            e for e in self._read_all(request_id)
+            if e.get("run_id") == run_id
+        ]
+
+    def _read_entries_all_runs(self, request_id: str) -> dict[str, list[dict]]:
+        """Group entries by run_id."""
+        by_run: dict[str, list[dict]] = {}
+        for e in self._read_all(request_id):
+            by_run.setdefault(e.get("run_id", ""), []).append(e)
+        return by_run
+
+    def _read_all(self, request_id: str) -> list[dict]:
+        """Read every line from the JSONL file for *request_id*."""
+        p = self._events_file(request_id)
+        if not p.exists():
+            return []
+        entries: list[dict] = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+        return entries
