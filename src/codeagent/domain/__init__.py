@@ -8,8 +8,23 @@ from pathlib import Path
 from typing import Optional
 
 from codeagent.constants import DEFAULT_EXEC_TIMEOUT
+from codeagent.domain.runtime import RunContext
 
 LOCAL_HOST_MARKER = "__local__"
+
+__all__ = [
+    "HostSpec",
+    "RepoEntry",
+    "TopicSpec",
+    "RepoMap",
+    "Target",
+    "RunRequest",
+    "RunResult",
+    "RunContext",
+    "SessionRecord",
+    "current_hostname",
+    "resolve_is_local",
+]
 
 
 @dataclass(frozen=True)

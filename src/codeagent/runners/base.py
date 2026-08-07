@@ -92,7 +92,10 @@ class BaseRunner(ABC):
             self._cleanup()
             return RunResult(returncode=1, stderr=str(exc))
 
-        return self._parse_output(proc_obj, request)
+        try:
+            return self._parse_output(proc_obj, request)
+        finally:
+            self._cleanup()
 
     def _cleanup(self) -> None:
         """Clean up temporary resources. Subclasses should override."""

@@ -14,10 +14,12 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 from codeagent.config.repo_map import load_repo_map
 from codeagent.domain import (
     HostSpec,
+    RunContext,
     RunRequest,
     RunResult,
     Target,
@@ -32,7 +34,7 @@ from codeagent.transport.ssh import SSHTransport
 from codeagent.swarm.kernel import SwarmKernel, LocalDeliverySink
 from codeagent.swarm.delivery import DeliveryEngine
 from codeagent.swarm.model import Address, AddressKind, AgentLocation, Envelope, ExecutionMode, ReturnMode
-from codeagent.mailbox.store import MailboxStore
+from codeagent.mailbox.store import MailboxStore, resolve_root
 
 log = logging.getLogger(__name__)
 
@@ -935,7 +937,7 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     return 0
 
 
-def _execute(request: RunRequest, target: Target, registry: SessionRegistry, repo_map=None) -> RunResult:
+def _execute(request: RunRequest, target: Target, registry: SessionRegistry, repo_map=None, run_context: Optional[RunContext] = None) -> RunResult:
     """Core execution: local → LocalTransport, remote → SSH/RelayTransport.
 
     Session lifecycle (all under per-key lock):
@@ -945,6 +947,9 @@ def _execute(request: RunRequest, target: Target, registry: SessionRegistry, rep
       4. Execute (transport receives real session_id)
       5. Mark observed/active/failed based on result
     """
+    if run_context is not None:
+        log.info("[oracle] run_context: review_key=%s run_id=%s swarm_session=%s",
+                 run_context.review_key, run_context.run_id, run_context.swarm_session_id)
     ns_key = request.session_key or registry.compute_key(request, target)
 
     def _run() -> RunResult:
@@ -1010,6 +1015,77 @@ def _execute(request: RunRequest, target: Target, registry: SessionRegistry, rep
     return result
 
 
+def _bootstrap_oracle_swarm(
+    request: RunRequest,
+    ns_key: str,
+) -> RunContext:
+    """Pre-spawn bootstrap for oracle: create RunContext, swarm session, and dispatch INIT.
+
+    Phase 1 of Oracle design: sets up the mailbox infrastructure so the
+    oracle agent has a persistent session before _execute runs.  Does NOT
+    call communicate/pump — that is Phase 2.
+
+    Returns a fully-populated RunContext.  Side effects:
+      - Creates swarm session dirs in mailbox root
+      - Registers oracle AgentLocation in kernel routing table
+      - Writes INIT envelope to oracle mailbox
+    """
+    run_id = uuid4().hex[:12]
+    request_id = uuid4().hex[:12]
+    sid = f"oracle-{ns_key}-{run_id}"
+
+    mailbox_root = resolve_root()
+    kernel, _store = _get_swarm_kernel(store_root=mailbox_root)
+
+    # Create session with manager + oracle roster
+    kernel.create_session(
+        session_id=sid,
+        manager_id="manager",
+        roster=["oracle"],
+    )
+
+    # Register oracle agent location
+    kernel.register(
+        AgentLocation(
+            agent_id="oracle",
+            host_alias="__local__",
+            backend="omp",
+            execution_mode=ExecutionMode.MAILBOX_WORKER,
+            return_mode=ReturnMode.BIDIRECTIONAL,
+            mailbox_root=str(mailbox_root),
+        ),
+        session_id=sid,
+    )
+
+    # Dispatch manager → oracle TASK/INIT envelope
+    kernel.direct(
+        session_id=sid,
+        sender="manager",
+        to_agent="oracle",
+        envelope=Envelope(
+            subject="oracle-init",
+            body=request.task,
+            kind="TASK",
+            run_id=run_id,
+            request_id=request_id,
+        ),
+    )
+
+    rc = RunContext(
+        review_key=ns_key,
+        generation=1,
+        run_id=run_id,
+        request_id=request_id,
+        swarm_session_id=sid,
+        mailbox_root=str(mailbox_root),
+    )
+    log.info(
+        "[oracle] bootstrap complete: sid=%s run_id=%s mailbox=%s",
+        sid, run_id, mailbox_root,
+    )
+    return rc
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     task = args.task or sys.stdin.read().strip()
     if not task:
@@ -1045,7 +1121,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
         repo_map = RepoMap(midocs_root=Path("."), hosts={}, topics={})
     registry = SessionRegistry()
     target = resolve_target(request, repo_map)
-    result = _execute(request, target, registry, repo_map)
+
+    # Oracle pre-spawn bootstrap: create RunContext + swarm session + INIT envelope
+    run_context: Optional[RunContext] = None
+    if request.agent == "oracle":
+        ns_key = request.session_key or registry.compute_key(request, target)
+        run_context = _bootstrap_oracle_swarm(request, ns_key)
+        # Oracle runs have no hard timeout — 8h default handled by RunContext.hard_deadline
+        request.timeout = 0
+
+    result = _execute(request, target, registry, repo_map, run_context=run_context)
 
     if result.stdout:
         print(result.stdout)

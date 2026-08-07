@@ -112,11 +112,23 @@ def resolve_agent_profile(agent_name: str) -> AgentProfile:
 class OMPRunner(BaseRunner):
     """Runs tasks through the local ``omp`` CLI."""
 
+    # Bounded visible-text buffer (last N assistant messages).
+    _MAX_VISIBLE_MESSAGES = 5
+
     def __init__(self, config: Optional[RunnerConfig] = None) -> None:
         super().__init__(config)
         if not self.config.binary:
             self.config.binary = _DEFAULT_BINARY
         self._identity_path: Optional[Path] = None
+        # Incremental JSONL parsing state (set per-run in run())
+        self._backend_session_id: Optional[str] = None
+        self._terminal_seen: bool = False
+        self._visible_texts: list[str] = []
+        self._run_result: Optional[RunResult] = None
+        self._run_context: Optional[object] = None
+        self._current_request: Optional[RunRequest] = None
+        # Session observer callback (set by caller via on_session kwarg or attribute)
+        self._on_session_observer: Optional[object] = None
 
     # ------------------------------------------------------------------
     # BaseRunner contract
@@ -169,7 +181,21 @@ class OMPRunner(BaseRunner):
 
         Oracle-class agents (park=true, auto-exit=false) get a 1-hour timeout
         instead of the default 10-minute ``DEFAULT_EXEC_TIMEOUT``.
+
+        Accepts an optional ``RunContext`` attached to *request* (as
+        ``request.run_context``) for injecting swarm mailbox env vars.
         """
+        # Store request so _extra_env can read RunContext (called from base)
+        self._current_request = request
+        # Reset incremental JSONL state for this run
+        self._backend_session_id = None
+        self._terminal_seen = False
+        self._visible_texts = []
+        self._run_result = None
+
+        # Extract RunContext if present (bootstrap provides it)
+        self._run_context = getattr(request, "run_context", None)
+
         # Resolve agent profile early for timeout + swarm session
         self._agent_profile: Optional[AgentProfile] = None
         if request.agent:
@@ -194,10 +220,82 @@ class OMPRunner(BaseRunner):
             self._ensure_swarm_session(request)
 
         try:
-            return super().run(request)
+            result = super().run(request)
+            # Attach incremental state to result
+            self._run_result = result
+            return result
         finally:
             if original_timeout is not None:
                 self.config.timeout = original_timeout
+            self._current_request = None
+
+    # ------------------------------------------------------------------
+    # Incremental JSONL parsing (streaming via _run_pump)
+    # ------------------------------------------------------------------
+
+    def _consume_line(self, channel: str, line: str) -> None:
+        """Incrementally parse OMP JSONL events from stdout.
+
+        Called by ``_run_pump`` on the main thread for every output line.
+        Filters noise (thinking, tool_calls, stderr) and collects:
+          - Session ID from ``{"type":"session","id":"..."}``
+          - Visible assistant text from ``{"type":"assistant","message_end":{...}}``
+          - Terminal signal from ``{"type":"agent_end"}``
+        """
+        if channel != "stdout":
+            return
+        line = line.strip()
+        if not line:
+            return
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return
+
+        msg_type = obj.get("type", "")
+
+        if msg_type == "session":
+            session_id = obj.get("id")
+            if session_id:
+                self._on_session(session_id)
+
+        elif msg_type == "assistant":
+            end = obj.get("message_end", {})
+            text = end.get("message")
+            if text:
+                # Bounded buffer — keep only the last N visible messages
+                self._visible_texts.append(text)
+                if len(self._visible_texts) > self._MAX_VISIBLE_MESSAGES:
+                    self._visible_texts = self._visible_texts[-self._MAX_VISIBLE_MESSAGES:]
+
+        elif msg_type == "agent_end":
+            self._terminal_seen = True
+            # DON'T stop reading — base pump continues until EOF.
+            # Terminal is a signal, not a stream terminator.
+
+        # All other types (thinking, tool_calls, error, etc.) are ignored.
+
+    def _on_session(self, backend_id: str) -> None:
+        """Handle a session-start event from the OMP JSONL stream.
+
+        Stores the backend session ID and propagates it to:
+          1. ``self._run_result.session_id`` (if a result object exists)
+          2. Any observer callback registered on this runner
+        """
+        self._backend_session_id = backend_id
+        LOG.info("OMP session started: %s", backend_id)
+
+        # Propagate to RunResult if already created
+        if self._run_result is not None:
+            self._run_result.session_id = backend_id
+
+        # Invoke observer callback if registered
+        observer = getattr(self, "_on_session_observer", None)
+        if observer is not None:
+            try:
+                observer(backend_id)
+            except Exception:
+                LOG.warning("on_session observer callback failed", exc_info=True)
 
     def _ensure_swarm_session(self, request: RunRequest) -> None:
         """Create a swarm session for oracle agents if ``SWARM_SESSION_ID`` is not set.
@@ -249,7 +347,7 @@ class OMPRunner(BaseRunner):
                 request.agent, exc_info=True,
             )
 
-    def _extra_env(self) -> Optional[dict[str, str]]:
+    def _extra_env(self, request: Optional[RunRequest] = None) -> Optional[dict[str, str]]:
         """Inject swarm mailbox identity for the OMP plugin (Oracle P1-3).
 
         The plugin reads OMP_MAILBOX_SESSION_ID / OMP_MAILBOX_AGENT_ID at
@@ -258,11 +356,57 @@ class OMPRunner(BaseRunner):
         here so the plugin activates without the agent hand-writing an
         identity file.
 
+        If *request* carries a ``run_context`` (a :class:`RunContext` from
+        the bootstrap dispatcher), its fields take precedence for setting
+        ``SWARM_SESSION_ID``, ``OMP_WORKER_ID``, ``MAILBOX_ROOT``, and
+        ``OMP_MAILBOX_IDENTITY_FILE``.
+
         Env vars (checked in precedence order):
+            RunContext fields  — highest priority (bootstrap provides them).
             SWARM_SESSION_ID  — canonical; set by swarm dispatcher.
             OMP_SESSION_ID    — alias; used when SWARM_SESSION_ID is absent.
         """
+        # Fall back to stored request from run() if not passed explicitly
+        if request is None:
+            request = getattr(self, "_current_request", None)
 
+        # ── RunContext injection (Phase 2b) ────────────────────────────
+        run_ctx = getattr(self, "_run_context", None)
+        if run_ctx is None and request is not None:
+            run_ctx = getattr(request, "run_context", None)
+
+        if run_ctx is not None:
+            swarm_sid = getattr(run_ctx, "swarm_session_id", "") or ""
+            if swarm_sid:
+                worker_id = getattr(run_ctx, "mailbox_agent_id", "") or "oracle"
+                mailbox_root = getattr(run_ctx, "mailbox_root", "") or ""
+
+                # Generate identity file
+                token = f"{int(_time.time())}_{secrets.token_hex(4)}"
+                identity_dir = Path.home() / ".omp" / "mailbox-identity"
+                identity_dir.mkdir(parents=True, exist_ok=True)
+                identity_path = identity_dir / f"{token}.json"
+                nonce = secrets.token_hex(8)
+                identity_path.write_text(json.dumps({
+                    "session_id": swarm_sid,
+                    "worker_id": worker_id,
+                    "owner_pid": os.getpid(),
+                    "nonce": nonce,
+                }))
+                self._identity_path = identity_path
+
+                return {
+                    "SWARM_SESSION_ID": swarm_sid,
+                    "OMP_SESSION_ID": swarm_sid,
+                    "OMP_WORKER_ID": worker_id,
+                    "MAILBOX_ROOT": mailbox_root,
+                    "OMP_MAILBOX_SESSION_ID": swarm_sid,
+                    "OMP_MAILBOX_AGENT_ID": worker_id,
+                    "OMP_MAILBOX_IDENTITY_FILE": str(identity_path),
+                    "OMP_MAILBOX_NONCE": nonce,
+                }
+
+        # ── Fallback: env-var based (existing behavior) ────────────────
         # Accept both SWARM_SESSION_ID (canonical) and OMP_SESSION_ID (alias).
         # SWARM_SESSION_ID takes precedence when both are set.
         swarm_sid = os.environ.get("SWARM_SESSION_ID") or os.environ.get("OMP_SESSION_ID")
@@ -305,6 +449,8 @@ class OMPRunner(BaseRunner):
             stdout=proc.stdout,
             stderr=proc.stderr,
         )
+        # Store reference so _on_session can update it during streaming
+        self._run_result = result
 
         # Clean up prompt file
         self._cleanup_prompt_file()
@@ -312,33 +458,39 @@ class OMPRunner(BaseRunner):
         if proc.returncode != 0:
             return result
 
-        # Parse JSONL output
-        session_id: Optional[str] = None
+        # Use incremental state from _consume_line as primary source.
+        # Falls back to full re-parse if _consume_line didn't fire
+        # (e.g., future base runner changes).
+        session_id = self._backend_session_id
         final_message: Optional[str] = None
 
-        for line in proc.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        if self._visible_texts:
+            # Incremental buffer has the last N messages — use the last one
+            final_message = self._visible_texts[-1]
+        else:
+            # Fallback: re-parse stdout (original behavior)
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
 
-            msg_type = msg.get("type", "")
+                msg_type = msg.get("type", "")
 
-            if msg_type == "session":
-                session_id = msg.get("id")
+                if msg_type == "session" and not session_id:
+                    session_id = msg.get("id")
 
-            elif msg_type == "assistant":
-                end = msg.get("message_end", {})
-                text = end.get("message")
-                if text:
-                    final_message = text
+                elif msg_type == "assistant":
+                    end = msg.get("message_end", {})
+                    text = end.get("message")
+                    if text:
+                        final_message = text
 
-            elif msg_type == "agent_end":
-                # Terminal signal — everything after is noise
-                break
+                elif msg_type == "agent_end":
+                    break
 
         result.session_id = session_id
         if final_message is not None:
