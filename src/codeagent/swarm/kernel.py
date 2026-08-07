@@ -865,12 +865,22 @@ class SwarmKernel:
         """
         session = self._require_session(session_id)
 
-        # Find manager-pull agents registered on from_host
+        # Find manager-pull agents registered on from_host.
+        # Fallback: when loc.return_mode is unset (CLI register),
+        # check session.return_modes dict (set at session creation
+        # or via --return-mode arg).
         pull_agents = [
             aid for (sid, aid), loc in self._routing.items()
             if sid == session_id
             and loc.host_alias == from_host
-            and loc.return_mode == ReturnMode.MANAGER_PULL
+            and (
+                loc.return_mode == ReturnMode.MANAGER_PULL
+                or (
+                    loc.return_mode is None
+                    and session.return_modes.get(aid)
+                    == ReturnMode.MANAGER_PULL.value
+                )
+            )
         ]
         if not pull_agents:
             return []

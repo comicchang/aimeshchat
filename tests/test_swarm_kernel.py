@@ -1031,6 +1031,59 @@ class TestPullRemote:
             result = k.pull_remote("s1", "host-a")
         assert len(result) == 2
 
+    def test_pull_remote_falls_back_to_session_return_modes(self, store):
+        """When loc.return_mode is None (CLI register without --return-mode),
+        pull_remote should fall back to session.return_modes dict."""
+        k = SwarmKernel(store=store)
+        acl = ACL(
+            authority="mgr",
+            allowed_senders=["mgr", "w1"],
+            room_members=["mgr", "w1"],
+            policy="open",
+        )
+        # Session created with return_modes mapping
+        k.create_session("s1", "mgr", ["w1"], acl=acl,
+                         return_modes={"w1": "manager-pull"})
+        # Register agent without explicit return_mode (simulates CLI register)
+        k.register(
+            AgentLocation("w1", "host-a", "cli"),  # return_mode=None
+            "s1",
+        )
+        # Verify loc.return_mode is indeed None
+        loc = k.get_location("s1", "w1")
+        assert loc is not None
+        assert loc.return_mode is None
+
+        # Session.return_modes should have the mapping
+        session = k.get_session("s1")
+        assert session is not None
+        assert session.return_modes.get("w1") == "manager-pull"
+
+        from unittest.mock import patch
+        fake_msg = {
+            "msg_id": "fallback-001",
+            "session_id": "s1",
+            "from": "w1",
+            "to": "manager",
+            "subject": "report",
+            "body": "done",
+            "kind": "REPORT",
+            "created_at": "2026-01-01T00:00:00Z",
+            "run_id": "run-1",
+            "request_id": "req-1",
+            "reply_to": "",
+            "trace_id": "",
+            "causation_id": "",
+        }
+        completed = MagicMock()
+        completed.returncode = 0
+        completed.stdout = __import__("json").dumps(fake_msg)
+        completed.stderr = ""
+        with patch("codeagent.swarm.kernel.subprocess.run", return_value=completed):
+            result = k.pull_remote("s1", "host-a")
+        assert len(result) == 1
+        assert result[0]["msg_id"] == "fallback-001"
+
 
 # ── ingest ─────────────────────────────────────────────────────────────
 

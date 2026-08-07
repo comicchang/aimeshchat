@@ -400,7 +400,8 @@ class TestChannel:
     def test_channel_not_found(self):
         _setup_full("ch-nf", "mgr", "w1")
         rc, _, err = _run(["swarm", "channel", "ch-nf", "ghost-ch",
-                           "--from", "mgr", "--body", "x"])
+                           "--from", "mgr", "--body", "x",
+                           "--run-id", "r1", "--request-id", "req1"])
         assert rc == 1
         assert "channel not found" in err
 

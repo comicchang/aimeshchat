@@ -31,7 +31,7 @@ from codeagent.transport.router import TransportRouter
 from codeagent.transport.ssh import SSHTransport
 from codeagent.swarm.kernel import SwarmKernel, LocalDeliverySink
 from codeagent.swarm.delivery import DeliveryEngine
-from codeagent.swarm.model import Address, AddressKind, AgentLocation, Envelope
+from codeagent.swarm.model import Address, AddressKind, AgentLocation, Envelope, ExecutionMode, ReturnMode
 from codeagent.mailbox.store import MailboxStore
 
 log = logging.getLogger(__name__)
@@ -194,6 +194,14 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     reg_p.add_argument("--backend", default="cli", choices=["cli", "omp", "tmux"])
     reg_p.add_argument("--card", default="",
                        help="P2: agent_card JSON {display_name,description,agent_version,capabilities[]}")
+    reg_p.add_argument("--execution-mode", default=None,
+                       choices=["mailbox-worker", "local-omp-mcp"],
+                       help="How this agent is executed")
+    reg_p.add_argument("--return-mode", default=None,
+                       choices=["manager-pull", "bidirectional"],
+                       help="How results flow back from worker to manager")
+    reg_p.add_argument("--mailbox-root", default="",
+                       help="Root path for agent mailbox storage")
 
     # whoami
     who_p = swarm_sub.add_parser("whoami", help="Show this agent's identity + agent card")
@@ -422,10 +430,15 @@ def _swarm_create_session(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
 
 def _swarm_register(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    exec_mode = ExecutionMode(args.execution_mode) if args.execution_mode else None
+    ret_mode = ReturnMode(args.return_mode) if args.return_mode else None
     loc = AgentLocation(
         agent_id=args.agent,
         host_alias=args.host,
         backend=args.backend,
+        execution_mode=exec_mode,
+        return_mode=ret_mode,
+        mailbox_root=args.mailbox_root,
     )
     reg = kernel.register(loc, args.session_id)
     if args.card:
@@ -435,12 +448,19 @@ def _swarm_register(kernel: SwarmKernel, args: argparse.Namespace) -> int:
             print(f"error: invalid --card JSON: {exc}", file=sys.stderr)
             return 1
         kernel.set_agent_card(args.session_id, args.agent, card)
-    print(json.dumps({
+    out: dict = {
         "agent_id": reg.agent_id,
         "session_id": reg.session_id,
         "host_alias": reg.location.host_alias,
         "backend": reg.location.backend,
-    }, indent=2))
+    }
+    if exec_mode:
+        out["execution_mode"] = exec_mode.value
+    if ret_mode:
+        out["return_mode"] = ret_mode.value
+    if args.mailbox_root:
+        out["mailbox_root"] = args.mailbox_root
+    print(json.dumps(out, indent=2))
     return 0
 
 
@@ -509,34 +529,35 @@ def _swarm_direct(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
 def _swarm_channel(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     kind = args.kind.upper()
-    if _require_kind_correlation(kind, getattr(args, 'run_id', ''), getattr(args, 'request_id', ''), getattr(args, 'reply_to', '')):
+    if _require_kind_correlation(kind, args.run_id, args.request_id, args.reply_to):
         return 1
     attachments = _parse_attachments(args.attachment) if args.attachment else []
-    env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments)
+    env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments,
+                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id)
     receipts = kernel.channel(args.session_id, args.sender, args.channel_id, env)
     out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
     print(json.dumps(out, indent=2))
     return 0
-_swarm_channel
 
 
 def _swarm_broadcast(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     kind = args.kind.upper()
-    if _require_kind_correlation(kind, getattr(args, 'run_id', ''), getattr(args, 'request_id', ''), getattr(args, 'reply_to', '')):
+    if _require_kind_correlation(kind, args.run_id, args.request_id, args.reply_to):
         return 1
-    env = Envelope(subject=args.subject, body=args.body, kind=args.kind)
+    env = Envelope(subject=args.subject, body=args.body, kind=args.kind,
+                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id)
     receipts = kernel.broadcast(args.session_id, args.sender, env)
     out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
     print(json.dumps(out, indent=2))
     return 0
-_swarm_broadcast
 
 
 def _swarm_notice(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     kind = args.kind.upper()
-    if _require_kind_correlation(kind, getattr(args, 'run_id', ''), getattr(args, 'request_id', ''), getattr(args, 'reply_to', '')):
+    if _require_kind_correlation(kind, args.run_id, args.request_id, args.reply_to):
         return 1
-    env = Envelope(subject=args.subject, body=args.body, kind=args.kind)
+    env = Envelope(subject=args.subject, body=args.body, kind=args.kind,
+                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id)
     receipts = kernel.notice(args.session_id, args.sender, args.topic, env, ttl=args.ttl)
     out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
     print(json.dumps(out, indent=2))

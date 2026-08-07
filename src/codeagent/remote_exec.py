@@ -270,12 +270,18 @@ def _dispatch_mailbox_direct(args: list[str], mailbox_root: str | None = None) -
             out = "\n".join(lines)
         else:
             raise _DirectUnsupported(f"unmapped subcommand: {cmd}")
-    except ValueError as e:
+    except (ValueError, KeyError, TypeError) as e:
+        # P2 (oracle-lite): terminal error → exit 2 (schema/validation/roster —
+        # retry is pointless).  Matches cli.py which sys.exit(2) for ValueError.
+        # DeliveryEngine._is_terminal_error recognizes "exit 2" and dead-letters.
+        # KeyError covers missing required fields (e.g. AttachmentRef.from_dict);
+        # TypeError covers wrong payload shapes.
         err = str(e) + "\n"
-        exit_code = 1
+        exit_code = 2
     except _DirectUnsupported:
         raise
     except Exception as e:
+        # exit 1 = retryable (transient/environment errors, retry may succeed)
         err = f"error: {e}\n"
         exit_code = 1
 

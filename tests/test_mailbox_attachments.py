@@ -420,5 +420,5 @@ class TestRemoteExecAttachmentForwarding:
              "--attachment", json.dumps(bad)],
             mailbox_root=str(store.root),
         )
-        assert exit_code == 1
+        assert exit_code == 2  # ValueError → terminal (matches cli.py sys.exit(2))
         assert "sha256" in err

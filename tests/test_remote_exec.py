@@ -211,7 +211,7 @@ class TestHandleMailbox:
         assert msg["stdout"] == "cleared 5"
 
     def test_direct_error_returns_stderr(self, capsys):
-        """ValueError from MailboxStore propagates as stderr + exit_code=1."""
+        """MailboxStore error propagates as stderr + exit_code (forwarded from dispatch)."""
         with patch(
             "codeagent.remote_exec._dispatch_mailbox_direct",
             return_value=("", "session not found: s1\n", 1),
