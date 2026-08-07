@@ -917,14 +917,14 @@ class SwarmKernel:
                     continue
                 msg = json.loads(raw)
                 if isinstance(msg, dict):
+                    msg["_pull_host"] = from_host
+                    msg["_pull_mailbox_root"] = agent_mailbox_root
                     messages.append(msg)
-                    self._finalize_remote(from_host, session_id, manager_id, msg,
-                                          mailbox_root=agent_mailbox_root)
                 elif isinstance(msg, list):
-                    messages.extend(msg)
                     for m in msg:
-                        self._finalize_remote(from_host, session_id, manager_id, m,
-                                              mailbox_root=agent_mailbox_root)
+                        m["_pull_host"] = from_host
+                        m["_pull_mailbox_root"] = agent_mailbox_root
+                    messages.extend(msg)
             except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
                 log.warning(
                     "pull_remote: error reading from agent=%s host=%s: %s",
@@ -932,9 +932,9 @@ class SwarmKernel:
                 )
         return messages
 
-    def _finalize_remote(self, from_host: str, session_id: str,
-                         manager_id: str, msg: dict,
-                         mailbox_root: str = "") -> None:
+    def finalize_remote(self, from_host: str, session_id: str,
+                        manager_id: str, msg: dict,
+                        mailbox_root: str = "") -> None:
         """Finalize a message on the remote mailbox after successful read."""
         msg_id = msg.get("msg_id", "")
         if not msg_id:
@@ -963,6 +963,22 @@ class SwarmKernel:
                 "pull_remote: finalize error for msg=%s host=%s: %s",
                 msg_id, from_host, exc,
             )
+
+    def release_remote(self, session_id: str, msg_id: str, from_host: str,
+                       manager_id: str, mailbox_root: str = "") -> bool:
+        """Release message back to remote inbox (on ingest/ACL failure)."""
+        cmd = ["codeagent", "mailbox", "release",
+               "--host", from_host, "--session", session_id,
+               "--agent", manager_id, "--owner", manager_id,
+               "--msg-id", msg_id]
+        if mailbox_root:
+            cmd.insert(1, "--mailbox-root")
+            cmd.insert(2, mailbox_root)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return r.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
 
     def ingest(self, session_id: str, messages: list[dict]) -> list[str]:
         """Validate and persist messages into canonical history.

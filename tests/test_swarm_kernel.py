@@ -979,25 +979,20 @@ class TestPullRemote:
         read_result.returncode = 0
         read_result.stdout = __import__("json").dumps(fake_msg)
         read_result.stderr = ""
-        finalize_result = MagicMock()
-        finalize_result.returncode = 0
-        finalize_result.stdout = ""
-        finalize_result.stderr = ""
         with patch("codeagent.swarm.kernel.subprocess.run",
-                    side_effect=[read_result, finalize_result]) as mock_run:
+                    return_value=read_result) as mock_run:
             result = k.pull_remote("s1", "host-a")
         assert len(result) == 1
         assert result[0]["msg_id"] == "remote-001"
-        # Verify the SSH command structure (first call = read)
+        # Verify annotations for caller-side finalize
+        assert result[0]["_pull_host"] == "host-a"
+        assert "_pull_mailbox_root" in result[0]
+        # Verify the SSH command structure (single call = read)
         read_args = mock_run.call_args_list[0][0][0]
         assert "mailbox" in read_args
         assert "read" in read_args
         assert "--host" in read_args
         assert "host-a" in read_args
-        # Verify finalize was called
-        finalize_args = mock_run.call_args_list[1][0][0]
-        assert "finalize" in finalize_args
-        assert "--msg-id" in finalize_args
 
     def test_pull_skips_failed_command(self, store):
         k = _make_kernel_with_session(store)
@@ -1039,6 +1034,11 @@ class TestPullRemote:
         with patch("codeagent.swarm.kernel.subprocess.run", return_value=completed):
             result = k.pull_remote("s1", "host-a")
         assert len(result) == 2
+        # Verify annotations for caller-side finalize
+        assert result[0]["_pull_host"] == "host-a"
+        assert result[1]["_pull_host"] == "host-a"
+        assert "_pull_mailbox_root" in result[0]
+        assert "_pull_mailbox_root" in result[1]
 
     def test_pull_remote_falls_back_to_session_return_modes(self, store):
         """When loc.return_mode is None (CLI register without --return-mode),
@@ -1092,6 +1092,9 @@ class TestPullRemote:
             result = k.pull_remote("s1", "host-a")
         assert len(result) == 1
         assert result[0]["msg_id"] == "fallback-001"
+        # Verify annotations for caller-side finalize
+        assert result[0]["_pull_host"] == "host-a"
+        assert "_pull_mailbox_root" in result[0]
 
 
 # ── ingest ─────────────────────────────────────────────────────────────

@@ -887,9 +887,21 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
             messages = []
             for host in remote_hosts:
                 messages.extend(kernel.pull_remote(args.session_id, host))
-                persisted = kernel.ingest(args.session_id, messages)
-                if persisted:
-                    print(f"ingested {len(persisted)} message(s)", file=sys.stderr)
+            persisted_ids = set(kernel.ingest(args.session_id, messages))
+            if persisted_ids:
+                print(f"ingested {len(persisted_ids)} message(s)", file=sys.stderr)
+
+            # finalize/release each pulled message based on ingest outcome
+            for msg in messages:
+                mid = msg.get("msg_id", "")
+                pull_host = msg.get("_pull_host", "")
+                pull_root = msg.get("_pull_mailbox_root", "")
+                if mid in persisted_ids:
+                    kernel.finalize_remote(pull_host, args.session_id,
+                                           manager, msg, pull_root)
+                else:
+                    kernel.release_remote(args.session_id, mid,
+                                          pull_host, manager, pull_root)
         except (ValueError, OSError) as exc:
             log.debug("launch pull_remote/ingest error: %s", exc)
 
