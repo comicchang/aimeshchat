@@ -1030,10 +1030,10 @@ def _bootstrap_oracle_swarm(
       - Registers oracle AgentLocation in kernel routing table
       - Writes INIT envelope to oracle mailbox
     """
-    run_id = uuid4().hex[:12]
+    run_id = uuid4().hex[:10]
     request_id = uuid4().hex[:12]
-    sid = f"oracle-{ns_key}-{run_id}"
-
+    safe_key = ns_key.replace(":", "-")[-12:]
+    sid = f"ora-{safe_key}-{run_id}"
     mailbox_root = resolve_root()
     kernel, _store = _get_swarm_kernel(store_root=mailbox_root)
 
@@ -1127,9 +1127,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if request.agent == "oracle":
         ns_key = request.session_key or registry.compute_key(request, target)
         run_context = _bootstrap_oracle_swarm(request, ns_key)
-        # Oracle runs have no hard timeout — 8h default handled by RunContext.hard_deadline
-        request.timeout = 0
-
+        # Timeout handled by OMPRunner._ORACLE_TIMEOUT (3600s) — don't override here
     result = _execute(request, target, registry, repo_map, run_context=run_context)
 
     if result.stdout:
