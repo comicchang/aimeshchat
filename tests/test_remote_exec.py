@@ -84,7 +84,7 @@ class TestHandleCapabilities:
         _handle_capabilities({})
         msg = json.loads(capsys.readouterr().out)
         assert msg["type"] == "capabilities"
-        assert "opencode" in msg["backends"]
+        assert "omp" in msg["backends"]
         assert "resume" in msg["features"]
 
 
@@ -108,7 +108,7 @@ class TestHandleRun:
     def test_run_default_backend(self, fake_runner, tmp_path, capsys):
         runner = fake_runner()
         with (
-            patch("codeagent.remote_exec.GoWrapperRunner", return_value=runner),
+            patch("codeagent.remote_exec.OMPRunner", return_value=runner),
         ):
             _handle_run({"task": "t", "workdir": str(tmp_path)})
         lines = [json.loads(l) for l in capsys.readouterr().out.splitlines()]
@@ -141,7 +141,7 @@ class TestHandleRun:
             captured["timeout"] = config.timeout
             return runner
 
-        with patch("codeagent.remote_exec.GoWrapperRunner", side_effect=_capture):
+        with patch("codeagent.remote_exec.OMPRunner", side_effect=_capture):
             _handle_run({"task": "t", "workdir": str(tmp_path)})
         assert captured["timeout"] == DEFAULT_EXEC_TIMEOUT
 
@@ -312,7 +312,7 @@ class TestMainLoop:
         runner.run.return_value = RunResult(returncode=0, stdout="ok", stderr="", session_id=None)
 
         with (
-            patch("codeagent.remote_exec.GoWrapperRunner", return_value=runner),
+            patch("codeagent.remote_exec.OMPRunner", return_value=runner),
             patch("codeagent.remote_exec._dispatch_mailbox_direct",
                   return_value=("ok", "", 0)),
         ):

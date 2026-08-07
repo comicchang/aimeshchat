@@ -597,30 +597,6 @@ class TestRemoteExecMain:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# remote_exec — _run_go_wrapper tempfile safety
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestRunGoWrapperTempfile:
-    def test_uses_named_tempfile_not_mktemp(self):
-        """Verify the source uses NamedTemporaryFile, not mktemp."""
-        src = Path(__file__).resolve().parents[1] / "src" / "codeagent" / "runners" / "go_wrapper.py"
-        code = src.read_text()
-        # mktemp should NOT appear (was the bug)
-        assert "mktemp" not in code, "go_wrapper.py still uses unsafe mktemp()"
-        # NamedTemporaryFile should appear
-        assert "NamedTemporaryFile" in code
-
-    def test_output_file_always_cleaned(self):
-        """Verify output_file cleanup happens in _cleanup."""
-        src = Path(__file__).resolve().parents[1] / "src" / "codeagent" / "runners" / "go_wrapper.py"
-        code = src.read_text()
-        # _cleanup should handle output file deletion
-        assert "_cleanup" in code
-        assert "_output_file" in code
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # remote_exec — _run_omp json.dumps fix
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -662,7 +638,6 @@ class TestProcessGroupIsolation:
         src = Path(__file__).resolve().parents[1] / "src" / "codeagent" / "remote_exec.py"
         code = src.read_text()
         # Should import runners
-        assert "GoWrapperRunner" in code
         assert "OMPRunner" in code
         # Should NOT have raw subprocess handling
         assert "_run_go_wrapper" not in code

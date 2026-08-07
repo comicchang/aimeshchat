@@ -1,4 +1,4 @@
-"""Tests for the runner layer — GoWrapperRunner and OMPRunner."""
+"""Tests for the runner layer — OMPRunner."""
 from __future__ import annotations
 
 import json
@@ -13,8 +13,7 @@ import pytest
 
 from codeagent.domain import RunRequest, RunResult
 from codeagent.runners.base import BaseRunner, RunnerConfig
-from codeagent.runners.go_wrapper import GoWrapperRunner
-from codeagent.runners.omp import OMPRunner
+from codeagent.runners.omp import OMPRunner, AgentProfile, resolve_agent_profile
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -36,341 +35,7 @@ def _completed(
 
 
 # ── GoWrapperRunner ─────────────────────────────────────────────────────
-
-
-class TestGoWrapperRunner:
-    """Tests for GoWrapperRunner._build_cmd and _parse_output."""
-
-    def _runner(self, **config_kw) -> GoWrapperRunner:
-        return GoWrapperRunner(config=RunnerConfig(**config_kw))
-
-    # -- binary resolution ------------------------------------------------
-
-    def test_binary_from_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("CODEAGENT_WRAPPER_BIN", "/custom/wrapper")
-        monkeypatch.delenv("MAILBOX_ROOT", raising=False)
-        r = GoWrapperRunner()
-        assert r.config.binary == "/custom/wrapper"
-
-    def test_binary_from_which(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("CODEAGENT_WRAPPER_BIN", raising=False)
-        monkeypatch.setattr(
-            "codeagent.runners.go_wrapper.shutil.which",
-            lambda x: "/usr/local/bin/codeagent-wrapper" if x == "codeagent-wrapper" else None,
-        )
-        r = GoWrapperRunner()
-        assert r.config.binary == "/usr/local/bin/codeagent-wrapper"
-
-    def test_binary_fallback_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("CODEAGENT_WRAPPER_BIN", raising=False)
-        monkeypatch.setattr(
-            "codeagent.runners.go_wrapper.shutil.which",
-            lambda x: None,
-        )
-        r = GoWrapperRunner()
-        assert r.config.binary.endswith("codeagent-wrapper")
-        assert "~" not in r.config.binary  # must be expanded
-
-    def test_explicit_binary_overrides_all(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("CODEAGENT_WRAPPER_BIN", "/should/not/use")
-        r = self._runner(binary="/explicit/bin")
-        assert r.config.binary == "/explicit/bin"
-
-    # -- _build_cmd -------------------------------------------------------
-
-    def test_basic_cmd(self, tmp_path: Path) -> None:
-        r = self._runner(binary="/usr/local/bin/wrapper")
-        req = RunRequest(task="fix the bug", workdir="/src")
-        cmd = r._build_cmd(req)
-        assert cmd[0] == "/usr/local/bin/wrapper"
-        assert "--skip-permissions" in cmd
-        assert "fix the bug" in cmd
-        assert "/src" in cmd
-
-    def test_resume_cmd(self) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(task="continue", resume_session_id="backend-sess-42")
-        cmd = r._build_cmd(req)
-        assert cmd[1] == "resume"
-        assert "backend-sess-42" in cmd
-        # session_key (namespace) should NOT be used
-        assert req.session_key is None
-
-    def test_resume_uses_session_id_not_session_key(self) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(
-            task="continue",
-            session_key="namespace-key",
-            resume_session_id="backend-id-99",
-        )
-        cmd = r._build_cmd(req)
-        assert "backend-id-99" in cmd
-        assert "namespace-key" not in cmd
-
-    def test_new_session_overrides_resume(self) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(task="start fresh", resume_session_id="backend-sess-42", new_session=True)
-        cmd = r._build_cmd(req)
-        # "resume" should NOT appear when new_session=True
-        assert "resume" not in cmd
-
-    def test_backend_flag(self) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(task="do it", backend="claude")
-        cmd = r._build_cmd(req)
-        assert "--backend" in cmd
-        idx = cmd.index("--backend")
-        assert cmd[idx + 1] == "claude"
-
-    def test_agent_flag(self) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(task="do it", agent="coder")
-        cmd = r._build_cmd(req)
-        assert "--agent" in cmd
-        assert cmd[cmd.index("--agent") + 1] == "coder"
-
-    def test_model_flag(self) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(task="do it", model="opus")
-        cmd = r._build_cmd(req)
-        assert "--model" in cmd
-        assert cmd[cmd.index("--model") + 1] == "opus"
-
-    def test_skills_flag(self) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(task="do it", skills="refactor,test")
-        cmd = r._build_cmd(req)
-        assert "--skills" in cmd
-        assert cmd[cmd.index("--skills") + 1] == "refactor,test"
-
-    def test_output_file_created(self, tmp_path: Path) -> None:
-        r = self._runner(binary="/usr/bin/wrapper", output_dir=tmp_path)
-        req = RunRequest(task="do it")
-        cmd = r._build_cmd(req)
-        assert "--output" in cmd
-        idx = cmd.index("--output")
-        output_path = Path(cmd[idx + 1])
-        assert output_path.parent == tmp_path
-
-    def test_no_workdir_omitted(self) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        req = RunRequest(task="do it", workdir="")
-        cmd = r._build_cmd(req)
-        # task is the last positional
-        assert cmd[-1] == "do it"
-        # workdir should not be appended
-        assert cmd.count("do it") == 1
-
-    # -- _parse_output ----------------------------------------------------
-
-    def test_parse_json_output(self, tmp_path: Path) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        # Simulate the output file
-        out_file = tmp_path / "go_out_123.json"
-        out_file.write_text(
-            json.dumps(
-                {
-                    "session_id": "sess-42",
-                    "task_id": "task-1",
-                    "pid": 9999,
-                    "backend": "claude",
-                    "status": "ok",
-                    "error": "",
-                }
-            )
-        )
-        r._output_file = out_file
-
-        proc = _completed(returncode=0, stdout="done", stderr="")
-        result = r._parse_output(proc, RunRequest(task="x"))
-        assert result.session_id == "sess-42"
-        assert result.backend == "claude"
-        assert result.returncode == 0
-
-    def test_parse_stderr_fallback(self) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        # No output file
-        r._output_file = Path("/nonexistent")
-
-        stderr = "SESSION_ID: sess-99\nSelected backend: codex\n"
-        proc = _completed(returncode=0, stdout="output", stderr=stderr)
-        result = r._parse_output(proc, RunRequest(task="x"))
-        assert result.session_id == "sess-99"
-        assert result.backend == "codex"
-
-    def test_parse_error_status(self, tmp_path: Path) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        out_file = tmp_path / "go_out_err.json"
-        out_file.write_text(
-            json.dumps(
-                {
-                    "session_id": "sess-err",
-                    "backend": "claude",
-                    "status": "error",
-                    "error": "backend crashed",
-                }
-            )
-        )
-        r._output_file = out_file
-
-        proc = _completed(returncode=1, stdout="", stderr="")
-        result = r._parse_output(proc, RunRequest(task="x"))
-        assert result.returncode == 1
-        assert result.stderr == "backend crashed"
-
-    def test_parse_malformed_json_ignored(self, tmp_path: Path) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        out_file = tmp_path / "go_out_bad.json"
-        out_file.write_text("NOT JSON")
-        r._output_file = out_file
-
-        stderr = "SESSION_ID: fallback-id\n"
-        proc = _completed(returncode=0, stdout="", stderr=stderr)
-        result = r._parse_output(proc, RunRequest(task="x"))
-        assert result.session_id == "fallback-id"
-
-    def test_output_file_cleaned_up(self, tmp_path: Path) -> None:
-        r = self._runner(binary="/usr/bin/wrapper")
-        out_file = tmp_path / "go_out_clean.json"
-        out_file.write_text(json.dumps({"session_id": "s1", "backend": "b1"}))
-        r._output_file = out_file
-
-        proc = _completed(returncode=0, stdout="", stderr="")
-        r._parse_output(proc, RunRequest(task="x"))
-        assert not out_file.exists()
-
-    # -- run() integration (mocked subprocess) ----------------------------
-
-    def test_run_success(self, tmp_path: Path) -> None:
-        out_file = tmp_path / "go_out_run.json"
-        out_file.write_text(
-            json.dumps({"session_id": "s1", "backend": "claude", "status": "ok"})
-        )
-
-        mock_popen = mock.MagicMock(return_value=_completed(0, "ok", ""))
-        with mock.patch("subprocess.Popen", mock_popen):
-            r = self._runner(binary="/usr/bin/wrapper", output_dir=tmp_path)
-            # Patch _build_cmd to set _output_file to our known path
-            with mock.patch.object(
-                r,
-                "_build_cmd",
-                wraps=r._build_cmd,
-            ) as m:
-                # We need to manually set _output_file since the mock wraps
-                orig_build = r._build_cmd
-
-                def patched_build(req):
-                    cmd = orig_build(req)
-                    r._output_file = out_file
-                    return cmd
-
-                with mock.patch.object(r, "_build_cmd", side_effect=patched_build):
-                    result = r.run(RunRequest(task="fix it"))
-                    assert result.returncode == 0
-                    assert result.session_id == "s1"
-                    assert result.backend == "claude"
-
-    def test_run_binary_not_found(self) -> None:
-        r = self._runner(binary="/nonexistent/binary")
-        result = r.run(RunRequest(task="hello"))
-        assert result.returncode == 127
-        assert "No such file" in result.stderr or "not found" in result.stderr.lower()
-
-    def test_run_timeout(self) -> None:
-        mock_proc = mock.MagicMock()
-        mock_proc.pid = 9999
-        exc = subprocess.TimeoutExpired(cmd="wrapper", timeout=5)
-        exc.proc = mock_proc
-
-        mock_popen = mock.MagicMock()
-        mock_popen.return_value = mock_proc
-        mock_proc.communicate.side_effect = exc
-
-        with mock.patch("subprocess.Popen", mock_popen):
-            r = self._runner(binary="/usr/bin/wrapper")
-            r.config.timeout = 5
-            result = r.run(RunRequest(task="long task"))
-            assert result.returncode == -1
-            assert "timeout" in result.stderr.lower()
-
-    def test_run_os_error(self) -> None:
-        mock_popen = mock.MagicMock(side_effect=OSError("permission denied"))
-        with mock.patch("subprocess.Popen", mock_popen):
-            r = self._runner(binary="/usr/bin/wrapper")
-            result = r.run(RunRequest(task="hello"))
-            assert result.returncode == 1
-            assert "permission denied" in result.stderr
-
-    def test_output_file_cleanup_on_success(self, tmp_path: Path) -> None:
-        """Output temp file should be cleaned up after successful run."""
-        out_file = tmp_path / "go_out_clean.json"
-        out_file.write_text(json.dumps({"session_id": "s1", "backend": "claude", "status": "ok"}))
-
-        mock_popen = mock.MagicMock(return_value=_completed(0, "ok", ""))
-        with mock.patch("subprocess.Popen", mock_popen):
-            r = self._runner(binary="/usr/bin/wrapper", output_dir=tmp_path)
-            orig_build = r._build_cmd
-
-            def patched_build(req):
-                cmd = orig_build(req)
-                r._output_file = out_file
-                return cmd
-
-            with mock.patch.object(r, "_build_cmd", side_effect=patched_build):
-                result = r.run(RunRequest(task="fix it"))
-                assert result.returncode == 0
-                # Output file should be cleaned up by _cleanup
-                assert not out_file.exists()
-
-    def test_output_file_cleanup_on_failure(self, tmp_path: Path) -> None:
-        """Output temp file should be cleaned up even when process fails."""
-        out_file = tmp_path / "go_out_fail.json"
-        out_file.write_text(json.dumps({"session_id": "s1", "backend": "claude", "status": "error", "error": "crash"}))
-
-        mock_popen = mock.MagicMock(return_value=_completed(1, "", "error"))
-        with mock.patch("subprocess.Popen", mock_popen):
-            r = self._runner(binary="/usr/bin/wrapper", output_dir=tmp_path)
-            orig_build = r._build_cmd
-
-            def patched_build(req):
-                cmd = orig_build(req)
-                r._output_file = out_file
-                return cmd
-
-            with mock.patch.object(r, "_build_cmd", side_effect=patched_build):
-                result = r.run(RunRequest(task="fix it"))
-                assert result.returncode == 1
-                # Output file should be cleaned up by _cleanup
-                assert not out_file.exists()
-
-    def test_output_file_cleanup_on_timeout(self, tmp_path: Path) -> None:
-        """Output temp file should be cleaned up on timeout."""
-        out_file = tmp_path / "go_out_timeout.json"
-        out_file.write_text("{}")
-
-        mock_proc = mock.MagicMock()
-        mock_proc.pid = 9999
-        exc = subprocess.TimeoutExpired(cmd="wrapper", timeout=5)
-        exc.proc = mock_proc
-
-        mock_popen = mock.MagicMock()
-        mock_popen.return_value = mock_proc
-        mock_proc.communicate.side_effect = exc
-
-        with mock.patch("subprocess.Popen", mock_popen):
-            r = self._runner(binary="/usr/bin/wrapper", output_dir=tmp_path)
-            orig_build = r._build_cmd
-
-            def patched_build(req):
-                cmd = orig_build(req)
-                r._output_file = out_file
-                return cmd
-
-            with mock.patch.object(r, "_build_cmd", side_effect=patched_build):
-                result = r.run(RunRequest(task="long task"))
-                assert result.returncode == -1
-                # Output file should be cleaned up by _cleanup
-                assert not out_file.exists()
+# (removed — GoWrapperRunner deleted)
 
 
 # ── OMPRunner ────────────────────────────────────────────────────────────
@@ -657,6 +322,231 @@ class TestOMPRunner:
             assert result.returncode == 1
             # Prompt file should be cleaned up (set to None in _parse_output)
             assert r._prompt_file is None
+
+    # -- agent profile resolution ------------------------------------------
+
+    def test_agent_oracle_resolves_model_and_thinking(self, tmp_path: Path) -> None:
+        """agent='oracle' should set --model, --thinking, --append-system-prompt from profile."""
+        from codeagent.runners.omp import AgentProfile, resolve_agent_profile
+
+        # Create fake agent profile
+        agents_dir = tmp_path / ".omp" / "agent" / "agents"
+        agents_dir.mkdir(parents=True)
+        profile_file = agents_dir / "oracle.md"
+        profile_file.write_text(
+            "---\n"
+            "name: oracle\n"
+            "model: gpt-5.6-sol\n"
+            "thinking: high\n"
+            "spawning: true\n"
+            "auto-exit: false\n"
+            "park: true\n"
+            "park-class: advisor\n"
+            "system-prompt: append\n"
+            "---\n"
+            "# Oracle\n\nYou are a senior architecture advisor.\n"
+        )
+
+        # Monkey-patch Path.home for this test
+        orig_home = Path.home
+        try:
+            Path.home = classmethod(lambda cls: tmp_path)  # type: ignore[assignment]
+            prof = resolve_agent_profile("oracle")
+        finally:
+            Path.home = orig_home  # type: ignore[assignment]
+
+        assert prof.name == "oracle"
+        assert prof.model == "gpt-5.6-sol"
+        assert prof.thinking == "high"
+        assert prof.park is True
+        assert prof.auto_exit is False
+        assert prof.system_prompt_path == str(profile_file)
+
+    def test_agent_oracle_build_cmd_flags(self, tmp_path: Path) -> None:
+        """_build_cmd with agent='oracle' should include --model, --thinking, --append-system-prompt."""
+        from codeagent.runners.omp import AgentProfile
+
+        profile = AgentProfile(
+            name="oracle",
+            model="gpt-5.6-sol",
+            thinking="high",
+            system_prompt_path=str(tmp_path / "oracle.md"),
+            park=True,
+            auto_exit=False,
+        )
+
+        r = self._runner(binary="/usr/bin/omp")
+        r._agent_profile = profile  # stash as run() would
+        req = RunRequest(task="analyze architecture", agent="oracle")
+        cmd = r._build_cmd(req)
+
+        assert "--model" in cmd
+        assert cmd[cmd.index("--model") + 1] == "gpt-5.6-sol"
+        assert "--thinking" in cmd
+        assert cmd[cmd.index("--thinking") + 1] == "high"
+        assert "--append-system-prompt" in cmd
+        assert cmd[cmd.index("--append-system-prompt") + 1] == str(tmp_path / "oracle.md")
+        r._cleanup_prompt_file()
+
+    def test_request_model_overrides_profile_model(self, tmp_path: Path) -> None:
+        """Explicit request.model should override the agent profile model."""
+        from codeagent.runners.omp import AgentProfile
+
+        profile = AgentProfile(
+            name="oracle",
+            model="gpt-5.6-sol",
+            thinking="high",
+            system_prompt_path=str(tmp_path / "oracle.md"),
+            park=True,
+            auto_exit=False,
+        )
+
+        r = self._runner(binary="/usr/bin/omp")
+        r._agent_profile = profile
+        req = RunRequest(task="do it", agent="oracle", model="claude-opus")
+        cmd = r._build_cmd(req)
+
+        # request.model wins
+        assert cmd[cmd.index("--model") + 1] == "claude-opus"
+        # thinking still from profile
+        assert "--thinking" in cmd
+        assert cmd[cmd.index("--thinking") + 1] == "high"
+        r._cleanup_prompt_file()
+
+    def test_no_agent_no_profile_flags(self) -> None:
+        """Without agent, no --thinking or --append-system-prompt should appear."""
+        r = self._runner(binary="/usr/bin/omp")
+        r._agent_profile = None
+        req = RunRequest(task="do it", model="gpt-5")
+        cmd = r._build_cmd(req)
+
+        assert "--model" in cmd
+        assert "--thinking" not in cmd
+        assert "--append-system-prompt" not in cmd
+        r._cleanup_prompt_file()
+
+    def test_unknown_agent_returns_error(self) -> None:
+        """run() with an unknown agent name should return an error result."""
+        r = self._runner(binary="/usr/bin/omp")
+        result = r.run(RunRequest(task="do it", agent="nonexistent-agent-xyz"))
+        assert result.returncode == 1
+        assert "Unknown agent profile" in result.stderr
+
+    def test_oracle_timeout_override(self, tmp_path: Path) -> None:
+        """Oracle-class agents should get _ORACLE_TIMEOUT instead of DEFAULT_EXEC_TIMEOUT."""
+        from codeagent.runners.omp import AgentProfile, _ORACLE_TIMEOUT
+
+        profile = AgentProfile(
+            name="oracle", model="gpt-5", park=True, auto_exit=False,
+        )
+        stdout = '{"type": "agent_end"}\n'
+        mock_popen = mock.MagicMock(return_value=_completed(0, stdout, ""))
+
+        with mock.patch("subprocess.Popen", mock_popen):
+            r = self._runner(binary="/usr/bin/omp")
+            original_timeout = r.config.timeout
+            # Inject profile as run() would
+            with mock.patch.object(r, "_ensure_swarm_session"):
+                with mock.patch(
+                    "codeagent.runners.omp.resolve_agent_profile",
+                    return_value=profile,
+                ):
+                    result = r.run(RunRequest(task="review", agent="oracle"))
+                    # During run, timeout should have been overridden
+                    # After run, it should be restored
+                    assert r.config.timeout == original_timeout
+
+    def test_non_oracle_no_timeout_override(self) -> None:
+        """Non-oracle agents (auto_exit=True) should keep default timeout."""
+        from codeagent.runners.omp import AgentProfile
+
+        profile = AgentProfile(
+            name="sisyphus", model="mimo", park=False, auto_exit=True,
+        )
+        stdout = '{"type": "agent_end"}\n'
+        mock_popen = mock.MagicMock(return_value=_completed(0, stdout, ""))
+
+        with mock.patch("subprocess.Popen", mock_popen):
+            r = self._runner(binary="/usr/bin/omp")
+            original_timeout = r.config.timeout
+            with mock.patch(
+                "codeagent.runners.omp.resolve_agent_profile",
+                return_value=profile,
+            ):
+                result = r.run(RunRequest(task="implement", agent="sisyphus"))
+                assert r.config.timeout == original_timeout
+
+    def test_oracle_creates_swarm_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Oracle agents should trigger swarm session creation via _ensure_swarm_session."""
+        from codeagent.runners.omp import AgentProfile
+
+        profile = AgentProfile(
+            name="oracle", model="gpt-5", park=True, auto_exit=False,
+        )
+        stdout = '{"type": "agent_end"}\n'
+        mock_popen = mock.MagicMock(return_value=_completed(0, stdout, ""))
+
+        ensure_calls: list[str] = []
+
+        def mock_ensure(self, request):
+            ensure_calls.append(request.agent)
+
+        with mock.patch("subprocess.Popen", mock_popen):
+            r = self._runner(binary="/usr/bin/omp")
+            with mock.patch(
+                "codeagent.runners.omp.resolve_agent_profile",
+                return_value=profile,
+            ):
+                with mock.patch.object(
+                    OMPRunner, "_ensure_swarm_session", mock_ensure,
+                ):
+                    r.run(RunRequest(task="review", agent="oracle"))
+                    assert ensure_calls == ["oracle"]
+
+    def test_non_oracle_no_swarm_session(self) -> None:
+        """Non-oracle agents should NOT trigger swarm session creation."""
+        from codeagent.runners.omp import AgentProfile
+
+        profile = AgentProfile(
+            name="sisyphus", model="mimo", park=False, auto_exit=True,
+        )
+        stdout = '{"type": "agent_end"}\n'
+        mock_popen = mock.MagicMock(return_value=_completed(0, stdout, ""))
+
+        ensure_calls: list[str] = []
+
+        def mock_ensure(self, request):
+            ensure_calls.append(request.agent)
+
+        with mock.patch("subprocess.Popen", mock_popen):
+            r = self._runner(binary="/usr/bin/omp")
+            with mock.patch(
+                "codeagent.runners.omp.resolve_agent_profile",
+                return_value=profile,
+            ):
+                with mock.patch.object(
+                    OMPRunner, "_ensure_swarm_session", mock_ensure,
+                ):
+                    r.run(RunRequest(task="implement", agent="sisyphus"))
+                    assert ensure_calls == []
+
+    def test_no_agent_no_swarm_session(self) -> None:
+        """No agent → no swarm session creation."""
+        stdout = '{"type": "agent_end"}\n'
+        mock_popen = mock.MagicMock(return_value=_completed(0, stdout, ""))
+
+        ensure_calls: list[str] = []
+
+        def mock_ensure(self, request):
+            ensure_calls.append(request.agent)
+
+        with mock.patch("subprocess.Popen", mock_popen):
+            r = self._runner(binary="/usr/bin/omp")
+            with mock.patch.object(
+                OMPRunner, "_ensure_swarm_session", mock_ensure,
+            ):
+                r.run(RunRequest(task="do it"))
+                assert ensure_calls == []
 
 
 # ── BaseRunner contract ─────────────────────────────────────────────────

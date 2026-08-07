@@ -55,7 +55,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("task", nargs="?", help="Task text (or stdin)")
     run_p.add_argument("workdir", nargs="?", default="", help="Working directory")
     run_p.add_argument("--host", help="Execute on remote host")
-    run_p.add_argument("--backend", default="opencode")
+    run_p.add_argument("--backend", default="omp")
     run_p.add_argument("--agent")
     run_p.add_argument("--model")
     run_p.add_argument("--skills")
@@ -69,7 +69,7 @@ def _build_parser() -> argparse.ArgumentParser:
     route_p = sub.add_parser("route", help="Route task via repo-map")
     route_p.add_argument("args", nargs="*", help="list | where <topic> | <topic> [task...]")
     route_p.add_argument("--repo", type=int, default=0)
-    route_p.add_argument("--backend", default="opencode")
+    route_p.add_argument("--backend", default="omp")
     route_p.add_argument("--agent")
     route_p.add_argument("--model")
     route_p.add_argument("--raw", action="store_true")
@@ -1016,10 +1016,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print("error: no task provided", file=sys.stderr)
         return 1
 
+    # Resolve agent → runner: oracle agents always use OMPRunner
+    backend = args.backend
+    if args.agent == "oracle":
+        backend = "omp"
+
     request = RunRequest(
         task=task,
         workdir=args.workdir,
-        backend=args.backend,
+        backend=backend,
         agent=args.agent,
         model=args.model,
         skills=getattr(args, 'skills', None),

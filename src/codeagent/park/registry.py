@@ -58,7 +58,7 @@ class ParkRegistry:
             yield conn
 
     def _lock(self, key: str) -> SessionLock:
-        return SessionLock(key)
+        return SessionLock('park:' + key)
 
     # ── CRUD ─────────────────────────────────────────────────
 

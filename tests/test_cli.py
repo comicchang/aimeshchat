@@ -315,7 +315,7 @@ class TestRunDefaults:
         ):
             main(["run", "do something"])
         request = mock_exec.call_args.args[0]
-        assert request.backend == "opencode"
+        assert request.backend == "omp"
 
     def test_run_new_session(self, tmp_path):
         from codeagent.cli import main

@@ -130,7 +130,7 @@ class SessionRegistry:
 
         Called immediately when a new session is being spawned (i.e.
         ``--new-session`` or no existing record found).  Holds
-        SessionLock(key) to prevent races with concurrent spawns.
+        SessionLock("session:" + key) to prevent races with concurrent spawns.
 
         If *clear_session* is True, the old session_id is discarded
         (used with ``--new-session`` to avoid resuming a stale session).
@@ -143,7 +143,7 @@ class SessionRegistry:
         model = request.model or ""
         topic = request.topic or ""
 
-        with SessionLock(key), self._connect() as conn:
+        with SessionLock("session:" + key), self._connect() as conn:
             if clear_session:
                 # Force-clear old session_id for --new-session
                 conn.execute(
@@ -189,7 +189,7 @@ class SessionRegistry:
     def mark_observed(self, key: str, session_id: str) -> None:
         """Transition to "observed" once the runner has captured the session id."""
         now = time.time()
-        with SessionLock(key), self._connect() as conn:
+        with SessionLock("session:" + key), self._connect() as conn:
             conn.execute(
                 "UPDATE sessions SET session_id = ?, status = 'observed', updated_at = ? "
                 "WHERE key = ?",
@@ -199,7 +199,7 @@ class SessionRegistry:
     def mark_active(self, key: str) -> None:
         """Transition to "active" — runner confirmed the session is running."""
         now = time.time()
-        with SessionLock(key), self._connect() as conn:
+        with SessionLock("session:" + key), self._connect() as conn:
             conn.execute(
                 "UPDATE sessions SET status = 'active', updated_at = ? "
                 "WHERE key = ?",
@@ -209,7 +209,7 @@ class SessionRegistry:
     def mark_failed(self, key: str) -> None:
         """Transition to "failed" — runner reported an error."""
         now = time.time()
-        with SessionLock(key), self._connect() as conn:
+        with SessionLock("session:" + key), self._connect() as conn:
             conn.execute(
                 "UPDATE sessions SET status = 'failed', updated_at = ? "
                 "WHERE key = ?",
@@ -244,7 +244,7 @@ class SessionRegistry:
         else:
             status = "failed"
 
-        with SessionLock(key), self._connect() as conn:
+        with SessionLock("session:" + key), self._connect() as conn:
             existing = conn.execute(
                 "SELECT created_at FROM sessions WHERE key = ?", (key,)
             ).fetchone()
@@ -286,14 +286,14 @@ class SessionRegistry:
 
     def delete(self, key: str) -> bool:
         """Delete the record for *key*.  Returns True if a row was removed."""
-        with SessionLock(key), self._connect() as conn:
+        with SessionLock("session:" + key), self._connect() as conn:
             cur = conn.execute("DELETE FROM sessions WHERE key = ?", (key,))
             return cur.rowcount > 0
 
     def bind(self, key: str, session_id: str) -> None:
         """Manually bind a session_id to a key (``codeagent sessions bind``)."""
         now = time.time()
-        with SessionLock(key), self._connect() as conn:
+        with SessionLock("session:" + key), self._connect() as conn:
             cur = conn.execute(
                 "UPDATE sessions SET session_id = ?, status = 'active', updated_at = ? "
                 "WHERE key = ?",
@@ -353,7 +353,7 @@ class SessionRegistry:
         deleted = 0
         # Delete each under its own lock
         for key in stale_keys:
-            with SessionLock(key), self._connect() as conn:
+            with SessionLock("session:" + key), self._connect() as conn:
                 cur = conn.execute(
                     "DELETE FROM sessions WHERE key = ? AND status IN ('starting', 'observed') "
                     "AND updated_at < ?",
@@ -365,7 +365,7 @@ class SessionRegistry:
 
     @contextmanager
     def run_with_lock(self, key: str) -> Generator[SessionLock, None, None]:
-        """Hold SessionLock(key) for the entire execution turn.
+        """Hold SessionLock("session:" + key) for the entire execution turn.
 
         Use this when the caller needs to perform multiple registry
         operations atomically under a single lock:
@@ -374,5 +374,5 @@ class SessionRegistry:
                 # multiple reads/writes here
                 pass
         """
-        with SessionLock(key) as lock:
+        with SessionLock("session:" + key) as lock:
             yield lock

@@ -19,9 +19,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import stat
 import subprocess
 import tempfile
+import time as _time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +36,77 @@ from .base import BaseRunner, RunnerConfig
 LOG = logging.getLogger(__name__)
 
 _DEFAULT_BINARY = "omp"
+
+# Oracle-class agents (park=true, auto-exit=false) get a 1-hour timeout
+# instead of the default 10-minute DEFAULT_EXEC_TIMEOUT.
+_ORACLE_TIMEOUT = 3600
+
+
+# ---------------------------------------------------------------------------
+# Agent profile resolution
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AgentProfile:
+    """Resolved agent profile from ``~/.omp/agent/agents/<name>.md`` frontmatter."""
+
+    name: str
+    model: str = ""
+    thinking: str = ""
+    system_prompt_path: str = ""  # path to the .md file for --append-system-prompt
+    auto_exit: bool = True
+    park: bool = False
+    park_class: str = ""
+    spawning: bool = False
+
+
+def _parse_frontmatter(text: str) -> dict[str, str]:
+    """Parse simple YAML frontmatter (key: value pairs) between ``---`` markers."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    fm_text = text[4:end]  # skip opening "---\n"
+    result: dict[str, str] = {}
+    for line in fm_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line:
+            key, _, value = line.partition(":")
+            key = key.strip()
+            value = value.strip()
+            # Strip matching quotes
+            if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
+                value = value[1:-1]
+            result[key] = value
+    return result
+
+
+def resolve_agent_profile(agent_name: str) -> AgentProfile:
+    """Load agent profile from ``~/.omp/agent/agents/<name>.md`` frontmatter.
+
+    Raises :class:`ValueError` if the profile file does not exist.
+    """
+    profile_path = Path.home() / ".omp" / "agent" / "agents" / f"{agent_name}.md"
+    if not profile_path.exists():
+        raise ValueError(f"Unknown agent profile: {agent_name}")
+
+    text = profile_path.read_text(encoding="utf-8")
+    fm = _parse_frontmatter(text)
+
+    return AgentProfile(
+        name=fm.get("name", agent_name),
+        model=fm.get("model", ""),
+        thinking=fm.get("thinking", ""),
+        system_prompt_path=str(profile_path),
+        auto_exit=fm.get("auto-exit", "true").lower() == "true",
+        park=fm.get("park", "false").lower() == "true",
+        park_class=fm.get("park-class", ""),
+        spawning=fm.get("spawning", "false").lower() == "true",
+    )
 
 
 class OMPRunner(BaseRunner):
@@ -61,9 +135,24 @@ class OMPRunner(BaseRunner):
         if request.resume_session_id and not request.new_session:
             cmd.extend(["--resume", request.resume_session_id])
 
-        # Model
-        if request.model:
-            cmd.extend(["--model", request.model])
+        # ── Agent profile resolution ──────────────────────────────────
+        # If request.agent is set, load profile from ~/.omp/agent/agents/<agent>.md
+        # and apply model / thinking / system-prompt from frontmatter.
+        # Explicit request.model still wins over profile model.
+        profile = getattr(self, "_agent_profile", None)
+
+        if profile:
+            # Thinking level from profile
+            if profile.thinking:
+                cmd.extend(["--thinking", profile.thinking])
+            # System prompt from agent profile (--append-system-prompt takes a file path)
+            if profile.system_prompt_path:
+                cmd.extend(["--append-system-prompt", profile.system_prompt_path])
+
+        # Model: explicit request.model > profile model
+        model = request.model or (profile.model if profile else None)
+        if model:
+            cmd.extend(["--model", model])
 
         # Auto-approve (skip interactive confirmations)
         if request.skip_permissions:
@@ -74,6 +163,91 @@ class OMPRunner(BaseRunner):
         cmd.append(f"@{self._prompt_file}")
 
         return cmd
+
+    def run(self, request: RunRequest) -> RunResult:
+        """Execute with agent-profile timeout override and swarm session bootstrap.
+
+        Oracle-class agents (park=true, auto-exit=false) get a 1-hour timeout
+        instead of the default 10-minute ``DEFAULT_EXEC_TIMEOUT``.
+        """
+        # Resolve agent profile early for timeout + swarm session
+        self._agent_profile: Optional[AgentProfile] = None
+        if request.agent:
+            try:
+                self._agent_profile = resolve_agent_profile(request.agent)
+            except ValueError as exc:
+                return RunResult(returncode=1, stderr=str(exc))
+
+        # Override timeout for oracle-class agents
+        original_timeout: Optional[int] = None
+        if self._agent_profile and self._agent_profile.park and not self._agent_profile.auto_exit:
+            original_timeout = self.config.timeout
+            self.config.timeout = _ORACLE_TIMEOUT
+            LOG.debug(
+                "agent=%s is oracle-class (park=true, auto-exit=false); "
+                "overriding timeout %ds → %ds",
+                request.agent, original_timeout, _ORACLE_TIMEOUT,
+            )
+
+        # Ensure swarm session for oracle agents so _extra_env activates
+        if self._agent_profile and self._agent_profile.park:
+            self._ensure_swarm_session(request)
+
+        try:
+            return super().run(request)
+        finally:
+            if original_timeout is not None:
+                self.config.timeout = original_timeout
+
+    def _ensure_swarm_session(self, request: RunRequest) -> None:
+        """Create a swarm session for oracle agents if ``SWARM_SESSION_ID`` is not set.
+
+        The ``_extra_env`` method only injects mailbox identity when
+        ``SWARM_SESSION_ID`` (or ``OMP_SESSION_ID``) is present in the
+        environment.  For oracle agents spawned from ``_cmd_run`` / ``_execute``
+        — which never create a swarm session — this method bridges the gap by
+        generating a session ID and registering manager ↔ agent in the swarm
+        kernel.
+        """
+        swarm_sid = os.environ.get("SWARM_SESSION_ID") or os.environ.get("OMP_SESSION_ID")
+        if swarm_sid:
+            return  # already wired
+
+        # Generate a new swarm session ID
+        swarm_sid = f"swarm_{int(_time.time())}_{secrets.token_hex(4)}"
+        os.environ["SWARM_SESSION_ID"] = swarm_sid
+
+        # Set MAILBOX_ROOT if not already set (required by _extra_env)
+        if not os.environ.get("MAILBOX_ROOT"):
+            mailbox_root = Path.home() / ".omp" / "mailbox"
+            mailbox_root.mkdir(parents=True, exist_ok=True)
+            os.environ["MAILBOX_ROOT"] = str(mailbox_root)
+
+        # Set OMP_WORKER_ID for the agent
+        agent_name = request.agent or "agent"
+        if not os.environ.get("OMP_WORKER_ID"):
+            os.environ["OMP_WORKER_ID"] = agent_name
+
+        # Create session in swarm kernel (manager ↔ agent roster)
+        try:
+            from codeagent.hooks.swarm_hooks import _get_kernel
+            kernel, _store = _get_kernel()
+            manager_id = "manager"
+            kernel.create_session(
+                session_id=swarm_sid,
+                manager_id=manager_id,
+                roster=[manager_id, agent_name],
+            )
+            LOG.info(
+                "created swarm session %s for agent=%s (roster: %s ↔ %s)",
+                swarm_sid, agent_name, manager_id, agent_name,
+            )
+        except Exception:
+            LOG.warning(
+                "failed to create swarm session for agent=%s; "
+                "mailbox will be unavailable",
+                request.agent, exc_info=True,
+            )
 
     def _extra_env(self) -> Optional[dict[str, str]]:
         """Inject swarm mailbox identity for the OMP plugin (Oracle P1-3).
@@ -88,8 +262,6 @@ class OMPRunner(BaseRunner):
             SWARM_SESSION_ID  — canonical; set by swarm dispatcher.
             OMP_SESSION_ID    — alias; used when SWARM_SESSION_ID is absent.
         """
-        import secrets
-        import time as _time
 
         # Accept both SWARM_SESSION_ID (canonical) and OMP_SESSION_ID (alias).
         # SWARM_SESSION_ID takes precedence when both are set.

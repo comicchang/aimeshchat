@@ -2,7 +2,7 @@
 
 Usage: python -m codeagent.remote_exec
 Reads JSONL requests from stdin, writes JSONL responses to stdout.
-Delegates to GoWrapperRunner or OMPRunner locally on the remote machine.
+Delegates to OMPRunner locally on the remote machine.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from codeagent.constants import (
     STREAM_CURSOR_INITIAL,
 )
 from codeagent.domain import RunRequest
-from codeagent.runners import GoWrapperRunner, OMPRunner
+from codeagent.runners import OMPRunner
 from codeagent.runners.base import RunnerConfig
 from codeagent.wire.protocol import WIRE_VERSION, decode_request
 
@@ -69,7 +69,7 @@ def _handle_capabilities(req: dict) -> None:
     _send({
         "type": "capabilities",
         "wire_version": WIRE_VERSION,
-        "backends": ["codex", "claude", "gemini", "opencode", "omp"],
+        "backends": ["omp"],
         "features": ["resume", "session", "timeout"],
     })
 
@@ -78,7 +78,7 @@ def _handle_run(req: dict) -> None:
     """Execute a task locally using the appropriate runner."""
     task = req.get("task", "")
     workdir = req.get("workdir", ".")
-    backend = req.get("backend", "opencode")
+    backend = req.get("backend", "omp")
     agent = req.get("agent")
     model = req.get("model")
     resume_session_id = req.get("resume_session_id")
@@ -112,7 +112,8 @@ def _handle_run(req: dict) -> None:
     if backend == "omp":
         runner = OMPRunner(config=config)
     else:
-        runner = GoWrapperRunner(config=config)
+        _send({"type": "error", "message": f"unsupported backend: {backend}"})
+        return
 
     # Run via tested runner implementation
     result = runner.run(request)
