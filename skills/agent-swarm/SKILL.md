@@ -16,10 +16,8 @@ Manager 和 Worker 不得绕过 manifest/routing table 直接拼远端路径或�
 
 |概念|定义|来源|
 |---|---|---|
-|**SessionManifest**|session 的不可变权威配置：session_id、manager、agents、manifest_hash、protocol_version。`swarm create-session` 产生，session.json 是其持久化形式|`swarm/kernel.py`|
-|**AgentLocation**|agent_id → (host_alias, backend, capabilities) 的路由条目。`execution_mode`、`mailbox_root`、`return_mode` 未在当前 model.py 实现|[DESIGN: requires model extension for execution_mode/mailbox_root/return_mode] `swarm/kernel.py`|
-|**SwarmKernel**|协议核心：register/send/broadcast/poll/reconcile。所有 backend（CLI/OMP/Tmux）共享同一 kernel 实例|`swarm/kernel.py`|
-|**MailboxStore**|leaf storage：session 隔离的 inbox/processing/archive/_corrupt + status.json。通过 `mailbox` CLI 或 kernel delivery 访问|`mailbox/store.py`|
+|**SessionManifest**|session 的不可变权威配置：session_id、manager、agents。`swarm create-session` 产生，session.json 是其持久化形式。manifest_hash 字段已在 model 声明但 CLI 暂未输出。|`swarm/kernel.py`, `swarm/model.py`|
+|**AgentLocation**|agent_id → (host_alias, backend, capabilities, execution_mode?, mailbox_root?, return_mode?) 的路由条目。model.py 已声明可选字段，`_persist_routing` 已持久化；CLI register 暂未暴露这些参数。|`swarm/kernel.py`, `swarm/model.py`|
 |**execution_mode**|Worker 的执行模型：`mailbox-worker`（远端 OMP Worker）或 `local-omp-mcp`（本地 OMP + 远端 omp-execd MCP）。互斥，session 创建时选定|本协议 §Execution Mode|
 
 Manager 的唯一入口是 `swarm` 子命令（`codeagent swarm direct/poll/watch/status`）；bare `mailbox send` 仅用于 bootstrap 和故障诊断。
@@ -47,9 +45,9 @@ Read **one** role file based on your identity:
 | `$OMP_WORKER_ID` | Role | Load |
 |---|---|---|
 | `manager` | Manager | `skill://agent-swarm/roles/manager.md` |
-| anything else | Worker | `skill://agent-swarm/roles/worker.md` |
+| other non-empty value | Worker | `skill://agent-swarm/roles/worker.md` |
 
-If `$OMP_WORKER_ID` is unset: **error** — role cannot be determined. Set `$OMP_WORKER_ID` explicitly.
+If `$OMP_WORKER_ID` is unset or empty: **error** — role cannot be determined. Set `$OMP_WORKER_ID` explicitly.
 
 ## Shared Protocol Reference
 

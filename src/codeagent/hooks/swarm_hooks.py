@@ -32,7 +32,7 @@ from typing import Any, Optional
 from codeagent.mailbox.store import MailboxStore
 from codeagent.swarm.kernel import LocalDeliverySink, SwarmKernel
 from codeagent.swarm.model import AgentLocation, Envelope
-
+from codeagent.mailbox.protocol import AttachmentRef
 # Module-level kernel instance (lazy singleton for OMP process lifetime)
 _kernel: Optional[SwarmKernel] = None
 _store: Optional[MailboxStore] = None
@@ -146,8 +146,13 @@ def on_agent_message(
     run_id = msg_dict.get("run_id", "")
     request_id = msg_dict.get("request_id", "")
     reply_to = msg_dict.get("reply_to", "")
+    attachments_raw = msg_dict.get("attachments", None)
+    attachments = [AttachmentRef.from_dict(a) if isinstance(a, dict) else a for a in (attachments_raw or [])]
+    causation_id = msg_dict.get("causation_id", "")
+    trace_id = msg_dict.get("trace_id", "")
     env = Envelope(subject=subject, body=body, kind=kind,
-                   run_id=run_id, request_id=request_id, reply_to=reply_to)
+                   run_id=run_id, request_id=request_id, reply_to=reply_to,
+                   attachments=attachments, causation_id=causation_id, trace_id=trace_id)
 
     if to_id == "*":
         receipts = kernel.broadcast(session_id, agent_id, env)

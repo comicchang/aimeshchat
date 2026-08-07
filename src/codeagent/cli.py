@@ -222,6 +222,9 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     ch_p.add_argument("--subject", default="")
     ch_p.add_argument("--body", required=True)
     ch_p.add_argument("--attachment", action="append", default=[])
+    ch_p.add_argument("--run-id", default="", help="Run ID for request tracking")
+    ch_p.add_argument("--request-id", default="", help="Request ID for causation chain")
+    ch_p.add_argument("--reply-to", default="", help="Message ID being replied to")
 
     # create-channel
     cc_p = swarm_sub.add_parser("create-channel", help="Create a named channel within a session")
@@ -236,6 +239,9 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     bc_p.add_argument("--kind", default="NOTICE")
     bc_p.add_argument("--subject", default="")
     bc_p.add_argument("--body", required=True)
+    bc_p.add_argument("--run-id", default="", help="Run ID for request tracking")
+    bc_p.add_argument("--request-id", default="", help="Request ID for causation chain")
+    bc_p.add_argument("--reply-to", default="", help="Message ID being replied to")
 
     # notice
     nt_p = swarm_sub.add_parser("notice", help="Send a notice to the session")
@@ -247,6 +253,9 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     nt_p.add_argument("--ttl", type=int, default=0)
     nt_p.add_argument("--kind", default="NOTICE")
     nt_p.add_argument("--subject", required=True)
+    nt_p.add_argument("--run-id", default="", help="Run ID for request tracking")
+    nt_p.add_argument("--request-id", default="", help="Request ID for causation chain")
+    nt_p.add_argument("--reply-to", default="", help="Message ID being replied to")
 
     # poll
     pl_p = swarm_sub.add_parser("poll", help="Poll agent inbox")
@@ -463,17 +472,26 @@ def _swarm_create_channel(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     return 0
 
 
-def _swarm_direct(kernel: SwarmKernel, args: argparse.Namespace) -> int:
-    # ── Correlation-protocol enforcement ──────────────────────────────
-    kind = args.kind.upper()
-    if kind in ("TASK",) and not args.run_id:
+def _require_kind_correlation(kind: str, run_id: str, request_id: str, reply_to: str) -> int:
+    """Validate correlation fields for TASK/REPORT kinds.
+
+    Returns 0 on success, prints error and returns 1 on failure.
+    """
+    if kind in ("TASK", "INIT") and not run_id:
         print(f"error: --run-id is required for kind={kind}", file=sys.stderr)
         return 1
-    if kind in ("TASK",) and not args.request_id:
+    if kind in ("TASK", "INIT") and not request_id:
         print(f"error: --request-id is required for kind={kind}", file=sys.stderr)
         return 1
-    if kind == "REPORT" and not args.reply_to:
-        print(f"error: --reply-to is required for kind=REPORT", file=sys.stderr)
+    if kind == "REPORT" and not reply_to:
+        print("error: --reply-to is required for kind=REPORT", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _swarm_direct(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    kind = args.kind.upper()
+    if _require_kind_correlation(kind, args.run_id, args.request_id, args.reply_to):
         return 1
 
     attachments = _parse_attachments(args.attachment) if args.attachment else []
@@ -490,23 +508,34 @@ def _swarm_direct(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
 
 def _swarm_channel(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    kind = args.kind.upper()
+    if _require_kind_correlation(kind, getattr(args, 'run_id', ''), getattr(args, 'request_id', ''), getattr(args, 'reply_to', '')):
+        return 1
     attachments = _parse_attachments(args.attachment) if args.attachment else []
     env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments)
     receipts = kernel.channel(args.session_id, args.sender, args.channel_id, env)
     out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
     print(json.dumps(out, indent=2))
     return 0
+_swarm_channel
 
 
 def _swarm_broadcast(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    kind = args.kind.upper()
+    if _require_kind_correlation(kind, getattr(args, 'run_id', ''), getattr(args, 'request_id', ''), getattr(args, 'reply_to', '')):
+        return 1
     env = Envelope(subject=args.subject, body=args.body, kind=args.kind)
     receipts = kernel.broadcast(args.session_id, args.sender, env)
     out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
     print(json.dumps(out, indent=2))
     return 0
+_swarm_broadcast
 
 
 def _swarm_notice(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    kind = args.kind.upper()
+    if _require_kind_correlation(kind, getattr(args, 'run_id', ''), getattr(args, 'request_id', ''), getattr(args, 'reply_to', '')):
+        return 1
     env = Envelope(subject=args.subject, body=args.body, kind=args.kind)
     receipts = kernel.notice(args.session_id, args.sender, args.topic, env, ttl=args.ttl)
     out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]

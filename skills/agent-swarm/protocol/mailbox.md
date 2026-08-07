@@ -42,8 +42,7 @@ Mailbox root is `.mailbox/` under the shared repository, session-isolated:
 | `trace_id` | no | distributed trace correlation ID |
 | `causation_id` | no | parent msg_id that caused this message |
 
-> **⚠ [DESIGN ONLY — validation is kind-dependent]**: The current `validate_message` implementation accepts `TASK` messages without `run_id` or `request_id` (permissive validation). Full enforcement of kind-conditional required fields (e.g., requiring `run_id`/`request_id` on every TASK) requires a code change to the validation layer.
-
+> **⚠ [DESIGN ONLY — PERMISSIVE EDGE CASE]**: `validate_message` enforces kind-conditional required fields for TASK/INIT/REPORT (kIND_CONDITIONAL_REQUIRED) at both the protocol layer and CLI (swarm direct exits 1 for missing --run-id). However, `reply_to` is NOT enforced for QUESTION/RESPONSE, and `attachments` is NOT enforced for REPORT/EVIDENCE. These edge cases remain permissive until protocol layer is updated. See `codeagent/mailbox/protocol.py:20-25`.
 Messages are **immutable**. Corrections require a new message with `--reply-to <msg_id>`.
 
 ## Message Kinds
