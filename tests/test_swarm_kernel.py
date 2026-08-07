@@ -975,20 +975,29 @@ class TestPullRemote:
         import subprocess
         from unittest.mock import patch
 
-        completed = MagicMock()
-        completed.returncode = 0
-        completed.stdout = __import__("json").dumps(fake_msg)
-        completed.stderr = ""
-        with patch("codeagent.swarm.kernel.subprocess.run", return_value=completed) as mock_run:
+        read_result = MagicMock()
+        read_result.returncode = 0
+        read_result.stdout = __import__("json").dumps(fake_msg)
+        read_result.stderr = ""
+        finalize_result = MagicMock()
+        finalize_result.returncode = 0
+        finalize_result.stdout = ""
+        finalize_result.stderr = ""
+        with patch("codeagent.swarm.kernel.subprocess.run",
+                    side_effect=[read_result, finalize_result]) as mock_run:
             result = k.pull_remote("s1", "host-a")
         assert len(result) == 1
         assert result[0]["msg_id"] == "remote-001"
-        # Verify the SSH command structure
-        args = mock_run.call_args[0][0]
-        assert "mailbox" in args
-        assert "read" in args
-        assert "--host" in args
-        assert "host-a" in args
+        # Verify the SSH command structure (first call = read)
+        read_args = mock_run.call_args_list[0][0][0]
+        assert "mailbox" in read_args
+        assert "read" in read_args
+        assert "--host" in read_args
+        assert "host-a" in read_args
+        # Verify finalize was called
+        finalize_args = mock_run.call_args_list[1][0][0]
+        assert "finalize" in finalize_args
+        assert "--msg-id" in finalize_args
 
     def test_pull_skips_failed_command(self, store):
         k = _make_kernel_with_session(store)

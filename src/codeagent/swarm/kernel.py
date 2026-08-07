@@ -912,14 +912,46 @@ class SwarmKernel:
                 msg = json.loads(raw)
                 if isinstance(msg, dict):
                     messages.append(msg)
+                    self._finalize_remote(from_host, session_id, manager_id, msg)
                 elif isinstance(msg, list):
                     messages.extend(msg)
+                    for m in msg:
+                        self._finalize_remote(from_host, session_id, manager_id, m)
             except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
                 log.warning(
                     "pull_remote: error reading from agent=%s host=%s: %s",
                     agent_id, from_host, exc,
                 )
         return messages
+
+    def _finalize_remote(self, from_host: str, session_id: str,
+                         manager_id: str, msg: dict) -> None:
+        """Finalize a message on the remote mailbox after successful read."""
+        msg_id = msg.get("msg_id", "")
+        if not msg_id:
+            return
+        finalize_cmd = [
+            "codeagent", "mailbox", "finalize",
+            "--host", from_host,
+            "--session", session_id,
+            "--agent", manager_id,
+            "--owner", manager_id,
+            "--msg-id", msg_id,
+        ]
+        try:
+            result = subprocess.run(
+                finalize_cmd, capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                log.warning(
+                    "pull_remote: finalize failed for msg=%s host=%s: %s",
+                    msg_id, from_host, result.stderr.strip(),
+                )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            log.warning(
+                "pull_remote: finalize error for msg=%s host=%s: %s",
+                msg_id, from_host, exc,
+            )
 
     def ingest(self, session_id: str, messages: list[dict]) -> list[str]:
         """Validate and persist messages into canonical history.
@@ -932,7 +964,7 @@ class SwarmKernel:
 
         Returns the list of successfully persisted msg_ids.
         """
-        self._require_session(session_id)
+        session = self._require_session(session_id)
         persisted: list[str] = []
         for msg in messages:
             if not isinstance(msg, dict):
@@ -941,6 +973,15 @@ class SwarmKernel:
             ok, reason = validate_message(msg, session_id)
             if not ok:
                 log.warning("ingest: skipping invalid message: %s", reason)
+                continue
+            sender = msg.get("from", "")
+            if sender and sender not in session.roster:
+                log.debug("ingest: sender %s not in roster, skipping", sender)
+                continue
+            recipient = msg.get("to", "")
+            if recipient and recipient != session.manager_id:
+                log.debug("ingest: recipient %s != manager_id %s, skipping",
+                          recipient, session.manager_id)
                 continue
             try:
                 self._store.append_history(session_id, msg)

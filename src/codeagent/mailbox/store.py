@@ -1,6 +1,7 @@
 """Mailbox store — filesystem operations for session-based direct-inbox."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import string
@@ -888,18 +889,28 @@ class RequestLedger:
         Returns ``False`` (PROTOCOL_CONFLICT) when *event* is a terminal
         state and a terminal has already been recorded for this pair.
         Non-terminal events are **always** accepted.
-        """
-        if event in TERMINAL_STATES:
-            existing = self.get_terminal(request_id, run_id)
-            if existing is not None:
-                # CAS conflict — still append a PROTOCOL_CONFLICT marker
-                # so the ledger stays truly append-only, but signal failure.
-                self._append(request_id, run_id, "PROTOCOL_CONFLICT",
-                             {"frozen_event": event, "existing_terminal": existing})
-                return False
 
-        self._append(request_id, run_id, event, meta)
-        return True
+        Uses ``fcntl.flock`` to make the check-then-append atomic across
+        concurrent processes writing to the same request_id directory.
+        """
+        events_dir = self._events_dir(request_id)
+        events_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = events_dir / ".lock"
+        lock_fd = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if event in TERMINAL_STATES:
+                existing = self.get_terminal(request_id, run_id)
+                if existing is not None:
+                    self._append(request_id, run_id, "PROTOCOL_CONFLICT",
+                                 {"frozen_event": event, "existing_terminal": existing})
+                    return False
+
+            self._append(request_id, run_id, event, meta)
+            return True
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     def get_terminal(self, request_id: str, run_id: str) -> str | None:
         """Return the first terminal state recorded, or ``None``."""
