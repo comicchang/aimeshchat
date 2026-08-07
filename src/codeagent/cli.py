@@ -520,6 +520,12 @@ def _require_kind_correlation(kind: str, run_id: str, request_id: str, reply_to:
     if kind == "REPORT" and not reply_to:
         print("error: --reply-to is required for kind=REPORT", file=sys.stderr)
         return 1
+    if kind == "REPORT" and not run_id:
+        print("error: --run-id is required for kind=REPORT", file=sys.stderr)
+        return 1
+    if kind == "REPORT" and not request_id:
+        print("error: --request-id is required for kind=REPORT", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -757,11 +763,20 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
     # ── Phase 1: Bootstrap remote workers ────────────────────────────
     if args.bootstrap:
-        remote_agents = [
-            a for a in roster if a != manager
-            and kernel.get_location(args.session_id, a)
-            and kernel.get_location(args.session_id, a).host_alias != "__local__"
-        ]
+        remote_agents = []
+        for a in roster:
+            if a == manager:
+                continue
+            loc = kernel.get_location(args.session_id, a)
+            if not loc:
+                continue
+            if loc.host_alias == "__local__":
+                continue
+            em = loc.execution_mode
+            if em is not None and em != ExecutionMode.MAILBOX_WORKER:
+                log.info("launch bootstrap: skipping %s (execution_mode=%s)", a, em.value)
+                continue
+            remote_agents.append(a)
         for agent in remote_agents:
             loc = kernel.get_location(args.session_id, agent)
             host = loc.host_alias
@@ -774,6 +789,8 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
                 "--manager", manager,
                 "--agents", roster_csv,
             ]
+            if loc.mailbox_root:
+                cmd.extend(["--mailbox-root", loc.mailbox_root])
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                 if r.stdout.strip():
@@ -801,6 +818,8 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
                 "--run-id", init_run_id,
                 "--request-id", init_req_id,
             ]
+            if loc.mailbox_root:
+                cmd.extend(["--mailbox-root", loc.mailbox_root])
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                 if r.stdout.strip():
@@ -826,10 +845,23 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     import time as _time
 
     # Build set of non-manager agent_ids that have locations registered.
-    registered_workers = sorted({
-        a for a in roster if a != manager
-        and kernel.get_location(args.session_id, a)
-    })
+    registered_workers = []
+    for a in roster:
+        if a == manager:
+            continue
+        loc = kernel.get_location(args.session_id, a)
+        if not loc:
+            continue
+        em = loc.execution_mode
+        if em is not None and em != ExecutionMode.MAILBOX_WORKER:
+            log.info("launch pull: skipping %s (execution_mode=%s)", a, em.value)
+            continue
+        rm = loc.return_mode
+        if rm == ReturnMode.BIDIRECTIONAL:
+            log.info("launch pull: skipping %s (return_mode=bidirectional)", a)
+            continue
+        registered_workers.append(a)
+    registered_workers = sorted(registered_workers)
     if not registered_workers:
         print("warning: no registered workers found — skipping pull loop", file=sys.stderr)
         return 0

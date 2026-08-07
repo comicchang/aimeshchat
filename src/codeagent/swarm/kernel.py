@@ -888,6 +888,10 @@ class SwarmKernel:
         messages: list[dict] = []
         manager_id = session.manager_id
         for agent_id in pull_agents:
+            # Look up mailbox_root for this agent from routing table.
+            agent_loc = self._routing.get((session_id, agent_id))
+            agent_mailbox_root = agent_loc.mailbox_root if agent_loc else ""
+
             cmd = [
                 "codeagent", "mailbox", "read",
                 "--session", session_id,
@@ -896,6 +900,8 @@ class SwarmKernel:
                 "--host", from_host,
                 "--json",
             ]
+            if agent_mailbox_root:
+                cmd.extend(["--mailbox-root", agent_mailbox_root])
             try:
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=30,
@@ -912,11 +918,13 @@ class SwarmKernel:
                 msg = json.loads(raw)
                 if isinstance(msg, dict):
                     messages.append(msg)
-                    self._finalize_remote(from_host, session_id, manager_id, msg)
+                    self._finalize_remote(from_host, session_id, manager_id, msg,
+                                          mailbox_root=agent_mailbox_root)
                 elif isinstance(msg, list):
                     messages.extend(msg)
                     for m in msg:
-                        self._finalize_remote(from_host, session_id, manager_id, m)
+                        self._finalize_remote(from_host, session_id, manager_id, m,
+                                              mailbox_root=agent_mailbox_root)
             except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
                 log.warning(
                     "pull_remote: error reading from agent=%s host=%s: %s",
@@ -925,7 +933,8 @@ class SwarmKernel:
         return messages
 
     def _finalize_remote(self, from_host: str, session_id: str,
-                         manager_id: str, msg: dict) -> None:
+                         manager_id: str, msg: dict,
+                         mailbox_root: str = "") -> None:
         """Finalize a message on the remote mailbox after successful read."""
         msg_id = msg.get("msg_id", "")
         if not msg_id:
@@ -938,6 +947,8 @@ class SwarmKernel:
             "--owner", manager_id,
             "--msg-id", msg_id,
         ]
+        if mailbox_root:
+            finalize_cmd.extend(["--mailbox-root", mailbox_root])
         try:
             result = subprocess.run(
                 finalize_cmd, capture_output=True, text=True, timeout=10,
