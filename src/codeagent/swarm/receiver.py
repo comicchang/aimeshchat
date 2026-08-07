@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from codeagent.mailbox.protocol import Message
 from codeagent.mailbox.store import MailboxStore
 from codeagent.swarm.model import Subscription, _iter_inbox_files
 
@@ -197,7 +198,11 @@ class SwarmReceiver:
             pass
 
     def _handle_stream_event(self, event: dict[str, Any]) -> None:
-        """Process a single stream event: write to inbox, fire callbacks, ack."""
+        """Process a single stream event: write to inbox, fire callbacks.
+
+        C13: Receiver is notification-only — it NEVER acks/finalizes.
+        Agent/Worker must explicitly read→process→finalize (two-phase).
+        """
         msg_id = event.get("msg_id", "")
         if not msg_id:
             return
@@ -211,29 +216,21 @@ class SwarmReceiver:
         # inbox or processing or archive, skip writing.
         if self._is_msg_on_disk(msg_id):
             log.debug("SwarmReceiver: skipping already-stored msg_id=%s", msg_id)
-            success = self._fire_callbacks(event)
-            if success:
-                self._try_ack(msg_id)
-            else:
-                log.warning(
-                    "SwarmReceiver: msg_id=%s not acked — callback failure", msg_id,
-                )
+            self._fire_callbacks(event)
             return
 
         # Write to local inbox
         self._write_to_inbox(event)
 
-        # Fire callbacks — only ack on success
-        success = self._fire_callbacks(event)
-        if success:
-            self._try_ack(msg_id)
-        else:
-            log.warning(
-                "SwarmReceiver: msg_id=%s not acked — callback failure", msg_id,
-            )
+        # Fire callbacks (notification only — no ack)
+        self._fire_callbacks(event)
 
     def _write_to_inbox(self, event: dict[str, Any]) -> None:
-        """Write a stream event as a message file in the local inbox."""
+        """Write a stream event as a message file in the local inbox.
+
+        C15: Uses Message.from_dict().to_dict() to preserve ALL wire fields
+        (reply_to, run_id, request_id, trace_id, causation_id, attachments).
+        """
         msg_id = event.get("msg_id", "")
         inbox = self._store.agent_subdir(self._session_id, self._agent_id, "inbox")
         inbox.mkdir(parents=True, exist_ok=True)
@@ -242,7 +239,9 @@ class SwarmReceiver:
         if dest.exists():
             return  # Already exists (race with Syncthing or concurrent writer)
 
-        msg = {
+        # C15: Round-trip through Message serializer to preserve all fields.
+        # Required fields get defaults; optional fields pass through from wire.
+        msg = Message.from_dict({
             "session_id": self._session_id,
             "from": event.get("from", ""),
             "to": self._agent_id,
@@ -251,7 +250,11 @@ class SwarmReceiver:
             "kind": event.get("kind", "TASK"),
             "msg_id": msg_id,
             "created_at": event.get("created_at", ""),
-        }
+            **{k: event[k] for k in (
+                "reply_to", "run_id", "request_id",
+                "trace_id", "causation_id", "attachments",
+            ) if k in event},
+        }).to_dict()
         tmp = inbox / f".tmp-{msg_id}.json"
         try:
             with open(tmp, "w") as f:
@@ -271,21 +274,7 @@ class SwarmReceiver:
                 return True
         return False
 
-    def _try_ack(self, msg_id: str) -> None:
-        """Best-effort ack (consumed) for a message.
 
-        Uses finalize_from_inbox directly since receiver writes messages
-        to inbox (not processing), so the normal two-phase read→processing→
-        finalize flow never runs for auto-consumption.
-        """
-        if not msg_id:
-            return
-        try:
-            self._store.finalize_from_inbox(
-                self._session_id, self._agent_id, msg_id, owner=self._agent_id,
-            )
-        except Exception:
-            log.debug("SwarmReceiver: ack failed for msg_id=%s", msg_id)
 
     # ── Watch mode (local filesystem polling) ──────────────────────────
 
@@ -388,17 +377,12 @@ class SwarmReceiver:
         return new_msgs
 
     def _handle_watch_message(self, msg: dict) -> None:
-        """Process a message discovered by watch: fire callbacks, ack on success."""
-        success = self._fire_callbacks(msg)
-        msg_id = msg.get("msg_id", "")
+        """Process a message discovered by watch: fire callbacks only.
 
-        if success:
-            self._try_ack(msg_id)
-        else:
-            log.warning(
-                "SwarmReceiver: msg_id=%s not acked — no callback matched or callback raised",
-                msg_id,
-            )
+        C13: Receiver is notification-only — it NEVER acks/finalizes.
+        Agent/Worker must explicitly read→process→finalize (two-phase).
+        """
+        self._fire_callbacks(msg)
 
     # ── Callback dispatch ──────────────────────────────────────────────
 

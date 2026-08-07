@@ -275,7 +275,7 @@ class TestStreamMode:
         assert fired[0]["subject"] == "stream-msg"
 
     def test_stream_writes_to_local_inbox(self, store, kernel, tmp_path):
-        """Stream events are written then auto-archived (consumed)."""
+        """Stream events are written to inbox (notification-only, no auto-ack)."""
         events = [{
             "msg_id": "msg-inbox-1",
             "from": "bob",
@@ -295,12 +295,13 @@ class TestStreamMode:
 
         receiver.stop()
 
-        # P0-1 fix: receiver auto-acks consumed → message archived, not
-        # stuck in inbox
+        # C13: receiver is notification-only — message stays in inbox
+        # (agent/worker must explicitly read→process→finalize)
         inbox = store.agent_subdir("s1", "w1", "inbox")
         archive = store.agent_subdir("s1", "w1", "archive")
-        assert not (inbox / "msg-inbox-1.json").exists()
-        written = json.loads((archive / "msg-inbox-1.json").read_bytes())
+        assert (inbox / "msg-inbox-1.json").exists(), "message must stay in inbox"
+        assert not (archive / "msg-inbox-1.json").exists(), "message must NOT be auto-archived"
+        written = json.loads((inbox / "msg-inbox-1.json").read_bytes())
         assert written["msg_id"] == "msg-inbox-1"
         assert written["from"] == "bob"
         assert written["body"] == "test body"
@@ -392,12 +393,12 @@ class TestStreamMode:
 
         # Callback still fires (message exists on disk)
         assert len(fired) == 1
-        # P0-1 fix: auto-ack archives the pre-existing message (content
-        # preserved in archive, not overwritten)
+        # C13: receiver is notification-only — message stays in inbox
         inbox = store.agent_subdir("s1", "w1", "inbox")
         archive = store.agent_subdir("s1", "w1", "archive")
-        assert not (inbox / "msg-existing.json").exists()
-        written = json.loads((archive / "msg-existing.json").read_bytes())
+        assert (inbox / "msg-existing.json").exists(), "message stays in inbox"
+        assert not (archive / "msg-existing.json").exists(), "message NOT auto-archived"
+        written = json.loads((inbox / "msg-existing.json").read_bytes())
         assert written["subject"] == "pre-existing"  # not overwritten
 
     def test_stream_multiple_events(self, store, kernel, tmp_path):
@@ -431,50 +432,42 @@ class TestStreamMode:
 
 
 class TestAckAfterCallback:
-    """After callback fires, receiver auto-acks with 'consumed'."""
+    """C13: Receiver is notification-only — it does NOT ack/finalize."""
 
-    def test_watch_ack_consumed(self, store, kernel, tmp_path):
-        """Watch mode: message is acked (consumed → archive) after callback."""
+    def test_watch_no_auto_ack(self, store, kernel, tmp_path):
+        """Watch mode: message stays in inbox after callback (no auto-ack)."""
         _setup_session(kernel, store)
-        acked: list[str] = []
-        original_ack = kernel.ack
-
-        def tracking_ack(session_id, agent_id, msg_id, phase="consumed"):
-            acked.append(msg_id)
-            return original_ack(session_id, agent_id, msg_id, phase)
-
-        kernel.ack = tracking_ack
-
+        fired: list[dict] = []
         receiver = SwarmReceiver("s1", "w1", kernel, store)
-        receiver.subscribe(callback=lambda msg: None)
+        receiver.subscribe(callback=lambda msg: fired.append(msg))
         receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
         time.sleep(0.15)
 
         _write_msg(store, "s1", "w1", "msg-ack-test")
 
         deadline = time.monotonic() + 3.0
-        while not acked and time.monotonic() < deadline:
+        while not fired and time.monotonic() < deadline:
             time.sleep(0.05)
 
         receiver.stop()
 
-        # The ack may fail (msg not in processing), but the receiver
-        # still attempts it. Verify the callback fired.
-        # The ack failure is expected because watch mode doesn't use
-        # kernel.read() (which moves to processing), so ack can't finalize.
-        # This is by design — watch mode acks are best-effort.
+        # C13: callback fired but message stays in inbox (no auto-ack)
+        assert len(fired) == 1
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        archive = store.agent_subdir("s1", "w1", "archive")
+        assert (inbox / "msg-ack-test.json").exists(), "message stays in inbox"
+        assert not (archive / "msg-ack-test.json").exists(), "NOT auto-archived"
 
-    def test_stream_ack_consumed(self, store, kernel, tmp_path):
-        """Stream mode: after callback, receiver calls ack('consumed')."""
+    def test_stream_no_auto_ack(self, store, kernel, tmp_path):
+        """Stream mode: message stays in inbox after callback (no auto-ack)."""
         _setup_session(kernel, store)
 
         # Use kernel.direct to put a message in w1's inbox
         from codeagent.swarm.model import Envelope
-        env = Envelope(subject="s", body="b", kind="TASK")
+        env = Envelope(subject="s", body="b", kind="TASK", run_id="run-1", request_id="req-1")
         kernel.direct("s1", "mgr", "w1", env)
 
         # Read the actual message from inbox to get the real msg_id
-        # (LocalDeliverySink doesn't pass kernel's msg_id to store)
         msg = store.read("s1", "w1", "w1")
         assert msg is not None
         msg_id = msg["msg_id"]
@@ -514,13 +507,17 @@ class TestAckAfterCallback:
         time.sleep(0.3)
         receiver.stop()
 
-        # Verify callback fired
+        # C13: callback fired but message stays in inbox (no auto-ack)
         assert len(fired) == 1
-
-        # Verify message is in archive (consumed) — the ack succeeded
-        # because the message was already in processing from store.read()
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        # Message was already read to processing by store.read(), then
+        # receiver wrote stream event to inbox — it should still be there
         stats = store.stats("s1", "w1")
-        assert stats["archive"] == 1
+        # The original message was moved to processing by store.read(),
+        # then receiver wrote a new copy to inbox via _write_to_inbox.
+        # No auto-ack means the inbox copy stays.
+        assert stats["inbox"] >= 1 or stats["processing"] >= 1, \
+            "message must remain (not auto-archived)"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -734,7 +731,7 @@ class TestKernelIntegration:
         kernel.subscribe("s1", "w1", callback=lambda msg: fired.append(msg))
 
         kernel.direct("s1", "mgr", "w1",
-                       Envelope(subject="poll-test", body="b", kind="TASK"))
+                       Envelope(subject="poll-test", body="b", kind="TASK", run_id="run-1", request_id="req-1"))
 
         result = kernel.poll("s1", "w1")
         assert len(result.messages) == 1
@@ -1141,8 +1138,8 @@ class TestCallbackFailureSafety:
         assert (inbox / "msg-cb-raise.json").exists(), "message must stay in inbox after callback failure"
         assert not (archive / "msg-cb-raise.json").exists(), "message must NOT be archived after callback failure"
 
-    def test_callback_success_archives_message(self, store, kernel, tmp_path):
-        """Callback succeeds → message finalized from inbox to archive."""
+    def test_callback_success_stays_in_inbox(self, store, kernel, tmp_path):
+        """Callback succeeds → message stays in inbox (notification-only)."""
         _setup_session(kernel, store)
         fired: list[dict] = []
 
@@ -1151,22 +1148,21 @@ class TestCallbackFailureSafety:
         receiver.start_watch(mailbox_root=tmp_path, poll_interval=0.1)
         time.sleep(0.15)
 
-        _write_msg(store, "s1", "w1", "msg-cb-ok", subject="should-archive")
+        _write_msg(store, "s1", "w1", "msg-cb-ok", subject="should-stay")
 
         deadline = time.monotonic() + 3.0
         while not fired and time.monotonic() < deadline:
             time.sleep(0.05)
 
-        # Wait for ack to complete
         time.sleep(0.3)
         receiver.stop()
 
         assert len(fired) == 1
-        # Message should be in archive (consumed)
+        # C13: message stays in inbox — receiver is notification-only
         inbox = store.agent_subdir("s1", "w1", "inbox")
         archive = store.agent_subdir("s1", "w1", "archive")
-        assert not (inbox / "msg-cb-ok.json").exists(), "successful callback must archive the message"
-        assert (archive / "msg-cb-ok.json").exists(), "successful callback must move message to archive"
+        assert (inbox / "msg-cb-ok.json").exists(), "message stays in inbox after callback"
+        assert not (archive / "msg-cb-ok.json").exists(), "message NOT auto-archived"
 
     def test_no_callback_match_keeps_message_in_inbox(self, store, kernel, tmp_path):
         """No callback matches filters → message NOT archived."""
@@ -1228,3 +1224,190 @@ class TestCallbackFailureSafety:
         archive = store.agent_subdir("s1", "w1", "archive")
         assert (inbox / "msg-stream-fail.json").exists(), "stream failure must keep message in inbox"
         assert not (archive / "msg-stream-fail.json").exists(), "stream failure must NOT archive"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# C15: Field preservation — all correlation fields survive round-trip
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestFieldPreservation:
+    """C15: All wire fields survive stream→inbox round-trip."""
+
+    def test_stream_preserves_correlation_fields(self, store, kernel, tmp_path):
+        """Stream event with reply_to, run_id, request_id, trace_id, causation_id
+        survives _write_to_inbox and can be read back with all fields intact."""
+        _setup_session(kernel, store)
+        fired: list[dict] = []
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: fired.append(msg))
+
+        event = {
+            "msg_id": "msg-corr-fields",
+            "from": "mgr",
+            "to": "w1",
+            "kind": "TASK",
+            "subject": "correlation-test",
+            "body": "check fields",
+            "created_at": "2025-07-10T00:00:00Z",
+            "reply_to": "msg-original",
+            "run_id": "run-abc-123",
+            "request_id": "req-xyz-789",
+            "trace_id": "trace-aaa-bbb",
+            "causation_id": "cause-ccc-ddd",
+        }
+
+        # Write directly to inbox via _write_to_inbox
+        receiver._write_to_inbox(event)
+
+        # Read back from disk
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        written = json.loads((inbox / "msg-corr-fields.json").read_bytes())
+
+        # Assert ALL correlation fields survived
+        assert written["reply_to"] == "msg-original"
+        assert written["run_id"] == "run-abc-123"
+        assert written["request_id"] == "req-xyz-789"
+        assert written["trace_id"] == "trace-aaa-bbb"
+        assert written["causation_id"] == "cause-ccc-ddd"
+        # Required fields also present
+        assert written["session_id"] == "s1"
+        assert written["from"] == "mgr"
+        assert written["to"] == "w1"
+        assert written["msg_id"] == "msg-corr-fields"
+
+    def test_stream_preserves_attachments(self, store, kernel, tmp_path):
+        """Stream event with attachments survives _write_to_inbox."""
+        _setup_session(kernel, store)
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+
+        event = {
+            "msg_id": "msg-with-atts",
+            "from": "mgr",
+            "to": "w1",
+            "kind": "TASK",
+            "subject": "has-attachments",
+            "body": "see attached",
+            "created_at": "2025-07-10T00:00:00Z",
+            "attachments": [
+                {
+                    "artifact_id": "art-001",
+                    "source_host": "host-a",
+                    "remote_root": "/tmp/artifacts",
+                    "relative_path": "output.tar.gz",
+                    "size": 1024,
+                    "sha256": "a" * 64,
+                    "media_type": "application/gzip",
+                },
+            ],
+        }
+
+        receiver._write_to_inbox(event)
+
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        written = json.loads((inbox / "msg-with-atts.json").read_bytes())
+
+        assert len(written["attachments"]) == 1
+        att = written["attachments"][0]
+        assert att["artifact_id"] == "art-001"
+        assert att["sha256"] == "a" * 64
+        assert att["media_type"] == "application/gzip"
+
+    def test_history_entry_preserves_correlation_fields(self, store, kernel):
+        """DeliveryEngine._history_entry preserves all correlation fields."""
+        from codeagent.swarm.delivery import DeliveryEngine
+
+        engine = DeliveryEngine(mailbox_store=store)
+
+        envelope = {
+            "session_id": "s1",
+            "from": "mgr",
+            "to": "w1",
+            "subject": "test",
+            "body": "body",
+            "kind": "TASK",
+            "msg_id": "msg-hist-1",
+            "created_at": "2025-07-10T00:00:00Z",
+            "reply_to": "msg-orig",
+            "run_id": "run-1",
+            "request_id": "req-1",
+            "trace_id": "trace-1",
+            "causation_id": "cause-1",
+        }
+
+        entry = engine._history_entry(envelope, "msg-hist-1")
+
+        assert entry["reply_to"] == "msg-orig"
+        assert entry["run_id"] == "run-1"
+        assert entry["request_id"] == "req-1"
+        assert entry["trace_id"] == "trace-1"
+        assert entry["causation_id"] == "cause-1"
+
+    def test_history_entry_preserves_attachments(self, store, kernel):
+        """DeliveryEngine._history_entry preserves attachments."""
+        from codeagent.swarm.delivery import DeliveryEngine
+
+        engine = DeliveryEngine(mailbox_store=store)
+
+        envelope = {
+            "session_id": "s1",
+            "from": "mgr",
+            "to": "w1",
+            "subject": "test",
+            "body": "body",
+            "kind": "TASK",
+            "msg_id": "msg-hist-2",
+            "created_at": "2025-07-10T00:00:00Z",
+            "attachments": [
+                {"artifact_id": "a1", "source_host": "h1",
+                 "remote_root": "/r", "relative_path": "f.txt",
+                 "size": 100, "sha256": "b" * 64},
+            ],
+        }
+
+        entry = engine._history_entry(envelope, "msg-hist-2")
+
+        assert len(entry["attachments"]) == 1
+        assert entry["attachments"][0]["artifact_id"] == "a1"
+
+    def test_full_round_trip_all_fields(self, store, kernel, tmp_path):
+        """End-to-end: stream→inbox→read, all correlation fields match."""
+        _setup_session(kernel, store)
+        fired: list[dict] = []
+        receiver = SwarmReceiver("s1", "w1", kernel, store)
+        receiver.subscribe(callback=lambda msg: fired.append(msg))
+
+        event = {
+            "msg_id": "msg-roundtrip",
+            "from": "mgr",
+            "to": "w1",
+            "kind": "EVIDENCE",
+            "subject": "round-trip",
+            "body": "verify all fields",
+            "created_at": "2025-07-10T00:00:00Z",
+            "reply_to": "orig-msg",
+            "run_id": "run-rt",
+            "request_id": "req-rt",
+            "trace_id": "trace-rt",
+            "causation_id": "cause-rt",
+            "attachments": [
+                {"artifact_id": "att-rt", "source_host": "host-rt",
+                 "remote_root": "/data", "relative_path": "result.json",
+                 "size": 512, "sha256": "c" * 64},
+            ],
+        }
+
+        receiver._handle_stream_event(event)
+
+        # Callback received the event
+        assert len(fired) == 1
+
+        # Read back from inbox
+        inbox = store.agent_subdir("s1", "w1", "inbox")
+        written = json.loads((inbox / "msg-roundtrip.json").read_bytes())
+
+        # Every correlation field matches
+        for field in ("reply_to", "run_id", "request_id", "trace_id", "causation_id"):
+            assert written[field] == event[field], f"{field} mismatch"
+        assert len(written["attachments"]) == 1
+        assert written["attachments"][0]["artifact_id"] == "att-rt"

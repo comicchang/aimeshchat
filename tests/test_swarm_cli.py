@@ -210,11 +210,13 @@ class TestCreateSession:
         # 跨进程：新 CLI 进程（新 kernel）从 session.json 恢复 restricted
         rc, out, _ = _run(["swarm", "direct", "rst",
                            "--from", "w2", "--to", "w1",
+                           "--kind", "NOTICE",
                            "--subject", "x", "--body", "y"])
         assert rc == 1  # w2 不在 allowed_senders
 
         rc, out, _ = _run(["swarm", "direct", "rst",
                            "--from", "w1", "--to", "w2",
+                           "--kind", "NOTICE",
                            "--subject", "x", "--body", "y"])
         assert rc == 0  # w1 在 allowed_senders
         assert _json_out(out)["status"] == "delivered"
@@ -271,7 +273,8 @@ class TestDirect:
         rc, out, _ = _run(["swarm", "direct", "dir-s1",
                            "--from", "mgr", "--to", "w1",
                            "--kind", "TASK", "--subject", "do it",
-                           "--body", "please do this task"])
+                           "--body", "please do this task",
+                           "--run-id", "run-1", "--request-id", "req-1"])
         assert rc == 0
         data = _json_out(out)
         assert "msg_id" in data
@@ -285,7 +288,7 @@ class TestDirect:
                           "size": 10, "sha256": "a" * 64})
         rc, out, _ = _run(["swarm", "direct", "dir-att",
                            "--from", "mgr", "--to", "w1",
-                           "--subject", "att", "--body", "see attached",
+                           "--kind", "NOTICE", "--subject", "att", "--body", "see attached",
                            "--attachment", att])
         assert rc == 0
         data = _json_out(out)
@@ -297,12 +300,14 @@ class TestDirect:
         # w1 sends to w2 — should work (open policy)
         rc, out, _ = _run(["swarm", "direct", "dir-acl",
                            "--from", "w1", "--to", "w2",
+                           "--kind", "NOTICE",
                            "--subject", "hi", "--body", "hello"])
         assert rc == 0
 
     def test_direct_missing_session(self):
         rc, _, err = _run(["swarm", "direct", "ghost",
                            "--from", "mgr", "--to", "w1",
+                           "--kind", "NOTICE",
                            "--subject", "x", "--body", "y"])
         assert rc == 1
         assert "not found" in err
@@ -311,9 +316,62 @@ class TestDirect:
         _setup_full("dir-badatt", "mgr", "w1")
         rc, _, err = _run(["swarm", "direct", "dir-badatt",
                            "--from", "mgr", "--to", "w1",
+                           "--kind", "NOTICE",
                            "--subject", "x", "--body", "y",
                            "--attachment", "not-json"])
         assert rc == 1
+
+    # ── Correlation-protocol enforcement ───────────────────────────────
+
+    def test_direct_task_missing_run_id(self):
+        """TASK without --run-id must exit 1."""
+        _setup_full("dir-corr1", "mgr", "w1")
+        rc, _, err = _run(["swarm", "direct", "dir-corr1",
+                           "--from", "mgr", "--to", "w1",
+                           "--kind", "TASK", "--subject", "s", "--body", "b",
+                           "--request-id", "r1"])
+        assert rc == 1
+        assert "--run-id" in err
+
+    def test_direct_task_missing_request_id(self):
+        """TASK without --request-id must exit 1."""
+        _setup_full("dir-corr2", "mgr", "w1")
+        rc, _, err = _run(["swarm", "direct", "dir-corr2",
+                           "--from", "mgr", "--to", "w1",
+                           "--kind", "TASK", "--subject", "s", "--body", "b",
+                           "--run-id", "run-1"])
+        assert rc == 1
+        assert "--request-id" in err
+
+    def test_direct_report_missing_reply_to(self):
+        """REPORT without --reply-to must exit 1."""
+        _setup_full("dir-corr3", "mgr", "w1")
+        rc, _, err = _run(["swarm", "direct", "dir-corr3",
+                           "--from", "mgr", "--to", "w1",
+                           "--kind", "REPORT", "--subject", "s", "--body", "b"])
+        assert rc == 1
+        assert "--reply-to" in err
+
+    def test_direct_task_with_all_correlation_fields(self):
+        """TASK with run_id + request_id succeeds."""
+        _setup_full("dir-corr4", "mgr", "w1")
+        rc, out, _ = _run(["swarm", "direct", "dir-corr4",
+                           "--from", "mgr", "--to", "w1",
+                           "--kind", "TASK", "--subject", "s", "--body", "b",
+                           "--run-id", "run-1", "--request-id", "req-1"])
+        assert rc == 0
+        assert _json_out(out)["status"] == "delivered"
+
+    def test_direct_report_with_reply_to(self):
+        """REPORT with --reply-to succeeds."""
+        _setup_full("dir-corr5", "mgr", "w1")
+        rc, out, _ = _run(["swarm", "direct", "dir-corr5",
+                           "--from", "mgr", "--to", "w1",
+                           "--kind", "REPORT", "--subject", "s", "--body", "b",
+                           "--reply-to", "msg-orig",
+                           "--run-id", "run-1", "--request-id", "req-1"])
+        assert rc == 0
+        assert _json_out(out)["status"] == "delivered"
 
 
 # ── channel ──────────────────────────────────────────────────────────────
@@ -330,7 +388,7 @@ class TestChannel:
         kernel.create_channel("ch-s1", "dev", ["mgr", "w1"])
 
         rc, out, _ = _run(["swarm", "channel", "ch-s1", "dev",
-                           "--from", "mgr", "--kind", "TASK",
+                           "--from", "mgr", "--kind", "NOTICE",
                            "--subject", "channel msg", "--body", "in channel"])
         assert rc == 0
         data = _json_out(out)
@@ -437,6 +495,7 @@ class TestPoll:
         # Send a direct message to w1
         _run(["swarm", "direct", "poll-msg",
               "--from", "mgr", "--to", "w1",
+              "--kind", "NOTICE",
               "--subject", "task", "--body", "do this"])
         rc, out, _ = _run(["swarm", "poll", "poll-msg", "--agent", "w1"])
         assert rc == 0
@@ -450,6 +509,7 @@ class TestPoll:
         for i in range(3):
             _run(["swarm", "direct", "poll-lim",
                   "--from", "mgr", "--to", "w1",
+                  "--kind", "NOTICE",
                   "--subject", f"t{i}", "--body", f"b{i}"])
         rc, out, _ = _run(["swarm", "poll", "poll-lim",
                            "--agent", "w1", "--limit", "2"])
@@ -473,6 +533,7 @@ class TestAck:
         _setup_full("ack-s1", "mgr", "w1")
         _run(["swarm", "direct", "ack-s1",
               "--from", "mgr", "--to", "w1",
+              "--kind", "NOTICE",
               "--subject", "t", "--body", "b"])
         # Poll to get msg_id
         _, out, _ = _run(["swarm", "poll", "ack-s1", "--agent", "w1"])
@@ -530,6 +591,7 @@ class TestWatch:
         # Send a message first
         _run(["swarm", "direct", "wt-s1",
               "--from", "mgr", "--to", "w1",
+              "--kind", "NOTICE",
               "--subject", "hello", "--body", "world"])
         # Watch with 2 iterations (should poll twice and exit)
         rc, out, _ = _run(["swarm", "watch", "wt-s1",
@@ -570,7 +632,8 @@ class TestSwarmEndToEnd:
         rc, out, _ = _run(["swarm", "direct", sid,
                            "--from", "mgr", "--to", "w1",
                            "--kind", "TASK", "--subject", "init",
-                           "--body", "initialize subsystem"])
+                           "--body", "initialize subsystem",
+                           "--run-id", "run-e2e", "--request-id", "req-e2e"])
         assert rc == 0
         direct_receipt = _json_out(out)
         assert direct_receipt["status"] == "delivered"
@@ -589,7 +652,7 @@ class TestSwarmEndToEnd:
         kernel.create_channel(sid, "dev", ["mgr", "w1", "w2"])
 
         rc, out, _ = _run(["swarm", "channel", sid, "dev",
-                           "--from", "mgr", "--kind", "TASK",
+                           "--from", "mgr", "--kind", "NOTICE",
                            "--subject", "channel-task", "--body", "build it"])
         assert rc == 0
 
@@ -653,6 +716,7 @@ class TestOutbox:
         # Send message — transport fails, outbox entry remains
         _run(["swarm", "direct", sid,
               "--from", "mgr", "--to", "w1",
+              "--kind", "NOTICE",
               "--subject", "test", "--body", "payload"])
 
     def test_pending_json_lists_undelivered(self):
@@ -838,7 +902,7 @@ class TestSwarmHooks:
 
         result = on_agent_message(
             session_id="hook-msg", agent_id="mgr",
-            msg_dict={"to": "w1", "kind": "TASK", "subject": "s", "body": "b"},
+            msg_dict={"to": "w1", "kind": "NOTICE", "subject": "s", "body": "b"},
             store_root=tmp_path,
         )
         assert result["status"] == "delivered"
@@ -879,7 +943,7 @@ class TestSwarmHooks:
 
         result = on_agent_message(
             session_id="hook-ch", agent_id="mgr",
-            msg_dict={"to": "#dev", "kind": "TASK", "subject": "s", "body": "b"},
+            msg_dict={"to": "#dev", "kind": "NOTICE", "subject": "s", "body": "b"},
             store_root=tmp_path,
         )
         assert result["channel"] is True

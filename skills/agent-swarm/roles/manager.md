@@ -4,7 +4,7 @@
 
 ## 1. Scope
 
-This skill **only orchestrates** — no domain research, no evidence judgment. Manager may read `workers.toml`, Worker artifacts, `.mailbox/<session>/<agent>/status.json`, and its own session inbox. Never use `capture-pane` to infer state. `status.json` is a current-state snapshot; formal conclusions are in Worker `REPORT` messages.
+This skill **only orchestrates** — no domain research, no evidence judgment. Manager reads the **SessionManifest** (the authoritative registry for the session), Worker artifacts, `.mailbox/<session>/<agent>/status.json`, and its own session inbox. `workers.toml` is a legacy bootstrap source only; when a SessionManifest exists, it **supersedes** `workers.toml` for all dispatch, identity, and host-routing decisions. Never use `capture-pane` to infer state. `status.json` is a current-state snapshot; formal conclusions are in Worker `REPORT` messages.
 
 ## 2. Self-Initialization
 
@@ -19,13 +19,19 @@ Before dispatching or waiting for any Worker, Manager MUST initialize its own id
    ```
 
    Replace `<actual-session-id>` with the real session ID; never leave a placeholder.
-3. Check Manager inbox before declaring idle:
+3. **Manifest validation** (REQUIRED before any dispatch):
+   - Load the SessionManifest for this session.
+   - Verify the manifest's `manager` field matches `$OMP_WORKER_ID` ("manager").
+   - If the manifest declares workers that conflict with `workers.toml` entries (same `worker_id`, different `host` or `role`), the manifest **wins**; log a `MANIFEST_CONFLICT` warning and use manifest values.
+   - If no manifest exists, fall back to `workers.toml` and log `LEGACY_TOML_MODE`.
+   - Never proceed with a manifest whose `session_id` does not match `$OMP_SESSION_ID`.
+4. Check Manager inbox before declaring idle:
 
    ```bash
    mailbox peek --session <actual-session-id> --agent manager
    ```
 
-4. If pending > 0, drain every pre-existing REPORT/NOTICE before declaring IDLE:
+5. If pending > 0, drain every pre-existing REPORT/NOTICE before declaring IDLE:
 
    ```bash
    mailbox read --session <actual-session-id> --agent manager --owner manager --json
@@ -35,7 +41,7 @@ Before dispatching or waiting for any Worker, Manager MUST initialize its own id
    ```
 
    A failed peek or unreadable inbox is a startup failure, not an idle state.
-5. Write Manager's own status:
+6. Write Manager's own status:
 
    ```bash
    mailbox status --session <actual-session-id> --agent manager \
@@ -43,21 +49,38 @@ Before dispatching or waiting for any Worker, Manager MUST initialize its own id
      --last-conclusion "manager initialized"
    ```
 
-6. Start the configured mailbox plugin/watch or the documented polling loop.
+7. Start the configured mailbox plugin/watch or the documented polling loop.
 
 ## 3. Communication Model
 
 | Direction | Primary path | Purpose |
 |---|---|---|
-| Manager→Worker | standalone `mailbox` direct inbox | formal INIT/TASK, supplementary materials, traceable instructions |
+| Manager→Worker (local) | `codeagent swarm direct <session> --to <worker-id> --kind TASK ...` | formal INIT/TASK, supplementary materials |
+| Manager→Worker (remote) | `codeagent mailbox send ... --host <H>` | formal INIT/TASK when Worker is on a different host |
 | Manager→Worker | `tmux send-keys` | post-INIT inbox check prompt or short steering; **never** carries formal task body |
-| Worker→Manager | standalone `mailbox` direct inbox | REPORT, PROGRESS, QUESTION, NOTICE |
-| Worker→Worker | standalone `mailbox` direct inbox | peer Q&A, evidence and review requests; Syncthing syncs directly |
+| Worker→Manager (local) | `codeagent swarm direct <session> --to manager --kind REPORT ...` | REPORT, PROGRESS, QUESTION, NOTICE |
+| Worker→Manager (remote) | Worker writes to host-local manager/inbox; Manager pulls via `codeagent mailbox read` (see below) | REPORT when Worker has no direct access to Manager host |
+| Worker→Worker | `codeagent mailbox send ... --host <H>` or `codeagent swarm direct <session> --to <peer> ...` | peer Q&A, evidence and review requests; Syncthing syncs directly |
 | Worker→all observers | `.mailbox/<session>/<agent>/status.json` | IDLE/BUSY/DONE/BLOCKED, current task, last conclusion |
 
+### Manager-Pull Path (remote Worker → Manager)
+
+When a Worker is on a remote host and cannot write directly to the Manager's mailbox:
+
+1. Worker writes the message to its **host-local** manager inbox:
+   ```bash
+   codeagent mailbox send --session <session-id> --from <worker-id> --to manager \
+     --kind REPORT --subject "..." --body "..." --host <worker-host>
+   ```
+2. Manager periodically **pulls** from each remote host:
+   ```bash
+   codeagent mailbox read --session <session-id> --agent manager --owner manager --host <H>
+   ```
+   This is the **only** correct cross-host read primitive. Neither `manager-poll` nor `swarm poll --host` exists — use `codeagent mailbox read --host <H>` instead.
+
 Notification reachability:
-- **Local Worker** (shared tmux socket): direct inbox is authoritative; `send-keys MAILBOX_PENDING` is optional wake.
-- **Remote SSH Worker**: no local tmux socket; never use `send-keys`. Mailbox + status.json polling is the complete path.
+- **Local Worker** (shared tmux socket): `codeagent swarm direct` is authoritative; `send-keys MAILBOX_PENDING` is optional wake.
+- **Remote Worker**: Manager-pull is the complete path. `send-keys` is unavailable; never attempt it.
 - `send-keys` success proves neither delivery nor reading; only mailbox files and subsequent status/REPORT prove progress.
 
 ## 4. INIT Handshake
@@ -78,9 +101,16 @@ Manager must complete INIT for each Worker before dispatching tasks.
 
 - **Already-idle Worker** — if `.mailbox/<session-id>/<worker-id>/status.json` exists with `state=IDLE`, new INIT is **NO-OP**. Do not re-send INIT, do not require skill re-read. Just `mailbox peek` and wait for new TASK.
 
+  **[PROVISIONAL — registration CLI not yet available]**: When registration exists, this check MUST also validate that the Worker's `registration.json` has a matching generation and an active lease. Until `mailbox register` is implemented, status.json alone is the NO-OP gate.
+
 ### Four-Step INIT Sequence
 
-1. **Write formal INIT (a)**: `mailbox send` with `kind=TASK`, `subject=INIT` into target Worker inbox. Body must contain actual `session_id`, `worker_id`, role profile, artifact root, and compatibility requirements.
+0. **Preflight checks** (REQUIRED before sending INIT):
+   - Verify the Worker's `execution_mode` from SessionManifest (or workers.toml fallback): `local` vs `remote`. This determines whether `tmux send-keys` or manager-pull is the notification path.
+   - Verify the Worker's `return_mode`: how the Worker delivers results (local mailbox write, remote mailbox write + Manager pull, artifact-only). If `return_mode` is missing or unrecognized, **abort INIT** and log `MISSING_RETURN_MODE`.
+   - If `execution_mode` and `return_mode` conflict (e.g., `execution_mode=remote` but `return_mode=local-only`), abort and log `MODE_CONFLICT`.
+
+1. **Write formal INIT (a)**: `mailbox send` with `kind=TASK`, `subject=INIT` into target Worker inbox. Body must contain actual `session_id`, `worker_id`, role profile, artifact root, `execution_mode`, `return_mode`, and compatibility requirements.
 
 2. **Send check prompt (b)**: Immediately send a short prompt to the target pane. For local Workers with tmux:
 
@@ -109,11 +139,16 @@ The Worker writes its identity JSON to this injected `$OMP_MAILBOX_IDENTITY_FILE
 
 ## 5. Dispatch and Polling
 
-1. After INIT handshake, verify recipient and target status from workers.toml and `.mailbox/<session>/session.json`. Do not guess IDs.
-2. Dispatch with `mailbox send --session <session-id> --from manager --to <worker-id> --kind TASK`. Formal TASK requires completed INIT; subsequent local-only `send-keys` wake is optional.
+1. After INIT handshake, verify recipient and target status from SessionManifest (or workers.toml fallback) and `.mailbox/<session>/session.json`. Do not guess IDs.
+2. Dispatch with `codeagent swarm direct <session-id> --to <worker-id> --kind TASK ...` (local) or `codeagent mailbox send ... --host <H>` (remote). Formal TASK requires completed INIT; subsequent local-only `send-keys` wake is optional.
 3. Poll every 5 seconds: read target `status.json` and `mailbox stats` inbox count. When status transitions from `BUSY` to `DONE/BLOCKED`, drain Manager inbox to collect the corresponding `REPORT`.
-4. After each message is read and processed, `mailbox finalize` to archive. Then `mailbox clear` — only after task and receipt are fully handled.
-5. Status vs REPORT inconsistency: keep both, request Worker correction. Never silently overwrite.
+4. **Manager-pull polling** (for remote Workers): on each poll cycle, also run:
+   ```bash
+   codeagent mailbox read --session <session-id> --agent manager --owner manager --host <H>
+   ```
+   for each remote host `<H>` that has active Workers. This is how remote REPORT/PROGRESS/QUESTION messages arrive. Process all returned messages before the next sleep.
+5. After each message is read and processed, `mailbox finalize` to archive. Then `mailbox clear` — only after task and receipt are fully handled.
+6. Status vs REPORT inconsistency: keep both, request Worker correction. Never silently overwrite.
 
 Status interpretation for dispatch:
 - **IDLE/DONE/BLOCKED** + prior REPORT handled → may dispatch new TASK
@@ -122,11 +157,31 @@ Status interpretation for dispatch:
 
 ## 6. Report Verification
 
-Manager does NOT accept `status DONE` as proof of artifact validity. Must:
+Manager does NOT accept `status DONE` as proof of artifact validity. Every REPORT that claims completion MUST include an **AttachmentRef** — a structured reference with all seven fields:
+
+| Field | Description |
+|---|---|
+| `artifact_id` | Unique identifier for the artifact (e.g. `art-<session>-<worker>-<n>`) |
+| `source_host` | Host alias where the artifact was produced |
+| `remote_root` | Artifact root path on the source host |
+| `relative_path` | Path relative to the artifact root |
+| `size` | Exact byte count of the final artifact file |
+| `sha256` | Lowercase hex SHA-256 digest of the artifact content |
+| `media_type` | MIME type (e.g. `text/plain`, `image/png`; default `application/octet-stream`) |
+
+> **Note**: `request_id` belongs on the REPORT envelope (message-level correlation), not inside the AttachmentRef.
+
+### Verification Gate
+
+Before marking a task DONE or dispatching follow-up work:
+
 1. Read the final `REPORT` from inbox.
-2. Verify referenced artifact paths, sizes, hashes.
-3. Perform technical review.
-4. Only then proceed to next TASK or archive.
+2. Extract the `AttachmentRef`. If any of the seven fields is missing, **reject the REPORT** — send a correction request back to the Worker with `kind=NOTICE`, `subject=ARTIFACT_INCOMPLETE`.
+3. Verify `artifact_id` resolves to an actual file accessible to Manager (using `source_host` + `remote_root` + `relative_path` to locate it cross-host).
+4. Compute `sha256` of the file and compare against the reported digest. Mismatch → log `ARTIFACT_CONFLICT`, reject REPORT, request resend.
+5. Verify `size` matches actual file size. Mismatch → same as above.
+6. Verify the REPORT envelope's `request_id` matches the `request_id` of the TASK Manager originally dispatched. Mismatch → log `REQUEST_MISMATCH`, reject REPORT.
+7. Only after all fields validate may Manager proceed to next TASK or archive.
 
 Missing or stale status does not automatically mean BLOCKED. Check inbox and Worker reachability first.
 
@@ -173,8 +228,11 @@ Park 期间 agent 保持 IDLE 且 archive 受保护（`mailbox clear` 会检查 
 - **Syncthing conflict**: `.sync-conflict-*` are never valid. Compare originals, request resend. Never rename to fake delivery.
 - **Clock skew**: process by inbox mtime / actual arrival. Log `CLOCK_SKEW` on obvious skew. Never rewrite timestamps.
 - **Stale status / pending inbox**: `updated_at` exceeds SLA → `STALE` diagnostic (not IDLE/BLOCKED). Check inbox count, Syncthing, pane liveness. Local can re-wake; remote must wait for next Worker poll.
-- **Missing recipient**: sending fails → re-verify workers.toml, session.json, inbox path. Never create misspelled directories.
+- **Missing recipient**: sending fails → re-verify SessionManifest (or workers.toml), session.json, inbox path. Never create misspelled directories.
 - **Crash recovery**: `mailbox recover-stale` returns expired processing (>300s lease) to inbox. Run on startup or when `stats` shows non-zero processing. Never move files manually.
+- **Manifest mismatch**: SessionManifest `manager` does not match `$OMP_WORKER_ID` → abort startup, log `MANIFEST_MISMATCH`. Never operate under a manifest that doesn't claim you as manager.
+- **ARTIFACT_CONFLICT**: REPORT AttachmentRef sha256 or size does not match actual file → reject REPORT, log `ARTIFACT_CONFLICT`, request Worker resend with corrected AttachmentRef. Never accept a partial or corrupted artifact.
+- **Missing return_mode**: Worker's INIT or manifest entry lacks a valid `return_mode` → abort INIT for that Worker, log `MISSING_RETURN_MODE`. Never dispatch to a Worker whose delivery path is unknown.
 
 ## 11. Prevention Rules
 
@@ -185,3 +243,5 @@ Park 期间 agent 保持 IDLE 且 archive 受保护（`mailbox clear` 会检查 
 - Do not put large artifacts in message body; body holds summaries and artifact references only.
 - `mailbox clear` only clears archive, only after full task and receipt processing.
 - Remote Worker visibility relies on status/inbox polling; `send-keys` success ≠ delivery proof.
+- **Never skip artifact verification** — every REPORT with `status DONE` MUST have a validated AttachmentRef (artifact_id, source_host, remote_root, relative_path, size, sha256, media_type) before Manager accepts it. The REPORT envelope's `request_id` is also verified for correlation. No exceptions.
+- **Never guess host path** — always derive `--host <H>` from SessionManifest or an explicit Worker declaration. If the host is unknown, abort and log `UNKNOWN_HOST`. Never construct a hostname from assumptions.

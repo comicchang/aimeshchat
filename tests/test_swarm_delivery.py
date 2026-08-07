@@ -59,6 +59,8 @@ def _make_envelope(
     msg_id: str = "w1_20260101T000000_abc123",
     subject: str = "test-subject",
     body: str = "test-body",
+    run_id: str = "run-1",
+    request_id: str = "req-1",
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
@@ -70,6 +72,8 @@ def _make_envelope(
         "kind": "TASK",
         "msg_id": msg_id,
         "created_at": now,
+        "run_id": run_id,
+        "request_id": request_id,
     }
 
 
@@ -874,7 +878,8 @@ class TestStoreSendMsgIdDedup:
         """store.send with explicit msg_id uses that id."""
         _init_session(store)
         result = store.send(
-            "s1", "w1", "w2", "sub", "body",
+            "s1", "w1", "w2", "sub", "body", "TASK",
+            run_id="run-1", request_id="req-1",
             msg_id="custom_id_123",
         )
         assert "custom_id_123" in result
@@ -887,15 +892,17 @@ class TestStoreSendMsgIdDedup:
     def test_explicit_msg_id_duplicate_raises(self, store: MailboxStore) -> None:
         """Duplicate explicit msg_id raises ValueError."""
         _init_session(store)
-        store.send("s1", "w1", "w2", "sub1", "body1", msg_id="dup_id")
+        store.send("s1", "w1", "w2", "sub1", "body1", "TASK",
+                   run_id="run-1", request_id="req-1", msg_id="dup_id")
 
         with pytest.raises(ValueError, match="msg_id already exists"):
-            store.send("s1", "w1", "w2", "sub2", "body2", msg_id="dup_id")
+            store.send("s1", "w1", "w2", "sub2", "body2", "TASK",
+                       run_id="run-1", request_id="req-1", msg_id="dup_id")
 
     def test_explicit_msg_id_in_history_dedup(self, store: MailboxStore) -> None:
         """Duplicate msg_id detected even after message read (in history)."""
         _init_session(store)
-        store.send("s1", "w1", "w2", "sub", "body", msg_id="hist_dup")
+        store.send("s1", "w1", "w2", "sub", "body", "TASK", run_id="run-1", request_id="req-1", msg_id="hist_dup")
 
         # Read + archive the message
         store.read("s1", "w2", "r")
@@ -903,24 +910,27 @@ class TestStoreSendMsgIdDedup:
 
         # Same msg_id should still be rejected (exists in history)
         with pytest.raises(ValueError, match="msg_id already exists"):
-            store.send("s1", "w1", "w2", "sub2", "body2", msg_id="hist_dup")
+            store.send("s1", "w1", "w2", "sub2", "body2", "TASK",
+                       run_id="run-1", request_id="req-1", msg_id="hist_dup")
 
     def test_explicit_msg_id_path_traversal_rejected(self, store: MailboxStore) -> None:
         """Path traversal in msg_id is rejected."""
         _init_session(store)
         with pytest.raises(ValueError, match="invalid msg_id"):
-            store.send("s1", "w1", "w2", "sub", "body", msg_id="../escape")
+            store.send("s1", "w1", "w2", "sub", "body", "TASK", run_id="run-1", request_id="req-1", msg_id="../escape")
 
     def test_none_msg_id_generates_automatically(self, store: MailboxStore) -> None:
         """msg_id=None generates an automatic id (backwards compat)."""
         _init_session(store)
-        result = store.send("s1", "w1", "w2", "sub", "body")
+        result = store.send("s1", "w1", "w2", "sub", "body", "TASK",
+                           run_id="run-1", request_id="req-1")
         assert "sent" in result
 
     def test_no_msg_id_param_backwards_compat(self, store: MailboxStore) -> None:
         """Calling without msg_id parameter works exactly as before."""
         _init_session(store)
-        result = store.send("s1", "w1", "w2", "subject", "body")
+        result = store.send("s1", "w1", "w2", "subject", "body", "TASK",
+                           run_id="run-1", request_id="req-1")
         assert "sent" in result
         msg = store.read("s1", "w2", "r")
         assert msg is not None
@@ -1043,7 +1053,7 @@ class TestE2ECrossHostDeliveryChain:
         )
 
         # ── 3. Send direct message ─────────────────────────────────────
-        env = Envelope(subject="deploy", body="run CI", kind="TASK")
+        env = Envelope(subject="deploy", body="run CI", kind="TASK", run_id="run-1", request_id="req-1")
         receipt = kernel.direct("s1", "mgr", "remote-w", env)
         assert receipt.status == "delivered"
         msg_id = receipt.msg_id

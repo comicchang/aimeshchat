@@ -33,8 +33,10 @@ from codeagent.swarm.model import (
     Channel,
     DeliveryReceipt,
     Envelope,
+    ExecutionMode,
     PollResult,
     Registration,
+    ReturnMode,
     Roster,
     SendReceipt,
     Session,
@@ -176,10 +178,15 @@ class SwarmKernel:
                             members=list(cdata.get("members", [])),
                         )
                     for aid, rdata in (meta.get("routing") or {}).items():
+                        em_raw = rdata.get("execution_mode")
+                        rm_raw = rdata.get("return_mode")
                         self._routing[(sid, aid)] = AgentLocation(
                             agent_id=rdata.get("agent_id", aid),
                             host_alias=rdata.get("host_alias", ""),
                             backend=rdata.get("backend", "cli"),
+                            execution_mode=ExecutionMode(em_raw) if em_raw else None,
+                            mailbox_root=rdata.get("mailbox_root", ""),
+                            return_mode=ReturnMode(rm_raw) if rm_raw else None,
                         )
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                     chans = {}
@@ -190,6 +197,8 @@ class SwarmKernel:
                     roster=Roster(members=members),
                     acl=acl,
                     created_at=data.get("created_at", ""),
+                    execution_modes=data.get("execution_modes", {}),
+                    return_modes=data.get("return_modes", {}),
                 )
                 self._channels[sid] = chans
                 self._subscriptions[sid] = {}
@@ -204,6 +213,8 @@ class SwarmKernel:
         manager_id: str,
         roster: list[str],
         acl: Optional[ACL] = None,
+        execution_modes: Optional[dict[str, str]] = None,
+        return_modes: Optional[dict[str, str]] = None,
     ) -> Session:
         """Create a new swarm session with roster and ACL.
 
@@ -237,6 +248,8 @@ class SwarmKernel:
             roster=Roster(members=all_members),
             acl=acl,
             created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
+            execution_modes=dict(execution_modes) if execution_modes else {},
+            return_modes=dict(return_modes) if return_modes else {},
         )
 
         # Persist to filesystem via MailboxStore (ACL 权威入 session.json，
@@ -250,6 +263,8 @@ class SwarmKernel:
                 "room_members": acl.room_members,
                 "policy": acl.policy,
             },
+            execution_modes=dict(execution_modes) if execution_modes else None,
+            return_modes=dict(return_modes) if return_modes else None,
         )
 
         # Store swarm-level metadata alongside session.json (locked).
@@ -288,6 +303,24 @@ class SwarmKernel:
             raise ValueError(f"agent not in roster: {location.agent_id}")
         self._routing[(session_id, location.agent_id)] = location
         self._persist_routing(session_id)
+
+        # Persist execution_mode/return_mode to session.json so they
+        # survive across kernel restarts (session-level metadata).
+        em_update: Optional[dict[str, str]] = None
+        rm_update: Optional[dict[str, str]] = None
+        if location.execution_mode is not None:
+            session.execution_modes[location.agent_id] = location.execution_mode.value
+            em_update = {location.agent_id: location.execution_mode.value}
+        if location.return_mode is not None:
+            session.return_modes[location.agent_id] = location.return_mode.value
+            rm_update = {location.agent_id: location.return_mode.value}
+        if em_update or rm_update:
+            self._store.session_init(
+                session_id, session.manager_id, [],
+                execution_modes=em_update,
+                return_modes=rm_update,
+            )
+
         return Registration(
             agent_id=location.agent_id,
             session_id=session_id,
@@ -354,11 +387,18 @@ class SwarmKernel:
             routing = meta.get("routing", {})
             for (sid, aid), loc in self._routing.items():
                 if sid == session_id:
-                    routing[aid] = {
+                    entry: dict[str, Any] = {
                         "agent_id": loc.agent_id,
                         "host_alias": loc.host_alias,
                         "backend": loc.backend,
                     }
+                    if loc.execution_mode is not None:
+                        entry["execution_mode"] = loc.execution_mode.value
+                    if loc.mailbox_root:
+                        entry["mailbox_root"] = loc.mailbox_root
+                    if loc.return_mode is not None:
+                        entry["return_mode"] = loc.return_mode.value
+                    routing[aid] = entry
             for aid in deleted:
                 routing.pop(aid, None)
             meta["routing"] = routing

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from codeagent.constants import ISO_TIMESTAMP_FORMAT
+from codeagent.mailbox.protocol import Message
 from codeagent.mailbox.store import MailboxStore
 
 if False:  # TYPE_CHECKING
@@ -106,23 +107,17 @@ class DeliveryEngine:
         self._host_capabilities: dict[str, set[str]] = {}
 
     @staticmethod
-    def _history_entry(envelope: dict[str, Any], msg_id: str) -> dict[str, str]:
-        """Build a canonical history record (full 8-field message schema).
+    def _history_entry(envelope: dict[str, Any], msg_id: str) -> dict[str, Any]:
+        """Build a canonical history record preserving ALL message fields.
+
+        C15: Uses Message.from_dict().to_dict() round-trip to preserve
+        reply_to, run_id, request_id, trace_id, causation_id, attachments.
 
         Shared by deliver() and flush() so both successful paths append
         identical records — a drift here would silently fail
         append_history's validate_message and lose history.
         """
-        return {
-            "session_id": envelope.get("session_id", ""),
-            "from": envelope.get("from", ""),
-            "to": envelope.get("to", ""),
-            "subject": envelope.get("subject", ""),
-            "body": envelope.get("body", ""),
-            "kind": envelope.get("kind", "TASK"),
-            "msg_id": msg_id,
-            "created_at": envelope.get("created_at", ""),
-        }
+        return Message.from_dict({**envelope, "msg_id": msg_id}).to_dict()
 
     # ── public API ─────────────────────────────────────────────────────
 

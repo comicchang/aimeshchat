@@ -209,6 +209,9 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     dir_p.add_argument("--subject", required=True)
     dir_p.add_argument("--body", required=True)
     dir_p.add_argument("--attachment", action="append", default=[], help="Attachment JSON (repeatable)")
+    dir_p.add_argument("--run-id", default="", help="Run ID for request tracking")
+    dir_p.add_argument("--request-id", default="", help="Request ID for causation chain")
+    dir_p.add_argument("--reply-to", default="", help="Message ID being replied to")
 
     # channel
     ch_p = swarm_sub.add_parser("channel", help="Send to a channel")
@@ -461,8 +464,21 @@ def _swarm_create_channel(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
 
 def _swarm_direct(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    # ── Correlation-protocol enforcement ──────────────────────────────
+    kind = args.kind.upper()
+    if kind in ("TASK",) and not args.run_id:
+        print(f"error: --run-id is required for kind={kind}", file=sys.stderr)
+        return 1
+    if kind in ("TASK",) and not args.request_id:
+        print(f"error: --request-id is required for kind={kind}", file=sys.stderr)
+        return 1
+    if kind == "REPORT" and not args.reply_to:
+        print(f"error: --reply-to is required for kind=REPORT", file=sys.stderr)
+        return 1
+
     attachments = _parse_attachments(args.attachment) if args.attachment else []
-    env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments)
+    env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments,
+                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id)
     receipt = kernel.direct(args.session_id, args.sender, args.to, env)
     print(json.dumps({
         "msg_id": receipt.msg_id,

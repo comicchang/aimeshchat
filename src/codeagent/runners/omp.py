@@ -83,11 +83,17 @@ class OMPRunner(BaseRunner):
         belongs to the launcher, NOT to the agent's reasoning — inject it
         here so the plugin activates without the agent hand-writing an
         identity file.
+
+        Env vars (checked in precedence order):
+            SWARM_SESSION_ID  — canonical; set by swarm dispatcher.
+            OMP_SESSION_ID    — alias; used when SWARM_SESSION_ID is absent.
         """
         import secrets
         import time as _time
 
-        swarm_sid = os.environ.get("SWARM_SESSION_ID")
+        # Accept both SWARM_SESSION_ID (canonical) and OMP_SESSION_ID (alias).
+        # SWARM_SESSION_ID takes precedence when both are set.
+        swarm_sid = os.environ.get("SWARM_SESSION_ID") or os.environ.get("OMP_SESSION_ID")
         if not swarm_sid:
             return None
 

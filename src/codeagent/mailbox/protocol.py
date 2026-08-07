@@ -13,7 +13,14 @@ from codeagent.constants import LEASE_TIMEOUT_S
 VALID_KINDS = frozenset({"TASK", "REPORT", "PROGRESS", "EVIDENCE", "QUESTION", "RESPONSE", "NOTICE"})
 VALID_STATES = frozenset({"IDLE", "BUSY", "DONE", "BLOCKED"})
 REQUIRED_FIELDS = frozenset({"session_id", "from", "to", "subject", "body", "kind", "msg_id", "created_at"})
-OPTIONAL_FIELDS = frozenset({"reply_to", "run_id", "request_id", "attachments"})
+OPTIONAL_FIELDS = frozenset({"reply_to", "run_id", "request_id", "trace_id", "causation_id", "attachments"})
+# Per-kind field requirements beyond the global REQUIRED_FIELDS.
+# Keys are kind strings; values are sets of field names that MUST be present
+# (and non-empty-string) when a message carries that kind.
+KIND_CONDITIONAL_REQUIRED: dict[str, frozenset[str]] = {
+    "TASK":    frozenset({"run_id", "request_id"}),
+    "REPORT":  frozenset({"run_id", "request_id", "reply_to"}),
+}
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 # "*" is a reserved recipient meaning broadcast to every roster member except the sender.
@@ -223,6 +230,16 @@ def validate_message(msg: dict, expected_session_id: Optional[str] = None,
         return False, "subject must be non-empty"
     if not msg["body"].strip():
         return False, "body must be non-empty"
+    # Kind-conditional required fields (after basic field validation)
+    kind_extras = KIND_CONDITIONAL_REQUIRED.get(msg["kind"], frozenset())
+    if kind_extras:
+        missing_extras = kind_extras - set(msg.keys())
+        if missing_extras:
+            return False, f"kind {msg['kind']} requires fields: {', '.join(sorted(missing_extras))}"
+        for ef in sorted(kind_extras):
+            val = msg.get(ef, "")
+            if not isinstance(val, str) or not val.strip():
+                return False, f"kind {msg['kind']} requires non-empty {ef}"
     if expected_session_id is not None and msg["session_id"] != expected_session_id:
         return False, f"session_id mismatch: {msg['session_id']} vs {expected_session_id}"
     if expected_agent is not None and msg["to"] != expected_agent and msg["to"] != BROADCAST_TO:

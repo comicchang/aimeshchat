@@ -43,8 +43,10 @@ def _make_kernel_with_session(store, *, policy="open", extra_acl=None):
     return k
 
 
-def _env(subject="test", body="hello", kind="TASK"):
-    return Envelope(subject=subject, body=body, kind=kind)
+def _env(subject="test", body="hello", kind="TASK", run_id="run-1", request_id="req-1",
+         reply_to=""):
+    return Envelope(subject=subject, body=body, kind=kind, run_id=run_id, request_id=request_id,
+                    reply_to=reply_to)
 
 
 # ── Session creation ───────────────────────────────────────────────────
@@ -547,7 +549,7 @@ class TestSubscribe:
         fired = []
         k.subscribe("s1", "w1", callback=lambda msg: fired.append(msg), kinds=["REPORT"])
         k.direct("s1", "mgr", "w1", _env("task", "body", "TASK"))
-        k.direct("s1", "mgr", "w1", _env("report", "body", "REPORT"))
+        k.direct("s1", "mgr", "w1", _env("report", "body", "REPORT", reply_to="some-task-id"))
         k.poll("s1", "w1")
         assert len(fired) == 1
         assert fired[0]["kind"] == "REPORT"
@@ -608,7 +610,7 @@ class TestLocalDeliverySink:
     def test_deliver_writes_to_store(self, store):
         sink = LocalDeliverySink(store)
         store.session_init("s1", "mgr", ["w1"])
-        env = Envelope(subject="s", body="b", kind="TASK")
+        env = Envelope(subject="s", body="b", kind="TASK", run_id="run-1", request_id="req-1")
         sink.deliver("s1", "w1", env, "msg-001", "2025-01-01T00:00:00Z", "mgr")
         inbox = store.list_messages(store.agent_subdir("s1", "w1", "inbox"))
         assert len(inbox) == 1
@@ -617,7 +619,7 @@ class TestLocalDeliverySink:
         """P1-1: receipt msg_id must equal inbox file msg_id (not regenerated)."""
         sink = LocalDeliverySink(store)
         store.session_init("s1", "mgr", ["w1"])
-        env = Envelope(subject="s", body="b", kind="TASK")
+        env = Envelope(subject="s", body="b", kind="TASK", run_id="run-1", request_id="req-1")
         kernel_msg_id = "kernel-supplied-123"
         receipt = sink.deliver("s1", "w1", env, kernel_msg_id, "2025-01-01T00:00:00Z", "mgr")
         # Receipt must echo the kernel-supplied id
@@ -717,8 +719,8 @@ class TestTrace:
     def test_trace_fanout_same_id(self, store):
         k = SwarmKernel(store=store)
         k.create_session("s1", "mgr", ["w1", "w2"])
-        k.direct("s1", "mgr", "w1", Envelope(subject="t1", body="b", trace_id="trace-x"))
-        k.direct("s1", "mgr", "w2", Envelope(subject="t2", body="b", trace_id="trace-x", causation_id="p1"))
+        k.direct("s1", "mgr", "w1", Envelope(subject="t1", body="b", run_id="run-1", request_id="req-1", trace_id="trace-x"))
+        k.direct("s1", "mgr", "w2", Envelope(subject="t2", body="b", run_id="run-1", request_id="req-1", trace_id="trace-x", causation_id="p1"))
         r = k.trace("s1", "trace-x")
         assert r["leaf_count"] == 2
         assert all(l["state"] == "delivered" for l in r["leaves"])
@@ -743,7 +745,8 @@ class TestTrace:
         k.create_session("s1", "mgr", ["w1"])
         # 直接 store.send（写 inbox+history，trace_id 透传）——不经 kernel.direct
         # 的 local 投递（那会写 .delivered 标记），构造"无标记"场景。
-        store.send("s1", "mgr", "w1", subject="t", body="b", trace_id="tr-e")
+        store.send("s1", "mgr", "w1", subject="t", body="b", kind="REPORT",
+                   reply_to="orig-msg", run_id="run-1", request_id="req-1", trace_id="tr-e")
 
         # 无标记（delivery 未成功）→ unknown
         r = k.trace("s1", "tr-e")
@@ -796,3 +799,122 @@ class TestAgentCard:
         k2 = SwarmKernel(store=store)
         cards = k2.get_agent_cards("s1")
         assert cards["w1"]["display_name"] == "worker-1"
+
+
+# ── Execution mode / return mode persistence ───────────────────────────
+
+
+class TestModePersistence:
+    """Persist execution_mode/return_mode/mailbox_root across kernel restarts."""
+
+    def test_routing_persists_mode_fields(self, store):
+        """_persist_routing writes execution_mode/mailbox_root/return_mode
+        to swarm-meta.json and _load_persisted_sessions restores them."""
+        from codeagent.swarm.model import ExecutionMode, ReturnMode
+
+        k1 = SwarmKernel(store=store)
+        k1.create_session("s1", "mgr", ["w1"])
+        k1.register(
+            AgentLocation(
+                "w1", "192.168.1.10", "cli",
+                execution_mode=ExecutionMode.MAILBOX_WORKER,
+                mailbox_root="/data/mailbox/w1",
+                return_mode=ReturnMode.MANAGER_PULL,
+            ),
+            "s1",
+        )
+
+        # Simulate fresh kernel (new process)
+        k2 = SwarmKernel(store=store)
+        loc = k2.get_location("s1", "w1")
+        assert loc is not None
+        assert loc.execution_mode == ExecutionMode.MAILBOX_WORKER
+        assert loc.mailbox_root == "/data/mailbox/w1"
+        assert loc.return_mode == ReturnMode.MANAGER_PULL
+
+    def test_create_session_persists_modes_to_session_json(self, store):
+        """create_session passes execution_modes/return_modes to session_init
+        which writes them into session.json."""
+        from codeagent.swarm.model import ExecutionMode, ReturnMode
+
+        k1 = SwarmKernel(store=store)
+        k1.create_session(
+            "s1", "mgr", ["w1"],
+            execution_modes={"w1": ExecutionMode.LOCAL_OMP_MCP.value},
+            return_modes={"w1": ReturnMode.BIDIRECTIONAL.value},
+        )
+
+        # Verify session.json has the modes
+        data = store.read_session("s1")
+        assert data is not None
+        assert data["execution_modes"]["w1"] == "local-omp-mcp"
+        assert data["return_modes"]["w1"] == "bidirectional"
+
+        # Verify new kernel restores them on Session object
+        k2 = SwarmKernel(store=store)
+        s = k2.get_session("s1")
+        assert s is not None
+        assert s.execution_modes["w1"] == "local-omp-mcp"
+        assert s.return_modes["w1"] == "bidirectional"
+
+    def test_register_updates_session_modes(self, store):
+        """register() with execution_mode/return_mode persists them
+        to session.json so they survive a kernel restart."""
+        from codeagent.swarm.model import ExecutionMode, ReturnMode
+
+        k1 = SwarmKernel(store=store)
+        k1.create_session("s1", "mgr", ["w1", "w2"])
+        k1.register(
+            AgentLocation("w1", "host-a", "cli",
+                          execution_mode=ExecutionMode.MAILBOX_WORKER,
+                          return_mode=ReturnMode.MANAGER_PULL),
+            "s1",
+        )
+        k1.register(
+            AgentLocation("w2", "host-b", "omp",
+                          execution_mode=ExecutionMode.LOCAL_OMP_MCP,
+                          return_mode=ReturnMode.BIDIRECTIONAL),
+            "s1",
+        )
+
+        # Verify session object updated in-memory
+        s1 = k1.get_session("s1")
+        assert s1.execution_modes["w1"] == "mailbox-worker"
+        assert s1.execution_modes["w2"] == "local-omp-mcp"
+        assert s1.return_modes["w1"] == "manager-pull"
+        assert s1.return_modes["w2"] == "bidirectional"
+
+        # Simulate fresh kernel
+        k2 = SwarmKernel(store=store)
+        s2 = k2.get_session("s1")
+        assert s2 is not None
+        assert s2.execution_modes["w1"] == "mailbox-worker"
+        assert s2.execution_modes["w2"] == "local-omp-mcp"
+        assert s2.return_modes["w1"] == "manager-pull"
+        assert s2.return_modes["w2"] == "bidirectional"
+
+    def test_legacy_routing_without_modes_loads_defaults(self, store):
+        """Legacy swarm-meta.json without execution_mode/mailbox_root/return_mode
+        must still load cleanly with None/''/None defaults."""
+        import json
+
+        k1 = SwarmKernel(store=store)
+        k1.create_session("s1", "mgr", ["w1"])
+        k1.register(AgentLocation("w1", "old-host", "cli"), "s1")
+
+        # Strip mode fields to simulate legacy swarm-meta.json
+        meta_path = store.session_dir("s1") / "swarm-meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["routing"]["w1"] = {
+            "agent_id": "w1",
+            "host_alias": "old-host",
+            "backend": "cli",
+        }
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+        k2 = SwarmKernel(store=store)
+        loc = k2.get_location("s1", "w1")
+        assert loc is not None
+        assert loc.execution_mode is None
+        assert loc.mailbox_root == ""
+        assert loc.return_mode is None

@@ -40,6 +40,38 @@ If `.mailbox/<session-id>/<worker-id>/status.json` exists with `state=IDLE`, INI
 - Do not re-send or re-consume INIT.
 - Execute `mailbox peek --session <session-id> --agent <worker-id>` and follow normal polling contract with `mailbox read` for new TASK.
 
+> **Note**: When the registration CLI becomes available, this check will also require a valid `registration.json` with matching generation and active lease. Until then, status.json alone is the NO-OP gate.
+
+## Worker Registration
+
+> **[DESIGN ONLY — requires mailbox registration CLI not yet implemented]**
+>
+> The registration lifecycle below is specified but cannot be executed today.
+> The `mailbox` CLI has no `register`/`registration` subcommand.
+> Until a `mailbox register` command exists, Workers skip registration and
+> rely on the INIT handshake + status.json alone. The fields and validity
+> rules below describe the target protocol; they are NOT enforceable without CLI support.
+
+Before the INIT handshake, the Worker MUST write a registration record so the Manager and plugin can validate its identity and liveness. When the registration CLI becomes available:
+
+```bash
+mailbox register --session <session-id> --worker <worker-id> \
+  --generation <init-generation> --nonce <random-hex> \
+  --host-alias <hostname-alias> --backend <omp|ssh|tmux> \
+  --execution-mode <mode from INIT>
+```
+
+| Field | Description |
+|---|---|
+| `generation` | Monotonic counter from INIT. Each Manager restart increments generation. |
+| `nonce` | Random 16-hex-char value generated at Worker launch; prevents stale registration replay. |
+| `host_alias` | Short hostname identifying this machine in the swarm. |
+| `backend` | Transport the Worker was launched with. |
+| `execution_mode` | The mode assigned by INIT (e.g. `cooperative`, `reviewer`, `pilot`). |
+| `last_seen` | ISO-8601 timestamp; Worker updates this on each heartbeat or status write. |
+
+**Validity rule**: An already-idle Worker (status `IDLE` already present) is considered valid only if its registration `generation` matches the current INIT generation AND its `last_seen` is within the active lease window (default 120s). Stale or mismatched-generation registrations MUST be treated as uninitialized — the Worker must re-register before accepting tasks.
+
 ## INIT Handshake
 
 Manager writes a formal INIT (`kind=TASK`, `subject=INIT`) to your inbox, then sends a "check inbox" prompt via send-keys or available runner channel. The prompt is not the task body.
@@ -87,6 +119,23 @@ mailbox send --session <session-id> --from <worker-id> --to manager \
 5. Wrong target, insufficient capability, or underspecified task: send `NOTICE`, set `BLOCKED`, stop. Never silently execute.
 6. After processing, call `mailbox finalize` to archive.
 
+## ACK Semantics
+
+There are two distinct acknowledgments in the mailbox protocol. Workers MUST NOT conflate them.
+
+| ACK type | What it means | Who sends it | When |
+|---|---|---|---|
+| **Delivery ACK** | The transport layer received and persisted the message to the target inbox file. | `mailbox send` / transport adapter | Immediately on successful file write — no business logic involved. |
+| **Task Consumption ACK** | The Worker read, validated, and finalized the TASK message (inbox → processing → archive). | Worker via `mailbox finalize` | After the Worker has processed the message content and produced a result. |
+
+**REPORT correlation**: Every REPORT and EVIDENCE message MUST include the `request_id` field set to the originating TASK's `msg_id`. This lets the Manager correlate which TASK produced which result, even when multiple TASKs are in flight. A REPORT without `request_id` is a protocol violation.
+
+**Delivery ACK ≠ completion**: Receiving a delivery ACK for a REPORT only means the Manager's inbox file was written. The Worker MUST NOT consider its task complete until it has also:
+2. Written DONE or BLOCKED status.
+3. Verified the Manager's consumption (via `mailbox peek` or next-read confirming the REPORT was finalized on the Manager side), OR waited for the lease timeout to expire.
+
+   **Manager-pull exception**: In manager-pull mode, the Worker cannot SSH to the Manager host to verify consumption. The Worker MUST wait for the lease timeout (or next Manager pull receipt) instead of attempting cross-host `mailbox peek`. Writing DONE/BLOCKED status is sufficient; Manager will pull the REPORT on its next poll cycle.
+
 ## Status Lifecycle
 
 You only maintain `.mailbox/<session-id>/<worker-id>/status.json`. Five fields, human-readable snapshot:
@@ -116,7 +165,7 @@ Other agents may read your status but must not modify it.
 
 ## Polling Contract
 
-**Plugin mode**: no manual poll required. Plugin owns inbox watch, validation, peek→inject, status transitions. Worker still reviews injected messages before acting and must not clear archive until task is complete.
+**Plugin mode**: no manual poll required. Plugin ONLY watches the inbox filesystem, peeks at new message filenames, and notifies the Worker process (via `process.send` or injected IPC). Plugin MUST NOT call `mailbox read`, `mailbox finalize`, `mailbox release`, or write business-level status. Worker is the sole consumer: `read` (inbox→processing) → validate → process → `finalize` (processing→archive) → write status. Plugin notification is a hint, not a delivery guarantee — Worker still reviews the actual message body before acting and must not clear archive until task is complete.
 
 **Fallback mode**: `mailbox read` at task start, each major phase, before final REPORT, and after terminal status. Local `MAILBOX_PENDING` can accelerate a check; remote SSH Workers must actively poll. Process one message at a time (read→process→finalize).
 
@@ -135,16 +184,50 @@ All modes follow `BUSY → DONE|BLOCKED` status and final REPORT.
 
 ### Done
 
-1. Write and verify artifact.
+1. Write artifact and verify it (size + SHA256 — see Artifact Verification below).
 2. Poll inbox one last time before terminal state; `mailbox read` any remaining task-related messages.
-3. Send final `REPORT` to Manager with artifact path, summary, verification status, all inference/pending items.
+3. Send final `REPORT` to Manager. The REPORT envelope MUST carry `attachments` as a top-level `--attachment` CLI argument (one per attachment) — **no bare paths in the body**. Each AttachmentRef carries:
+
+   | Field | Description |
+   |---|---|
+   | `artifact_id` | Unique artifact identifier (e.g. `art-<session>-<worker>-<n>`) |
+   | `source_host` | Host alias where the artifact was produced |
+   | `remote_root` | Artifact root path on the source host |
+   | `relative_path` | Path relative to the artifact root |
+   | `size` | Exact byte count of the final artifact file |
+   | `sha256` | Lowercase hex SHA256 digest of the final artifact file |
+   | `media_type` | MIME type (e.g. `text/plain`, `image/png`; default `application/octet-stream`) |
+
+   The REPORT envelope MUST carry `request_id` set to the originating TASK's `msg_id` for correlation.
+
+   EVIDENCE messages that reference files MUST also use AttachmentRef. Empty `attachments` is valid only when the task produced no file artifact.
+
 4. Write `DONE` status.
 5. Check inbox again; after confirming all processed, `mailbox finalize` last message, `mailbox clear`, wait for next TASK.
+
+#### Artifact Verification
+
+Before sending REPORT, the Worker MUST verify every attachment:
+
+```bash
+# size check
+actual_size=$(stat -f%z "$artifact_path")   # macOS; use stat -c%s on Linux
+[ "$actual_size" = "$expected_size" ] || { echo "SIZE_MISMATCH"; exit 1; }
+
+# SHA256 check
+actual_hash=$(shasum -a 256 "$artifact_path" | cut -d' ' -f1)
+[ "$actual_hash" = "$expected_sha256" ] || { echo "HASH_MISMATCH"; exit 1; }
+```
+
+If verification fails, do NOT send REPORT. Write BLOCKED with reason `MISSING_ARTIFACT` and notify Manager. Hook into the request lifecycle: verification is part of task completion, not a post-hoc check.
 
 ### Blocked
 
 1. Save existing artifact and evidence boundary.
-2. Send `REPORT` or `NOTICE` with explicit reason code: `MISSING_BINARY`, `IDA_TIMEOUT`, `MISSING_IR`, `DEPENDENCY_UNRESOLVED`, `EVIDENCE_WALL`, `TOOL_UNAVAILABLE`, `PERMISSION_DENIED`, `SYNC_FAILED`, or `UNKNOWN`.
+2. Send `REPORT` or `NOTICE` with explicit reason code: `MISSING_BINARY`, `IDA_TIMEOUT`, `MISSING_IR`, `DEPENDENCY_UNRESOLVED`, `EVIDENCE_WALL`, `TOOL_UNAVAILABLE`, `PERMISSION_DENIED`, `SYNC_FAILED`, `PROTOCOL_CONFLICT`, `MISSING_ARTIFACT`, or `UNKNOWN`.
+
+   - `PROTOCOL_CONFLICT` — Worker received a message that violates the mailbox protocol (e.g. malformed kind, missing required fields, generation mismatch, conflicting state transitions). Do not attempt to process it; report the violation and stop.
+   - `MISSING_ARTIFACT` — Artifact verification (size or SHA256) failed, or the expected artifact file does not exist at the declared path. Do not send REPORT until the artifact is recovered or the task is re-assigned.
 3. Write `BLOCKED` status.
 4. Check inbox, process and finalize read messages, `mailbox clear`, stop expanding scope.
 

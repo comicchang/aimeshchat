@@ -7,6 +7,39 @@ description: Unified agent orchestration over the codeagent swarm/mailbox protoc
 
 > Role-specific rules: `skill://agent-swarm/roles/manager.md` or `skill://agent-swarm/roles/worker.md` | Protocol reference: `skill://agent-swarm/protocol/mailbox.md`
 
+# Architecture Authority
+
+本协议的**唯一控制面**是 SwarmKernel + SessionManifest。mailbox CLI 仅是 leaf storage/transport primitive。
+Manager 和 Worker 不得绕过 manifest/routing table 直接拼远端路径或依赖 bare mailbox 完成 lifecycle。
+
+## 关键概念
+
+|概念|定义|来源|
+|---|---|---|
+|**SessionManifest**|session 的不可变权威配置：session_id、manager、agents、manifest_hash、protocol_version。`swarm create-session` 产生，session.json 是其持久化形式|`swarm/kernel.py`|
+|**AgentLocation**|agent_id → (host_alias, backend, capabilities) 的路由条目。`execution_mode`、`mailbox_root`、`return_mode` 未在当前 model.py 实现|[DESIGN: requires model extension for execution_mode/mailbox_root/return_mode] `swarm/kernel.py`|
+|**SwarmKernel**|协议核心：register/send/broadcast/poll/reconcile。所有 backend（CLI/OMP/Tmux）共享同一 kernel 实例|`swarm/kernel.py`|
+|**MailboxStore**|leaf storage：session 隔离的 inbox/processing/archive/_corrupt + status.json。通过 `mailbox` CLI 或 kernel delivery 访问|`mailbox/store.py`|
+|**execution_mode**|Worker 的执行模型：`mailbox-worker`（远端 OMP Worker）或 `local-omp-mcp`（本地 OMP + 远端 omp-execd MCP）。互斥，session 创建时选定|本协议 §Execution Mode|
+
+Manager 的唯一入口是 `swarm` 子命令（`codeagent swarm direct/poll/watch/status`）；bare `mailbox send` 仅用于 bootstrap 和故障诊断。
+Worker 的唯一入口是 `mailbox read` + 两阶段消费；消息到达由 OMP plugin（只通知）或主动 polling 触发。
+
+## Execution Mode
+
+每个 Worker agent 在 SessionManifest 中声明 `execution_mode`，二者**互斥**：
+
+|execution_mode|描述|适用场景|
+|---|---|---|
+|`mailbox-worker`|远端主机运行完整 OMP Worker 进程 + plugin，通过 mailbox 协议通信|双向 SSH、Worker host 有 omp 二进制|
+|`local-omp-mcp`|所有 OMP agent/model 在 Manager 主机，远端仅 `omp-execd --stdio` MCP server|单向 SSH、Worker host 仅需 MCP executor|
+
+**`local-omp-mcp` profile 不属于传统 agent-swarm Worker**——它不参与 mailbox INIT/TASK/REPORT 生命周期。
+其任务通过命名 MCP workspace 工具分发，mailbox 仅作兼容/legacy。详见 `skill://agent-swarm/operations/remote.md`。
+
+`mailbox-worker` 和 `local-omp-mcp` 不得在同一 session 内同时用于同一 agent_id。
+`session-init` 必须校验 manifest 一致性，manager ID 冲突时拒绝创建（而非静默合并）。
+
 ## Role Determination
 
 Read **one** role file based on your identity:
@@ -16,71 +49,61 @@ Read **one** role file based on your identity:
 | `manager` | Manager | `skill://agent-swarm/roles/manager.md` |
 | anything else | Worker | `skill://agent-swarm/roles/worker.md` |
 
-If `$OMP_WORKER_ID` is unset, you are a **Worker**. Do not load the other role file — progressive disclosure keeps protocol noise minimal.
+If `$OMP_WORKER_ID` is unset: **error** — role cannot be determined. Set `$OMP_WORKER_ID` explicitly.
 
 ## Shared Protocol Reference
 
 The canonical mailbox protocol (message schema, status.json contract, two-phase consumption, CLI commands, error handling) lives in `skill://agent-swarm/protocol/mailbox.md`. Both roles reference it; neither duplicates its content.
-
 ## Deployment Modes
 
-本协议支持两种**互斥**的部署模式。所有 mailbox 命令、路径引用和通信假设必须与当前部署模式一致；混合模式会导致路径不一致、消息丢失或同步冲突。
+部署模式由**拓扑可达性**和 **execution_mode** 共同决定。
 
-**Default mode: B (Remote Transport)** — 本项目的标准部署方式。
-
-### Decision Tree
+### 拓扑选择
 
 ```
-.mailbox/ 目录是否通过 Syncthing（或其他共享 FS）在所有主机间同步？
+所有 agent host 是否共享同一 MAILBOX_ROOT 文件系统？
   │
   ├─ 是 → Mode A: Shared FS
   │       - mailbox ops 是本地文件系统操作
   │       - transport 层不参与 mailbox 通信
-  │       - 操作指南: skill://agent-swarm/operations/local.md
   │
-  └─ 否 → Mode B: Remote Transport (DEFAULT)
-          - 无共享文件系统
-          - mailbox 通过 SSH wire protocol 跨主机
-          - codeagent mailbox ... --host <alias>
-          - codeagent swarm ... 提供高级 IPC
-          - 操作指南: skill://agent-swarm/operations/remote.md
+  └─ 否 → 需要跨主机 mailbox transport（SSH/relay）
+          - Manager 必须通过 SessionManifest + SwarmKernel routing 操作
+          - 禁止 Manager 直接猜 host path 或手工 `mailbox --host`
 ```
 
-| Condition | Mode | MAILBOX_ROOT | Reference |
-|---|---|---|---|
-| 所有 agent 共享文件系统（Syncthing） | Mode A: Shared FS | 显式 `MAILBOX_ROOT=.mailbox` | `skill://agent-swarm/operations/local.md` |
-| 任何 agent 在无共享 FS 的远程主机 | Mode B: Remote Transport | 默认 `resolve_root()` | `skill://agent-swarm/operations/remote.md` |
+| 拓扑 | MAILBOX_ROOT | 通信方式 |
+|---|---|---|
+| Mode A (Shared FS) | 显式 `MAILBOX_ROOT=.mailbox` | 本地 FS |
+| 跨主机（无共享 FS） | 默认 `resolve_root()` | `codeagent swarm` + SwarmKernel transport |
 
-Determine mode from the session roster and workers.toml. If all agents share the mailbox root via Syncthing, use Mode A. If any agent is on a host without filesystem access to the mailbox root, use Mode B. Mixed sessions use Mode B for the remote agents and Mode A for the rest.
+### 回程模式 (return_mode)
+
+跨主机拓扑下，**Worker→Manager 的回程路径**由 Manager host 对 Worker host 的可达性决定：
+
+| return_mode | 拓扑要求 | Manager 行为 |
+|---|---|---|
+| `manager-pull` (默认，推荐) | 仅 Manager→Worker SSH 可达 | Worker 写 **host-local** manager inbox；Manager 定期 `codeagent mailbox read --host <H>` 从远端 host 的 manager inbox 拉取 |
+
+**单向上必须使用 `manager-pull`**。Worker 不得尝试反向 SSH 或通过 pane/send-keys 伪造回程。
 
 ### MAILBOX_ROOT Consistency
 
-**这是最常见的模式混合错误。** 以下规则适用于两种模式：
+**这是最常见的模式混合错误。** 以下规则适用于所有模式：
 
 1. **Mode A**: 所有参与者必须显式设置 `MAILBOX_ROOT=.mailbox`（env 或 `--mailbox-root`）
-2. **Mode B**: 本地操作使用默认 `resolve_root()`（`~/.local/share/codeagent/mailbox`）；远程操作通过 `--mailbox-root` 参数传递到远端
+2. **跨主机**: Manager host 使用默认 `resolve_root()`；远端 `mailbox_root` 由 SessionManifest 声明
 3. **永远不要**在 Mode A 中省略 `MAILBOX_ROOT`——CLI 默认值会指向不同路径
-4. **永远不要**在 Mode B 中假设所有主机共享同一 `MAILBOX_ROOT` 路径
-
-```bash
-# Mode A: 必须显式设置
-MAILBOX_ROOT=.mailbox mailbox send --session s1 --from manager --to w1 --kind TASK ...
-
-# Mode B: 本地操作（默认 MAILBOX_ROOT）
-mailbox send --session s1 --from manager --to w1 --kind TASK ...
-
-# Mode B: 跨主机操作
-codeagent mailbox send --session s1 --from manager --to w1 --kind TASK ... --host dev-server
-```
+4. **永远不要**在跨主机模式中假设所有主机共享同一 `MAILBOX_ROOT` 路径
 
 ### Mode-Mixing Audit Checklist
 
-在编辑任何 mailbox 相关命令前，检查：
-- [ ] 命令是否设置了 `MAILBOX_ROOT` 或 `--mailbox-root`？（Mode A 必须）
-- [ ] 路径引用 `.mailbox/` 是否与当前模式一致？
-- [ ] `Syncthing` 相关假设是否仅出现在 Mode A 上下文中？
-- [ ] `send-keys` 是否仅用于本地 Worker？（Mode B 远程 Worker 不可用）
-- [ ] CLI 命令是否使用正确的 resolution order？
+在编辑任何 mailbox 或 swarm 命令前，检查：
+- [ ] 命令是否通过 `swarm direct/poll` 还是 bare `mailbox`？（跨主机必须走 swarm）
+- [ ] `return_mode` 是否匹配拓扑？（单向必须 `manager-pull`）
+- [ ] `execution_mode` 是否已声明且不冲突？
+- [ ] `send-keys` 是否仅用于本地 Worker 的 INIT check prompt？（远程不可用）
+
 
 ## Shared Invariants
 
@@ -105,13 +128,20 @@ These rules apply to **every** agent regardless of role:
 
 ## CLI Resolution Order
 
-Standalone `mailbox` commands are the authoritative interface:
+跨主机通信的权威入口是 `codeagent swarm` 子命令，而非 bare `mailbox`：
 
-1. PATH command `mailbox` (from `codeagent` package via `uv tool install`)
-2. `codeagent mailbox` as unified cross-host entry point
-3. For swarm sessions: `codeagent swarm ...` subcommands
+1. `codeagent swarm direct/poll/watch/status` — SessionManifest-aware routing + delivery（当前 `poll`/`status` 为 local-only，跨主机聚合由 manager pull 补足）
+2. `codeagent mailbox ... --host <H>` — 跨主机 leaf transport primitive（read/peek/stats/send/status 均可通过 SSH 路由到远端 host 的本地 mailbox CLI）
+3. PATH command `mailbox` — 本地 FS mailbox 操作
 
-Never route through `scripts/tmux_worker.py` or other legacy wrappers.
+跨主机 manager-pull 回程：Manager 使用 `codeagent mailbox read --session <id> --agent manager --owner manager --host <H>` 从远端 host 的 manager inbox 拉取 REPORT。
+禁止 `scripts/tmux_worker.py` 或其他 legacy wrapper。
+
+## Protocol Version
+
+本协议 active design version: **v2 (session-based)**。
+同目录内 v1 legacy 命令仅用于 unmigrated Worker；OMP Remote v2 (`omp-execd` MCP) 属于独立架构，
+不继承本协议的 mailbox lifecycle。详见 §Execution Mode。
 
 ## Legacy (v1)
 
@@ -122,11 +152,5 @@ v1 concepts deprecated by this protocol:
 - **mailbox/outbox → relay → mailbox/inbox** → replaced by direct inbox
 - **cursor / unread / mark-read** → replaced by `mailbox read` / `mailbox finalize` two-phase
 
-Legacy commands (`request`, `request-role`, `batch-request`, `event-emit`, `event-wait`, `mailbox-send`, `mailbox-check`, `mailbox-relay`, `manager-poll`) are for unmigrated Workers only. New v2 work must not use them.
-
----
-
-- Manager rules: `skill://agent-swarm/roles/manager.md`
-- Worker rules: `skill://agent-swarm/roles/worker.md`
-- Protocol reference: `skill://agent-swarm/protocol/mailbox.md`
-- Deployment modes: `skill://agent-swarm/operations/local.md` / `skill://agent-swarm/operations/remote.md`
+Legacy commands (`request`, `request-role`, `batch-request`, `event-emit`, `event-wait`, `mailbox-send`, `mailbox-check`, `mailbox-relay`) are for unmigrated Workers only.
+跨主机 manager pull 使用 `codeagent mailbox ... --host <H>`（非 legacy，是当前唯一可用的跨主机 mailbox 传输原语），详见 `roles/manager.md`。

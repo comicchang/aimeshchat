@@ -112,9 +112,11 @@ def kernel(store: MailboxStore) -> SwarmKernel:
 
 
 def _env(subject: str = "test", body: str = "hello", kind: str = "TASK",
-         attachments: list[AttachmentRef] | None = None) -> Envelope:
+         attachments: list[AttachmentRef] | None = None,
+         run_id: str = "run-1", request_id: str = "req-1") -> Envelope:
     return Envelope(subject=subject, body=body, kind=kind,
-                    attachments=attachments or [])
+                    attachments=attachments or [],
+                    run_id=run_id, request_id=request_id)
 
 
 def _setup_session(kernel: SwarmKernel,
@@ -135,6 +137,8 @@ def _make_envelope_dict(
     subject: str = "test",
     body: str = "body",
     target_host: str = "",
+    run_id: str = "run-1",
+    request_id: str = "req-1",
 ) -> dict[str, Any]:
     """Build an envelope dict compatible with DeliveryEngine.deliver()."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -147,6 +151,8 @@ def _make_envelope_dict(
         "kind": "TASK",
         "msg_id": msg_id,
         "created_at": now,
+        "run_id": run_id,
+        "request_id": request_id,
     }
     if target_host:
         d["_target_host"] = target_host
@@ -175,8 +181,8 @@ class TestNoSyncthingLocalDelivery:
         store_b.session_init("s1", "mgr", ["w1"])
 
         # Send a message on store_a
-        store_a.send("s1", "mgr", "w1", "cross-host", "no syncthing",
-                     msg_id="ns-001")
+        store_a.send("s1", "mgr", "w1", "cross-host", "no syncthing", "TASK",
+                     run_id="run-1", request_id="req-1", msg_id="ns-001")
 
         # w1 on store_a sees the message
         peek_a = store_a.peek("s1", "w1")
@@ -293,9 +299,11 @@ class TestDuplicateDelivery:
     def test_store_send_rejects_duplicate_msg_id(self, store: MailboxStore) -> None:
         """MailboxStore.send raises on pre-existing msg_id (strict)."""
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "first", "body1", msg_id="dup-001")
+        store.send("s1", "mgr", "w1", "first", "body1", "TASK",
+                   run_id="run-1", request_id="req-1", msg_id="dup-001")
         with pytest.raises(ValueError, match="msg_id already exists"):
-            store.send("s1", "mgr", "w1", "second", "body2", msg_id="dup-001")
+            store.send("s1", "mgr", "w1", "second", "body2", "TASK",
+                       run_id="run-1", request_id="req-1", msg_id="dup-001")
 
         peek = store.peek("s1", "w1")
         assert peek["pending"] == 1
@@ -565,7 +573,7 @@ class TestTmuxOMPHooks:
             session_id="hook-s1", agent_id="mgr",
             msg_dict={
                 "to": "w1", "kind": "TASK", "subject": "from-hook",
-                "body": "via OMP",
+                "body": "via OMP", "run_id": "run-1", "request_id": "req-1",
             },
             store_root=tmp_path,
         )

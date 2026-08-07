@@ -34,7 +34,7 @@ class TestMailboxCli:
         capsys.readouterr()
         _run_cli(
             ["send", "--session", "s1", "--from", "mgr", "--to", "w1",
-             "--subject", "hello", "--body", "world", "--kind", "TASK"],
+             "--subject", "hello", "--body", "world", "--kind", "TASK", "--run-id", "run-1", "--request-id", "req-1"],
             store, capsys,
         )
         capsys.readouterr()
@@ -48,7 +48,7 @@ class TestMailboxCli:
         capsys.readouterr()
         _run_cli(
             ["send", "--session", "s1", "--from", "mgr", "--to", "w1",
-             "--subject", "s", "--body", "b", "--kind", "TASK"],
+             "--subject", "s", "--body", "b", "--kind", "TASK", "--run-id", "run-1", "--request-id", "req-1"],
             store, capsys,
         )
         capsys.readouterr()
@@ -63,7 +63,7 @@ class TestMailboxCli:
         capsys.readouterr()
         _run_cli(
             ["send", "--session", "s1", "--from", "mgr", "--to", "w1",
-             "--subject", "s", "--body", "b", "--kind", "TASK"],
+             "--subject", "s", "--body", "b", "--kind", "TASK", "--run-id", "run-1", "--request-id", "req-1"],
             store, capsys,
         )
         capsys.readouterr()
@@ -92,7 +92,7 @@ class TestMailboxCli:
         capsys.readouterr()
         _run_cli(
             ["send", "--session", "s1", "--from", "mgr", "--to", "w1",
-             "--subject", "s", "--body", "b", "--kind", "TASK"],
+             "--subject", "s", "--body", "b", "--kind", "TASK", "--run-id", "run-1", "--request-id", "req-1"],
             store, capsys,
         )
         capsys.readouterr()
@@ -109,7 +109,7 @@ class TestMailboxCli:
         capsys.readouterr()
         _run_cli(
             ["send", "--session", "s1", "--from", "mgr", "--to", "w1",
-             "--subject", "s", "--body", "b", "--kind", "TASK"],
+             "--subject", "s", "--body", "b", "--kind", "TASK", "--run-id", "run-1", "--request-id", "req-1"],
             store, capsys,
         )
         capsys.readouterr()
@@ -140,7 +140,7 @@ class TestMailboxCli:
         capsys.readouterr()
         _run_cli(
             ["send", "--session", "s1", "--from", "mgr", "--to", "w1",
-             "--subject", "s", "--body", "b", "--kind", "TASK"],
+             "--subject", "s", "--body", "b", "--kind", "TASK", "--run-id", "run-1", "--request-id", "req-1"],
             store, capsys,
         )
         capsys.readouterr()
@@ -248,7 +248,7 @@ class TestMailboxHook:
     def test_hook_pending(self, tmp_path, monkeypatch, capsys):
         store = MailboxStore(root=tmp_path)
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "subject here", "body", "TASK")
+        store.send("s1", "mgr", "w1", "subject here", "body", "TASK", run_id="run-1", request_id="req-1")
         monkeypatch.setenv("MAILBOX_ROOT", str(tmp_path))
         mailbox_hook.main(["s1", "w1"])
         out = capsys.readouterr().out

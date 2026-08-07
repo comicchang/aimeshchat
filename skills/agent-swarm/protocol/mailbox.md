@@ -24,7 +24,7 @@ Mailbox root is `.mailbox/` under the shared repository, session-isolated:
 
 ## Message Schema
 
-8 required fields, 3 optional association fields:
+8 required fields, 5 optional correlation fields (kind-conditional):
 
 | Field | Required | Description |
 |---|---|---|
@@ -36,9 +36,13 @@ Mailbox root is `.mailbox/` under the shared repository, session-isolated:
 | `kind` | yes | message type (see kinds below) |
 | `msg_id` | yes | unique message ID (matches filename) |
 | `created_at` | yes | UTC timestamp |
-| `reply_to` | no | references another msg_id |
-| `run_id` | no | run identifier |
-| `request_id` | no | request identifier |
+| `reply_to` | REQUIRED for REPORT, QUESTION, RESPONSE, TASK/INIT if responding to a prior message | references another msg_id |
+| `run_id` | REQUIRED for TASK, INIT, REPORT | run identifier (immutable once assigned) |
+| `request_id` | REQUIRED for TASK, INIT, REPORT | request identifier (immutable once assigned) |
+| `trace_id` | no | distributed trace correlation ID |
+| `causation_id` | no | parent msg_id that caused this message |
+
+> **⚠ [DESIGN ONLY — validation is kind-dependent]**: The current `validate_message` implementation accepts `TASK` messages without `run_id` or `request_id` (permissive validation). Full enforcement of kind-conditional required fields (e.g., requiring `run_id`/`request_id` on every TASK) requires a code change to the validation layer.
 
 Messages are **immutable**. Corrections require a new message with `--reply-to <msg_id>`.
 
@@ -54,7 +58,117 @@ Messages are **immutable**. Corrections require a new message with `--reply-to <
 | `RESPONSE` | Any→Any | answer to a QUESTION |
 | `NOTICE` | Any→Any | status change, error, or coordination signal |
 
+## Request Lifecycle
+
+Every TASK/INIT message defines a request lifecycle. The lifecycle is scoped to `(session_id, request_id, run_id)` and governed by the following rules.
+
+### Identity Fields
+
+- `request_id` + `run_id` are **REQUIRED** on every TASK/INIT and on every REPORT that concludes the request.
+- Both are **immutable** once assigned by the Manager at dispatch time. Workers MUST copy them verbatim into all correlated messages (REPORT, PROGRESS, EVIDENCE, QUESTION).
+- A Worker that loses or mutates `request_id`/`run_id` produces an orphaned message. The Manager MUST reject it.
+
+### Terminal State Machine
+
+Per-request states progress monotonically:
+
+```
+DISPATCHED → ACKED → RUNNING → DONE
+                      ↓
+                      BLOCKED
+                      ↓→ CANCELLED
+                      ↓→ EXPIRED
+```
+
+Note: DONE, BLOCKED, CANCELLED, and EXPIRED are **all** terminal states. A request reaches exactly one of them (see Terminal Exclusivity below). The diagram does not imply transitions between terminal states — CANCELLED and EXPIRED branch independently from RUNNING, just like DONE and BLOCKED.
+
+| State | Author | Meaning |
+|---|---|---|
+| `DISPATCHED` | Manager | TASK/INIT written to inbox |
+| `ACKED` | Worker | Worker read the TASK (mailbox read claim) |
+| `RUNNING` | Worker | Worker actively executing (set via PROGRESS) |
+| `DONE` | Worker | Terminal — task completed successfully |
+| `BLOCKED` | Worker | Terminal — cannot proceed (includes reason) |
+| `CANCELLED` | Manager | Terminal — Manager rescinds the request |
+| `EXPIRED` | Manager | Terminal — SLA exceeded, Manager declares stale |
+| `UNKNOWN/STALE` | Manager | Terminal — watchdog fired, no terminal within SLA |
+
+### Terminal Exclusivity (CAS)
+
+A request may reach exactly **ONE** terminal state. The first terminal write wins; all subsequent attempts are **PROTOCOL_CONFLICT**.
+
+```bash
+# Manager or Worker writes terminal state:
+# - If no prior terminal exists for (session_id, request_id, run_id) → accepted
+# - If a terminal already exists → REJECTED with PROTOCOL_CONFLICT
+```
+
+Implementation: terminal writes MUST be compare-and-swap (CAS) — check that no terminal record exists before writing. If a second terminal arrives, the request is **frozen**: no further dispatch or state change is permitted.
+
+### ACK_ONLY Watchdog
+
+If a request reaches ACKED but no terminal state (DONE/BLOCKED/CANCELLED/EXPIRED) appears within the configured SLA:
+
+1. Manager marks the request `UNKNOWN/STALE`.
+2. Manager MUST trigger one of: retry (new run_id), recover (check-in with Worker), or escalate (alert operator).
+3. The stale Worker's status.json remains `BUSY` until it self-corrects or the session terminates.
+
+The SLA is a deployment-time configuration. The watchdog reads the request event ledger, not status.json.
+
+---
+
+## Artifact Attachment
+
+REPORT and EVIDENCE messages that claim task completion or provide evidence MUST include an `attachments` array. Each element is an `AttachmentRef`.
+
+### AttachmentRef Schema
+
+| Field | Required | Description |
+|---|---|---|
+| `artifact_id` | yes | content-addressed identifier (`<session>/<request>/<run>/<agent>/<sha256>`) |
+| `source_host` | yes | hostname where the artifact was produced |
+| `remote_root` | yes | artifact root path on the source host |
+| `relative_path` | yes | path relative to the artifact root |
+| `size` | yes | byte count (decimal integer) |
+| `sha256` | yes | SHA-256 hex digest of the artifact content |
+| `media_type` | yes | MIME type (e.g. `application/json`, `text/plain`, `image/png`; default `application/octet-stream`) |
+
+> **Note**: `request_id` is a message-level correlation field (on the REPORT envelope), not part of the attachment itself.
+
+### Manager Verification
+
+Before reducing a request to DONE, the Manager MUST:
+
+1. Fetch each artifact via `codeagent artifact pull --host <source_host> --artifact-id <artifact_id> --remote-root <remote_root> --relative-path <relative_path> --size <size> --sha256 <sha256> --dest <dest>` (the real cross-host transport).
+2. Verify `size` matches the actual byte count.
+3. Verify `sha256` matches the actual content digest.
+4. If either check fails → reject the REPORT; request remains RUNNING.
+
+### Content-Addressed Namespace
+
+Artifact identity is the tuple `(session, request, run, agent, sha256)`. Two artifacts with the same content hash but different source contexts are distinct entries. The namespace prevents ambiguity when multiple Workers produce files with the same relative path.
+
+### ARTIFACT_CONFLICT
+
+If a REPORT references a `relative_path` that already exists for the same `(session_id, request_id)` but with a **different** `sha256`:
+
+- The existing artifact is **immutable**. Overwrite is **REJECTED**.
+- The conflicting REPORT MUST be treated as a protocol violation.
+- Resolution: the Worker MUST use a distinct `relative_path` or re-derive the content with a new hash.
+
+---
+
 ## status.json Contract
+
+> **⚠ AVAILABILITY SNAPSHOT ONLY**
+>
+> `status.json` is a 5-field availability diagnostic. It tells the Manager whether a Worker is IDLE/BUSY/DONE/BLOCKED **right now**.
+>
+> **It is NOT a task terminal state ledger.** Terminal states (DONE, BLOCKED, CANCELLED, EXPIRED, UNKNOWN/STALE) are authoritative only in the **request event ledger** — the sequence of REPORT/NOTICE messages with `request_id` + `run_id`.
+>
+> A Worker may self-report `DONE` in status.json before the Manager has verified artifacts and accepted the REPORT. Conversely, status.json may lag behind the event ledger if the Worker crashes after writing the REPORT but before updating status.
+>
+> **Manager logic MUST derive request outcomes from the mailbox event stream, not from status.json.**
 
 Each agent writes only its own `.mailbox/<session>/<agent>/status.json`. Exactly 5 fields:
 
@@ -167,10 +281,21 @@ mailbox recover-stale --session <session-id> --agent <agent-id>
 
 The standalone CLI is the authoritative protocol boundary. A tmux/oh-my-pi plugin, opencode adapter, or another runner MAY invoke `mailbox peek` at safe boundaries for notification; the **plugin only notifies — never consumes**. The agent reads via `mailbox read`.
 
+**Hard boundary — plugin MUST NOT:**
+- Call `mailbox read` or `mailbox finalize` or `mailbox release` — those are agent-only operations.
+- Write `status.json` or any business-logic status. Status is owned by the agent process.
+- Infer request lifecycle state from status.json or terminal output. State truth lives in the mailbox event ledger.
+- Mutate, reorder, or replay messages. The mailbox is an append-only log.
+
+**Plugin MAY:**
+- Call `mailbox peek` to discover pending count and notify the agent.
+- Call `mailbox stats` for dashboard/health display.
+- Invoke `send-keys` with `MAILBOX_PENDING` as a convenience wake for local Workers.
+
 Requirements:
 - Plugin must not depend on private runner hooks.
 - Plugin must not run concurrently with a manual consumer.
-- Plugin must use the same validation and atomic read→processing path.
+- Plugin must use only validate non-consumption properties (msg_id, kind, from).
 
 ## Error Handling
 

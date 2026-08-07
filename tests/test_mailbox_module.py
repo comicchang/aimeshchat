@@ -30,6 +30,7 @@ class TestProtocol:
             "session_id": "s1", "from": "mgr", "to": "w1",
             "subject": "hi", "body": "there", "kind": "TASK",
             "msg_id": "mgr_123", "created_at": "2025-01-01T00:00:00Z",
+            "run_id": "run-1", "request_id": "req-1",
         }
         ok, reason = validate_message(msg)
         assert ok
@@ -55,6 +56,7 @@ class TestProtocol:
             "session_id": "s1", "from": "mgr", "to": "w1",
             "subject": "hi", "body": "there", "kind": "TASK",
             "msg_id": "mgr_123", "created_at": "2025-01-01T00:00:00Z",
+            "run_id": "run-1", "request_id": "req-1",
         }
         ok, reason = validate_message(msg, expected_agent="w2")
         assert not ok
@@ -65,6 +67,7 @@ class TestProtocol:
             "session_id": "s1", "from": "mgr", "to": "w1",
             "subject": "hi", "body": "there", "kind": "TASK",
             "msg_id": "mgr_123", "created_at": "2025-01-01T00:00:00Z",
+            "run_id": "run-1", "request_id": "req-1",
         }
         ok, reason = validate_message(msg, filename="other.json")
         assert not ok
@@ -75,6 +78,7 @@ class TestProtocol:
             "session_id": "s1", "from": "mgr", "to": "w1",
             "subject": "hi", "body": "there", "kind": "TASK",
             "msg_id": "../escape", "created_at": "2025-01-01T00:00:00Z",
+            "run_id": "run-1", "request_id": "req-1",
         }
         ok, reason = validate_message(msg)
         assert not ok
@@ -116,7 +120,7 @@ class TestStore:
 
     def test_send_and_peek(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        result = store.send("s1", "mgr", "w1", "hello", "world", "TASK")
+        result = store.send("s1", "mgr", "w1", "hello", "world", "TASK", run_id="run-1", request_id="req-1")
         assert "sent" in result
         peek = store.peek("s1", "w1")
         assert peek["pending"] == 1
@@ -146,7 +150,7 @@ class TestStore:
 
     def test_read_consumes(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")
         assert msg is not None
         assert msg["subject"] == "t"
@@ -158,7 +162,7 @@ class TestStore:
 
     def test_finalize(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")
         result = store.finalize("s1", "w1", msg["msg_id"], "w1")
         assert "finalized" in result
@@ -166,7 +170,7 @@ class TestStore:
     def test_finalize_from_inbox(self, store):
         """finalize_from_inbox archives directly from inbox (swarm auto-ack)."""
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         # Message is still in inbox (no read() called)
         peek = store.peek("s1", "w1")
         msg_id = peek["messages"][0]["msg_id"]
@@ -177,7 +181,7 @@ class TestStore:
     def test_finalize_from_inbox_processing(self, store):
         """finalize_from_inbox also archives messages already in processing."""
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")  # inbox → processing
         assert msg is not None
         result = store.finalize_from_inbox("s1", "w1", msg["msg_id"], "w1")
@@ -186,7 +190,7 @@ class TestStore:
 
     def test_release(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")
         result = store.release("s1", "w1", msg["msg_id"], "w1")
         assert "released" in result
@@ -202,14 +206,14 @@ class TestStore:
 
     def test_stats(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         stats = store.stats("s1", "w1")
         assert stats["inbox"] == 1
         assert stats["processing"] == 0
 
     def test_clear_archive(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")
         store.finalize("s1", "w1", msg["msg_id"], "w1")
         result = store.clear("s1", "w1")
@@ -295,7 +299,7 @@ class TestSendErrors:
         inbox = store.agent_subdir("s1", "w1", "inbox")
         (inbox / "dup.json").write_text('{}')
         with mock.patch("codeagent.mailbox.store.gen_msg_id", side_effect=["dup", "dup2"]):
-            result = store.send("s1", "mgr", "w1", "s", "b", "TASK")
+            result = store.send("s1", "mgr", "w1", "s", "b", "TASK", run_id="run-1", request_id="req-1")
         assert "dup2.json" in result
         assert (inbox / "dup.json").exists()
 
@@ -346,7 +350,7 @@ class TestReadCorruption:
 
     def test_claim_collision_retries(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        sent = store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        sent = store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg_id = sent.split("/")[-1].replace(".json", "")
         processing = store.agent_subdir("s1", "w1", "processing")
         processing.mkdir(parents=True, exist_ok=True)
@@ -360,7 +364,7 @@ class TestReadCorruption:
 
     def test_replace_oserror_retries(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
 
         real_replace = os.replace
         calls = {"n": 0}
@@ -383,7 +387,7 @@ class TestReadCorruption:
 class TestFinalizeErrors:
     def _read_one(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         return store.read("s1", "w1", "w1")
 
     def test_invalid_msg_id(self, store):
@@ -436,7 +440,7 @@ class TestReleaseErrors:
 
     def test_multiple_claims(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")
         processing = store.agent_subdir("s1", "w1", "processing")
         (processing / f".claim-{msg['msg_id']}-w2.json").write_text(
@@ -446,7 +450,7 @@ class TestReleaseErrors:
 
     def test_owner_mismatch(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")
         processing = store.agent_subdir("s1", "w1", "processing")
         for cf in processing.glob(".claim-*.json"):
@@ -474,7 +478,7 @@ class TestRecoverStale:
         from datetime import datetime, timezone, timedelta
 
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")
         processing = store.agent_subdir("s1", "w1", "processing")
         old = (datetime.now(timezone.utc) - timedelta(seconds=2 * LEASE_TIMEOUT_S))
@@ -492,7 +496,7 @@ class TestRecoverStale:
 
     def test_fresh_claim_not_recovered(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         store.read("s1", "w1", "w1")
         result = store.recover_stale("s1", "w1")
         assert "recovered 0" in result
@@ -592,7 +596,7 @@ class TestReadStatusInvalid:
 class TestClearPurge:
     def test_clear_prune_stale(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")
         store.finalize("s1", "w1", msg["msg_id"], "w1")
         result = store.clear("s1", "w1", prune_stale=True)
@@ -624,7 +628,7 @@ class TestCheckLegacy:
 
     def test_valid_message_archived(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         results = store.check("s1", "w1")
         assert len(results) == 1
         assert results[0]["subject"] == "t"
@@ -633,8 +637,8 @@ class TestCheckLegacy:
 
     def test_max_messages_limit(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t1", "b", "TASK")
-        store.send("s1", "mgr", "w1", "t2", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t1", "b", "TASK", run_id="run-1", request_id="req-1")
+        store.send("s1", "mgr", "w1", "t2", "b", "TASK", run_id="run-1", request_id="req-1")
         results = store.check("s1", "w1", max_messages=1)
         assert len(results) == 1
 
@@ -662,7 +666,7 @@ class TestConcurrentRead:
         from concurrent.futures import ThreadPoolExecutor
 
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
 
         barrier = threading.Barrier(2)
 
@@ -758,7 +762,7 @@ class TestAttachments:
             self._ref(),
             AttachmentRef("art-2", "worker-1", "/tmp/a", "b/c.txt", 7, "b" * 64, "text/plain"),
         ]
-        store.send("s1", "mgr", "w1", "t", "b", "TASK", attachments=refs)
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1", attachments=refs)
         msg = store.read("s1", "w1", "w1")
         atts = msg["attachments"]
         assert len(atts) == 2
@@ -769,7 +773,7 @@ class TestAttachments:
 
     def test_broadcast_with_attachments(self, store):
         store.session_init("s1", "mgr", ["w1", "w2"])
-        store.send("s1", "mgr", "*", "t", "b", "TASK", attachments=[self._ref()])
+        store.send("s1", "mgr", "*", "t", "b", "TASK", run_id="run-1", request_id="req-1", attachments=[self._ref()])
         for aid in ("w1", "w2"):
             msg = store.read("s1", aid, aid)
             assert msg["attachments"][0]["artifact_id"] == "art-1"
@@ -777,42 +781,42 @@ class TestAttachments:
     def test_send_rejects_bad_sha256(self, store):
         store.session_init("s1", "mgr", ["w1"])
         with pytest.raises(ValueError, match="sha256"):
-            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+            store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1",
                        attachments=[self._ref(sha256="xyz")])
 
     def test_send_rejects_short_sha256(self, store):
         store.session_init("s1", "mgr", ["w1"])
         with pytest.raises(ValueError, match="sha256"):
-            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+            store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1",
                        attachments=[self._ref(sha256="a" * 63)])
 
     def test_send_rejects_negative_size(self, store):
         store.session_init("s1", "mgr", ["w1"])
         with pytest.raises(ValueError, match="size"):
-            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+            store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1",
                        attachments=[self._ref(size=-1)])
 
     def test_send_rejects_empty_artifact_id(self, store):
         store.session_init("s1", "mgr", ["w1"])
         with pytest.raises(ValueError, match="artifact_id"):
-            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+            store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1",
                        attachments=[self._ref(artifact_id="")])
 
     def test_send_rejects_path_traversal(self, store):
         store.session_init("s1", "mgr", ["w1"])
         with pytest.raises(ValueError, match="relative_path"):
-            store.send("s1", "mgr", "w1", "t", "b", "TASK",
+            store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1",
                        attachments=[self._ref(relative_path="../escape")])
 
     def test_send_rejects_non_list(self, store):
         store.session_init("s1", "mgr", ["w1"])
         with pytest.raises(ValueError, match="attachments must be a list"):
-            store.send("s1", "mgr", "w1", "t", "b", "TASK", attachments="nope")
+            store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1", attachments="nope")
 
     def test_send_rejects_non_dict_item(self, store):
         store.session_init("s1", "mgr", ["w1"])
         with pytest.raises(ValueError, match="attachment"):
-            store.send("s1", "mgr", "w1", "t", "b", "TASK", attachments=[42])
+            store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1", attachments=[42])
 
     def test_attachment_ref_roundtrip(self):
         r = self._ref()
@@ -829,6 +833,7 @@ class TestAttachments:
             "session_id": "s1", "from": "mgr", "to": "w1",
             "subject": "hi", "body": "there", "kind": "TASK",
             "msg_id": "mgr_123", "created_at": "2025-01-01T00:00:00Z",
+            "run_id": "run-1", "request_id": "req-1",
             "attachments": [{"artifact_id": "", "source_host": "h",
                               "remote_root": "/r", "relative_path": "p",
                               "size": 1, "sha256": "a" * 64}],
@@ -842,6 +847,7 @@ class TestAttachments:
             "session_id": "s1", "from": "mgr", "to": "w1",
             "subject": "hi", "body": "there", "kind": "TASK",
             "msg_id": "mgr_123", "created_at": "2025-01-01T00:00:00Z",
+            "run_id": "run-1", "request_id": "req-1",
             "attachments": "not-a-list",
         }
         ok, reason = validate_message(msg)
@@ -855,7 +861,7 @@ class TestAttachments:
 class TestHistory:
     def test_send_appends_history(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         h = store.read_history("s1")
         assert len(h) == 1
         assert h[0]["subject"] == "t"
@@ -870,7 +876,7 @@ class TestHistory:
 
     def test_history_independent_of_archive(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         msg = store.read("s1", "w1", "w1")
         store.finalize("s1", "w1", msg["msg_id"], "w1")
         store.clear("s1", "w1")  # wipes the per-recipient archive only
@@ -883,7 +889,8 @@ class TestHistory:
         base = datetime(2026, 1, 1, tzinfo=timezone.utc)
         for i, kind in enumerate(["TASK", "PROGRESS", "TASK"]):
             msg = Message("s1", "mgr", "w1", f"t{i}", "b", kind, f"m{i}",
-                          (base + timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                          (base + timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          run_id="run-1", request_id="req-1")
             store.append_history("s1", msg.to_dict())
         h = store.read_history("s1")
         assert [m["subject"] for m in h] == ["t2", "t1", "t0"]  # newest first
@@ -896,7 +903,7 @@ class TestHistory:
     def test_history_append_only(self, store):
         store.session_init("s1", "mgr", ["w1"])
         msg = Message("s1", "mgr", "w1", "t", "b", "TASK", "m1",
-                      "2026-01-01T00:00:00Z").to_dict()
+                      "2026-01-01T00:00:00Z", run_id="run-1", request_id="req-1").to_dict()
         store.append_history("s1", msg)
         with pytest.raises(ValueError, match="already exists"):
             store.append_history("s1", msg)
@@ -916,7 +923,7 @@ class TestHistory:
 
     def test_history_skips_corrupt_entry(self, store):
         store.session_init("s1", "mgr", ["w1"])
-        store.send("s1", "mgr", "w1", "t", "b", "TASK")
+        store.send("s1", "mgr", "w1", "t", "b", "TASK", run_id="run-1", request_id="req-1")
         hd = store.history_dir("s1")
         (hd / "junk.json").write_text("{not json")
         assert len(store.read_history("s1")) == 1
@@ -955,3 +962,17 @@ class TestSessionInitIdempotent:
         # w1 and w2 subdirs still exist (not duplicated)
         assert (store.root / "s1" / "w1" / "inbox").is_dir()
         assert (store.root / "s1" / "w2" / "inbox").is_dir()
+
+    def test_session_init_rejects_manager_conflict(self, store):
+        """session_init with different manager_id MUST reject, not silently merge."""
+        store.session_init("s1", "mgr", ["w1", "w2"])
+
+        with pytest.raises(ValueError, match="already has manager.*mgr.*cannot reassign.*other"):
+            store.session_init("s1", "other", ["w1", "w3"])
+
+        # Original session unchanged — no agents from the rejected call
+        meta = store.read_session("s1")
+        assert meta is not None
+        assert meta["manager"] == "mgr"
+        assert sorted(meta["agents"]) == ["w1", "w2"]
+        assert not (store.root / "s1" / "w3" / "inbox").is_dir()

@@ -23,6 +23,18 @@ class AddressKind(str, Enum):
     NOTICE = "notice"
 
 
+class ExecutionMode(str, Enum):
+    """How an agent is executed."""
+    MAILBOX_WORKER = "mailbox-worker"
+    LOCAL_OMP_MCP = "local-omp-mcp"
+
+
+class ReturnMode(str, Enum):
+    """How results flow back from worker to manager."""
+    MANAGER_PULL = "manager-pull"
+    BIDIRECTIONAL = "bidirectional"
+
+
 # ── Agent / Location ───────────────────────────────────────────────────
 
 
@@ -33,6 +45,9 @@ class AgentLocation:
     host_alias: str       # SSH alias, or "__local__" for co-located
     backend: str           # "cli" | "omp" | "tmux" | "custom"
     capabilities: tuple[str, ...] = ()
+    execution_mode: Optional[ExecutionMode] = None
+    mailbox_root: str = ""
+    return_mode: Optional[ReturnMode] = None
 
 
 # ── Address ────────────────────────────────────────────────────────────
@@ -117,6 +132,9 @@ class Session:
     acl: ACL = field(default_factory=ACL)
     channels: dict[str, Channel] = field(default_factory=dict)
     created_at: str = ""
+    manifest_hash: str = ""
+    execution_modes: dict[str, str] = field(default_factory=dict)  # agent_id -> ExecutionMode value
+    return_modes: dict[str, str] = field(default_factory=dict)     # agent_id -> ReturnMode value
 
 
 # ── Receipts / Results ─────────────────────────────────────────────────

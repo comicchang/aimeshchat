@@ -45,4 +45,9 @@ OMP_MAILBOX_IDENTITY_FILE=~/.omp/mailbox-identity/${TOKEN}.json omp -c
 
 ---
 
-*Content in this file is a structural placeholder. Deployment mode details are maintained alongside the protocol.*
+## Relationship to Active Design
+
+本文件描述 **Mode A (Shared FS)** 部署模式的运维细节。
+协议权威定义在 `skill://agent-swarm/protocol/mailbox.md`，
+Skill 入口在 `skill://agent-swarm/SKILL.md`（active design version: **v2 session-based**）。
+拓扑选择和 MAILBOX_ROOT 规则见 `SKILL.md` §Deployment Modes。

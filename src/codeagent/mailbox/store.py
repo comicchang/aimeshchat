@@ -111,7 +111,9 @@ class MailboxStore:
     # ── Session ────────────────────────────────────────────────────────
 
     def session_init(self, session_id: str, manager_id: str, agent_ids: list[str],
-                     acl: Optional[dict] = None) -> str:
+                     acl: Optional[dict] = None,
+                     execution_modes: Optional[dict[str, str]] = None,
+                     return_modes: Optional[dict[str, str]] = None) -> str:
         """B4-Manifest: acl dict 可选——与 roster 一起持久化到 session.json
         （权威副本），供远端 ensure 同步。每次写递增 manifest_revision。"""
         # Validate all IDs before creating anything
@@ -128,6 +130,13 @@ class MailboxStore:
             if existing is None:
                 raise ValueError(f"session dir exists but session.json missing: {session_id}")
 
+            old_manager = existing.get("manager", "")
+            if old_manager and old_manager != manager_id:
+                raise ValueError(
+                    f"session {session_id} already has manager={old_manager!r}, "
+                    f"cannot reassign to manager={manager_id!r}"
+                )
+
             old_agents = set(existing.get("agents", []))
             new_agents = sorted(set(agent_ids))
             merged = sorted(old_agents | set(new_agents))
@@ -136,7 +145,7 @@ class MailboxStore:
             # Manifest revision bumps on every control-plane write
             revision = int(existing.get("manifest_revision", 0)) + 1
 
-            if not added and acl is None:
+            if not added and acl is None and execution_modes is None and return_modes is None:
                 # Nothing new — still bump revision? No: no-op if nothing changed.
                 return f"session {session_id} ok (merged 0 agents)"
 
@@ -151,6 +160,14 @@ class MailboxStore:
             existing["manifest_revision"] = revision
             if acl is not None:
                 existing["acl"] = acl
+            if execution_modes is not None:
+                existing_em = existing.get("execution_modes", {})
+                existing_em.update(execution_modes)
+                existing["execution_modes"] = existing_em
+            if return_modes is not None:
+                existing_rm = existing.get("return_modes", {})
+                existing_rm.update(return_modes)
+                existing["return_modes"] = existing_rm
             tmp = sd / ".tmp-session.json"
             with open(tmp, "w") as f:
                 f.write(json.dumps(existing, indent=2, ensure_ascii=False))
@@ -175,6 +192,10 @@ class MailboxStore:
         }
         if acl is not None:
             meta["acl"] = acl
+        if execution_modes is not None:
+            meta["execution_modes"] = execution_modes
+        if return_modes is not None:
+            meta["return_modes"] = return_modes
         tmp = sd / ".tmp-session.json"
         with open(tmp, "w") as f:
             f.write(json.dumps(meta, indent=2, ensure_ascii=False))

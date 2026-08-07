@@ -143,7 +143,11 @@ def on_agent_message(
     subject = msg_dict.get("subject", "")
     body = msg_dict.get("body", "")
 
-    env = Envelope(subject=subject, body=body, kind=kind)
+    run_id = msg_dict.get("run_id", "")
+    request_id = msg_dict.get("request_id", "")
+    reply_to = msg_dict.get("reply_to", "")
+    env = Envelope(subject=subject, body=body, kind=kind,
+                   run_id=run_id, request_id=request_id, reply_to=reply_to)
 
     if to_id == "*":
         receipts = kernel.broadcast(session_id, agent_id, env)
