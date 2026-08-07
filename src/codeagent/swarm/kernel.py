@@ -886,12 +886,13 @@ class SwarmKernel:
             return []
 
         messages: list[dict] = []
+        manager_id = session.manager_id
         for agent_id in pull_agents:
             cmd = [
                 "codeagent", "mailbox", "read",
                 "--session", session_id,
-                "--agent", "manager",
-                "--owner", "manager",
+                "--agent", manager_id,
+                "--owner", manager_id,
                 "--host", from_host,
                 "--json",
             ]
