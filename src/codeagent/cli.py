@@ -316,6 +316,18 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     ob_purge = ob_sub.add_parser("purge", help="Delete dead-lettered entries")
     ob_purge.add_argument("--session", dest="session_id", help="Filter by session ID")
 
+    # launch
+    la_p = swarm_sub.add_parser("launch", help="Bootstrap remote workers and start manager-pull loop")
+    la_p.add_argument("session_id", help="Session identifier")
+    la_p.add_argument("--bootstrap", action="store_true",
+                      help="Send session-init + INIT task to each remote worker")
+    la_p.add_argument("--pull", action="store_true",
+                      help="Start manager-pull loop after bootstrap")
+    la_p.add_argument("--poll-interval", type=int, default=5,
+                      help="Pull loop interval in seconds (default 5)")
+    la_p.add_argument("--max-iterations", type=int, default=0,
+                      help="Max pull iterations (0 = until all workers terminal)")
+
 
 def _get_swarm_kernel(store_root: Optional[Path] = None) -> tuple[SwarmKernel, MailboxStore]:
     """Create a SwarmKernel with DeliveryEngine sink for cross-host delivery.
@@ -393,6 +405,8 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             return _swarm_watch(kernel, args)
         elif cmd == "outbox":
             return _swarm_outbox(kernel, args)
+        elif cmd == "launch":
+            return _swarm_launch(kernel, args)
         else:
             print(f"error: unknown swarm command: {cmd}", file=sys.stderr)
             return 1
@@ -724,6 +738,144 @@ def _swarm_outbox(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
     print(f"error: unknown outbox command: {cmd}", file=sys.stderr)
     return 1
+
+
+def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
+    """Bootstrap remote workers and start manager-pull loop.
+
+    1. If --bootstrap: SSH to each non-local agent — mailbox session-init + send INIT.
+    2. If --pull: poll loop — pull_remote/ingest/replay until all workers terminal.
+    """
+    session = kernel.get_session(args.session_id)
+    if session is None:
+        print(f"error: session not found: {args.session_id}", file=sys.stderr)
+        return 1
+
+    manager = session.manager_id
+    roster = list(session.roster)
+    roster_csv = ",".join(roster)
+
+    # ── Phase 1: Bootstrap remote workers ────────────────────────────
+    if args.bootstrap:
+        remote_agents = [
+            a for a in roster if a != manager
+            and kernel.get_location(args.session_id, a)
+            and kernel.get_location(args.session_id, a).host_alias != "__local__"
+        ]
+        for agent in remote_agents:
+            loc = kernel.get_location(args.session_id, agent)
+            host = loc.host_alias
+
+            # session-init on remote host
+            cmd = [
+                "codeagent", "mailbox", "session-init",
+                "--host", host,
+                "--session", args.session_id,
+                "--manager", manager,
+                "--agents", roster_csv,
+            ]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if r.stdout.strip():
+                    print(r.stdout.strip())
+                if r.returncode != 0:
+                    print(f"error: session-init failed for {agent}@{host}: {r.stderr.strip()}", file=sys.stderr)
+                    return 1
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                print(f"error: session-init exception for {agent}@{host}: {exc}", file=sys.stderr)
+                return 1
+
+            # send INIT task to this worker
+            cmd = [
+                "codeagent", "mailbox", "send",
+                "--host", host,
+                "--session", args.session_id,
+                "--to", agent,
+                "--from", manager,
+                "--kind", "TASK",
+                "--subject", "INIT",
+                "--body", json.dumps({"session_id": args.session_id, "agent": agent}),
+            ]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if r.stdout.strip():
+                    print(r.stdout.strip())
+                if r.returncode != 0:
+                    print(f"error: send INIT failed for {agent}@{host}: {r.stderr.strip()}", file=sys.stderr)
+                    return 1
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                print(f"error: send INIT exception for {agent}@{host}: {exc}", file=sys.stderr)
+                return 1
+
+        print(json.dumps({
+            "phase": "bootstrap",
+            "session_id": args.session_id,
+            "remote_agents": remote_agents,
+            "status": "done",
+        }, indent=2))
+
+    # ── Phase 2: Manager-pull loop ───────────────────────────────────
+    if not args.pull:
+        return 0
+
+    import time as _time
+
+    # Build set of non-manager agent_ids that have locations registered.
+    registered_workers = sorted({
+        a for a in roster if a != manager
+        and kernel.get_location(args.session_id, a)
+    })
+    if not registered_workers:
+        print("warning: no registered workers found — skipping pull loop", file=sys.stderr)
+        return 0
+
+    print(json.dumps({
+        "phase": "pull",
+        "session_id": args.session_id,
+        "tracking_workers": registered_workers,
+    }, indent=2))
+
+    iteration = 0
+    max_iter = args.max_iterations
+    while True:
+        # Pull messages from remote hosts (for manager-pull return mode).
+        try:
+            messages = kernel.pull_remote(args.session_id, "")
+            if messages:
+                persisted = kernel.ingest(args.session_id, messages)
+                if persisted:
+                    print(f"ingested {len(persisted)} message(s)", file=sys.stderr)
+        except (ValueError, OSError) as exc:
+            log.debug("launch pull_remote/ingest error: %s", exc)
+
+        # Replay canonical history to check for terminal REPORTs.
+        all_history = kernel._store.read_history(args.session_id)
+        reported = set()
+        for m in all_history:
+            if m.get("kind") == "REPORT" and m.get("from") != manager:
+                reported.add(m["from"])
+
+        if reported >= set(registered_workers):
+            print(json.dumps({
+                "phase": "pull",
+                "status": "all_workers_reported",
+                "reported": sorted(reported),
+            }, indent=2))
+            break
+
+        iteration += 1
+        if max_iter and iteration >= max_iter:
+            print(json.dumps({
+                "phase": "pull",
+                "status": "max_iterations",
+                "reported": sorted(reported),
+                "pending": sorted(set(registered_workers) - reported),
+            }, indent=2))
+            break
+
+        _time.sleep(args.poll_interval)
+
+    return 0
 
 
 def _execute(request: RunRequest, target: Target, registry: SessionRegistry, repo_map=None) -> RunResult:

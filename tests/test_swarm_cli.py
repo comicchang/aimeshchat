@@ -1028,3 +1028,134 @@ class TestOMPRunnerHooks:
         source = Path(omp_mod.__file__).read_text()
         assert "on_agent_start" in source
         assert "on_agent_stop" in source
+
+
+# ── swarm launch ────────────────────────────────────────────────────────
+
+
+class TestSwarmLaunch:
+    """swarm launch help and bootstrap dry-run."""
+
+    def test_swarm_launch_help(self):
+        rc, out, _ = _run(["swarm", "launch", "--help"])
+        assert rc == 0
+        assert "session_id" in out
+        assert "--bootstrap" in out
+        assert "--pull" in out
+        assert "--poll-interval" in out
+        assert "--max-iterations" in out
+
+    def test_swarm_launch_no_session(self):
+        """Launch with nonexistent session returns error."""
+        rc, _, err = _run(["swarm", "launch", "nonexistent"])
+        assert rc == 1
+        assert "not found" in err
+
+    def test_swarm_launch_bootstrap_dry_run(self):
+        """--bootstrap with remote agents calls session-init + send via subprocess."""
+        _setup_full(session_id="launch-s1", manager="mgr", members="w1")
+
+        # Register w1 on a remote host so bootstrap has work to do.
+        rc, _, _ = _run(["swarm", "register", "launch-s1",
+                         "--agent", "w1", "--host", "remote-host-1", "--backend", "cli",
+                         "--return-mode", "manager-pull"])
+        assert rc == 0
+
+        called_cmds = []
+
+        def fake_run(cmd, **kwargs):
+            called_cmds.append(cmd)
+            return mock.MagicMock(returncode=0, stdout="ok\n", stderr="")
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            rc, out, err = _run(["swarm", "launch", "launch-s1", "--bootstrap"])
+
+        assert rc == 0
+        # Should have called session-init and send for w1
+        init_calls = [c for c in called_cmds if "session-init" in c]
+        send_calls = [c for c in called_cmds if c[1] == "mailbox" and c[2] == "send"]
+        assert len(init_calls) == 1
+        assert len(send_calls) == 1
+
+        init_cmd = init_calls[0]
+        assert "--host" in init_cmd
+        assert init_cmd[init_cmd.index("--host") + 1] == "remote-host-1"
+        assert init_cmd[init_cmd.index("--session") + 1] == "launch-s1"
+        assert init_cmd[init_cmd.index("--manager") + 1] == "mgr"
+
+        send_cmd = send_calls[0]
+        assert send_cmd[send_cmd.index("--to") + 1] == "w1"
+        assert send_cmd[send_cmd.index("--from") + 1] == "mgr"
+        assert send_cmd[send_cmd.index("--subject") + 1] == "INIT"
+        assert send_cmd[send_cmd.index("--kind") + 1] == "TASK"
+
+    def test_swarm_launch_bootstrap_skips_local(self):
+        """--bootstrap skips agents on __local__ host."""
+        _setup_full(session_id="launch-s2", manager="mgr", members="w1,w2")
+
+        called_cmds = []
+
+        def fake_run(cmd, **kwargs):
+            called_cmds.append(cmd)
+            return mock.MagicMock(returncode=0, stdout="ok\n", stderr="")
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            rc, out, _ = _run(["swarm", "launch", "launch-s2", "--bootstrap"])
+
+        assert rc == 0
+        # All agents are __local__ so no subprocess calls should have been made
+        assert len(called_cmds) == 0
+        assert '"status": "done"' in out
+
+    def test_swarm_launch_pull_no_workers(self):
+        """--pull with no registered non-manager workers skips loop."""
+        # Create session only (no register calls), so no locations exist.
+        _setup_session(session_id="launch-s3", manager="mgr", members="w1")
+        rc, out, err = _run(["swarm", "launch", "launch-s3", "--pull"])
+        assert rc == 0
+        assert "no registered workers" in err
+
+    def test_swarm_launch_pull_exits_on_report(self):
+        """--pull loop exits when all workers send REPORT."""
+        _setup_full(session_id="launch-s4", manager="mgr", members="w1")
+
+        # Register w1 so it appears in the pull tracking.
+        rc, _, _ = _run(["swarm", "register", "launch-s4",
+                         "--agent", "w1", "--host", "__local__", "--backend", "cli"])
+        assert rc == 0
+
+        # Write a REPORT directly into canonical history so pull loop finds it.
+        import codeagent.cli as cli_mod
+        kernel, _ = cli_mod._get_swarm_kernel()
+        kernel._store.append_history("launch-s4", {
+            "msg_id": "report-1",
+            "from": "w1",
+            "to": "mgr",
+            "kind": "REPORT",
+            "subject": "DONE",
+            "body": "finished",
+            "session_id": "launch-s4",
+            "created_at": "2026-08-07T00:00:00Z",
+            "run_id": "run-1",
+            "request_id": "req-1",
+            "reply_to": "init-msg-1",
+        })
+
+        rc, out, _ = _run(["swarm", "launch", "launch-s4", "--pull",
+                           "--poll-interval", "0", "--max-iterations", "5"])
+        assert rc == 0
+        assert "all_workers_reported" in out
+
+    def test_swarm_launch_pull_max_iterations(self):
+        """--pull loop respects --max-iterations."""
+        _setup_full(session_id="launch-s5", manager="mgr", members="w1")
+
+        rc, _, _ = _run(["swarm", "register", "launch-s5",
+                         "--agent", "w1", "--host", "__local__", "--backend", "cli"])
+        assert rc == 0
+
+        rc, out, _ = _run(["swarm", "launch", "launch-s5", "--pull",
+                           "--poll-interval", "0", "--max-iterations", "3"])
+        assert rc == 0
+        assert "max_iterations" in out
+        assert '"pending"' in out
