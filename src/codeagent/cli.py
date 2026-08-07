@@ -786,6 +786,9 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
                 return 1
 
             # send INIT task to this worker
+            import uuid as _uuid
+            init_run_id = f"run-{_uuid.uuid4().hex[:12]}"
+            init_req_id = f"req-{_uuid.uuid4().hex[:12]}"
             cmd = [
                 "codeagent", "mailbox", "send",
                 "--host", host,
@@ -795,6 +798,8 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
                 "--kind", "TASK",
                 "--subject", "INIT",
                 "--body", json.dumps({"session_id": args.session_id, "agent": agent}),
+                "--run-id", init_run_id,
+                "--request-id", init_req_id,
             ]
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -837,11 +842,19 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
     iteration = 0
     max_iter = args.max_iterations
+    # Collect unique remote hosts from worker locations
+    remote_hosts = sorted({
+        kernel.get_location(args.session_id, w).host_alias
+        for w in registered_workers
+        if kernel.get_location(args.session_id, w)
+        and kernel.get_location(args.session_id, w).host_alias != "__local__"
+    })
     while True:
-        # Pull messages from remote hosts (for manager-pull return mode).
+        # Pull messages from each remote host (for manager-pull return mode).
         try:
-            messages = kernel.pull_remote(args.session_id, "")
-            if messages:
+            messages = []
+            for host in remote_hosts:
+                messages.extend(kernel.pull_remote(args.session_id, host))
                 persisted = kernel.ingest(args.session_id, messages)
                 if persisted:
                     print(f"ingested {len(persisted)} message(s)", file=sys.stderr)
