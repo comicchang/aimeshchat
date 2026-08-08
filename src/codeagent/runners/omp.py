@@ -277,6 +277,15 @@ class OMPRunner(BaseRunner):
             if text:
                 # Live progress echo — user visibility during long runs
                 print(f"[oracle progress] {text[:200]}", file=sys.stderr, flush=True)
+                # Persist progress to file for park info display
+                try:
+                    _progress_dir = Path.home() / ".omp" / "park" / "progress"
+                    _progress_dir.mkdir(parents=True, exist_ok=True)
+                    _key = getattr(self._current_request, "session_key", "unknown") if self._current_request else "unknown"
+                    with (_progress_dir / f"{_key}.txt").open("a") as f:
+                        f.write(f"{text}\n---\n")
+                except Exception:
+                    pass  # never break execution on file write errors
                 # Bounded buffer — keep only the last N visible messages
                 self._visible_texts.append(text)
                 if len(self._visible_texts) > self._MAX_VISIBLE_MESSAGES:
