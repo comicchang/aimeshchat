@@ -194,6 +194,7 @@ class OMPRunner(BaseRunner):
         """
         # Store request so _extra_env can read RunContext (called from base)
         self._current_request = request
+        self._current_session_key = getattr(request, "session_key", "unknown") if request else "unknown"
         # Reset incremental JSONL state for this run
         self._backend_session_id = None
         self._terminal_seen = False
@@ -281,7 +282,7 @@ class OMPRunner(BaseRunner):
                 try:
                     _progress_dir = Path.home() / ".omp" / "park" / "progress"
                     _progress_dir.mkdir(parents=True, exist_ok=True)
-                    _key = getattr(self._current_request, "session_key", "unknown") if self._current_request else "unknown"
+                    _key = self._current_session_key
                     with (_progress_dir / f"{_key}.txt").open("a") as f:
                         f.write(f"{text}\n---\n")
                 except Exception:

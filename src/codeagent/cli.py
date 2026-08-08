@@ -1525,11 +1525,6 @@ def _cmd_park(args: argparse.Namespace) -> int:
                 chunks = progress_file.read_text().strip().split("\n---")
                 if chunks:
                     print(f"  last_message: {chunks[-1].strip()[:500]}")
-            progress_file = Path.home() / ".omp" / "park" / "progress" / f"{args.review_key}.txt"
-            if progress_file.exists():
-                chunks = progress_file.read_text().strip().split("\n---")
-                if chunks:
-                    print(f"  last_message: {chunks[-1].strip()[:500]}")
         else:
             print(f"(no instance for '{args.review_key}')")
 
