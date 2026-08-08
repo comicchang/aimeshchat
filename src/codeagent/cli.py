@@ -1104,7 +1104,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     # Resolve agent → runner: oracle agents always use OMPRunner
     backend = args.backend
-    if args.agent == "oracle":
+    if args.agent and args.agent.startswith("oracle"):
         backend = "omp"
 
     request = RunRequest(
@@ -1138,7 +1138,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     # Oracle pre-spawn bootstrap: create RunContext + swarm session + INIT envelope
     run_context: Optional[RunContext] = None
-    if request.agent == "oracle":
+    if request.agent and request.agent.startswith("oracle"):
         ns_key = request.session_key or registry.compute_key(request, target)
         run_context = _bootstrap_oracle_swarm(request, ns_key)
         # Timeout handled by OMPRunner._ORACLE_TIMEOUT (3600s) — don't override here
@@ -1170,7 +1170,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     # Auto park acquire: register oracle session as HOT_PARKED so
     # park info/renew/release work without manual steps.
-    if request.agent == "oracle" and result.returncode == 0 and result.session_id:
+    if request.agent and request.agent.startswith("oracle") and result.returncode == 0 and result.session_id:
         import subprocess as _sp
         _sp.run([
             "codeagent", "park", "acquire",
