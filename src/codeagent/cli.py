@@ -1121,6 +1121,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         host=args.host,
     )
 
+    # Propagate --output path so OMPRunner._build_cmd can pass it to omp
+    if args.output:
+        request.output = args.output
+
     repo_map = None
     try:
         repo_map = load_repo_map()
@@ -1163,6 +1167,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(result.stdout)
     if result.stderr:
         print(result.stderr, file=sys.stderr)
+
+    # Auto park acquire: register oracle session as HOT_PARKED so
+    # park info/renew/release work without manual steps.
+    if request.agent == "oracle" and result.returncode == 0 and result.session_id:
+        import subprocess as _sp
+        _sp.run([
+            "codeagent", "park", "acquire",
+            ns_key, "--agent-type", "oracle",
+            "--backend-id", result.session_id,
+            "--peer-id", result.session_id,
+        ], capture_output=True, timeout=10)
+
     if args.output:
         Path(args.output).write_text(json.dumps({
             "session_id": result.session_id,
@@ -1468,7 +1484,6 @@ def _cmd_park(args: argparse.Namespace) -> int:
     elif cmd == "info":
         m = registry.lookup(args.review_key)
         if m:
-            import json
             print(json.dumps({
                 "review_key": m.review_key,
                 "lifecycle": m.lifecycle.value,
@@ -1485,9 +1500,27 @@ def _cmd_park(args: argparse.Namespace) -> int:
             print(f"(no instance for '{args.review_key}')")
 
     elif cmd == "revive":
-        result = park_revive(args.review_key, args.prompt or "")
-        print(f"method={result.method} success={result.success}")
-        print(result.context[:500])
+        rv = park_revive(args.review_key, args.prompt or "")
+        out = {
+            "method": rv.method,
+            "success": rv.success,
+            "context": rv.context[:500],
+            "prompt": args.prompt or "",
+        }
+        if args.prompt and rv.method in ("hot", "warm", "cold"):
+            cmd_list = [
+                sys.executable, "-m", "codeagent.cli", "run",
+                "--session-key", args.review_key,
+                "--agent", "oracle",
+                args.prompt,
+                str(Path.cwd()),
+            ]
+            if rv.method == "cold":
+                cmd_list.insert(cmd_list.index("run") + 1, "--new-session")
+            r = subprocess.run(cmd_list, capture_output=True, text=True, timeout=3600)
+            out["revive_output"] = r.stdout[-500:]
+            out["revive_returncode"] = r.returncode
+        print(json.dumps(out, indent=2))
 
     elif cmd == "acquire":
         import time

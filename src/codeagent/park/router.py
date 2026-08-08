@@ -17,11 +17,13 @@ class ReviveResult:
         method: str,
         context: str = "",
         manifest: Optional[ParkManifest] = None,
+        prompt: str = "",
     ) -> None:
         self.success = success
         self.method = method  # "hot", "warm", "cold", "failed"
         self.context = context
         self.manifest = manifest
+        self.prompt = prompt
 
 
 def revive_or_spawn(review_key: str, prompt: str = "") -> ReviveResult:
@@ -49,6 +51,7 @@ def revive_or_spawn(review_key: str, prompt: str = "") -> ReviveResult:
                 f"use hub send to peer_agent_id={manifest.peer_agent_id}"
             ),
             manifest=manifest,
+            prompt=prompt,
         )
 
     if manifest and manifest.lifecycle in (Lifecycle.COLD_RESUMABLE, Lifecycle.RELEASED):
@@ -61,6 +64,7 @@ def revive_or_spawn(review_key: str, prompt: str = "") -> ReviveResult:
                     f"backend_session_id={manifest.backend_session_id}"
                 ),
                 manifest=manifest,
+                prompt=prompt,
             )
 
     # Cold reconstruction
@@ -70,6 +74,7 @@ def revive_or_spawn(review_key: str, prompt: str = "") -> ReviveResult:
         method="cold",
         context=cold_context,
         manifest=manifest,
+        prompt=prompt,
     )
 
 

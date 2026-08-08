@@ -174,6 +174,11 @@ class OMPRunner(BaseRunner):
         self._prompt_file = self._write_prompt_file(request.task)
         cmd.append(f"@{self._prompt_file}")
 
+        # Structured output path — lets session_id flow into exit JSON
+        output_path = getattr(request, "output", None)
+        if output_path:
+            cmd.extend(["--output", output_path])
+
         return cmd
 
     def run(self, request: RunRequest) -> RunResult:
