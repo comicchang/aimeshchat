@@ -1002,6 +1002,23 @@ def _execute(request: RunRequest, target: Target, registry: SessionRegistry, rep
         if result.session_id:
             registry.mark_observed(ns_key, result.session_id)
             registry.upsert(ns_key, result, request, target)
+            # Auto park acquire: register oracle session as HOT_PARKED so
+            # park info/renew/release work without manual steps.  Done here
+            # (inside _execute) rather than in _cmd_run so it fires even if
+            # the outer shell backgrounds the process before stdout prints.
+            if request.agent and request.agent.startswith("oracle") and result.returncode == 0:
+                try:
+                    subprocess.run(
+                        [
+                            "codeagent", "park", "acquire",
+                            ns_key, "--agent-type", request.agent,
+                            "--backend-id", result.session_id,
+                            "--peer-id", result.session_id,
+                        ],
+                        capture_output=True, timeout=10,
+                    )
+                except Exception as exc:
+                    log.warning("auto park acquire failed (non-fatal): %s", exc)
         elif result.returncode == 0:
             registry.mark_active(ns_key)
         else:
@@ -1185,17 +1202,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(result.stdout)
     if result.stderr:
         print(result.stderr, file=sys.stderr)
-
-    # Auto park acquire: register oracle session as HOT_PARKED so
-    # park info/renew/release work without manual steps.
-    if request.agent and request.agent.startswith("oracle") and result.returncode == 0 and result.session_id:
-        import subprocess as _sp
-        _sp.run([
-            "codeagent", "park", "acquire",
-            ns_key, "--agent-type", request.agent,
-            "--backend-id", result.session_id,
-            "--peer-id", result.session_id,
-        ], capture_output=True, timeout=10)
 
     if args.output:
         Path(args.output).write_text(json.dumps({

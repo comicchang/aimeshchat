@@ -265,14 +265,18 @@ class TestOMPRunner:
         assert result.returncode == 127
 
     def test_run_timeout(self) -> None:
+        import io
+
         mock_proc = mock.MagicMock()
         mock_proc.pid = 9999
+        mock_proc.stdout = io.StringIO("")
+        mock_proc.stderr = io.StringIO("")
         exc = subprocess.TimeoutExpired(cmd="omp", timeout=30)
         exc.proc = mock_proc
 
         mock_popen = mock.MagicMock()
         mock_popen.return_value = mock_proc
-        mock_proc.communicate.side_effect = exc
+        mock_proc.wait.side_effect = exc
 
         with mock.patch("subprocess.Popen", mock_popen):
             r = self._runner(binary="/usr/bin/omp")
@@ -574,8 +578,12 @@ class TestBaseRunnerContract:
 
     def test_timeout_calls_killpg(self) -> None:
         """BaseRunner should call os.killpg on timeout."""
+        import io
+
         mock_proc = mock.MagicMock()
         mock_proc.pid = 12345
+        mock_proc.stdout = io.StringIO("")
+        mock_proc.stderr = io.StringIO("")
 
         class Dummy(BaseRunner):
             def _build_cmd(self, request):
@@ -588,7 +596,7 @@ class TestBaseRunnerContract:
 
         mock_popen = mock.MagicMock()
         mock_popen.return_value = mock_proc
-        mock_proc.communicate.side_effect = timeout_exc
+        mock_proc.wait.side_effect = timeout_exc
 
         with mock.patch("subprocess.Popen", mock_popen), \
              mock.patch("os.killpg") as mock_killpg, \

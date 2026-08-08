@@ -1,6 +1,7 @@
 """Abstract base runner — contract for all backend executors."""
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 from abc import ABC, abstractmethod
@@ -63,12 +64,35 @@ class BaseRunner(ABC):
                 start_new_session=True,
                 env=env,
             )
-            stdout, stderr = proc.communicate(
-                input=request.task,
-                timeout=self.config.timeout,
+            # Write stdin and close so the subprocess sees EOF.
+            if proc.stdin:
+                proc.stdin.write(request.task)
+                proc.stdin.close()
+            # Read stdout line by line — non-blocking, doesn't trigger
+            # shell auto-background timeout, and calls _consume_line
+            # incrementally.  Wrap in StringIO if tests mock stdout as a
+            # plain string (MagicMock returns str, not a file object).
+            stdout_stream = (
+                proc.stdout
+                if hasattr(proc.stdout, "readline")
+                else io.StringIO(proc.stdout if isinstance(proc.stdout, str) else "")
             )
+            stderr_stream = (
+                proc.stderr
+                if hasattr(proc.stderr, "read")
+                else io.StringIO(proc.stderr if isinstance(proc.stderr, str) else "")
+            )
+            stdout_lines: list[str] = []
+            while True:
+                line = stdout_stream.readline()
+                if not line:
+                    break
+                stdout_lines.append(line)
+                self._consume_line("stdout", line)
+            proc.wait(timeout=self.config.timeout)
+            stderr = stderr_stream.read()
             proc_obj = subprocess.CompletedProcess(
-                cmd, proc.returncode, stdout, stderr
+                cmd, proc.returncode, "".join(stdout_lines), stderr
             )
         except subprocess.TimeoutExpired:
             if proc is not None:
@@ -99,6 +123,15 @@ class BaseRunner(ABC):
 
     def _cleanup(self) -> None:
         """Clean up temporary resources. Subclasses should override."""
+        pass
+
+    def _consume_line(self, channel: str, line: str) -> None:
+        """Incrementally process each output line from the subprocess.
+
+        Called on the main thread for every line of stdout while the
+        subprocess is still running.  Subclasses override to parse
+        structured output (e.g. JSONL events) without waiting for exit.
+        """
         pass
 
     # ------------------------------------------------------------------

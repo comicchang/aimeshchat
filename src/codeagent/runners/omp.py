@@ -125,6 +125,7 @@ class OMPRunner(BaseRunner):
         self._backend_session_id: Optional[str] = None
         self._terminal_seen: bool = False
         self._visible_texts: list[str] = []
+        self._stdout_line_count: int = 0
         self._run_result: Optional[RunResult] = None
         self._run_context: Optional[object] = None
         self._current_request: Optional[RunRequest] = None
@@ -197,6 +198,7 @@ class OMPRunner(BaseRunner):
         self._backend_session_id = None
         self._terminal_seen = False
         self._visible_texts = []
+        self._stdout_line_count = 0
         self._run_result = None
 
         # Extract RunContext if present (bootstrap provides it)
@@ -247,12 +249,16 @@ class OMPRunner(BaseRunner):
           - Session ID from ``{"type":"session","id":"..."}``
           - Visible assistant text from ``{"type":"assistant","message_end":{...}}``
           - Terminal signal from ``{"type":"agent_end"}``
+        Also emits a heartbeat '.' to stderr every 30 stdout lines.
         """
         if channel != "stdout":
             return
         line = line.strip()
         if not line:
             return
+        self._stdout_line_count += 1
+        if self._stdout_line_count % 30 == 0:
+            print(".", end="", file=sys.stderr, flush=True)
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
