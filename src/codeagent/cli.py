@@ -1161,7 +1161,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     )
                 request.task += "--- END PENDING ---\n"
 
-    result = _execute(request, target, registry, repo_map, run_context=run_context)
+    try:
+        result = _execute(request, target, registry, repo_map, run_context=run_context)
+    except Exception as exc:
+        # Crash recovery: try to recover oracle response from mailbox
+        recovered = ""
+        if run_context:
+            try:
+                store = MailboxStore(root=Path(run_context.mailbox_root))
+                msgs = store.read_history(run_context.swarm_session_id)
+                for m in reversed(msgs):
+                    if m.get('kind') == 'REPORT' and m.get('from') == 'oracle':
+                        recovered = m.get('body', '')[:2000]
+                        break
+            except Exception:
+                pass
+        if recovered:
+            print(f"[recovered from mailbox]: {recovered}", file=sys.stderr)
+        print(f"[oracle error - output may be incomplete]: {exc}", file=sys.stderr)
+        result = RunResult(returncode=1, stderr=str(exc))
 
     if result.stdout:
         print(result.stdout)
@@ -1174,7 +1192,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         import subprocess as _sp
         _sp.run([
             "codeagent", "park", "acquire",
-            ns_key, "--agent-type", "oracle",
+            ns_key, "--agent-type", request.agent,
             "--backend-id", result.session_id,
             "--peer-id", result.session_id,
         ], capture_output=True, timeout=10)

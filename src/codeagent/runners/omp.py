@@ -21,6 +21,7 @@ import logging
 import os
 import secrets
 import stat
+import sys
 import subprocess
 import tempfile
 import time as _time
@@ -268,6 +269,8 @@ class OMPRunner(BaseRunner):
             end = obj.get("message_end", {})
             text = end.get("message")
             if text:
+                # Live progress echo — user visibility during long runs
+                print(f"[oracle progress] {text[:200]}", file=sys.stderr, flush=True)
                 # Bounded buffer — keep only the last N visible messages
                 self._visible_texts.append(text)
                 if len(self._visible_texts) > self._MAX_VISIBLE_MESSAGES:
@@ -289,6 +292,7 @@ class OMPRunner(BaseRunner):
         """
         self._backend_session_id = backend_id
         LOG.info("OMP session started: %s", backend_id)
+        print(f"[oracle session] {backend_id}", file=sys.stderr, flush=True)
 
         # Propagate to RunResult if already created
         if self._run_result is not None:
