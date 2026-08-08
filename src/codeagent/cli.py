@@ -1071,6 +1071,16 @@ def _bootstrap_oracle_swarm(
         ),
     )
 
+    # Inject mailbox identity so oracle knows how to receive follow-ups
+    request.task += (
+        f"\n\n--- MAILBOX IDENTITY ---\n"
+        f"You are oracle agent in swarm session {sid}.\n"
+        f"Check inbox: mailbox read --session {sid} --agent oracle --owner oracle --json\n"
+        f"Read skill://agent-swarm/roles/worker.md for protocol.\n"
+        f"Manager may send follow-up TASK/QUESTION via mailbox.\n"
+        f"Before each response, check your inbox for new messages.\n"
+    )
+
     rc = RunContext(
         review_key=ns_key,
         generation=1,
@@ -1128,6 +1138,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
         ns_key = request.session_key or registry.compute_key(request, target)
         run_context = _bootstrap_oracle_swarm(request, ns_key)
         # Timeout handled by OMPRunner._ORACLE_TIMEOUT (3600s) — don't override here
+
+        # Warm resume: check oracle inbox for pending manager messages
+        if not request.new_session and run_context is not None:
+            _kernel, _store = _get_swarm_kernel(
+                store_root=Path(run_context.mailbox_root),
+            )
+            pending_result = _kernel.poll(
+                run_context.swarm_session_id, "oracle",
+            )
+            pending = pending_result.messages
+            if pending:
+                request.task += "\n\n--- PENDING MAILBOX MESSAGES ---\n"
+                for msg in pending:
+                    request.task += (
+                        f"From {msg.get('from', '?')}: "
+                        f"{msg.get('body', '')[:500]}\n"
+                    )
+                request.task += "--- END PENDING ---\n"
+
     result = _execute(request, target, registry, repo_map, run_context=run_context)
 
     if result.stdout:
