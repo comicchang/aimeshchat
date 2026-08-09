@@ -49,7 +49,7 @@ def _get_transport(host: HostSpec, repo_map=None):
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("codeagent", description="Multi-host code agent orchestration")
+    p = argparse.ArgumentParser("meshkit", description="Multi-host code agent orchestration")
     p.add_argument("--version", "-v", action="version", version=f"%(prog)s {__version__}")
 
     sub = p.add_subparsers(dest="command")
@@ -240,6 +240,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ora_release = ora_sub.add_parser("release", help="Terminal state + release park + stop runtime")
     ora_release.add_argument("review_key")
+
+    ora_result = ora_sub.add_parser("result", help="Print the oracle's latest response (from session transcript)")
+    ora_result.add_argument("review_key")
+    ora_result.add_argument("--all", action="store_true", help="Print all assistant messages")
 
     return p
 
@@ -877,7 +881,7 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
             # session-init on remote host
             cmd = [
-                "codeagent", "mailbox", "session-init",
+                "meshkit", "mailbox", "session-init",
                 "--host", host,
                 "--session", args.session_id,
                 "--manager", manager,
@@ -901,7 +905,7 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
             init_run_id = f"run-{_uuid.uuid4().hex[:12]}"
             init_req_id = f"req-{_uuid.uuid4().hex[:12]}"
             cmd = [
-                "codeagent", "mailbox", "send",
+                "meshkit", "mailbox", "send",
                 "--host", host,
                 "--session", args.session_id,
                 "--to", agent,
@@ -1102,7 +1106,7 @@ def _execute(request: RunRequest, target: Target, registry: SessionRegistry, rep
                 try:
                     subprocess.run(
                         [
-                            "codeagent", "park", "acquire",
+                            "meshkit", "park", "acquire",
                             ns_key, "--agent-type", request.agent,
                             "--backend-id", result.session_id,
                             "--peer-id", result.session_id,
@@ -1814,6 +1818,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
     from codeagent.oracle import (
         cmd_oracle_ask,
         cmd_oracle_release,
+        cmd_oracle_result,
         cmd_oracle_start,
         cmd_oracle_status,
         cmd_oracle_watch,
@@ -1821,7 +1826,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
 
     cmd = args.ora_cmd
     if cmd is None:
-        print("oracle: missing subcommand. Try: codeagent oracle start|ask|status|watch|release", file=sys.stderr)
+        print("oracle: missing subcommand. Try: codeagent oracle start|ask|status|watch|release|result", file=sys.stderr)
         return 1
     handlers = {
         "start": cmd_oracle_start,
@@ -1829,6 +1834,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
         "status": cmd_oracle_status,
         "watch": cmd_oracle_watch,
         "release": cmd_oracle_release,
+        "result": cmd_oracle_result,
     }
     return handlers[cmd](args)
 

@@ -12,7 +12,7 @@ dependencies = []
 
 
 [project.scripts]
-codeagent = "codeagent.cli:main"
+meshkit = "codeagent.cli:main"
 codeagent-remote-exec = "codeagent.remote_exec:main"
 mailbox = "codeagent.mailbox.cli:main"
 mailbox-hook = "codeagent.mailbox.hook:main"

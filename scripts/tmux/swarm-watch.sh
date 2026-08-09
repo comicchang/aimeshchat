@@ -4,8 +4,8 @@
 # Usage:
 #   ./scripts/tmux/swarm-watch.sh <session_id> <agent_id> [interval] [pane_name]
 #
-# Opens a new tmux window (or pane) running `codeagent swarm watch` in a loop.
-# Requires: codeagent on PATH, tmux.
+# Opens a new tmux window (or pane) running `meshkit swarm watch` in a loop.
+# Requires: meshkit on PATH, tmux.
 
 set -euo pipefail
 
@@ -15,8 +15,8 @@ INTERVAL="${3:-5}"
 PANE_NAME="${4:-swarm-watch-${AGENT_ID}}"
 
 # Check prerequisites
-if ! command -v codeagent >/dev/null 2>&1; then
-    echo "error: codeagent not found on PATH" >&2
+if ! command -v meshkit >/dev/null 2>&1; then
+    echo "error: meshkit not found on PATH" >&2
     exit 1
 fi
 

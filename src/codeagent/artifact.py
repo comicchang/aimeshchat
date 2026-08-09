@@ -99,7 +99,7 @@ def pull_artifact(
     if not sock.exists():
         raise TransportError(
             f"No ControlMaster socket for {host_alias} at {sock}. "
-            f"Run 'codeagent ssh warm {host_alias}' first."
+            f"Run 'meshkit ssh warm {host_alias}' first."
         )
 
     remote_path = f"{host_alias}:{remote_root.rstrip('/')}/{desc.relative_path}"

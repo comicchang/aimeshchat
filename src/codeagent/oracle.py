@@ -543,7 +543,100 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
     return 0
 
 
-# ── watch ──────────────────────────────────────────────────────────────
+# ── result：从 OMP 会话转录提取最新回答 ───────────────────────────────
+
+
+def _find_session_file(backend_session_id: str) -> Optional[Path]:
+    """Locate the OMP session transcript file for a backend session id.
+
+    Session files live under ~/.omp/agent/sessions/<dir>/*_<session_id>.jsonl
+    where <dir> is the cwd-derived name (e.g. -src-codeagent-py). Falls back
+    to scanning all session dirs when the derived dir misses.
+    """
+    sessions_root = Path.home() / ".omp" / "agent" / "sessions"
+    if not sessions_root.is_dir():
+        return None
+
+    def _candidate_dirs() -> list[Path]:
+        dirs: list[Path] = []
+        for d in sessions_root.iterdir():
+            if not d.is_dir():
+                continue
+            if any(f.name.endswith(f"_{backend_session_id}.jsonl") for f in d.iterdir()):
+                dirs.append(d)
+        return dirs
+
+    candidates = _candidate_dirs()
+    if not candidates:
+        return None
+    best: Optional[Path] = None
+    for d in candidates:
+        for f in sorted(d.glob(f"*_{backend_session_id}.jsonl")):
+            if best is None or f.stat().st_mtime > best.stat().st_mtime:
+                best = f
+    return best
+
+
+def _extract_assistant_messages(path: Path, max_messages: int = 1) -> list[str]:
+    """Extract the last *max_messages* assistant text messages from a session JSONL."""
+    msgs: list[str] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if obj.get("type") != "message":
+                    continue
+                m = obj.get("message", {})
+                if m.get("role") != "assistant":
+                    continue
+                content = m.get("content", [])
+                text = "".join(
+                    c.get("text", "") for c in content
+                    if isinstance(c, dict) and c.get("type") == "text"
+                )
+                if text.strip():
+                    msgs.append(text)
+    except OSError:
+        return []
+    return msgs[-max_messages:]
+
+
+def cmd_oracle_result(args: argparse.Namespace) -> int:
+    """Print the persist-oracle's latest response for a review key.
+
+    Reads the OMP session transcript directly — no manual file extraction.
+    ``--all`` prints every assistant message since the last checkpoint;
+    default prints the latest one.
+    """
+    review_key = args.review_key
+    manifest = ParkRegistry().lookup(review_key)
+    backend_id = (manifest.backend_session_id if manifest else "") or ""
+    if not backend_id:
+        print(f"no backend session for review key {review_key!r} "
+              "(oracle start 后才有)", file=sys.stderr)
+        return 1
+
+    path = _find_session_file(backend_id)
+    if path is None:
+        print(f"session transcript not found for {backend_id} "
+              f"(under ~/.omp/agent/sessions/)", file=sys.stderr)
+        return 1
+
+    max_msgs = 0 if getattr(args, "all", False) else 1
+    msgs = _extract_assistant_messages(path, max_messages=max_msgs or 10**6)
+    if not msgs:
+        print(f"(no assistant messages in {path.name})", file=sys.stderr)
+        return 1
+    for m in msgs:
+        print(m)
+        print("\n" + "─" * 60 + "\n")
+    return 0
 
 
 def cmd_oracle_watch(args: argparse.Namespace) -> int:

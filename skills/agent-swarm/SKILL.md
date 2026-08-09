@@ -1,6 +1,6 @@
 ---
 name: agent-swarm
-description: Unified agent orchestration over the codeagent swarm/mailbox protocol — manager dispatch or worker execution, determined by role. Progressive disclosure: loads only the relevant role file.
+description: Unified agent orchestration over the meshkit swarm/mailbox protocol — manager dispatch or worker execution, determined by role. Progressive disclosure: loads only the relevant role file.
 ---
 
 # agent-swarm — Unified Orchestration Protocol
@@ -20,7 +20,7 @@ Manager 和 Worker 不得绕过 manifest/routing table 直接拼远端路径或�
 |**AgentLocation**|agent_id → (host_alias, backend, capabilities, execution_mode?, mailbox_root?, return_mode?) 的路由条目。model.py 已声明可选字段，`_persist_routing` 已持久化；CLI register 暂未暴露这些参数。|`swarm/kernel.py`, `swarm/model.py`|
 |**execution_mode**|Worker 的执行模型：`mailbox-worker`（远端 OMP Worker）或 `local-omp-mcp`（本地 OMP + 远端 omp-execd MCP）。互斥，session 创建时选定|本协议 §Execution Mode|
 
-Manager 的唯一入口是 `swarm` 子命令（`codeagent swarm direct/poll/watch/status`）；bare `mailbox send` 仅用于 bootstrap 和故障诊断。
+Manager 的唯一入口是 `swarm` 子命令（`meshkit swarm direct/poll/watch/status`）；bare `mailbox send` 仅用于 bootstrap 和故障诊断。
 Worker 的唯一入口是 `mailbox read` + 两阶段消费；消息到达由 OMP plugin（只通知）或主动 polling 触发。
 
 ## Execution Mode
@@ -82,7 +82,7 @@ The canonical mailbox protocol (message schema, status.json contract, two-phase 
 | 拓扑 | MAILBOX_ROOT | 通信方式 |
 |---|---|---|
 | Mode A (Shared FS) | 显式 `MAILBOX_ROOT=.mailbox` | 本地 FS |
-| 跨主机（无共享 FS） | 默认 `resolve_root()` | `codeagent swarm` + SwarmKernel transport |
+| 跨主机（无共享 FS） | 默认 `resolve_root()` | `meshkit swarm` + SwarmKernel transport |
 
 ### 回程模式 (return_mode)
 
@@ -90,7 +90,7 @@ The canonical mailbox protocol (message schema, status.json contract, two-phase 
 
 | return_mode | 拓扑要求 | Manager 行为 |
 |---|---|---|
-| `manager-pull` (默认，推荐) | 仅 Manager→Worker SSH 可达 | Worker 写 **host-local** manager inbox；Manager 定期 `codeagent mailbox read --host <H>` 从远端 host 的 manager inbox 拉取 |
+| `manager-pull` (默认，推荐) | 仅 Manager→Worker SSH 可达 | Worker 写 **host-local** manager inbox；Manager 定期 `meshkit mailbox read --host <H>` 从远端 host 的 manager inbox 拉取 |
 
 **单向上必须使用 `manager-pull`**。Worker 不得尝试反向 SSH 或通过 pane/send-keys 伪造回程。
 
@@ -118,12 +118,12 @@ The canonical mailbox protocol (message schema, status.json contract, two-phase 
 
 ```
 Manager(Mac)                          Remote(OA-MIANYIN-2)
-  │ codeagent gateway ensure --host OA-MIANYIN-2
+  │ meshkit gateway ensure --host OA-MIANYIN-2
   │   ├─ wire v2 probe（REMOTE_UPGRADE_REQUIRED if <2）
   │   ├─ tmux/架构预检（缺 OMP 只关对应 capability）
   │   └─ 远端 gateway 启动（私有 tmux socket）
   │
-  │ SSH ControlMaster 单次 `codeagent gateway rpc --stdio`（有界控制）
+  │ SSH ControlMaster 单次 `meshkit gateway rpc --stdio`（有界控制）
   ├── session.ensure   → 远端缓存只读 manifest（manager/roster/version）
   ├── runtime.spawn    → 远端 tmux supervisor 拉起 Agent（argv 无 shell）
   └── runtime.send     → 消息进远端 inbox → 插件唤醒（steer/nextTurn）
@@ -145,7 +145,7 @@ Manager 发送 --require-ack TASK
 
 - 任务终态以 mailbox RequestLedger 为准；runtime 只由显式 `runtime stop` / `oracle release` 终止。
 - 断线期间消息进 DeliveryEngine durable outbox；重连后从最后 cursor 补流，去重消费。
-- `codeagent events watch --session <id> --cursor <c> --jsonl` 观察事件流（只控制观察连接 timeout）。
+- `meshkit events watch --session <id> --cursor <c> --jsonl` 观察事件流（只控制观察连接 timeout）。
 
 ### 跨设备写作流程
 
@@ -171,7 +171,7 @@ These rules apply to **every** agent regardless of role:
 5. **No capture-pane** — do not use terminal text to infer agent state. Use status.json and inbox polling.
 6. **Two-phase consumption** — `mailbox read` (inbox→processing) → process → `mailbox finalize` (processing→archive). No shortcuts.
 7. **status.json is a snapshot** — five fields only. Full conclusions belong in REPORT messages and artifacts, not in status.
-8. **Lifecycle vs mailbox status 正交** — `mailbox status` 仅描述工作状态（IDLE/BUSY/DONE/BLOCKED）。Park 是独立的 lifecycle 概念（由 `codeagent park registry` 管理），不在 status.json 表达。Park 期间 agent 保持 IDLE 且 archive 受保护（禁止 `mailbox clear`）。
+8. **Lifecycle vs mailbox status 正交** — `mailbox status` 仅描述工作状态（IDLE/BUSY/DONE/BLOCKED）。Park 是独立的 lifecycle 概念（由 `meshkit park registry` 管理），不在 status.json 表达。Park 期间 agent 保持 IDLE 且 archive 受保护（禁止 `mailbox clear`）。
 
 ## Initialization Flow
 
@@ -179,19 +179,19 @@ These rules apply to **every** agent regardless of role:
 2. **Load your role file** — `roles/manager.md` or `roles/worker.md`.
 3. **Read the protocol** — `protocol/mailbox.md` for the canonical CLI schema and state machine.
 4. **Load deployment mode** — `operations/local.md` or `operations/remote.md` based on session topology.
-5. **跨设备 runtime** — Manager `codeagent gateway ensure --host <H>` 预检 + 启动远端 gateway（见 §Gateway 跨设备运行时）。
+5. **跨设备 runtime** — Manager `meshkit gateway ensure --host <H>` 预检 + 启动远端 gateway（见 §Gateway 跨设备运行时）。
 6. **Follow role-specific initialization** — Manager self-init or Worker INIT handshake.
 
 ## CLI Resolution Order
 
-跨主机通信的权威入口是 `codeagent swarm` 子命令 + `codeagent gateway` 控制面，而非 bare `mailbox`：
+跨主机通信的权威入口是 `meshkit swarm` 子命令 + `meshkit gateway` 控制面，而非 bare `mailbox`：
 
-1. `codeagent gateway ensure/start/status/rpc` — 每设备本地控制面（session.ensure/runtime.spawn/register/send/stop/events.list）
-2. `codeagent swarm direct/poll/watch/status` — SessionManifest-aware routing + delivery（`poll`/`status` 为 local-only，跨主机聚合由 manager pull / gateway events 补足）
-3. `codeagent mailbox ... --host <H>` — 跨主机 leaf transport primitive（read/peek/stats/send/status 均可通过 SSH 路由到远端 host 的本地 mailbox CLI）
+1. `meshkit gateway ensure/start/status/rpc` — 每设备本地控制面（session.ensure/runtime.spawn/register/send/stop/events.list）
+2. `meshkit swarm direct/poll/watch/status` — SessionManifest-aware routing + delivery（`poll`/`status` 为 local-only，跨主机聚合由 manager pull / gateway events 补足）
+3. `meshkit mailbox ... --host <H>` — 跨主机 leaf transport primitive（read/peek/stats/send/status 均可通过 SSH 路由到远端 host 的本地 mailbox CLI）
 4. PATH command `mailbox` — 本地 FS mailbox 操作
 
-跨主机 manager-pull 回程：Manager 使用 `codeagent mailbox read --session <id> --agent manager --owner manager --host <H>` 从远端 host 的 manager inbox 拉取 REPORT。
+跨主机 manager-pull 回程：Manager 使用 `meshkit mailbox read --session <id> --agent manager --owner manager --host <H>` 从远端 host 的 manager inbox 拉取 REPORT。
 禁止 `scripts/tmux_worker.py` 或其他 legacy wrapper。
 
 ## Protocol Version
@@ -210,4 +210,4 @@ v1 concepts deprecated by this protocol:
 - **cursor / unread / mark-read** → replaced by `mailbox read` / `mailbox finalize` two-phase
 
 Legacy commands (`request`, `request-role`, `batch-request`, `event-emit`, `event-wait`, `mailbox-send`, `mailbox-check`, `mailbox-relay`) are for unmigrated Workers only.
-跨主机 manager pull 使用 `codeagent mailbox ... --host <H>`（非 legacy，是当前唯一可用的跨主机 mailbox 传输原语），详见 `roles/manager.md`。
+跨主机 manager pull 使用 `meshkit mailbox ... --host <H>`（非 legacy，是当前唯一可用的跨主机 mailbox 传输原语），详见 `roles/manager.md`。

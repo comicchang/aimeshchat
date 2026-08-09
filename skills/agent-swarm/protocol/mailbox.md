@@ -138,7 +138,7 @@ REPORT and EVIDENCE messages that claim task completion or provide evidence MUST
 
 Before reducing a request to DONE, the Manager MUST:
 
-1. Fetch each artifact via `codeagent artifact pull --host <source_host> --artifact-id <artifact_id> --remote-root <remote_root> --relative-path <relative_path> --size <size> --sha256 <sha256> --dest <dest>` (the real cross-host transport).
+1. Fetch each artifact via `meshkit artifact pull --host <source_host> --artifact-id <artifact_id> --remote-root <remote_root> --relative-path <relative_path> --size <size> --sha256 <sha256> --dest <dest>` (the real cross-host transport).
 2. Verify `size` matches the actual byte count.
 3. Verify `sha256` matches the actual content digest.
 4. If either check fails → reject the REPORT; request remains RUNNING.
@@ -217,8 +217,8 @@ All commands operate on session-based paths. `<session-id>` and `<agent-id>` are
 
 CLI resolution order:
 1. PATH command `mailbox` (from `codeagent` package via `uv tool install`)
-2. `codeagent mailbox` as unified cross-host entry point
-3. For swarm sessions: `codeagent swarm ...` subcommands
+2. `meshkit mailbox` as unified cross-host entry point
+3. For swarm sessions: `meshkit swarm ...` subcommands
 
 Never route through `scripts/tmux_worker.py` or other legacy wrappers.
 

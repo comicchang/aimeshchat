@@ -50,7 +50,7 @@ class GatewayClient:
         if not self._socket_path.exists():
             raise GatewayError(
                 "GATEWAY_DOWN",
-                f"gateway socket not found: {self._socket_path} (run 'codeagent gateway start')",
+                f"gateway socket not found: {self._socket_path} (run 'meshkit gateway start')",
             )
         payload = (req.to_json() + "\n").encode("utf-8")
         if len(payload) > MAX_FRAME_LENGTH + 1:
