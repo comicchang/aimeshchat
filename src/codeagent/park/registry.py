@@ -100,6 +100,32 @@ class ParkRegistry:
                 )
                 conn.commit()
 
+    def update(self, review_key: str, manifest: ParkManifest) -> None:
+        """覆盖已有实例的 manifest（保留 lifecycle 行；用于 backend session
+        变更等原位更新，避免 release+acquire 撞 UNIQUE key）。"""
+        with self._lock(review_key):
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM park_leases WHERE key = ?", (review_key,),
+                ).fetchone()
+                if row is None:
+                    self.acquire(review_key, manifest)
+                    return
+                now = time.time()
+                conn.execute(
+                    "UPDATE park_leases SET manifest_json = ?, lifecycle = ?, "
+                    "soft_expires = ?, hard_expires = ?, last_activity = ? WHERE key = ?",
+                    (
+                        json.dumps(self._manifest_to_dict(manifest)),
+                        manifest.lifecycle.value,
+                        manifest.soft_expires_at or (now + PARK_DEFAULTS["ttl_seconds"]),
+                        manifest.hard_expires_at or (now + PARK_DEFAULTS["hard_limit_seconds"]),
+                        now,
+                        review_key,
+                    ),
+                )
+                conn.commit()
+
     def release(self, review_key: str) -> None:
         """释放 park 实例（标记为 RELEASED）。"""
         with self._lock(review_key):

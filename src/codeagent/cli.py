@@ -38,6 +38,8 @@ from codeagent.mailbox.store import MailboxStore, resolve_root
 
 log = logging.getLogger(__name__)
 
+_DEFAULT_ORACLE_AGENT = "oracle"
+
 _router = TransportRouter()
 
 
@@ -169,6 +171,76 @@ def _build_parser() -> argparse.ArgumentParser:
     park_sweep_p = park_sub.add_parser("sweep", help="Evict expired park instances")
     park_sweep_p.add_argument("--dry-run", action="store_true", help="Preview without evicting")
 
+    # ── gateway ─────────────────────────────────────────────────────────
+    gw_p = sub.add_parser("gateway", help="Per-device local control plane")
+    gw_sub = gw_p.add_subparsers(dest="gw_cmd")
+    gw_start = gw_sub.add_parser("start", help="Start the local gateway (idempotent)")
+    gw_ensure = gw_sub.add_parser("ensure", help="Verify + start a remote host's gateway")
+    gw_ensure.add_argument("--host", required=True, help="SSH alias for the remote host")
+    gw_status = gw_sub.add_parser("status", help="Show local gateway status")
+    gw_stop = gw_sub.add_parser("stop", help="Stop the local gateway")
+    gw_serve = gw_sub.add_parser("serve", help="Foreground gateway process (tmux pane command)")
+    gw_rpc = gw_sub.add_parser("rpc", help="Bounded RPC to the local gateway")
+    gw_rpc.add_argument("--stdio", action="store_true", help="Read one request from stdin, write one response")
+    gw_rpc.add_argument("method", nargs="?", default="", help="Gateway method (when not --stdio)")
+    gw_rpc.add_argument("--params", default="", help="JSON params dict (when not --stdio)")
+    gw_rpc.add_argument("--timeout", type=float, default=15.0)
+
+    # ── events ──────────────────────────────────────────────────────────
+    ev_p = sub.add_parser("events", help="Runtime event observability")
+    ev_sub = ev_p.add_subparsers(dest="ev_cmd")
+    ev_watch = ev_sub.add_parser("watch", help="Watch runtime events (cursor-resumable)")
+    ev_watch.add_argument("--session", default="", help="Filter by session_id")
+    ev_watch.add_argument("--request-id", default="", help="Filter by request_id")
+    ev_watch.add_argument("--runtime-id", default="", help="Filter by runtime_id")
+    ev_watch.add_argument("--cursor", default="0", help="Resume cursor (local event_id)")
+    ev_watch.add_argument("--filters", default="", help="Comma-separated event kinds")
+    ev_watch.add_argument("--limit", type=int, default=200)
+    ev_watch.add_argument("--interval", type=float, default=1.0)
+    ev_watch.add_argument("--timeout", type=float, default=10.0,
+                          help="Observation connection timeout (never the task timeout)")
+    ev_watch.add_argument("--jsonl", action="store_true", dest="jsonl", help="Emit one JSON event per line")
+
+    # ── runtime ─────────────────────────────────────────────────────────
+    rt_p = sub.add_parser("runtime", help="Runtime supervision")
+    rt_sub = rt_p.add_subparsers(dest="rt_cmd")
+    rt_status = rt_sub.add_parser("status", help="Probe a runtime")
+    rt_status.add_argument("runtime_id", help="Runtime ID")
+    rt_stop = rt_sub.add_parser("stop", help="Stop a runtime")
+    rt_stop.add_argument("runtime_id", help="Runtime ID")
+    rt_stop.add_argument("--reason", default="stopped")
+
+    # ── oracle ──────────────────────────────────────────────────────────
+    ora_p = sub.add_parser("oracle", help="Persistent-context advisory sessions")
+    ora_sub = ora_p.add_subparsers(dest="ora_cmd")
+
+    ora_start = ora_sub.add_parser("start", help="Create review/session/runtime")
+    ora_start.add_argument("review_key", help="Review key (e.g. project:oracle:domain:topic)")
+    ora_start.add_argument("--agent", default=_DEFAULT_ORACLE_AGENT, help="Oracle agent profile")
+    ora_start.add_argument("--backend", default="omp", help="Runtime backend (omp|opencode)")
+    ora_start.add_argument("--workdir", default="", help="Working directory")
+    ora_start.add_argument("--model", default="", help="Model override")
+    ora_start.add_argument("--prompt", default="", help="Initial prompt (default empty — first TASK comes via ask)")
+
+    ora_ask = ora_sub.add_parser("ask", help="Hot/warm/cold deliver a prompt to the review")
+    ora_ask.add_argument("review_key")
+    ora_ask.add_argument("prompt", nargs="?", default="", help="Prompt text (or stdin)")
+    ora_ask.add_argument("--agent", default=_DEFAULT_ORACLE_AGENT)
+    ora_ask.add_argument("--backend", default="omp")
+    ora_ask.add_argument("--model", default="")
+
+    ora_status = ora_sub.add_parser("status", help="Aggregate receipt/progress/park")
+    ora_status.add_argument("review_key")
+
+    ora_watch = ora_sub.add_parser("watch", help="Watch runtime events (cursor-resumable)")
+    ora_watch.add_argument("review_key")
+    ora_watch.add_argument("--cursor", default="0")
+    ora_watch.add_argument("--interval", type=float, default=1.0)
+    ora_watch.add_argument("--timeout", type=float, default=10.0)
+
+    ora_release = ora_sub.add_parser("release", help="Terminal state + release park + stop runtime")
+    ora_release.add_argument("review_key")
+
     return p
 
 
@@ -222,6 +294,10 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     dir_p.add_argument("--run-id", default="", help="Run ID for request tracking")
     dir_p.add_argument("--request-id", default="", help="Request ID for causation chain")
     dir_p.add_argument("--reply-to", default="", help="Message ID being replied to")
+    dir_p.add_argument(
+        "--require-ack", action="store_true", default=False,
+        help="v2: demand a RECEIPT(READ) from the recipient when consumed",
+    )
 
     # channel
     ch_p = swarm_sub.add_parser("channel", help="Send to a channel")
@@ -235,6 +311,10 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     ch_p.add_argument("--run-id", default="", help="Run ID for request tracking")
     ch_p.add_argument("--request-id", default="", help="Request ID for causation chain")
     ch_p.add_argument("--reply-to", default="", help="Message ID being replied to")
+    ch_p.add_argument(
+        "--require-ack", action="store_true", default=False,
+        help="v2: demand a RECEIPT(READ) from each recipient when consumed",
+    )
 
     # create-channel
     cc_p = swarm_sub.add_parser("create-channel", help="Create a named channel within a session")
@@ -252,6 +332,10 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     bc_p.add_argument("--run-id", default="", help="Run ID for request tracking")
     bc_p.add_argument("--request-id", default="", help="Request ID for causation chain")
     bc_p.add_argument("--reply-to", default="", help="Message ID being replied to")
+    bc_p.add_argument(
+        "--require-ack", action="store_true", default=False,
+        help="v2: demand a RECEIPT(READ) from each recipient when consumed",
+    )
 
     # notice
     nt_p = swarm_sub.add_parser("notice", help="Send a notice to the session")
@@ -266,6 +350,10 @@ def _build_swarm_parser(sub: argparse._SubParsersAction) -> None:
     nt_p.add_argument("--run-id", default="", help="Run ID for request tracking")
     nt_p.add_argument("--request-id", default="", help="Request ID for causation chain")
     nt_p.add_argument("--reply-to", default="", help="Message ID being replied to")
+    nt_p.add_argument(
+        "--require-ack", action="store_true", default=False,
+        help="v2: demand a RECEIPT(READ) from each recipient when consumed",
+    )
 
     # poll
     pl_p = swarm_sub.add_parser("poll", help="Poll agent inbox")
@@ -538,7 +626,8 @@ def _swarm_direct(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
     attachments = _parse_attachments(args.attachment) if args.attachment else []
     env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments,
-                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id)
+                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id,
+                   require_ack=getattr(args, "require_ack", False))
     receipt = kernel.direct(args.session_id, args.sender, args.to, env)
     print(json.dumps({
         "msg_id": receipt.msg_id,
@@ -555,7 +644,8 @@ def _swarm_channel(kernel: SwarmKernel, args: argparse.Namespace) -> int:
         return 1
     attachments = _parse_attachments(args.attachment) if args.attachment else []
     env = Envelope(subject=args.subject, body=args.body, kind=args.kind, attachments=attachments,
-                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id)
+                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id,
+                   require_ack=getattr(args, "require_ack", False))
     receipts = kernel.channel(args.session_id, args.sender, args.channel_id, env)
     out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
     print(json.dumps(out, indent=2))
@@ -567,7 +657,8 @@ def _swarm_broadcast(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     if _require_kind_correlation(kind, args.run_id, args.request_id, args.reply_to):
         return 1
     env = Envelope(subject=args.subject, body=args.body, kind=args.kind,
-                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id)
+                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id,
+                   require_ack=getattr(args, "require_ack", False))
     receipts = kernel.broadcast(args.session_id, args.sender, env)
     out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
     print(json.dumps(out, indent=2))
@@ -579,7 +670,8 @@ def _swarm_notice(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     if _require_kind_correlation(kind, args.run_id, args.request_id, args.reply_to):
         return 1
     env = Envelope(subject=args.subject, body=args.body, kind=args.kind,
-                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id)
+                   reply_to=args.reply_to, run_id=args.run_id, request_id=args.request_id,
+                   require_ack=getattr(args, "require_ack", False))
     receipts = kernel.notice(args.session_id, args.sender, args.topic, env, ttl=args.ttl)
     out = [{"msg_id": r.msg_id, "recipient": r.recipient, "status": r.status} for r in receipts]
     print(json.dumps(out, indent=2))
@@ -1113,16 +1205,40 @@ def _bootstrap_oracle_swarm(
     return rc
 
 
+def _resolve_agent_backend(agent: Optional[str], requested: str) -> str:
+    """Resolve the runtime backend for an agent.
+
+    Oracle-class agents (agent.startswith("oracle")) prefer OMP (full
+    hot/in-loop) and fall back to OpenCode — resolved via the RuntimeRegistry
+    with the persist-oracle required capability ``warm_resume``. Generic is
+    only used when explicitly requested. Non-oracle agents pass through.
+    """
+    if not agent or not agent.startswith("oracle"):
+        return requested
+    from codeagent.runtime.base import CAP_WARM_RESUME
+    from codeagent.runtime.registry import RuntimeRegistry
+
+    reg = RuntimeRegistry()
+    try:
+        return reg.get(requested or None, required_capabilities=frozenset({CAP_WARM_RESUME})).name
+    except Exception:
+        for name in ("omp", "opencode"):
+            try:
+                return reg.get(name, required_capabilities=frozenset({CAP_WARM_RESUME})).name
+            except Exception:
+                continue
+        return requested
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     task = args.task or sys.stdin.read().strip()
     if not task:
         print("error: no task provided", file=sys.stderr)
         return 1
 
-    # Resolve agent → runner: oracle agents always use OMPRunner
-    backend = args.backend
-    if args.agent and args.agent.startswith("oracle"):
-        backend = "omp"
+    # Runtime resolution via the registry — oracle agents are NOT hardcoded
+    # to OMP (they prefer it, but degrade to OpenCode when unavailable).
+    backend = _resolve_agent_backend(args.agent, args.backend)
 
     request = RunRequest(
         task=task,
@@ -1508,7 +1624,7 @@ def _cmd_park(args: argparse.Namespace) -> int:
     elif cmd == "info":
         m = registry.lookup(args.review_key)
         if m:
-            print(json.dumps({
+            out = {
                 "review_key": m.review_key,
                 "lifecycle": m.lifecycle.value,
                 "agent_type": m.agent_type,
@@ -1519,12 +1635,22 @@ def _cmd_park(args: argparse.Namespace) -> int:
                 "created_at": m.created_at,
                 "last_activity_at": m.last_activity_at,
                 "soft_expires_at": m.soft_expires_at,
-            }, indent=2))
-            progress_file = Path.home() / ".omp" / "park" / "progress" / f"{args.review_key}.txt"
-            if progress_file.exists():
-                chunks = progress_file.read_text().strip().split("\n---")
-                if chunks:
-                    print(f"  last_message: {chunks[-1].strip()[:500]}")
+            }
+            # Runtime observability comes from the gateway EventStore
+            # (last_event/tool_stats/elapsed/runtime_health) — NOT from
+            # progress files.
+            try:
+                from codeagent.gateway.client import GatewayClient
+                from codeagent.gateway.model import GatewayError as GWErr
+
+                client = GatewayClient(timeout=5)
+                info = client.call("runtime.info", {"review_key": args.review_key})
+                out["runtime"] = info
+            except GWErr as exc:
+                out["runtime_error"] = f"{exc.code}: {exc.message}"
+            except Exception as exc:
+                out["runtime_error"] = str(exc)
+            print(json.dumps(out, indent=2))
         else:
             print(f"(no instance for '{args.review_key}')")
 
@@ -1631,6 +1757,82 @@ def _cmd_artifact(args: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_gateway(args: argparse.Namespace) -> int:
+    """Dispatch gateway subcommands."""
+    from codeagent.gateway import cli as gw_cli
+
+    cmd = args.gw_cmd
+    if cmd is None:
+        print("gateway: missing subcommand. Try: codeagent gateway start|ensure|status|stop|serve|rpc", file=sys.stderr)
+        return 1
+    handlers = {
+        "start": gw_cli.cmd_gateway_start,
+        "ensure": gw_cli.cmd_gateway_ensure,
+        "status": gw_cli.cmd_gateway_status,
+        "stop": gw_cli.cmd_gateway_stop,
+        "serve": gw_cli.cmd_gateway_serve,
+        "rpc": gw_cli.cmd_gateway_rpc,
+    }
+    return handlers[cmd](args)
+
+
+def _cmd_events(args: argparse.Namespace) -> int:
+    """Dispatch events subcommands."""
+    from codeagent.gateway import cli as gw_cli
+
+    if args.ev_cmd == "watch":
+        return gw_cli.cmd_events_watch(args)
+    print("events: missing subcommand. Try: codeagent events watch", file=sys.stderr)
+    return 1
+
+
+def _cmd_runtime(args: argparse.Namespace) -> int:
+    """Dispatch runtime subcommands."""
+    from codeagent.gateway.client import GatewayClient
+    from codeagent.gateway.model import GatewayError
+
+    try:
+        client = GatewayClient(timeout=10)
+        if args.rt_cmd == "status":
+            result = client.call("runtime.probe", {"runtime_id": args.runtime_id})
+            print(json.dumps(result, indent=2))
+            health = result.get("health", {})
+            return 0 if health.get("alive") else 1
+        if args.rt_cmd == "stop":
+            result = client.call("runtime.stop", {"runtime_id": args.runtime_id, "reason": args.reason})
+            print(json.dumps(result, indent=2))
+            return 0
+    except GatewayError as exc:
+        print(f"error: {exc.message}", file=sys.stderr)
+        return 1
+    print("runtime: missing subcommand. Try: codeagent runtime status|stop", file=sys.stderr)
+    return 1
+
+
+def _cmd_oracle(args: argparse.Namespace) -> int:
+    """Dispatch oracle subcommands (start/ask/status/watch/release)."""
+    from codeagent.oracle import (
+        cmd_oracle_ask,
+        cmd_oracle_release,
+        cmd_oracle_start,
+        cmd_oracle_status,
+        cmd_oracle_watch,
+    )
+
+    cmd = args.ora_cmd
+    if cmd is None:
+        print("oracle: missing subcommand. Try: codeagent oracle start|ask|status|watch|release", file=sys.stderr)
+        return 1
+    handlers = {
+        "start": cmd_oracle_start,
+        "ask": cmd_oracle_ask,
+        "status": cmd_oracle_status,
+        "watch": cmd_oracle_watch,
+        "release": cmd_oracle_release,
+    }
+    return handlers[cmd](args)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1648,6 +1850,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         "artifact": _cmd_artifact,
         "swarm": _cmd_swarm,
         "park": _cmd_park,
+        "gateway": _cmd_gateway,
+        "events": _cmd_events,
+        "runtime": _cmd_runtime,
+        "oracle": _cmd_oracle,
     }
     # args.command is guaranteed to be one of the registered subcommands:
     # argparse rejects unknown names, and ``None`` was handled above.

@@ -291,6 +291,12 @@ class SSHTransport(Transport):
             session_id=session_id,
             skip_permissions=request.skip_permissions,
             timeout=request.timeout,
+            session_key=request.session_key,
+            request_id=request.request_id,
+            run_id=request.run_id,
+            review_key=request.review_key,
+            require_ack=request.require_ack,
+            capabilities=request.capabilities,
         )
 
         ssh_cmd = cm.ssh_cmd(*remote_cmd)
@@ -564,12 +570,22 @@ class SSHStream:
         agent_id: str,
         cursor: str = STREAM_CURSOR_INITIAL,
         timeout: int = DEFAULT_EXEC_TIMEOUT,
+        stream_kind: str = "mailbox",
+        runtime_id: str = "",
     ) -> None:
-        """Open the stream — spawn the SSH process and issue a stream request."""
+        """Open the stream — spawn the SSH process and issue a stream request.
+
+        ``stream_kind`` selects the event source: "mailbox" (inbox cursor),
+        "runtime" (remote Gateway EventStore), or "all" (composite cursor).
+        The composite cursor is opaque to the client — stored and returned
+        verbatim on reconnect.
+        """
         self._session_id = session_id
         self._agent_id = agent_id
         self._cursor = cursor
         self._timeout = timeout
+        self._stream_kind = stream_kind
+        self._runtime_id = runtime_id
         self._closed = False
         self._spawn_and_subscribe()
 
@@ -632,10 +648,10 @@ class SSHStream:
                     continue
                 if msg_id:
                     self._seen_msg_ids.add(msg_id)
-                # Only adopt opaque server cursors ("epoch_ms/seq"); legacy
-                # non-opaque cursors would corrupt the lexicographic resume
-                # ordering on reconnect.
-                if isinstance(msg.cursor, str) and "/" in msg.cursor:
+                # Adopt the server cursor (opaque — mailbox "epoch/seq" OR
+                # base64url composite for stream_kind="all"). The client
+                # stores and returns it verbatim; it never parses it.
+                if isinstance(msg.cursor, str) and msg.cursor:
                     self._cursor = msg.cursor
                 events.append(payload)
 
@@ -715,9 +731,10 @@ class SSHStream:
             cursor=self._cursor,
             timeout=self._timeout,
             request_id=self._request_id,
+            stream_kind=getattr(self, "_stream_kind", "mailbox"),
+            agent_id=self._agent_id,
+            runtime_id=getattr(self, "_runtime_id", ""),
         )
-        # Also include agent_id for the remote to know which inbox to watch
-        req["agent_id"] = self._agent_id
         payload = encode_line(req)
         assert self._proc.stdin is not None
         self._proc.stdin.write(payload)

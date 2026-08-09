@@ -56,6 +56,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--trace-id", default="", help="cross-host trace id (B2)")
     s.add_argument("--msg-id", default=None, help="caller-provided msg_id for idempotent send")
     s.add_argument(
+        "--require-ack", action="store_true", default=False,
+        help="v2: demand a RECEIPT(READ) from the recipient when consumed",
+    )
+    s.add_argument(
+        "--receipt-type", default="",
+        help="v2: receipt_type for RECEIPT-kind messages (e.g. READ)",
+    )
+    s.add_argument(
         "--attachment", action="append", default=[],
         help=(
             'JSON object with artifact_id, source_host, remote_root, '
@@ -146,19 +154,40 @@ def main(argv: list[str] | None = None) -> None:
             print(store.session_init(args.session, args.manager, args.agents.split(","), acl=acl))
         elif args.cmd == "send":
             attachments = _parse_attachment_args(args.attachment)
-            print(store.send(
+            # v2: send through MailboxService so require_ack / receipt_type
+            # are honored and the JSON field is exactly `require_ack`.
+            from codeagent.mailbox.service import MailboxService
+            svc = MailboxService(store=store)
+            receipt = svc.send(
                 args.session, args.from_worker, args.to,
                 args.subject, args.body, args.kind,
                 args.reply_to, args.run_id, args.request_id,
                 trace_id=args.trace_id, causation_id=args.causation_id,
                 attachments=attachments or None,
                 msg_id=args.msg_id,
-            ))
+                require_ack=args.require_ack,
+                receipt_type=args.receipt_type,
+            )
+            if receipt.status == "failed":
+                raise ValueError(receipt.error or "send failed")
+            if receipt.detail:
+                print(receipt.detail)
+            else:
+                print(f"sent → {args.to}/inbox/{receipt.msg_id}.json")
         elif args.cmd == "peek":
             result = store.peek(args.session, args.agent, args.max_messages, args.max_subject)
             json.dump(result, sys.stdout, ensure_ascii=False)
         elif args.cmd == "read":
-            msg = store.read(args.session, args.agent, args.owner)
+            # v2: claim via MailboxService — emits RECEIPT(READ) for
+            # require_ack messages; never consumes when the ack route is
+            # unresolved.
+            from codeagent.mailbox.service import ACK_ROUTE_UNRESOLVED, MailboxService
+            svc = MailboxService(store=store)
+            outcome = svc.read(args.session, args.agent, args.owner)
+            if outcome.status == ACK_ROUTE_UNRESOLVED:
+                print(outcome.error, file=sys.stderr)
+                sys.exit(2)  # terminal — retry is pointless (roster missing)
+            msg = outcome.message
             if msg:
                 if getattr(args, "json", False):
                     json.dump(msg, sys.stdout, ensure_ascii=False)

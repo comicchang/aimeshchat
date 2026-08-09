@@ -26,9 +26,11 @@ import subprocess
 import tempfile
 import time as _time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from codeagent.constants import ISO_TIMESTAMP_FORMAT
 from codeagent.domain import RunRequest, RunResult
 from codeagent.hooks.swarm_hooks import on_agent_start, on_agent_stop
 
@@ -126,6 +128,7 @@ class OMPRunner(BaseRunner):
         self._terminal_seen: bool = False
         self._visible_texts: list[str] = []
         self._stdout_line_count: int = 0
+        self._events: list[dict] = []  # normalized RuntimeEvent-shaped dicts
         self._run_result: Optional[RunResult] = None
         self._run_context: Optional[object] = None
         self._current_request: Optional[RunRequest] = None
@@ -200,6 +203,7 @@ class OMPRunner(BaseRunner):
         self._terminal_seen = False
         self._visible_texts = []
         self._stdout_line_count = 0
+        self._events = []
         self._run_result = None
 
         # Extract RunContext if present (bootstrap provides it)
@@ -245,59 +249,77 @@ class OMPRunner(BaseRunner):
     def _consume_line(self, channel: str, line: str) -> None:
         """Incrementally parse OMP JSONL events from stdout.
 
-        Called by ``_run_pump`` on the main thread for every output line.
-        Filters noise (thinking, tool_calls, stderr) and collects:
-          - Session ID from ``{"type":"session","id":"..."}``
-          - Visible assistant text from ``{"type":"assistant","message_end":{...}}``
-          - Terminal signal from ``{"type":"agent_end"}``
-        Also emits a heartbeat '.' to stderr every 30 stdout lines.
+        Normalizes session/message/turn/tool/usage/agent_end JSONL into
+        RuntimeEvent-shaped dicts (appended to ``self._events``). Keeps the
+        bounded visible-text buffer for the final message. Progress files
+        and stderr heartbeats are REMOVED — observability comes from the
+        gateway EventStore, not the runner.
         """
         if channel != "stdout":
             return
         line = line.strip()
         if not line:
             return
-        self._stdout_line_count += 1
-        if self._stdout_line_count % 30 == 0:
-            print(".", end="", file=sys.stderr, flush=True)
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             return
 
         msg_type = obj.get("type", "")
+        created_at = datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT)
+        base = {
+            "session_id": getattr(self, "_current_session_key", "") or "",
+            "agent_id": (self._agent_profile.name if getattr(self, "_agent_profile", None) else ""),
+            "request_id": (self._current_request.request_id if getattr(self, "_current_request", None) else ""),
+            "run_id": (self._current_request.run_id if getattr(self, "_current_request", None) else ""),
+            "created_at": created_at,
+        }
 
         if msg_type == "session":
             session_id = obj.get("id")
             if session_id:
                 self._on_session(session_id)
+                self._events.append({
+                    **base, "kind": "RUNTIME_STATE",
+                    "payload": {"state": "session_start", "backend_session_id": session_id},
+                })
 
         elif msg_type == "assistant":
             end = obj.get("message_end", {})
             text = end.get("message")
             if text:
-                # Live progress echo — user visibility during long runs
-                print(f"[oracle progress] {text[:200]}", file=sys.stderr, flush=True)
-                # Persist progress to file for park info display
-                try:
-                    _progress_dir = Path.home() / ".omp" / "park" / "progress"
-                    _progress_dir.mkdir(parents=True, exist_ok=True)
-                    _key = self._current_session_key
-                    with (_progress_dir / f"{_key}.txt").open("a") as f:
-                        f.write(f"{text}\n---\n")
-                except Exception:
-                    pass  # never break execution on file write errors
+                self._events.append({
+                    **base, "kind": "ASSISTANT_PROGRESS", "payload": {"text": text[:1000]},
+                })
                 # Bounded buffer — keep only the last N visible messages
                 self._visible_texts.append(text)
                 if len(self._visible_texts) > self._MAX_VISIBLE_MESSAGES:
                     self._visible_texts = self._visible_texts[-self._MAX_VISIBLE_MESSAGES:]
 
+        elif msg_type == "turn":
+            self._events.append({
+                **base, "kind": "TURN_STARTED",
+                "payload": {"id": obj.get("id", "")},
+            })
+
+        elif msg_type == "tool":
+            self._events.append({
+                **base, "kind": "TOOL_STARTED",
+                "payload": {"name": obj.get("name", ""), "input": str(obj.get("input", ""))[:500]},
+            })
+
+        elif msg_type == "usage":
+            self._events.append({
+                **base, "kind": "USAGE", "payload": obj.get("usage", {}) or {},
+            })
+
         elif msg_type == "agent_end":
             self._terminal_seen = True
-            # DON'T stop reading — base pump continues until EOF.
-            # Terminal is a signal, not a stream terminator.
+            self._events.append({
+                **base, "kind": "TASK_STATE", "payload": {"state": "agent_end"},
+            })
 
-        # All other types (thinking, tool_calls, error, etc.) are ignored.
+        # All other types (thinking, error, etc.) are ignored.
 
     def _on_session(self, backend_id: str) -> None:
         """Handle a session-start event from the OMP JSONL stream.

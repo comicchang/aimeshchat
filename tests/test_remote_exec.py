@@ -32,10 +32,10 @@ class TestReadRequest:
     def test_valid_request(self, monkeypatch):
         monkeypatch.setattr(
             "sys.stdin",
-            io.StringIO('{"wire_version":1,"command":"ping"}\n'),
+            io.StringIO(f'{{"wire_version":{WIRE_VERSION},"command":"ping"}}\n'),
         )
         req = _read_request()
-        assert req == {"wire_version": 1, "command": "ping"}
+        assert req == {"wire_version": WIRE_VERSION, "command": "ping"}
 
     def test_eof_returns_none(self, monkeypatch):
         monkeypatch.setattr("sys.stdin", io.StringIO(""))
@@ -48,12 +48,12 @@ class TestReadRequest:
         assert '"type": "error"' in err
 
     def test_missing_command_field(self, monkeypatch, capsys):
-        monkeypatch.setattr("sys.stdin", io.StringIO('{"wire_version":1}\n'))
+        monkeypatch.setattr("sys.stdin", io.StringIO(f'{{"wire_version":{WIRE_VERSION}}}\n'))
         assert _read_request() is None
         assert "error" in capsys.readouterr().out
 
     def test_line_too_long_rejected(self, monkeypatch, capsys):
-        line = '{"wire_version":1,"command":"ping","x":"' + "a" * (MAX_LINE_LENGTH + 10) + '"}\n'
+        line = f'{{"wire_version":{WIRE_VERSION},"command":"ping","x":"' + "a" * (MAX_LINE_LENGTH + 10) + '"}\n'
         monkeypatch.setattr("sys.stdin", io.StringIO(line))
         assert _read_request() is None
         out = capsys.readouterr().out
@@ -89,26 +89,31 @@ class TestHandleCapabilities:
 
 
 class TestHandleRun:
-    """_handle_run: runner dispatch + wire result emission."""
+    """_handle_run: runner dispatch via RuntimeRegistry + wire result emission."""
 
     @pytest.fixture
-    def fake_runner(self):
+    def fake_adapter(self):
+        from codeagent.runtime.base import RuntimeHandle
+
         def _make(session_id="sess-1", returncode=0, stdout="done"):
-            runner = MagicMock()
-            runner.run.return_value = RunResult(
-                returncode=returncode,
-                stdout=stdout,
-                stderr="",
-                session_id=session_id,
+            adapter = MagicMock()
+            adapter.spawn.return_value = RuntimeHandle(
+                runtime_id="rt-1",
+                runtime="omp",
+                backend_session_id=session_id,
+                capabilities=frozenset(),
+                supervisor="process",
+                mode="short_task",
+                extra={"result": {"returncode": returncode, "stdout": stdout, "stderr": ""}},
             )
-            return runner
+            return adapter
 
         return _make
 
-    def test_run_default_backend(self, fake_runner, tmp_path, capsys):
-        runner = fake_runner()
+    def test_run_default_backend(self, fake_adapter, tmp_path, capsys):
+        adapter = fake_adapter()
         with (
-            patch("codeagent.remote_exec.OMPRunner", return_value=runner),
+            patch("codeagent.runtime.registry.RuntimeRegistry.get", return_value=adapter),
         ):
             _handle_run({"task": "t", "workdir": str(tmp_path)})
         lines = [json.loads(l) for l in capsys.readouterr().out.splitlines()]
@@ -119,29 +124,39 @@ class TestHandleRun:
         assert result["exit_code"] == 0
         assert lines[-2]["id"] == "sess-1"
 
-    def test_run_omp_backend(self, fake_runner, tmp_path, capsys):
-        runner = fake_runner()
-        with patch("codeagent.remote_exec.OMPRunner", return_value=runner):
+    def test_run_omp_backend(self, fake_adapter, tmp_path, capsys):
+        adapter = fake_adapter()
+        with patch("codeagent.runtime.registry.RuntimeRegistry.get", return_value=adapter):
             _handle_run({"task": "t", "workdir": str(tmp_path), "backend": "omp"})
         types = [json.loads(l)["type"] for l in capsys.readouterr().out.splitlines()]
         assert "result" in types
+
+    def test_run_unknown_backend_errors(self, tmp_path, capsys):
+        from codeagent.runtime.registry import RuntimeErrorCode
+
+        def _boom(name, required_capabilities=None):
+            raise RuntimeErrorCode("UNSUPPORTED_RUNTIME", f"runtime {name!r} unavailable")
+
+        with patch("codeagent.runtime.registry.RuntimeRegistry.get", side_effect=_boom):
+            _handle_run({"task": "t", "workdir": str(tmp_path), "backend": "bogus"})
+        out = capsys.readouterr().out
+        assert "UNSUPPORTED_RUNTIME" in out
 
     def test_run_missing_workdir_errors(self, tmp_path, capsys):
         _handle_run({"task": "t", "workdir": str(tmp_path / "nope")})
         out = capsys.readouterr().out
         assert "workdir not found" in out
 
-    def test_run_timeout_default_used(self, fake_runner, tmp_path):
-        runner = fake_runner()
-        from codeagent.runners.base import RunnerConfig
-
+    def test_run_timeout_propagated(self, fake_adapter, tmp_path):
+        adapter = fake_adapter()
         captured = {}
 
-        def _capture(config: RunnerConfig) -> MagicMock:
-            captured["timeout"] = config.timeout
-            return runner
+        def _spy(request: dict):
+            captured["timeout"] = request.get("timeout")
+            return adapter.spawn.return_value
 
-        with patch("codeagent.remote_exec.OMPRunner", side_effect=_capture):
+        adapter.spawn.side_effect = _spy
+        with patch("codeagent.runtime.registry.RuntimeRegistry.get", return_value=adapter):
             _handle_run({"task": "t", "workdir": str(tmp_path)})
         assert captured["timeout"] == DEFAULT_EXEC_TIMEOUT
 
@@ -299,20 +314,26 @@ class TestMainLoop:
 
     def test_full_session(self, tmp_path, monkeypatch, capsys):
         reqs = (
-            '{"wire_version":1,"command":"ping"}\n'
-            '{"wire_version":1,"command":"capabilities"}\n'
-            f'{{"wire_version":1,"command":"run","task":"t","workdir":"{tmp_path}","timeout":600}}\n'
-            '{"wire_version":1,"command":"mailbox","args":["peek"]}\n'
-            '{"wire_version":1,"command":"bogus"}\n'
+            f'{{"wire_version":{WIRE_VERSION},"command":"ping"}}\n'
+            f'{{"wire_version":{WIRE_VERSION},"command":"capabilities"}}\n'
+            f'{{"wire_version":{WIRE_VERSION},"command":"run","task":"t","workdir":"{tmp_path}","timeout":600}}\n'
+            f'{{"wire_version":{WIRE_VERSION},"command":"mailbox","args":["peek"]}}\n'
+            f'{{"wire_version":{WIRE_VERSION},"command":"bogus"}}\n'
             '{"wire_version":99,"command":"ping"}\n'
             '{}\n'
         )
         monkeypatch.setattr("sys.stdin", io.StringIO(reqs))
-        runner = MagicMock()
-        runner.run.return_value = RunResult(returncode=0, stdout="ok", stderr="", session_id=None)
+        from codeagent.runtime.base import RuntimeHandle
+
+        adapter = MagicMock()
+        adapter.spawn.return_value = RuntimeHandle(
+            runtime_id="rt-1", runtime="omp", backend_session_id="",
+            capabilities=frozenset(), supervisor="process", mode="short_task",
+            extra={"result": {"returncode": 0, "stdout": "ok", "stderr": ""}},
+        )
 
         with (
-            patch("codeagent.remote_exec.OMPRunner", return_value=runner),
+            patch("codeagent.runtime.registry.RuntimeRegistry.get", return_value=adapter),
             patch("codeagent.remote_exec._dispatch_mailbox_direct",
                   return_value=("ok", "", 0)),
         ):

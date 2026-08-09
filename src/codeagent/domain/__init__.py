@@ -114,6 +114,12 @@ class RunRequest:
     raw: bool = False
     timeout: int = DEFAULT_EXEC_TIMEOUT
     resume_session_id: Optional[str] = None  # actual backend session ID for resume (passed by CLI from registry lookup)
+    # v2 wire round-trip fields (Manager → remote_exec, preserved verbatim)
+    request_id: str = ""
+    run_id: str = ""
+    review_key: str = ""
+    require_ack: bool = False
+    capabilities: tuple[str, ...] = ()
 
 
 @dataclass

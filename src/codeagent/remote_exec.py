@@ -22,8 +22,6 @@ from codeagent.constants import (
     STREAM_CURSOR_INITIAL,
 )
 from codeagent.domain import RunRequest
-from codeagent.runners import OMPRunner
-from codeagent.runners.base import RunnerConfig
 from codeagent.wire.protocol import WIRE_VERSION, decode_request
 
 SUPPORTED_COMMANDS = {"run", "ping", "capabilities", "mailbox", "stream"}
@@ -66,10 +64,13 @@ def _handle_ping(req: dict) -> None:
 
 
 def _handle_capabilities(req: dict) -> None:
+    from codeagent.runtime.registry import RuntimeRegistry
+
+    backends = RuntimeRegistry().names()
     _send({
         "type": "capabilities",
         "wire_version": WIRE_VERSION,
-        "backends": ["omp"],
+        "backends": backends,
         "features": ["resume", "session", "timeout"],
     })
 
@@ -85,6 +86,16 @@ def _handle_run(req: dict) -> None:
     skip_permissions = req.get("skip_permissions", True)
     skills = req.get("skills")
     timeout = req.get("timeout", DEFAULT_EXEC_TIMEOUT)
+
+    # v2 correlation fields — round-trip verbatim (session_key must NOT
+    # collapse to None; it was a historical bug).
+    session_key = req.get("session_key") or None
+    request_id = req.get("request_id", "")
+    run_id = req.get("run_id", "")
+    review_key = req.get("review_key", "")
+    require_ack = bool(req.get("require_ack", False))
+    caps_raw = req.get("capabilities") or []
+    capabilities = tuple(str(c) for c in caps_raw if isinstance(c, str))
 
     _send({"type": "accepted", "wire_version": WIRE_VERSION})
 
@@ -105,29 +116,60 @@ def _handle_run(req: dict) -> None:
         skip_permissions=skip_permissions,
         timeout=timeout,
         resume_session_id=resume_session_id,
+        session_key=session_key,
+        request_id=request_id,
+        run_id=run_id,
+        review_key=review_key,
+        require_ack=require_ack,
+        capabilities=capabilities,
     )
 
-    # Select runner by backend
-    config = RunnerConfig(timeout=timeout)
-    if backend == "omp":
-        runner = OMPRunner(config=config)
-    else:
-        _send({"type": "error", "message": f"unsupported backend: {backend}"})
+    # Select runner via the RuntimeRegistry (bounded short-task path).
+    from codeagent.runtime.registry import RuntimeRegistry, RuntimeErrorCode
+
+    try:
+        adapter = RuntimeRegistry().get(backend)
+    except RuntimeErrorCode as exc:
+        _send({"type": "error", "message": f"{exc.code}: {exc.message}"})
         return
 
-    # Run via tested runner implementation
-    result = runner.run(request)
+    try:
+        handle = adapter.spawn({
+            "task": task,
+            "workdir": workdir,
+            "agent_id": agent or "",
+            "model": model or "",
+            "session_id": session_key or "",
+            "review_key": review_key,
+            "request_id": request_id,
+            "run_id": run_id,
+            "backend_session_id": resume_session_id,
+            "short_task": True,
+            "timeout": timeout,
+            "profile_args": [],
+        })
+    except Exception as exc:
+        _send({"type": "error", "message": f"run failed: {exc}"})
+        return
+
+    # Bounded adapters put their result in handle.extra["result"].
+    result = (handle.extra or {}).get("result") or {}
+    returncode = int(result.get("returncode", 0))
+    stdout = result.get("stdout", "") or ""
+    stderr = result.get("stderr", "") or ""
 
     # Send session ID if available
-    if result.session_id:
-        _send({"type": "session", "id": result.session_id})
+    if handle.backend_session_id:
+        _send({"type": "session", "id": handle.backend_session_id})
+    elif result.get("session_id"):
+        _send({"type": "session", "id": result["session_id"]})
 
     # Send result
     _send({
         "type": "result",
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "exit_code": result.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": returncode,
     })
 
 
@@ -167,6 +209,8 @@ def _dispatch_mailbox_direct(args: list[str], mailbox_root: str | None = None) -
         s.add_argument("--request-id", default="")
         s.add_argument("--msg-id", default=None)
         s.add_argument("--attachment", action="append", default=[])
+        s.add_argument("--require-ack", action="store_true", default=False)
+        s.add_argument("--receipt-type", default="")
 
         pk = sub.add_parser("peek")
         pk.add_argument("--session", required=True)
@@ -233,13 +277,21 @@ def _dispatch_mailbox_direct(args: list[str], mailbox_root: str | None = None) -
                 if not isinstance(d, dict):
                     raise ValueError(f"--attachment must be a JSON object")
                 attachments.append(AttachmentRef.from_dict(d))
-            out = store.send(
+            # v2: route through MailboxService (require_ack / receipt_type).
+            from codeagent.mailbox.service import MailboxService
+            svc = MailboxService(store=store)
+            receipt = svc.send(
                 ns.session, ns.from_worker, ns.to,
                 ns.subject, ns.body, ns.kind,
                 ns.reply_to, ns.run_id, ns.request_id,
                 attachments=attachments or None,
                 msg_id=getattr(ns, 'msg_id', None),
+                require_ack=getattr(ns, 'require_ack', False),
+                receipt_type=getattr(ns, 'receipt_type', ''),
             )
+            if receipt.status == "failed":
+                raise ValueError(receipt.error or "send failed")
+            out = receipt.detail or f"sent → {ns.to}/inbox/{receipt.msg_id}.json"
         elif cmd == "peek":
             import json as _json
             out = _json.dumps(
@@ -247,7 +299,14 @@ def _dispatch_mailbox_direct(args: list[str], mailbox_root: str | None = None) -
                 ensure_ascii=False,
             )
         elif cmd == "read":
-            msg = store.read(ns.session, ns.agent, ns.owner)
+            # v2: claim via MailboxService — emits RECEIPT(READ) for
+            # require_ack messages on the remote host too.
+            from codeagent.mailbox.service import ACK_ROUTE_UNRESOLVED, MailboxService
+            svc = MailboxService(store=store)
+            outcome = svc.read(ns.session, ns.agent, ns.owner)
+            if outcome.status == ACK_ROUTE_UNRESOLVED:
+                raise ValueError(outcome.error or "ack route unresolved")
+            msg = outcome.message
             if msg:
                 if ns.json:
                     import json as _json
@@ -381,6 +440,8 @@ class _StreamSubscription:
     agent_id: str
     cursor: str  # opaque server cursor ("epoch_ms/seq"), or STREAM_CURSOR_INITIAL
     last_heartbeat: float = field(default_factory=time.monotonic)
+    stream_kind: str = "mailbox"  # mailbox | runtime | all
+    runtime_id: str = ""
 
 
 def _cursor_gt(a: str, b: str) -> bool:
@@ -403,12 +464,16 @@ def _cursor_gt(a: str, b: str) -> bool:
 
 
 def _poll_streams(subs: list[_StreamSubscription]) -> None:
-    """Poll mailbox stores for new messages and emit stream_event frames.
+    """Poll mailbox stores + local Gateway EventStore; emit stream_event frames.
 
-    For each subscription, checks the agent's inbox for messages with
-    ``_cursor`` lexicographically greater than the subscription's cursor.
-    Emits one ``stream_event`` per new message with the full Message
-    payload and advances the cursor.
+    For each subscription:
+      - stream_kind mailbox: poll the agent's inbox (plain epoch/seq cursor)
+      - stream_kind runtime: poll the local EventStore (composite cursor)
+      - stream_kind all: poll BOTH, advancing a composite cursor
+
+    Emits one ``stream_event`` per new message/event with the full payload
+    and advances the subscription cursor. Consumers dedupe by msg_id
+    (mailbox) or (source_host, runtime_id, generation, source_sequence).
     """
     if not subs:
         return
@@ -417,8 +482,43 @@ def _poll_streams(subs: list[_StreamSubscription]) -> None:
     now = time.monotonic()
 
     for sub in subs:
+        if sub.stream_kind in ("mailbox", "all"):
+            _poll_mailbox(sub, store)
+        if sub.stream_kind in ("runtime", "all"):
+            _poll_runtime_events(sub)
+
+        # Heartbeat: emit a pong if we haven't sent anything recently
+        if now - sub.last_heartbeat >= STREAM_HEARTBEAT_INTERVAL:
+            _send({
+                "type": "pong",
+                "wire_version": WIRE_VERSION,
+                "heartbeat": True,
+            })
+            sub.last_heartbeat = now
+
+
+def _poll_mailbox(sub: _StreamSubscription, store: MailboxStore) -> None:
+    """Emit inbox messages newer than the mailbox cursor component.
+
+    Polls BOTH the subscribed agent's inbox AND the session manager's inbox
+    on this host — the manager inbox is the return path for READ receipts /
+    REPORPs generated by local claims (cross-host flow is one-way SSH: the
+    Manager's stream carries them back).
+    """
+    last_cursor = ""
+    inboxes: list[str] = [sub.agent_id]
+    try:
+        meta = store.read_session(sub.session_id)
+        if meta:
+            members = {meta.get("manager", "")} | set(meta.get("agents", []) or [])
+            for member in sorted(m for m in members if m):
+                if member not in inboxes:
+                    inboxes.append(member)
+    except Exception:
+        pass
+    for agent_id in inboxes:
         try:
-            inbox = store.agent_subdir(sub.session_id, sub.agent_id, "inbox")
+            inbox = store.agent_subdir(sub.session_id, agent_id, "inbox")
             files = store.list_messages(inbox)
             for f in files:
                 try:
@@ -429,49 +529,95 @@ def _poll_streams(subs: list[_StreamSubscription]) -> None:
                 msg_id = msg.get("msg_id", f.stem)
                 # Opaque cursor discipline: only messages carrying the
                 # server-generated _cursor participate in stream delivery.
-                # Legacy pre-0.2.0 messages (no _cursor) are skipped —
-                # mixing msg_id fallbacks with opaque cursors breaks the
-                # ordering and can silently drop new mail.
                 if not msg_cursor:
                     continue
-                # P0-b: compare numerically, not lexicographically. The seq
-                # component is zero-padded now, but legacy cursors written
-                # before the padding ("epoch/10") would sort before
-                # "epoch/9" as strings — silent stream skip. Parse both
-                # sides into (epoch_ms, seq) ints.
-                if not _cursor_gt(msg_cursor, sub.cursor):
+                mailbox_cursor, _rt = _split_cursor(sub.cursor)
+                if not _cursor_gt(msg_cursor, mailbox_cursor):
                     continue
-                # Emit event with full Message payload
                 event = {
                     'type': 'stream_event',
                     'request_id': sub.request_id,
                     'session_id': sub.session_id,
-                    'cursor': msg_cursor,
+                    'cursor': _advance_cursor(sub, msg_cursor=msg_cursor),
                     'payload': {
                         k: msg.get(k, '')
                         for k in ('msg_id', 'from', 'to', 'kind', 'subject',
                                   'body', 'created_at', 'reply_to', 'run_id',
                                   'request_id')
                     },
+                    'source': 'mailbox',
+                    'inbox_agent': agent_id,
                 }
                 if msg.get('attachments'):
                     event['payload']['attachments'] = msg['attachments']
                 if msg.get('trace_id'):
                     event['payload']['trace_id'] = msg['trace_id']
                 _send(event)
-                sub.cursor = msg_cursor
+                last_cursor = msg_cursor
         except Exception:
             # Don't let one subscription's error kill the loop
             pass
+    if last_cursor:
+        if sub.stream_kind == "mailbox":
+            sub.cursor = last_cursor
+        else:
+            sub.cursor = _advance_cursor(sub, msg_cursor=last_cursor)
 
-        # Heartbeat: emit a pong if we haven't sent anything recently
-        if now - sub.last_heartbeat >= STREAM_HEARTBEAT_INTERVAL:
+
+def _poll_runtime_events(sub: _StreamSubscription) -> None:
+    """Emit local Gateway EventStore events newer than the runtime cursor."""
+    last_event_id = 0
+    try:
+        from codeagent.gateway.events import EventStore
+
+        _mc, runtime_event_id = _split_cursor(sub.cursor)
+        store = EventStore()
+        events, _next_cursor = store.list_after(
+            cursor=runtime_event_id,
+            limit=200,
+            session_id=sub.session_id if sub.session_id else "",
+            runtime_id=sub.runtime_id,
+        )
+        for ev in events:
             _send({
-                "type": "pong",
-                "wire_version": WIRE_VERSION,
-                "heartbeat": True,
+                'type': 'stream_event',
+                'request_id': sub.request_id,
+                'session_id': sub.session_id,
+                'cursor': _advance_cursor(sub, runtime_event_id=ev.event_id),
+                'payload': ev.to_dict(),
+                'source': 'runtime',
             })
-            sub.last_heartbeat = now
+            last_event_id = ev.event_id
+    except Exception:
+        # EventStore unavailable — the runtime leg simply yields nothing.
+        pass
+    if last_event_id and sub.stream_kind in ("runtime", "all"):
+        sub.cursor = _advance_cursor(sub, runtime_event_id=last_event_id)
+
+
+def _split_cursor(cursor: str) -> tuple[str, int]:
+    """Split an opaque cursor into (mailbox_cursor, runtime_event_id)."""
+    try:
+        from codeagent.wire.protocol import split_composite_cursor
+        return split_composite_cursor(cursor)
+    except Exception:
+        return cursor, 0
+
+
+def _advance_cursor(sub: _StreamSubscription, msg_cursor: str = "", runtime_event_id: int = 0) -> str:
+    """Advance the subscription cursor after emitting an event.
+
+    mailbox → plain epoch/seq cursor; runtime/all → composite base64url.
+    """
+    if sub.stream_kind == "mailbox":
+        return msg_cursor or sub.cursor
+    from codeagent.wire.protocol import make_composite_cursor
+    mailbox_cursor, rt = _split_cursor(sub.cursor)
+    if msg_cursor:
+        mailbox_cursor = msg_cursor
+    if runtime_event_id:
+        rt = runtime_event_id
+    return make_composite_cursor(mailbox_cursor, rt)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -553,6 +699,11 @@ def main(argv: list[str] | None = None) -> None:
             if not agent_id:
                 _send({"type": "error", "message": "stream requires agent_id"})
                 continue
+            stream_kind = req.get("stream_kind", "mailbox")
+            if stream_kind not in ("mailbox", "runtime", "all"):
+                _send({"type": "error", "message": f"invalid stream_kind: {stream_kind}"})
+                continue
+            runtime_id = req.get("runtime_id", "")
             # Replace existing sub for same request_id
             active_subs[:] = [s for s in active_subs if s.request_id != request_id]
             sub = _StreamSubscription(
@@ -560,12 +711,15 @@ def main(argv: list[str] | None = None) -> None:
                 session_id=session_id,
                 agent_id=agent_id,
                 cursor=cursor,
+                stream_kind=stream_kind,
+                runtime_id=runtime_id,
             )
             active_subs.append(sub)
             _send({
                 "type": "accepted",
                 "wire_version": WIRE_VERSION,
                 "request_id": request_id,
+                "stream_kind": stream_kind,
             })
             # Immediately poll to deliver any messages already in the inbox
             _poll_streams(active_subs)

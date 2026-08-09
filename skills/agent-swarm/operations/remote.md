@@ -6,13 +6,9 @@
 
 Remote mode applies when Workers are on hosts **without shared filesystem access** to the Manager's mailbox root. All communication crosses a host boundary via SSH transport.
 
-The primitive for all cross-host mailbox operations is:
+**v2 control plane（跨设备 runtime）优先**：Manager 先用 `codeagent gateway ensure --host <H>` 预检（wire v2 / tmux / 架构）并启动远端 gateway，然后 session.ensure / runtime.spawn / runtime.send 走 SSH ControlMaster 单次 `gateway rpc --stdio`；mailbox + RuntimeEvent 走长期 SSHStream 回流。远端永不反向连接 Manager、不开放端口。
 
-```bash
-codeagent mailbox <subcommand> ... --host <H>
-```
-
-This IS the real cross-host transport. Every cross-host read, send, peek, stats, and status call routes through this entry point. Never construct bare `mailbox` commands with guessed remote paths — `--host <H>` handles SSH routing, path resolution, and CLI invocation on the target host.
+**leaf transport（纯 mailbox 消息）**：`codeagent mailbox <subcommand> ... --host <H>` 仍是跨主机 mailbox 消息传输原语。
 
 ### What IS the transport
 

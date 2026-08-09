@@ -113,3 +113,43 @@ def repo_map(hosts_dict, sample_topics, tmp_path: Path) -> RepoMap:
         hosts=hosts_dict,
         topics=sample_topics,
     )
+
+
+# ---------------------------------------------------------------------------
+# F3: forbid accidental real-backend spawns (they hang the suite)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _no_real_backend_spawn(monkeypatch):
+    """Block accidental real `omp`/`opencode` subprocess spawns.
+
+    These binaries run indefinitely (waiting on a model) and hang the suite
+    (test_runtime_registry hung for 90s+ before this guard). Tests that
+    INTENTIONALLY exercise a backend must patch ``subprocess.Popen`` (or the
+    runner/adapter) explicitly — the explicit patch overrides this guard.
+
+    Implemented as a Popen SUBCLASS (not a function wrapper) so
+    ``MagicMock(spec=subprocess.Popen)`` still exposes the real attribute
+    surface (poll/communicate/wait/…).
+    """
+    import subprocess as _sp
+
+    _BLOCKED = frozenset({"omp", "opencode"})
+
+    class _GuardedPopen(_sp.Popen):
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            argv = args[0] if args else kwargs.get("args", [])
+            if isinstance(argv, (list, tuple)) and argv and isinstance(argv[0], str):
+                binary = argv[0]
+                head = binary.rsplit("/", 1)[-1]
+                # Block bare names (PATH-resolved real backends) and EXISTING
+                # absolute paths. Allow nonexistent paths (e.g. /nonexistent/omp)
+                # — Popen raises FileNotFoundError naturally, no hang.
+                if head in _BLOCKED and ("/" not in binary or Path(binary).exists()):
+                    raise RuntimeError(
+                        f"tests must not spawn real backend binary: {argv!r} "
+                        "(patch subprocess.Popen / the adapter to mock it)"
+                    )
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(_sp, "Popen", _GuardedPopen)

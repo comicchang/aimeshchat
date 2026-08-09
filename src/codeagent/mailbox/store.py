@@ -231,6 +231,8 @@ class MailboxStore:
         trace_id: str = "", causation_id: str = "",
         attachments: Optional[list] = None,
         msg_id: Optional[str] = None,
+        require_ack: bool = False,
+        receipt_type: str = "",
     ) -> str:
         """Deliver a message. ``to_id == "*"`` broadcasts to every roster
         member except the sender (same msg_id, one envelope per inbox).
@@ -337,6 +339,8 @@ class MailboxStore:
             reply_to=reply_to, run_id=run_id, request_id=request_id,
             trace_id=trace_id, causation_id=causation_id,
             attachments=refs,
+            require_ack=require_ack,
+            receipt_type=receipt_type,
         )
 
         ok, reason = validate_message(msg.to_dict(), session_id)
@@ -851,7 +855,7 @@ class MailboxStore:
 
 # ── Request lifecycle ledger ────────────────────────────────────────────
 
-TERMINAL_STATES = frozenset({"DONE", "BLOCKED", "CANCELLED", "EXPIRED"})
+TERMINAL_STATES = frozenset({"DONE", "BLOCKED", "CANCELLED", "EXPIRED", "UNKNOWN_STALE"})
 _NON_TERMINAL = frozenset({"DISPATCHED", "ACKED", "RUNNING"})
 
 
@@ -919,9 +923,99 @@ class RequestLedger:
                 return entry["event"]
         return None
 
+    def apply_message(self, msg: dict) -> str:
+        """Reduce one mailbox message onto the request ledger.
+
+        Maps a message to the canonical request lifecycle state and
+        records it (idempotently, terminal CAS enforced):
+
+          TASK/INIT        → DISPATCHED   (first TASK for (request_id, run_id))
+          RECEIPT(READ)    → ACKED        (reply_to = acked msg_id)
+          PROGRESS (first) → RUNNING
+          REPORT / NOTICE  → existing CAS (terminal via record_event)
+          anything else    → no-op
+
+        Returns the recorded event name, or "" when the message maps to
+        no state transition. The ledger stays the single source of truth
+        for request state; ``status.json`` only reflects availability.
+        """
+        kind = msg.get("kind", "")
+        run_id = msg.get("run_id", "") or ""
+        request_id = msg.get("request_id", "") or ""
+        if not request_id or not run_id:
+            return ""
+
+        if kind == "RECEIPT":
+            if msg.get("receipt_type") != "READ":
+                return ""
+            self.record_event(request_id, run_id, "ACKED", {
+                "msg_id": msg.get("msg_id", ""),
+                "reply_to": msg.get("reply_to", ""),
+            })
+            return "ACKED"
+
+        if kind in ("TASK", "INIT"):
+            self.record_event(request_id, run_id, "DISPATCHED", {
+                "msg_id": msg.get("msg_id", ""),
+                "from": msg.get("from", ""),
+            })
+            return "DISPATCHED"
+
+        if kind == "PROGRESS":
+            # Only the FIRST correlated PROGRESS transitions to RUNNING;
+            # later progress events are informational.
+            if self.get_terminal(request_id, run_id) is None:
+                has_running = any(
+                    e["event"] == "RUNNING"
+                    for e in self._read_entries(request_id, run_id)
+                )
+                if not has_running:
+                    self.record_event(request_id, run_id, "RUNNING", {
+                        "msg_id": msg.get("msg_id", ""),
+                    })
+                    return "RUNNING"
+            return ""
+
+        if kind in ("REPORT", "NOTICE"):
+            # Terminal CAS: record_event rejects a second terminal.
+            self.record_event(request_id, run_id, kind, {
+                "msg_id": msg.get("msg_id", ""),
+                "from": msg.get("from", ""),
+                "terminal": kind in TERMINAL_STATES,
+            })
+            return kind
+
+        return ""
+
     def get_events(self, request_id: str, run_id: str) -> list[dict]:
         """Return all events for *(request_id, run_id)*, newest last."""
         return self._read_entries(request_id, run_id)
+
+    def record_artifact_verdict(
+        self, request_id: str, run_id: str, verified: bool
+    ) -> dict:
+        """Record an artifact verification outcome as a terminal event.
+
+        *verified=True*  → terminal ``DONE``  (meta ``{"source":"artifact_verify"}``).
+        *verified=False* → terminal ``BLOCKED`` (meta ``{"source":"artifact_verify",
+        "reason":"sha256_mismatch"}``).
+
+        Returns ``{"terminal": <state>, "cas": True}`` when the terminal was
+        newly recorded, or ``{"terminal": <existing>, "cas": False}`` when a
+        prior terminal already existed (terminal CAS conflict).
+        """
+        if verified:
+            state = "DONE"
+            meta: dict = {"source": "artifact_verify"}
+        else:
+            state = "BLOCKED"
+            meta = {"source": "artifact_verify", "reason": "sha256_mismatch"}
+        accepted = self.record_event(request_id, run_id, state, meta)
+        if accepted:
+            return {"terminal": state, "cas": True}
+        # Terminal CAS conflict — a prior terminal already exists.
+        existing = self.get_terminal(request_id, run_id)
+        return {"terminal": existing or state, "cas": False}
 
     def find_stale(self, sla_seconds: int = 300) -> list[dict]:
         """Return ACKED-but-not-terminal requests older than *sla_seconds*.

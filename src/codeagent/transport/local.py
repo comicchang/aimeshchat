@@ -69,6 +69,12 @@ class LocalTransport(Transport):
             session_id=session_id,
             skip_permissions=request.skip_permissions,
             timeout=request.timeout,
+            session_key=request.session_key,
+            request_id=request.request_id,
+            run_id=request.run_id,
+            review_key=request.review_key,
+            require_ack=request.require_ack,
+            capabilities=request.capabilities,
         )
         return _run_wire(
             ["codeagent-remote-exec"],

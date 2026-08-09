@@ -487,8 +487,9 @@ class TestSessionRegistry:
         target = _make_target()
         key = "lock-test:key"
 
-        # Acquire the lock externally
-        lock = SessionLock(key)
+        # Acquire the lock externally — key must match mark_starting's
+        # SessionLock("session:" + key), not the bare key.
+        lock = SessionLock("session:" + key)
         lock.acquire()
 
         errors: list[Exception] = []
@@ -543,8 +544,8 @@ class TestSessionRegistry:
 
         def waiter():
             entered.wait(timeout=5)
-            # Try to acquire same key — should block
-            lock = SessionLock(key)
+            # Try to acquire same key — must use run_with_lock's prefixed key
+            lock = SessionLock("session:" + key)
             got = lock.acquire(blocking=False)
             if got:
                 lock.release()

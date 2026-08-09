@@ -107,12 +107,12 @@ class TestRemoteExecValidation:
         pytest.fail("No error response found")
 
     def test_unknown_command_returns_error(self):
-        resp = _run_remote_exec({"wire_version": 1, "command": "nonexistent"})
+        resp = _run_remote_exec({"wire_version": WIRE_VERSION, "command": "nonexistent"})
         assert resp["type"] == "error"
         assert "unknown" in resp["message"].lower()
 
     def test_missing_required_field_returns_error(self):
-        resp = _run_remote_exec({"wire_version": 1, "command": "run"})
+        resp = _run_remote_exec({"wire_version": WIRE_VERSION, "command": "run"})
         assert resp["type"] == "error"
         assert "task" in resp["message"].lower()
 

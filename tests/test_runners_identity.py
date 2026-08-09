@@ -67,7 +67,10 @@ class TestIdentityInjection:
         """BaseRunner.run passes extra_env to the subprocess."""
         monkeypatch.setenv("SWARM_SESSION_ID", "s1")
         runner = OMPRunner()
-        request = _request()
+        # agent=None: OMPRunner.run must not early-return on profile resolution
+        # (a nonexistent profile would return before spawn) — the env contract
+        # is exercised through the SWARM_SESSION_ID fallback instead.
+        request = _request(agent=None)
 
         env_seen = {}
 
@@ -78,9 +81,14 @@ class TestIdentityInjection:
                 self.stdout = ""
                 self.stderr = ""
                 self.cmd = cmd
+                self.args = cmd
+                self.pid = 4242
 
-            def communicate(self, input=None, timeout=None):
-                return self.stdout, self.stderr
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
 
         with patch("subprocess.Popen", side_effect=_FakeProc):
             runner._build_cmd = lambda r: ["omp", "--print", "--mode", "json", "@x"]
@@ -90,4 +98,5 @@ class TestIdentityInjection:
             runner.run(request)
 
         assert env_seen.get("env") is not None
+        assert env_seen["env"].get("SWARM_SESSION_ID") == "s1"
         assert env_seen["env"]["OMP_MAILBOX_SESSION_ID"] == "s1"

@@ -1,13 +1,27 @@
-"""Abstract base runner — contract for all backend executors."""
+"""Abstract base runner — contract for all backend executors.
+
+The base class owns the subprocess lifecycle split into four primitives so
+long tasks are no longer bound to ``Popen.wait`` / ``communicate(timeout)``:
+
+  - ``spawn(request)`` — build argv + env, Popen
+  - ``pump(proc)``     — yield (channel, line) reading stdout AND stderr
+                         concurrently (a full stderr pipe must not deadlock)
+  - ``wait(proc)``     — wait for exit, build CompletedProcess
+  - ``stop(proc)``     — terminate the process group
+
+``run()`` composes them for the legacy bounded path. Long tasks are
+supervised by the gateway + tmux runtime, NOT by this runner.
+"""
 from __future__ import annotations
 
 import io
 import os
 import subprocess
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from codeagent.constants import DEFAULT_EXEC_TIMEOUT
 from codeagent.domain import RunRequest, RunResult
@@ -23,92 +37,108 @@ class RunnerConfig:
 
 
 class BaseRunner(ABC):
-    """Abstract runner — subclasses implement ``_build_cmd`` and ``_parse_output``.
+    """Abstract runner — subclasses implement ``_build_cmd``, ``_extra_env``,
+    ``_consume_line`` and ``_parse_output``.
 
-    The base class owns the subprocess lifecycle:
-      1. Build the command via ``_build_cmd(request)``.
-      2. Run it with ``subprocess.run`` (Popen under the hood for timeout).
-      3. Parse structured output via ``_parse_output(proc, request)``.
-      4. Return a ``RunResult``.
+    Lifecycle primitives (spawn/pump/wait/stop) let callers drive long
+    tasks without binding them to a shell ``wait``.
     """
 
     def __init__(self, config: Optional[RunnerConfig] = None) -> None:
         self.config = config or RunnerConfig()
 
     # ------------------------------------------------------------------
-    # Public API
+    # Lifecycle primitives
+    # ------------------------------------------------------------------
+
+    def spawn(self, request: RunRequest) -> subprocess.Popen:
+        """Build argv + env and start the process. Returns the Popen."""
+        cmd = self._build_cmd(request)
+        if not cmd:
+            raise ValueError("failed to build command")
+        env = None
+        extra_env = self._extra_env()
+        if extra_env:
+            env = os.environ.copy()
+            env.update(extra_env)
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=request.workdir or None,
+            start_new_session=True,
+            env=env,
+        )
+
+    def pump(self, proc: subprocess.Popen) -> Iterator[tuple[str, str]]:
+        """Yield ``(channel, line)`` reading stdout and stderr concurrently.
+
+        stderr is drained by a daemon thread into a buffer; stdout is read
+        line-by-line on the caller thread. Concurrent draining prevents a
+        full stderr pipe from deadlocking a chatty agent.
+        """
+        stderr_lines: list[str] = []
+
+        def _drain_stderr() -> None:
+            stream = proc.stderr
+            if stream is None:
+                return
+            for line in stream:
+                stderr_lines.append(line)
+
+        t = threading.Thread(target=_drain_stderr, daemon=True)
+        t.start()
+
+        stdout_stream = proc.stdout
+        if not hasattr(stdout_stream, "readline"):
+            # Tests may hand us a plain string.
+            stdout_stream = io.StringIO(stdout_stream if isinstance(stdout_stream, str) else "")
+        if stdout_stream is not None:
+            for line in stdout_stream:
+                yield "stdout", line
+        t.join(timeout=5)
+        for line in stderr_lines:
+            yield "stderr", line
+
+    def wait(self, proc: subprocess.Popen, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        """Wait for exit and return a CompletedProcess (stdout from pump)."""
+        timeout = timeout if timeout is not None else self.config.timeout
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise
+        return subprocess.CompletedProcess(
+            proc.args, proc.returncode, "", "",
+        )
+
+    def stop(self, proc: subprocess.Popen) -> None:
+        """Terminate the process group (SIGKILL) — for timeouts/aborts."""
+        try:
+            os.killpg(os.getpgid(proc.pid), 9)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    # ------------------------------------------------------------------
+    # Public API (legacy bounded path)
     # ------------------------------------------------------------------
 
     def run(self, request: RunRequest) -> RunResult:
-        """Execute a task and return the result."""
-        import signal
+        """Execute a bounded task and return the result.
 
-        cmd = self._build_cmd(request)
-        if not cmd:
-            return RunResult(returncode=1, stderr="failed to build command")
-
-        proc = None
+        Used only for explicit short tasks (OMPRunner ``--print``). Long
+        tasks are supervised by the gateway + tmux runtime.
+        """
         try:
-            env = None
-            extra_env = self._extra_env()
-            if extra_env:
-                env = os.environ.copy()
-                env.update(extra_env)
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=request.workdir or None,
-                start_new_session=True,
-                env=env,
-            )
-            # Write stdin and close so the subprocess sees EOF.
-            if proc.stdin:
-                proc.stdin.write(request.task)
-                proc.stdin.close()
-            # Read stdout line by line — non-blocking, doesn't trigger
-            # shell auto-background timeout, and calls _consume_line
-            # incrementally.  Wrap in StringIO if tests mock stdout as a
-            # plain string (MagicMock returns str, not a file object).
-            stdout_stream = (
-                proc.stdout
-                if hasattr(proc.stdout, "readline")
-                else io.StringIO(proc.stdout if isinstance(proc.stdout, str) else "")
-            )
-            stderr_stream = (
-                proc.stderr
-                if hasattr(proc.stderr, "read")
-                else io.StringIO(proc.stderr if isinstance(proc.stderr, str) else "")
-            )
-            stdout_lines: list[str] = []
-            while True:
-                line = stdout_stream.readline()
-                if not line:
-                    break
-                stdout_lines.append(line)
-                self._consume_line("stdout", line)
-            proc.wait(timeout=self.config.timeout)
-            stderr = stderr_stream.read()
-            proc_obj = subprocess.CompletedProcess(
-                cmd, proc.returncode, "".join(stdout_lines), stderr
-            )
-        except subprocess.TimeoutExpired:
-            if proc is not None:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
+            proc = self.spawn(request)
+        except ValueError as exc:
             self._cleanup()
-            return RunResult(
-                returncode=-1,
-                stderr=f"timeout after {self.config.timeout}s",
-            )
+            return RunResult(returncode=1, stderr=str(exc))
         except FileNotFoundError as exc:
             self._cleanup()
             return RunResult(returncode=127, stderr=str(exc))
@@ -116,6 +146,29 @@ class BaseRunner(ABC):
             self._cleanup()
             return RunResult(returncode=1, stderr=str(exc))
 
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        try:
+            for channel, line in self.pump(proc):
+                if channel == "stdout":
+                    stdout_lines.append(line)
+                    self._consume_line("stdout", line)
+                else:
+                    stderr_lines.append(line)
+            proc_obj = self.wait(proc)
+        except subprocess.TimeoutExpired:
+            self.stop(proc)
+            self._cleanup()
+            return RunResult(
+                returncode=-1,
+                stderr=f"timeout after {self.config.timeout}s",
+            )
+        except OSError as exc:
+            self._cleanup()
+            return RunResult(returncode=1, stderr=str(exc))
+
+        proc_obj.stdout = "".join(stdout_lines)
+        proc_obj.stderr = "".join(stderr_lines)
         try:
             return self._parse_output(proc_obj, request)
         finally:
@@ -146,15 +199,11 @@ class BaseRunner(ABC):
         """
 
     def _extra_env(self) -> Optional[dict[str, str]]:
-        """Extra environment variables for the subprocess, or None.
-
-        Subclasses override to inject identity/context (e.g. OMP mailbox
-        identity for the swarm plugin). Called only when non-empty.
-        """
+        """Extra environment variables for the subprocess, or None."""
         return None
 
     @abstractmethod
     def _parse_output(
-        self, proc: subprocess.CompletedProcess[str], request: RunRequest
+        self, proc: subprocess.CompletedProcess, request: RunRequest
     ) -> RunResult:
         """Extract structured fields from process output."""

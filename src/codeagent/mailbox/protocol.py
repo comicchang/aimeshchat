@@ -10,16 +10,25 @@ from codeagent.constants import LEASE_TIMEOUT_S
 
 # ── Constants ──────────────────────────────────────────────────────────
 
-VALID_KINDS = frozenset({"TASK", "REPORT", "PROGRESS", "EVIDENCE", "QUESTION", "RESPONSE", "NOTICE"})
+# Protocol version 2 adds require_ack + RECEIPT(READ). v1 messages are
+# still readable (protocol_version=1 / require_ack=False on load); all
+# newly written messages carry PROTOCOL_VERSION.
+PROTOCOL_VERSION = 2
+
+VALID_KINDS = frozenset({"TASK", "REPORT", "PROGRESS", "EVIDENCE", "QUESTION", "RESPONSE", "NOTICE", "RECEIPT"})
 VALID_STATES = frozenset({"IDLE", "BUSY", "DONE", "BLOCKED"})
 REQUIRED_FIELDS = frozenset({"session_id", "from", "to", "subject", "body", "kind", "msg_id", "created_at"})
-OPTIONAL_FIELDS = frozenset({"reply_to", "run_id", "request_id", "trace_id", "causation_id", "attachments"})
+OPTIONAL_FIELDS = frozenset({"protocol_version", "require_ack", "receipt_type", "reply_to", "run_id", "request_id", "trace_id", "causation_id", "attachments"})
 # Per-kind field requirements beyond the global REQUIRED_FIELDS.
 # Keys are kind strings; values are sets of field names that MUST be present
 # (and non-empty-string) when a message carries that kind.
 KIND_CONDITIONAL_REQUIRED: dict[str, frozenset[str]] = {
     "TASK":    frozenset({"run_id", "request_id"}),
     "REPORT":  frozenset({"run_id", "request_id", "reply_to"}),
+    # A RECEIPT must identify the message it acknowledges (reply_to), the
+    # run/request it belongs to, and carry a receipt_type. require_ack is
+    # forced False below — receipts never demand receipts (no loops).
+    "RECEIPT": frozenset({"reply_to", "run_id", "request_id", "receipt_type"}),
 }
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -37,6 +46,12 @@ class MessageKind(str, Enum):
     QUESTION = "QUESTION"
     RESPONSE = "RESPONSE"
     NOTICE = "NOTICE"
+    RECEIPT = "RECEIPT"
+
+
+class ReceiptType(str, Enum):
+    """Kinds of delivery/consumption receipts."""
+    READ = "READ"
 
 
 class AgentState(str, Enum):
@@ -103,6 +118,9 @@ class Message:
     trace_id: str = ""
     causation_id: str = ""
     attachments: list[AttachmentRef] = field(default_factory=list)
+    protocol_version: int = PROTOCOL_VERSION
+    require_ack: bool = False
+    receipt_type: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -114,7 +132,11 @@ class Message:
             "kind": self.kind,
             "msg_id": self.msg_id,
             "created_at": self.created_at,
+            "protocol_version": self.protocol_version,
+            "require_ack": self.require_ack,
         }
+        if self.receipt_type:
+            d["receipt_type"] = self.receipt_type
         if self.reply_to:
             d["reply_to"] = self.reply_to
         if self.run_id:
@@ -146,6 +168,11 @@ class Message:
             trace_id=d.get("trace_id", ""),
             causation_id=d.get("causation_id", ""),
             attachments=[AttachmentRef.from_dict(a) for a in d.get("attachments", []) if isinstance(a, dict)],
+            # v1 messages (no protocol_version key) read back as v1 and are
+            # never treated as requiring an ack — no guessing.
+            protocol_version=d.get("protocol_version", 1),
+            require_ack=bool(d.get("require_ack", False)),
+            receipt_type=d.get("receipt_type", ""),
         )
 
 
@@ -226,6 +253,17 @@ def validate_message(msg: dict, expected_session_id: Optional[str] = None,
     for field_name in ("subject", "body", "session_id", "from", "to", "msg_id", "created_at"):
         if not isinstance(msg.get(field_name), str):
             return False, f"{field_name} must be string"
+    # v2 protocol fields: strict typing, lenient on absence (v1 compat).
+    pv = msg.get("protocol_version", 1)
+    if not isinstance(pv, int) or isinstance(pv, bool) or pv < 1:
+        return False, "protocol_version must be a positive int"
+    if not isinstance(msg.get("require_ack", False), bool):
+        return False, "require_ack must be bool"
+    rt = msg.get("receipt_type", "")
+    if not isinstance(rt, str):
+        return False, "receipt_type must be string"
+    if rt and rt not in {t.value for t in ReceiptType}:
+        return False, f"invalid receipt_type: {rt}"
     if not msg["subject"].strip():
         return False, "subject must be non-empty"
     if not msg["body"].strip():
@@ -240,6 +278,15 @@ def validate_message(msg: dict, expected_session_id: Optional[str] = None,
             val = msg.get(ef, "")
             if not isinstance(val, str) or not val.strip():
                 return False, f"kind {msg['kind']} requires non-empty {ef}"
+    # Receipt loop prevention: receipts must never demand receipts, and a
+    # READ receipt must name the message it acknowledges via reply_to.
+    if msg["kind"] == "RECEIPT":
+        if msg.get("require_ack", False):
+            return False, "RECEIPT must not set require_ack (no receipt loops)"
+        if msg.get("receipt_type", "") != ReceiptType.READ.value:
+            return False, f"RECEIPT requires receipt_type={ReceiptType.READ.value!r}"
+        if not msg.get("reply_to", "").strip():
+            return False, "RECEIPT requires non-empty reply_to (acked msg_id)"
     if expected_session_id is not None and msg["session_id"] != expected_session_id:
         return False, f"session_id mismatch: {msg['session_id']} vs {expected_session_id}"
     if expected_agent is not None and msg["to"] != expected_agent and msg["to"] != BROADCAST_TO:

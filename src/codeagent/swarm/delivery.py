@@ -113,11 +113,20 @@ class DeliveryEngine:
         C15: Uses Message.from_dict().to_dict() round-trip to preserve
         reply_to, run_id, request_id, trace_id, causation_id, attachments.
 
+        v2: a new send (envelope without protocol_version — kernel/dict
+        envelopes don't carry it) must be recorded as protocol_version=2;
+        only dicts read from disk keep their original (possibly v1) version.
+
         Shared by deliver() and flush() so both successful paths append
         identical records — a drift here would silently fail
         append_history's validate_message and lose history.
         """
-        return Message.from_dict({**envelope, "msg_id": msg_id}).to_dict()
+        from codeagent.mailbox.protocol import PROTOCOL_VERSION
+        return Message.from_dict({
+            **envelope,
+            "msg_id": msg_id,
+            "protocol_version": envelope.get("protocol_version", PROTOCOL_VERSION),
+        }).to_dict()
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -243,6 +252,8 @@ class DeliveryEngine:
                 "request_id": getattr(envelope, 'request_id', ''),
                 "trace_id": getattr(envelope, 'trace_id', ''),
                 "causation_id": getattr(envelope, 'causation_id', ''),
+                "require_ack": getattr(envelope, 'require_ack', False),
+                "receipt_type": getattr(envelope, 'receipt_type', ''),
                 "msg_id": msg_id,
                 "created_at": created_at,
                 "_target_agent": target_agent,
@@ -664,6 +675,8 @@ class DeliveryEngine:
         attachments = envelope.get("attachments") or []
         msg_id = envelope.get("msg_id", "")
         trace_id = envelope.get("trace_id", "")
+        require_ack = bool(envelope.get("require_ack", False))
+        receipt_type = envelope.get("receipt_type", "")
 
         args = [
             "send",
@@ -675,6 +688,10 @@ class DeliveryEngine:
             "--kind", kind,
             "--msg-id", msg_id,
         ]
+        if require_ack:
+            args.append("--require-ack")
+        if receipt_type:
+            args.extend(["--receipt-type", receipt_type])
         for att in attachments:
             args.extend(["--attachment", json.dumps(att, ensure_ascii=False)])
         if reply_to:

@@ -20,6 +20,7 @@ from codeagent.wire.protocol import (
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
+    WIRE_VERSION,
     encode_line,
 )
 
@@ -49,7 +50,7 @@ def _remote_exec_responds(ready: bool = True, session_id: str | None = None) -> 
     """Build a sequence of JSONL response lines from a remote exec helper."""
     lines: list[bytes] = []
     if ready:
-        lines.append(encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"}))
+        lines.append(encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.2.0"}))
     lines.append(encode_line({"type": MSG_ACCEPTED, "wire_version": 1}))
     if session_id:
         lines.append(encode_line({"type": MSG_SESSION, "id": session_id}))
@@ -532,7 +533,7 @@ class TestRunWire:
         mock_popen.return_value = mock_proc
         result = _run_wire(
             ["python3", "-m", "codeagent.remote_exec"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="__local__",
             backend="opencode",
@@ -552,7 +553,7 @@ class TestRunWire:
         mock_popen.return_value = mock_proc
         result = _run_wire(
             ["python3", "-m", "codeagent.remote_exec"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="__local__",
             backend="opencode",
@@ -567,7 +568,7 @@ class TestRunWire:
         with pytest.raises(TransportError, match="timed out"):
             _run_wire(
                 ["python3"],
-                {"wire_version": 1, "command": "run", "task": "test"},
+                {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
                 workdir="/tmp",
                 host_name="__local__",
                 backend="opencode",
@@ -583,7 +584,7 @@ class TestRunWire:
         with pytest.raises(TransportError, match="not found"):
             _run_wire(
                 ["nonexistent-binary"],
-                {"wire_version": 1, "command": "run", "task": "test"},
+                {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
                 workdir="/tmp",
                 host_name="__local__",
                 backend="opencode",
@@ -599,7 +600,7 @@ class TestRunWire:
         mock_popen.return_value = mock_proc
         result = _run_wire(
             ["python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="__local__",
             backend="opencode",
@@ -618,7 +619,7 @@ class TestRunWire:
         mock_popen.return_value = mock_proc
         result = _run_wire(
             ["python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="__local__",
             backend="opencode",
@@ -630,14 +631,14 @@ class TestRunWire:
     def test_ready_message_skipped(self, mock_popen: MagicMock):
         """MSG_READY is handled gracefully (skipped)."""
         mock_proc = MagicMock()
-        ready = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
+        ready = encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.2.0"})
         result_msg = encode_line({"type": MSG_RESULT, "stdout": "done", "stderr": "", "exit_code": 0})
         mock_proc.communicate.return_value = (ready + result_msg, b"")
         mock_proc.returncode = 0
         mock_popen.return_value = mock_proc
         result = _run_wire(
             ["python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="__local__",
             backend="opencode",
@@ -654,7 +655,7 @@ class TestRunWire:
         mock_popen.return_value = mock_proc
         result = _run_wire(
             ["python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="__local__",
             backend="opencode",
@@ -790,7 +791,7 @@ class TestRunSSHWire:
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "-S", "/tmp/s.sock", "host", "python3", "-m", "codeagent.remote_exec"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="host",
             backend="opencode",
@@ -807,7 +808,7 @@ class TestRunSSHWire:
         with pytest.raises(TransportError, match="timed out"):
             _run_ssh_wire(
                 ["ssh", "host", "python3"],
-                {"wire_version": 1, "command": "run", "task": "test"},
+                {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
                 workdir="/tmp",
                 host_name="host",
                 backend="opencode",
@@ -823,7 +824,7 @@ class TestRunSSHWire:
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="host",
             backend="opencode",
@@ -840,7 +841,7 @@ class TestRunSSHWire:
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="host",
             backend="opencode",
@@ -851,14 +852,14 @@ class TestRunSSHWire:
     def test_ready_message_skipped(self, mock_popen: MagicMock):
         """MSG_READY is handled gracefully (skipped)."""
         mock_proc = MagicMock()
-        ready = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
+        ready = encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.2.0"})
         result_msg = encode_line({"type": MSG_RESULT, "stdout": "done", "stderr": "", "exit_code": 0})
         mock_proc.communicate.return_value = (ready + result_msg, b"")
         mock_proc.returncode = 0
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="host",
             backend="opencode",
@@ -872,7 +873,7 @@ class TestRunSSHWire:
         with pytest.raises(TransportError, match="ssh binary not found"):
             _run_ssh_wire(
                 ["nonexistent-ssh"],
-                {"wire_version": 1, "command": "run", "task": "test"},
+                {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
                 workdir="/tmp",
                 host_name="host",
                 backend="opencode",
@@ -887,7 +888,7 @@ class TestRunSSHWire:
         with pytest.raises(RuntimeError, match="boom"):
             _run_ssh_wire(
                 ["ssh", "host", "python3"],
-                {"wire_version": 1, "command": "run", "task": "test"},
+                {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
                 workdir="/tmp",
                 host_name="host",
                 backend="opencode",
@@ -905,7 +906,7 @@ class TestRunSSHWire:
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="host",
             backend="opencode",
@@ -922,7 +923,7 @@ class TestRunSSHWire:
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="host",
             backend="opencode",
@@ -940,7 +941,7 @@ class TestRunSSHWire:
         with pytest.raises(TransportError, match="wire version mismatch"):
             _run_ssh_wire(
                 ["ssh", "host", "python3"],
-                {"wire_version": 1, "command": "run", "task": "test"},
+                {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
                 workdir="/tmp",
                 host_name="host",
                 backend="opencode",
@@ -956,7 +957,7 @@ class TestRunSSHWire:
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
-            {"wire_version": 1, "command": "run", "task": "test"},
+            {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
             workdir="/tmp",
             host_name="host",
             backend="opencode",
@@ -1402,14 +1403,14 @@ class TestRunSSHMailbox:
         """mailbox_result is parsed into (exit_code, stdout, stderr)."""
         mock_proc = MagicMock()
         stdout = (
-            encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
+            encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.2.0"})
             + encode_line({"type": "mailbox_result", "stdout": "inbox: 1", "stderr": "", "exit_code": 0})
         )
         mock_proc.communicate.return_value = (stdout, b"")
         mock_proc.returncode = 0
         mock_popen.return_value = mock_proc
 
-        exit_code, out, err = _run_ssh_mailbox(["ssh", "host"], {"wire_version": 1, "command": "mailbox", "args": ["stats"]})
+        exit_code, out, err = _run_ssh_mailbox(["ssh", "host"], {"wire_version": WIRE_VERSION, "command": "mailbox", "args": ["stats"]})
         assert exit_code == 0
         assert out == "inbox: 1"
         assert err == ""

@@ -77,6 +77,8 @@ class Envelope:
     request_id: str = ""
     trace_id: str = ""
     causation_id: str = ""
+    require_ack: bool = False
+    receipt_type: str = ""
 
 
 # ── Session / Roster / ACL ─────────────────────────────────────────────

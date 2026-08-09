@@ -27,10 +27,11 @@ import pytest
 
 from codeagent.domain import HostSpec, RunRequest, RunResult
 from codeagent.transport.relay import RelayTransport
+from codeagent.wire.protocol import WIRE_VERSION
 
 _WIRE_OK = (
-    '{"type":"ready","wire_version":1,"package_version":"0.2.0"}\n'
-    '{"type":"accepted","wire_version":1}\n'
+    f'{{"type":"ready","wire_version":{WIRE_VERSION},"package_version":"0.2.0"}}\n'
+    f'{{"type":"accepted","wire_version":{WIRE_VERSION}}}\n'
     '{"type":"session","id":"sess-9"}\n'
     '{"type":"result","stdout":"ok","stderr":"","exit_code":0}\n'
 ).encode("utf-8")
@@ -555,7 +556,7 @@ class TestRelayPty:
     def test_unhandled_wire_type_goes_to_stderr(self, transport: RelayTransport):
         """Valid wire lines of unhandled types are surfaced on stderr."""
         proc = _make_proc()
-        chan = _PipeChannel(b'{"type":"pong","wire_version":1}\n' + _WIRE_OK)
+        chan = _PipeChannel(b'{"type":"pong","wire_version":WIRE_VERSION}\n' + _WIRE_OK)
 
         with (
             chan.patch_openpty(),

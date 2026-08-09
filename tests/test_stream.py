@@ -72,7 +72,7 @@ class TestStreamRequestProtocol:
 
     def test_decode_stream_request(self):
         raw = json.dumps({
-            "wire_version": 1, "command": "stream",
+            "wire_version": WIRE_VERSION, "command": "stream",
             "session_id": "s1", "cursor": "0",
         })
         req = decode_request(raw)
@@ -81,12 +81,12 @@ class TestStreamRequestProtocol:
         assert req["cursor"] == "0"
 
     def test_decode_stream_request_missing_session_id(self):
-        raw = json.dumps({"wire_version": 1, "command": "stream", "cursor": "0"})
+        raw = json.dumps({"wire_version": WIRE_VERSION, "command": "stream", "cursor": "0"})
         with pytest.raises(ValueError, match="session_id"):
             decode_request(raw)
 
     def test_decode_stream_request_missing_cursor(self):
-        raw = json.dumps({"wire_version": 1, "command": "stream", "session_id": "s1"})
+        raw = json.dumps({"wire_version": WIRE_VERSION, "command": "stream", "session_id": "s1"})
         with pytest.raises(ValueError, match="cursor"):
             decode_request(raw)
 
@@ -306,7 +306,7 @@ class TestServeModeStream:
     def test_stream_command_accepted(self):
         """A stream command produces an accepted response."""
         lines = [
-            json.dumps({"wire_version": 1, "command": "stream", "session_id": "s1", "agent_id": "a1", "cursor": "0", "request_id": "r1"}),
+            json.dumps({"wire_version": WIRE_VERSION, "command": "stream", "session_id": "s1", "agent_id": "a1", "cursor": "0", "request_id": "r1"}),
         ]
         sent = self._run_main_with_stdin(lines, mailbox_dir=Path("/tmp"))
 
@@ -320,7 +320,7 @@ class TestServeModeStream:
     def test_stream_command_requires_session_id(self):
         """Stream without session_id is rejected."""
         lines = [
-            json.dumps({"wire_version": 1, "command": "stream", "agent_id": "a1", "cursor": "0", "request_id": "r1"}),
+            json.dumps({"wire_version": WIRE_VERSION, "command": "stream", "agent_id": "a1", "cursor": "0", "request_id": "r1"}),
         ]
         sent = self._run_main_with_stdin(lines, mailbox_dir=Path("/tmp"))
 
@@ -330,7 +330,7 @@ class TestServeModeStream:
     def test_stream_command_requires_agent_id(self):
         """Stream without agent_id is rejected."""
         lines = [
-            json.dumps({"wire_version": 1, "command": "stream", "session_id": "s1", "cursor": "0", "request_id": "r1"}),
+            json.dumps({"wire_version": WIRE_VERSION, "command": "stream", "session_id": "s1", "cursor": "0", "request_id": "r1"}),
         ]
         sent = self._run_main_with_stdin(lines, mailbox_dir=Path("/tmp"))
 
@@ -568,7 +568,7 @@ class TestServeModeStream:
 
                 # Register a stream subscription
                 os.write(w_fd, json.dumps({
-                    "wire_version": 1,
+                    "wire_version": WIRE_VERSION,
                     "command": "stream",
                     "session_id": "s1",
                     "agent_id": "a1",
@@ -725,8 +725,8 @@ class TestSSHStream:
             "payload": {"msg_id": "m1", "from": "alice"},
         })
         # Same event twice
-        ready_line = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
-        accepted_line = encode_line({"type": MSG_ACCEPTED, "wire_version": 1})
+        ready_line = encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.2.0"})
+        accepted_line = encode_line({"type": MSG_ACCEPTED, "wire_version": WIRE_VERSION})
         stdout_io = io.BytesIO(ready_line + accepted_line + event_line + event_line)
         stdin_io = io.BytesIO()
 
@@ -760,8 +760,8 @@ class TestSSHStream:
             "cursor": "1719840000000/0",
             "payload": {"msg_id": "m1", "from": "alice"},
         })
-        ready1 = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
-        acc1 = encode_line({"type": MSG_ACCEPTED, "wire_version": 1})
+        ready1 = encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.2.0"})
+        acc1 = encode_line({"type": MSG_ACCEPTED, "wire_version": WIRE_VERSION})
         stdout1 = io.BytesIO(ready1 + acc1 + event1)
 
         # Second connection (reconnect): accepts and sends another event
@@ -772,8 +772,8 @@ class TestSSHStream:
             "cursor": "1719840000000/1",
             "payload": {"msg_id": "m2", "from": "bob"},
         })
-        ready2 = encode_line({"type": MSG_READY, "wire_version": 1, "package_version": "0.2.0"})
-        acc2 = encode_line({"type": MSG_ACCEPTED, "wire_version": 1})
+        ready2 = encode_line({"type": MSG_READY, "wire_version": WIRE_VERSION, "package_version": "0.2.0"})
+        acc2 = encode_line({"type": MSG_ACCEPTED, "wire_version": WIRE_VERSION})
         stdout2 = io.BytesIO(ready2 + acc2 + event2)
 
         stdin1 = io.BytesIO()

@@ -16,11 +16,14 @@ import time
 import tempfile
 from pathlib import Path
 
-# 隔离测试数据：使用临时 XDG 目录
+# 隔离测试数据：使用临时 XDG 目录（短路径——XDG_RUNTIME_DIR 泄漏会
+# 影响 ControlMaster socket，超 104 字节 AF_UNIX 限制则其他测试失败）
 _test_tmpdir = Path(tempfile.mkdtemp(prefix="park_e2e_"))
 os.environ["XDG_STATE_HOME"] = str(_test_tmpdir / "state")
 os.environ["XDG_DATA_HOME"] = str(_test_tmpdir / "data")
-os.environ["XDG_RUNTIME_DIR"] = str(_test_tmpdir / "runtime")
+_short_runtime = Path("/tmp") / f"parkrt-{os.getpid()}"
+os.environ["XDG_RUNTIME_DIR"] = str(_short_runtime)
+_SAVED_XDG = {"state": os.environ.get("XDG_STATE_HOME"), "data": os.environ.get("XDG_DATA_HOME"), "runtime": os.environ.get("XDG_RUNTIME_DIR")}
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -138,3 +141,14 @@ if __name__ == "__main__":
     test_5_resume_failure_cold_fallback()
     test_6_mailbox_archive_second_opinion()
     print("\n🎉 ALL E2E TESTS PASSED")
+
+def teardown_module(module):
+    """Restore the XDG env vars this module hijacked at import time —
+    otherwise the deep/short XDG_RUNTIME_DIR leaks into other test files
+    and breaks ControlMaster socket paths (AF_UNIX 104-byte limit)."""
+    for name, val in _SAVED_XDG.items():
+        key = f"XDG_{name.upper()}_HOME" if name != "runtime" else "XDG_RUNTIME_DIR"
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val

@@ -24,7 +24,10 @@ from typing import Any
 
 from codeagent.constants import DEFAULT_EXEC_TIMEOUT, MAX_LINE_LENGTH
 
-WIRE_VERSION = 1
+# v2 adds session_key/request_id/run_id/review_key/require_ack/capabilities
+# round-trip on `run`, plus stream_kind ("mailbox"|"runtime"|"all") and
+# runtime/request filters on `stream`.
+WIRE_VERSION = 2
 
 # ── message type constants ──────────────────────────────────────────────
 MSG_READY = "ready"
@@ -254,8 +257,20 @@ def make_request(
     skip_permissions: bool = True,
     timeout: int = DEFAULT_EXEC_TIMEOUT,
     wire_version: int = WIRE_VERSION,
+    session_key: str | None = None,
+    request_id: str = "",
+    run_id: str = "",
+    review_key: str = "",
+    require_ack: bool = False,
+    capabilities: tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build a request dict to send to the remote helper."""
+    """Build a request dict to send to the remote helper.
+
+    v2: ``session_key``/``request_id``/``run_id``/``review_key``/
+    ``require_ack``/``capabilities`` round-trip verbatim to the remote so
+    Manager-side correlation is preserved (session_key must NOT collapse
+    to None on the wire).
+    """
     req: dict[str, Any] = {
         "wire_version": wire_version,
         "command": command,
@@ -275,6 +290,15 @@ def make_request(
             req["resume_session_id"] = session_id
         req["skip_permissions"] = skip_permissions
         req["timeout"] = timeout
+        # v2 correlation fields — always present so the remote never
+        # guesses about them.
+        req["session_key"] = session_key or ""
+        req["request_id"] = request_id
+        req["run_id"] = run_id
+        req["review_key"] = review_key
+        req["require_ack"] = require_ack
+        if capabilities:
+            req["capabilities"] = list(capabilities)
     return req
 
 
@@ -285,12 +309,20 @@ def make_stream_request(
     timeout: int = DEFAULT_EXEC_TIMEOUT,
     request_id: str = "",
     wire_version: int = WIRE_VERSION,
+    stream_kind: str = "mailbox",
+    runtime_id: str = "",
+    agent_id: str = "",
 ) -> dict[str, Any]:
     """Build a stream subscription request.
 
     ``cursor`` is an opaque resume token — pass ``"0"`` for a fresh
     subscription or the last received cursor to resume after reconnect.
     ``request_id`` correlates the response; auto-generated if empty.
+
+    v2: ``stream_kind`` selects the event source — ``"mailbox"`` (inbox
+    cursor), ``"runtime"`` (local Gateway EventStore), or ``"all"``
+    (composite base64url cursor). ``runtime_id``/``agent_id`` filter the
+    runtime/request scope.
     """
     import uuid
     req: dict[str, Any] = {
@@ -300,7 +332,12 @@ def make_stream_request(
         "cursor": cursor,
         "timeout": timeout,
         "request_id": request_id or uuid.uuid4().hex[:12],
+        "stream_kind": stream_kind,
     }
+    if runtime_id:
+        req["runtime_id"] = runtime_id
+    if agent_id:
+        req["agent_id"] = agent_id
     return req
 
 
@@ -403,3 +440,46 @@ def make_stream_event(
         "cursor": cursor,
         "payload": payload,
     }
+
+
+# ── composite stream cursor (stream_kind="all") ────────────────────────
+
+import base64
+import json as _json
+
+COMPOSITE_CURSOR_VERSION = 2
+
+
+def make_composite_cursor(mailbox_cursor: str, runtime_event_id: int = 0) -> str:
+    """Encode a composite (mailbox + runtime) cursor as base64url JSON.
+
+    The CLIENT treats this as opaque — it only stores and returns it.
+    Only the server parses the inner fields.
+    """
+    obj = {
+        "v": COMPOSITE_CURSOR_VERSION,
+        "mailbox": mailbox_cursor or "0",
+        "runtime": int(runtime_event_id or 0),
+    }
+    raw = _json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def split_composite_cursor(cursor: str) -> tuple[str, int]:
+    """Parse a composite cursor into (mailbox_cursor, runtime_event_id).
+
+    Tries the composite format first; anything that does not decode to a
+    v2 composite object (e.g. legacy "epoch/seq" mailbox cursors) is
+    treated as a plain mailbox cursor.
+    """
+    if not cursor or not isinstance(cursor, str):
+        return "0", 0
+    try:
+        padded = cursor.encode("ascii") + b"=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded)
+        obj = _json.loads(raw.decode("utf-8"))
+        if obj.get("v") == COMPOSITE_CURSOR_VERSION:
+            return str(obj.get("mailbox", "0")), int(obj.get("runtime", 0))
+    except Exception:
+        pass
+    return cursor, 0
