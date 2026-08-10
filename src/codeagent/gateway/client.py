@@ -85,7 +85,7 @@ class GatewayClient:
 def rpc_stdio(socket_path: Optional[Path] = None) -> int:
     """SSH-bounded RPC: read one GatewayRequest from stdin, emit one response.
 
-    Used by ``codeagent gateway rpc --stdio`` over an SSH ControlMaster —
+    Used by ``postmesh gateway rpc --stdio`` over an SSH ControlMaster —
     a bounded control call, never a long-lived stream.
     """
     line = sys.stdin.readline()

@@ -517,7 +517,7 @@ def _is_ssh_error(stderr: str) -> bool:
 
 
 class SSHStream:
-    """Bidirectional JSONL stream to a remote ``codeagent remote-exec serve``.
+    """Bidirectional JSONL stream to a remote ``postmesh remote-exec serve``.
 
     Spawns ``ssh <host> postmesh-remote-exec`` (which enters serve mode
     automatically when ``stream`` is requested), keeps stdin/stdout open,

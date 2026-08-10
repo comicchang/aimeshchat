@@ -3,7 +3,7 @@
 - ``gateway start``  — spawn the gateway inside a private tmux pane (idempotent:
   an already-handshaking UDS returns success; a stale socket is only removed
   when same-UID, connect fails AND the tmux session is not alive).
-- ``gateway ensure`` — (P3) verify a remote host's codeagent/wire/tmux, then
+- ``gateway ensure`` — (P3) verify a remote host's postmesh/wire/tmux, then
   start its gateway over SSH.
 - ``gateway serve``  — foreground gateway process (the tmux pane's command).
 - ``gateway rpc --stdio`` — SSH-bounded control: one request in, one response out.
@@ -147,7 +147,7 @@ def _tmux_new_gateway_pane() -> tuple[int, str, str]:
 
 
 def cmd_gateway_ensure(args) -> int:
-    """Verify a remote host (codeagent/wire/tmux), then start its gateway over SSH.
+    """Verify a remote host (postmesh/wire/tmux), then start its gateway over SSH.
 
     Remote wire < 2 → REMOTE_UPGRADE_REQUIRED (no legacy fallback).
     Missing OMP/OpenCode only disables that runtime capability.

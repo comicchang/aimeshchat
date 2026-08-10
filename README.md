@@ -1,4 +1,4 @@
-# codeagent
+# postmesh
 
 Multi-host code agent orchestration with SSH, session persistence, and routing.
 
@@ -223,14 +223,14 @@ postmesh ssh warm dev-server build-box
 
 # Check status
 postmesh ssh status
-#   dev-server: alive (/run/user/1000/codeagent/ssh/abc123.sock)
+#   dev-server: alive (/run/user/1000/postmesh/ssh/abc123.sock)
 #   build-box: dead
 
 # Close connections
 postmesh ssh stop dev-server
 ```
 
-Socket path: `$XDG_RUNTIME_DIR/codeagent/ssh/<host-hash>.sock`
+Socket path: `$XDG_RUNTIME_DIR/postmesh/ssh/<host-hash>.sock`
 
 ## Architecture
 

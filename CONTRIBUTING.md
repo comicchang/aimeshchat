@@ -1,4 +1,4 @@
-# codeagent-py 贡献规范
+# postmesh-py 贡献规范
 
 ## 脱敏规则（硬性）
 

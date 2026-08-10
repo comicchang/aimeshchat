@@ -46,26 +46,26 @@ def _xdg_dir(env_var: str, default_suffix: str) -> Path:
 
 
 def config_dir() -> Path:
-    """Return the codeagent configuration directory.
+    """Return the postmesh configuration directory.
 
-    ``$XDG_CONFIG_HOME/codeagent`` or ``~/.config/codeagent``.
+    ``$XDG_CONFIG_HOME/postmesh`` or ``~/.config/postmesh``.
     """
     return _xdg_dir("XDG_CONFIG_HOME", ".config") / "postmesh"
 
 
 def state_dir() -> Path:
-    """Return the codeagent state directory.
+    """Return the postmesh state directory.
 
-    ``$XDG_STATE_HOME/codeagent`` or ``~/.local/state/codeagent``.
+    ``$XDG_STATE_HOME/postmesh`` or ``~/.local/state/postmesh``.
     """
     return _xdg_dir("XDG_STATE_HOME", ".local/state") / "postmesh"
 
 
 def runtime_dir() -> Path:
-    """Return the codeagent runtime directory for ephemeral files.
+    """Return the postmesh runtime directory for ephemeral files.
 
-    ``$XDG_RUNTIME_DIR/codeagent`` if set, otherwise
-    ``$TMPDIR/codeagent-$UID`` (or ``/tmp/codeagent-$UID`` as a last resort).
+    ``$XDG_RUNTIME_DIR/postmesh`` if set, otherwise
+    ``$TMPDIR/postmesh-$UID`` (or ``/tmp/postmesh-$UID`` as a last resort).
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:

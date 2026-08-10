@@ -1,8 +1,8 @@
 """SSH ControlMaster socket management.
 
 Each remote host gets an independent SSH ControlMaster socket.
-Socket path: ``$XDG_RUNTIME_DIR/codeagent/ssh/<host-hash>.sock``
-Fallback:    ``$TMPDIR/codeagent-<UID>/ssh/<host-hash>.sock``
+Socket path: ``$XDG_RUNTIME_DIR/postmesh/ssh/<host-hash>.sock``
+Fallback:    ``$TMPDIR/postmesh-<UID>/ssh/<host-hash>.sock``
 
 The *host-hash* is a stable 12-char hex digest of the SSH alias,
 so different aliases never share a socket.

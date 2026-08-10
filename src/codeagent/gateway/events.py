@@ -38,7 +38,7 @@ TOOL_UPDATE_RETENTION_DAYS = 7
 
 
 def gateway_state_dir() -> Path:
-    """$XDG_DATA_HOME/codeagent/gateway — control socket + event db live here."""
+    """$XDG_DATA_HOME/postmesh/gateway — control socket + event db live here."""
     xdg = os.environ.get("XDG_DATA_HOME")
     base = Path(xdg) if xdg else Path.home() / ".local" / "share"
     return base / "postmesh" / "gateway"

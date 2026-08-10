@@ -31,4 +31,4 @@
 - avg_park_duration（平均 park 时长）
 - revive_success_rate（hot revive 成功率）
 - warm_cold_degradation_rate（降级率）
-- metrics.jsonl 存放路径：~/.local/share/codeagent/park/metrics.jsonl
+- metrics.jsonl 存放路径：~/.local/share/postmesh/park/metrics.jsonl

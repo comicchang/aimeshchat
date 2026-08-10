@@ -9,7 +9,7 @@
 |------|----------|----------|
 | session manifest（roster/ACL/manager） | `session.json` | gateway 重启直接读取（kernel `_load_persisted_sessions`） |
 | park 实例 | ParkRegistry SQLite（`park.sqlite3` WAL） | gateway 重启扫描 `list_active()` 重建 `_runtimes`（A3） |
-| hub peer 映射 | `~/.local/share/codeagent/gateway/peers.json`（原子写） | gateway 重启从 peers.json 恢复（F2） |
+| hub peer 映射 | `~/.local/share/postmesh/gateway/peers.json`（原子写） | gateway 重启从 peers.json 恢复（F2） |
 | runtime liveness | **内存态**（进程级心跳） | 插件重注册（OMP session_start / opencode heartbeat）+ ParkRegistry 恢复 |
 | EventStore 事件 | SQLite WAL（`events.sqlite3`） | 永久保留（cursor 补流）；tool update 明细 7 天 sweep |
 | write.merge 记录 | **内存态** `_merges` | 重启丢失（可接受：merge 是一次性操作，冲突由 sha256 重新检测） |

@@ -8,7 +8,7 @@ Two modes:
   - **Watch mode** (local): polls a local mailbox inbox directory
     using stat-based mtime detection (stdlib only, no watchdog dep).
   - **Stream mode** (remote): opens an SSHStream to a remote host
-    running ``codeagent remote-exec serve`` and processes incoming
+    running ``postmesh remote-exec serve`` and processes incoming
     ``MSG_STREAM_EVENT`` frames pushed by the server.
 
 Lifecycle::
@@ -140,7 +140,7 @@ class SwarmReceiver:
     ) -> None:
         """Open an SSHStream to the remote host and start receiving events.
 
-        The remote host must be running ``codeagent remote-exec serve``
+        The remote host must be running ``postmesh remote-exec serve``
         with a stream subscription for this session/agent.
 
         Parameters
