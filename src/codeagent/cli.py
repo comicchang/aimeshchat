@@ -1,4 +1,4 @@
-"""CLI facade — unified entry point for all codeagent commands."""
+"""CLI facade — unified entry point for all postmesh commands."""
 from __future__ import annotations
 
 from codeagent.artifact import ArtifactDescriptor, pull_artifact, verify_artifact, validate_descriptor
@@ -1606,7 +1606,7 @@ def _cmd_park(args: argparse.Namespace) -> int:
     cmd = args.park_cmd
 
     if cmd is None:
-        print("park: missing subcommand. Try: codeagent park list|info|revive|release|sweep")
+        print("park: missing subcommand. Try: postmesh park list|info|revive|release|sweep")
         return 1
 
     if cmd == "list":
@@ -1767,7 +1767,7 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
 
     cmd = args.gw_cmd
     if cmd is None:
-        print("gateway: missing subcommand. Try: codeagent gateway start|ensure|status|stop|serve|rpc", file=sys.stderr)
+        print("gateway: missing subcommand. Try: postmesh gateway start|ensure|status|stop|serve|rpc", file=sys.stderr)
         return 1
     handlers = {
         "start": gw_cli.cmd_gateway_start,
@@ -1786,7 +1786,7 @@ def _cmd_events(args: argparse.Namespace) -> int:
 
     if args.ev_cmd == "watch":
         return gw_cli.cmd_events_watch(args)
-    print("events: missing subcommand. Try: codeagent events watch", file=sys.stderr)
+    print("events: missing subcommand. Try: postmesh events watch", file=sys.stderr)
     return 1
 
 
@@ -1809,7 +1809,7 @@ def _cmd_runtime(args: argparse.Namespace) -> int:
     except GatewayError as exc:
         print(f"error: {exc.message}", file=sys.stderr)
         return 1
-    print("runtime: missing subcommand. Try: codeagent runtime status|stop", file=sys.stderr)
+    print("runtime: missing subcommand. Try: postmesh runtime status|stop", file=sys.stderr)
     return 1
 
 
@@ -1826,7 +1826,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
 
     cmd = args.ora_cmd
     if cmd is None:
-        print("oracle: missing subcommand. Try: codeagent oracle start|ask|status|watch|release|result", file=sys.stderr)
+        print("oracle: missing subcommand. Try: postmesh oracle start|ask|status|watch|release|result", file=sys.stderr)
         return 1
     handlers = {
         "start": cmd_oracle_start,

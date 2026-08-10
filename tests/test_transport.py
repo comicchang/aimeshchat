@@ -421,7 +421,7 @@ class TestControlMaster:
 
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
         d = cm_mod._socket_dir()
-        assert d == tmp_path / "codeagent" / "ssh"
+        assert d == tmp_path / "postmesh" / "ssh"
         assert d.exists()
 
     def test_socket_dir_chmod_failure_ok(self, tmp_path: Path, monkeypatch):

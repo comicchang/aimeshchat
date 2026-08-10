@@ -28,7 +28,7 @@ from codeagent.constants import ISO_TIMESTAMP_FORMAT
 
 log = logging.getLogger(__name__)
 
-TMUX_SOCKET_DIR_ENV = "CODAGENT_TMUX_SOCKET_DIR"
+TMUX_SOCKET_DIR_ENV = "POSTMESH_TMUX_SOCKET_DIR"
 TMUX_SESSION_NAME = "codeagent-gateway"
 
 

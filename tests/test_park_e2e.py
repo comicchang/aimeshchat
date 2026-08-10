@@ -35,13 +35,13 @@ from codeagent.park.metrics import log_event, read_metrics, compute_stats
 
 
 def _clean():
-    db = _test_tmpdir / "state" / "codeagent" / "park" / "park.sqlite3"
+    db = _test_tmpdir / "state" / "postmesh" / "park" / "park.sqlite3"
     if db.exists():
         db.unlink()
-    snap_dir = _test_tmpdir / "data" / "codeagent" / "park" / "snapshots"
+    snap_dir = _test_tmpdir / "data" / "postmesh" / "park" / "snapshots"
     if snap_dir.exists():
         shutil.rmtree(snap_dir)
-    metrics = _test_tmpdir / "data" / "codeagent" / "park" / "metrics.jsonl"
+    metrics = _test_tmpdir / "data" / "postmesh" / "park" / "metrics.jsonl"
     if metrics.exists():
         metrics.unlink()
 

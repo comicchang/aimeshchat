@@ -321,8 +321,8 @@ def main(argv: list[str] | None = None) -> int:
     # Spec-provided env (e.g. OMP_MEMORY_CONFIG_PATH from oracle start).
     for k, v in spec.env.items():
         env[k] = v
-    env.setdefault("CODAGENT_RUNTIME_ID", spec.runtime_id)
-    env.setdefault("CODAGENT_GATEWAY_SOCKET", spec.gateway_socket)
+    env.setdefault("POSTMESH_RUNTIME_ID", spec.runtime_id)
+    env.setdefault("POSTMESH_GATEWAY_SOCKET", spec.gateway_socket)
     if spec.review_key:
         env.setdefault("REVIEW_KEY", spec.review_key)
     if spec.session_id:
@@ -365,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
             env["OMP_MAILBOX_NONCE"] = spec.nonce
         # Runtime adapter mode for the plugin.
         env["CODEAGENT_ROLE"] = "oracle" if spec.agent_id.startswith("oracle") else "worker"
-        env["CODAGENT_GATEWAY_SOCKET"] = spec.gateway_socket
+        env["POSTMESH_GATEWAY_SOCKET"] = spec.gateway_socket
 
     log_path = d / f"{spec.runtime_id}.log"
     try:

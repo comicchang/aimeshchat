@@ -238,7 +238,7 @@ class TestResolveRoot:
 
         monkeypatch.delenv("MAILBOX_ROOT", raising=False)
         monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-        assert resolve_root() == Path.home() / ".local" / "share" / "codeagent" / "mailbox"
+        assert resolve_root() == Path.home() / ".local" / "share" / "postmesh" / "mailbox"
 
     def test_env_override(self, tmp_path, monkeypatch):
         from codeagent.mailbox.store import resolve_root
@@ -251,7 +251,7 @@ class TestResolveRoot:
 
         monkeypatch.delenv("MAILBOX_ROOT", raising=False)
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-        assert resolve_root() == tmp_path / "codeagent" / "mailbox"
+        assert resolve_root() == tmp_path / "postmesh" / "mailbox"
 
 
 # ── TestReadSession ──────────────────────────────────────────────────────
