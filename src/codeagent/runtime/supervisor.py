@@ -153,7 +153,7 @@ def write_spec(spec: RuntimeSpec, dir: Optional[Path] = None) -> Path:
 def _runtime_dir(runtime_id: str) -> Path:
     xdg = os.environ.get("XDG_STATE_HOME")
     base = Path(xdg) if xdg else Path.home() / ".local" / "state"
-    d = base / "codeagent" / "runtime" / runtime_id
+    d = base / "postmesh" / "runtime" / runtime_id
     d.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(d, 0o700)

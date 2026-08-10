@@ -47,10 +47,10 @@ def _socket_dir() -> Path:
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
-        d = Path(xdg) / "codeagent" / "ssh"
+        d = Path(xdg) / "postmesh" / "ssh"
     else:
         uid = os.getuid()
-        d = Path(os.environ.get("TMPDIR", "/tmp")) / f"codeagent-{uid}" / "ssh"
+        d = Path(os.environ.get("TMPDIR", "/tmp")) / f"postmesh-{uid}" / "ssh"
     d.mkdir(parents=True, exist_ok=True)
     # Ensure restrictive permissions (0700) even if directory existed before.
     try:
