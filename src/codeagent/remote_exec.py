@@ -633,14 +633,14 @@ def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--help" in argv or "-h" in argv:
         print(
-            "usage: codeagent-remote-exec [--version]\n\n"
+            "usage: postmesh-remote-exec [--version]\n\n"
             "Remote execution helper — reads JSONL requests from stdin, "
             "writes JSONL responses to stdout (wire protocol).\n"
             "Commands over stdin: ping, capabilities, run, mailbox, stream."
         )
         return
     if "--version" in argv:
-        print(f"codeagent-remote-exec {__version__}")
+        print(f"postmesh-remote-exec {__version__}")
         return
 
     _send({"type": "ready", "wire_version": WIRE_VERSION, "package_version": __version__})

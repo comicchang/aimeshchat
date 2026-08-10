@@ -49,7 +49,7 @@ def _get_transport(host: HostSpec, repo_map=None):
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("meshkit", description="Multi-host code agent orchestration")
+    p = argparse.ArgumentParser("postmesh", description="Multi-host code agent orchestration")
     p.add_argument("--version", "-v", action="version", version=f"%(prog)s {__version__}")
 
     sub = p.add_subparsers(dest="command")
@@ -881,7 +881,7 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
             # session-init on remote host
             cmd = [
-                "meshkit", "mailbox", "session-init",
+                "postmesh", "mailbox", "session-init",
                 "--host", host,
                 "--session", args.session_id,
                 "--manager", manager,
@@ -905,7 +905,7 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
             init_run_id = f"run-{_uuid.uuid4().hex[:12]}"
             init_req_id = f"req-{_uuid.uuid4().hex[:12]}"
             cmd = [
-                "meshkit", "mailbox", "send",
+                "postmesh", "mailbox", "send",
                 "--host", host,
                 "--session", args.session_id,
                 "--to", agent,
@@ -1106,7 +1106,7 @@ def _execute(request: RunRequest, target: Target, registry: SessionRegistry, rep
                 try:
                     subprocess.run(
                         [
-                            "meshkit", "park", "acquire",
+                            "postmesh", "park", "acquire",
                             ns_key, "--agent-type", request.agent,
                             "--backend-id", result.session_id,
                             "--peer-id", result.session_id,

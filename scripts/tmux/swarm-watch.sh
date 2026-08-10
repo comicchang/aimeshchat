@@ -4,8 +4,8 @@
 # Usage:
 #   ./scripts/tmux/swarm-watch.sh <session_id> <agent_id> [interval] [pane_name]
 #
-# Opens a new tmux window (or pane) running `meshkit swarm watch` in a loop.
-# Requires: meshkit on PATH, tmux.
+# Opens a new tmux window (or pane) running `postmesh swarm watch` in a loop.
+# Requires: postmesh on PATH, tmux.
 
 set -euo pipefail
 
@@ -15,8 +15,8 @@ INTERVAL="${3:-5}"
 PANE_NAME="${4:-swarm-watch-${AGENT_ID}}"
 
 # Check prerequisites
-if ! command -v meshkit >/dev/null 2>&1; then
-    echo "error: meshkit not found on PATH" >&2
+if ! command -v postmesh >/dev/null 2>&1; then
+    echo "error: postmesh not found on PATH" >&2
     exit 1
 fi
 
@@ -26,7 +26,7 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 # If already inside tmux, split the current window; otherwise create a new session
-CMD="codeagent swarm watch ${SESSION_ID} --agent ${AGENT_ID} --interval ${INTERVAL}"
+CMD="postmesh swarm watch ${SESSION_ID} --agent ${AGENT_ID} --interval ${INTERVAL}"
 
 if [ -n "${TMUX:-}" ]; then
     # Already inside tmux — split the current pane

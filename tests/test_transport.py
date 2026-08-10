@@ -1045,7 +1045,7 @@ class TestSSHTransport:
         assert args[0] == "sh"
         assert args[1] == "-c"
         assert "source ~/.zshrc &&" in args[2]
-        assert "codeagent-remote-exec" in args[2]
+        assert "postmesh-remote-exec" in args[2]
 
     @patch("codeagent.transport.ssh.ControlMaster")
     @patch("subprocess.Popen")
@@ -1578,4 +1578,4 @@ class TestRelayTransport:
         assert "relay-login" in cmd
         assert "dev.example.com" in cmd
         assert "base64 -d" in cmd
-        assert "codeagent-remote-exec" in cmd
+        assert "postmesh-remote-exec" in cmd

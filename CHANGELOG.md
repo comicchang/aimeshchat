@@ -4,6 +4,18 @@ All notable changes to **codeagent** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] — 2026-08-11
+
+### Changed
+
+- **feat: 品牌统一改名 postmesh** — CLI binaries renamed `meshkit` →
+  `postmesh` and `meshkit-remote-exec` → `postmesh-remote-exec` (GitHub repo
+  becomes `comicchang/postmesh-py`). The Python package `codeagent` is
+  unchanged: module paths (`codeagent.cli`, `codeagent.remote_exec`),
+  `python -m codeagent.remote_exec`, and the `uv tool` install name
+  `codeagent` all stay. `mailbox` / `mailbox-hook` / `mailbox-health` are
+  kept as brand-neutral primitives.
+
 ## [Unreleased]
 
 ### v0.2.2 — B1/B2/B4 + P0 协议不变量（2026-08-03）
@@ -176,7 +188,7 @@ Initial public release of `codeagent-py` — multi-host code agent orchestration
 - **Wire protocol** (`codeagent.wire`): versioned JSONL protocol with
   `ready`/`accepted`/`session`/`result`/`error`/`mailbox_request` messages,
   max line length enforcement, and version-mismatch fail-closed.
-- **Entry points**: `codeagent`, `codeagent-remote-exec`, `mailbox`,
+- **Entry points**: `codeagent`, `meshkit-remote-exec`, `mailbox`,
   `mailbox-hook`, `mailbox-health`.
 
 ### Fixed

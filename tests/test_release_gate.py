@@ -64,17 +64,17 @@ def _localhost_ssh_available() -> bool:
 
 
 def _remote_exec_available() -> bool:
-    """Return True if codeagent-remote-exec is accessible via localhost SSH."""
+    """Return True if postmesh-remote-exec is accessible via localhost SSH."""
     if not _localhost_ssh_available():
         return False
-    # Check if codeagent-remote-exec is on the SSH session PATH
+    # Check if postmesh-remote-exec is on the SSH session PATH
     # (non-interactive SSH omits ~/.local/bin — same gap dotai setup's
     # shell_prefix fills on real hosts; prepend it here for parity)
     try:
         r = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
              "localhost",
-             "export PATH=$HOME/.local/bin:$PATH; codeagent-remote-exec --help"],
+             "export PATH=$HOME/.local/bin:$PATH; postmesh-remote-exec --help"],
             capture_output=True, timeout=10,
         )
         if r.returncode == 0:
@@ -95,7 +95,7 @@ def _remote_exec_available() -> bool:
 
 requires_localhost_ssh = pytest.mark.skipif(
     not _remote_exec_available(),
-    reason="localhost SSH or codeagent-remote-exec not available",
+    reason="localhost SSH or postmesh-remote-exec not available",
 )
 
 
@@ -533,7 +533,7 @@ class TestTmuxOMPHooks:
         script = (Path(__file__).resolve().parent.parent
                   / "scripts" / "tmux" / "swarm-watch.sh")
         content = script.read_text()
-        assert "codeagent swarm watch" in content
+        assert "postmesh swarm watch" in content
         assert "SESSION_ID" in content
 
     def test_swarm_hooks_importable(self) -> None:

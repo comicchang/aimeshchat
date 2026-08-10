@@ -6,31 +6,31 @@
 
 Remote mode applies when Workers are on hosts **without shared filesystem access** to the Manager's mailbox root. All communication crosses a host boundary via SSH transport.
 
-**v2 control plane（跨设备 runtime）优先**：Manager 先用 `meshkit gateway ensure --host <H>` 预检（wire v2 / tmux / 架构）并启动远端 gateway，然后 session.ensure / runtime.spawn / runtime.send 走 SSH ControlMaster 单次 `gateway rpc --stdio`；mailbox + RuntimeEvent 走长期 SSHStream 回流。远端永不反向连接 Manager、不开放端口。
+**v2 control plane（跨设备 runtime）优先**：Manager 先用 `postmesh gateway ensure --host <H>` 预检（wire v2 / tmux / 架构）并启动远端 gateway，然后 session.ensure / runtime.spawn / runtime.send 走 SSH ControlMaster 单次 `gateway rpc --stdio`；mailbox + RuntimeEvent 走长期 SSHStream 回流。远端永不反向连接 Manager、不开放端口。
 
-**leaf transport（纯 mailbox 消息）**：`meshkit mailbox <subcommand> ... --host <H>` 仍是跨主机 mailbox 消息传输原语。
+**leaf transport（纯 mailbox 消息）**：`postmesh mailbox <subcommand> ... --host <H>` 仍是跨主机 mailbox 消息传输原语。
 
 ### What IS the transport
 
 | Command | Scope | Notes |
 |---|---|---|
-| `meshkit mailbox read --session <id> --agent <a> --owner <a> --host <H>` | cross-host | Manager reads Worker's host-local inbox |
-| `meshkit mailbox peek --session <id> --agent <a> --host <H>` | cross-host | non-destructive inbox count |
-| `meshkit mailbox stats --session <id> --agent <a> --host <H>` | cross-host | 4-dir stats (inbox/processing/archive/_corrupt) |
-| `meshkit mailbox send --host <H> ...` | cross-host | push a message to remote host's local mailbox CLI |
-| `meshkit mailbox stats --session <id> --agent <a> --host <H>` | cross-host | read inbox/processing/archive/_corrupt counts (read-only) |
-| `meshkit mailbox status --session <id> --agent <a> --host <H> ...` | cross-host | **write-only** status update (IDLE/BUSY/DONE/BLOCKED); not a read command |
-| `meshkit swarm direct <s> --from X --to <a> --kind TASK ...` | local | SessionManifest-aware routing, local kernel delivery |
+| `postmesh mailbox read --session <id> --agent <a> --owner <a> --host <H>` | cross-host | Manager reads Worker's host-local inbox |
+| `postmesh mailbox peek --session <id> --agent <a> --host <H>` | cross-host | non-destructive inbox count |
+| `postmesh mailbox stats --session <id> --agent <a> --host <H>` | cross-host | 4-dir stats (inbox/processing/archive/_corrupt) |
+| `postmesh mailbox send --host <H> ...` | cross-host | push a message to remote host's local mailbox CLI |
+| `postmesh mailbox stats --session <id> --agent <a> --host <H>` | cross-host | read inbox/processing/archive/_corrupt counts (read-only) |
+| `postmesh mailbox status --session <id> --agent <a> --host <H> ...` | cross-host | **write-only** status update (IDLE/BUSY/DONE/BLOCKED); not a read command |
+| `postmesh swarm direct <s> --from X --to <a> --kind TASK ...` | local | SessionManifest-aware routing, local kernel delivery |
 
 ### What does NOT exist (never use)
 
 | Phantom command | Real replacement | Why it fails |
 |---|---|---|
-| `meshkit swarm send ...` | `meshkit swarm direct ...` | `send` is not a subcommand; `direct` is the real dispatch command |
-| `meshkit swarm poll --session ... --host <H>` | `meshkit mailbox read --host <H>` | `poll` is local-only; no `--host` flag |
-| `meshkit swarm status --host <H>` | `meshkit mailbox stats --host <H>` | `status` is local-only; use `mailbox stats` for cross-host counts |
-| `meshkit manager-poll` | `meshkit mailbox read --host <H>` | not a real subcommand |
-| `meshkit swarm status --all-hosts` | iterate hosts with `mailbox stats --host <H>` | not a real subcommand |
+| `postmesh swarm send ...` | `postmesh swarm direct ...` | `send` is not a subcommand; `direct` is the real dispatch command |
+| `postmesh swarm poll --session ... --host <H>` | `postmesh mailbox read --host <H>` | `poll` is local-only; no `--host` flag |
+| `postmesh swarm status --host <H>` | `postmesh mailbox stats --host <H>` | `status` is local-only; use `mailbox stats` for cross-host counts |
+| `postmesh manager-poll` | `postmesh mailbox read --host <H>` | not a real subcommand |
+| `postmesh swarm status --all-hosts` | iterate hosts with `mailbox stats --host <H>` | not a real subcommand |
 | `tmux send-keys` on remote Workers | n/a | no shared tmux socket across hosts |
 
 ## 2. Execution Mode
@@ -80,7 +80,7 @@ Both Manager→Worker and Worker→Manager SSH are available.
 
 - Workers can write directly to Manager's host-local mailbox.
 - Manager can read Worker's host-local mailbox.
-- Both sides use `meshkit mailbox ... --host <H>`.
+- Both sides use `postmesh mailbox ... --host <H>`.
 - Suitable for `mailbox-worker` execution mode.
 
 ### Profile C: Manager-Pull (default for cross-host)
@@ -106,7 +106,7 @@ Manager-pull uses a "push task, pull results" pattern:
 ### Step 1: Manager pushes TASK to Worker host
 
 ```bash
-meshkit mailbox send \
+postmesh mailbox send \
   --session <session-id> --from manager --to <worker-id> \
   --kind TASK --subject "<subject>" --body "<body>" \
   --host <worker-host>
@@ -138,7 +138,7 @@ mailbox send \
 ### Step 4: Manager pulls REPORT from Worker host
 
 ```bash
-meshkit mailbox read \
+postmesh mailbox read \
   --session <session-id> --agent manager --owner manager \
   --host <worker-host>
 ```
@@ -147,10 +147,10 @@ Manager uses `--host <H>` to SSH into the Worker host and read from the Manager'
 
 ```bash
 # Claim from remote host
-meshkit mailbox read --session <session-id> --agent manager --owner manager --host <H> --json
+postmesh mailbox read --session <session-id> --agent manager --owner manager --host <H> --json
 # ... verify report ...
 # Finalize on remote host
-meshkit mailbox finalize --session <session-id> --agent manager --msg-id <id> --owner manager --host <H>
+postmesh mailbox finalize --session <session-id> --agent manager --msg-id <id> --owner manager --host <H>
 ```
 
 ### Worker status write (host-local)
@@ -168,14 +168,14 @@ Manager reads Worker status from the Worker's host:
 
 ```bash
 # Read inbox/processing/archive counts (cross-host stats)
-meshkit mailbox stats --session <session-id> --agent <worker-id> --host <worker-host>
+postmesh mailbox stats --session <session-id> --agent <worker-id> --host <worker-host>
 ```
 
 ### Key constraint
 
 Worker MUST NOT attempt reverse SSH to Manager. The host-local Manager inbox is the **only** return path in manager-pull mode. `send-keys` is impossible (no shared tmux socket). No other transport exists.
 
-**Mailbox path resolution**: Worker uses bare `mailbox` CLI (local FS, no `--host`) for all reads, writes, and status updates on its own host. Manager uses `meshkit mailbox ... --host <H>` for all cross-host operations to the Worker's host. Never use `--host` on the Worker side or omit it on the Manager side when crossing host boundaries.
+**Mailbox path resolution**: Worker uses bare `mailbox` CLI (local FS, no `--host`) for all reads, writes, and status updates on its own host. Manager uses `postmesh mailbox ... --host <H>` for all cross-host operations to the Worker's host. Never use `--host` on the Worker side or omit it on the Manager side when crossing host boundaries.
 
 ## 5. Worker Startup by Execution Mode
 
@@ -185,7 +185,7 @@ Worker host runs a full OMP process with mailbox plugin. Standard INIT lifecycle
 
 ```bash
 # 1. Manager pushes INIT TASK to Worker host
-meshkit mailbox send \
+postmesh mailbox send \
   --session <session-id> --from manager --to <worker-id> \
   --kind TASK --subject "INIT" --body "<init-body>" \
   --host <worker-host>
@@ -199,7 +199,7 @@ mailbox status --session <session-id> --agent <worker-id> \
 mailbox finalize --session <session-id> --agent <worker-id> --msg-id <id> --owner <worker-id>
 
 # 3. Manager verifies Worker status (read stats from remote host)
-meshkit mailbox stats --session <session-id> --agent <worker-id> --host <worker-host>
+postmesh mailbox stats --session <session-id> --agent <worker-id> --host <worker-host>
 #    Expect: Worker processed INIT; state=IDLE visible in status.json on Worker host
 ```
 
@@ -259,7 +259,7 @@ An OMP plugin or adapter on the Worker host MAY provide `peek`-based notificatio
 
 ```bash
 # Check Worker inbox health from Manager host
-meshkit mailbox stats --session <session-id> --agent <worker-id> --host <worker-host>
+postmesh mailbox stats --session <session-id> --agent <worker-id> --host <worker-host>
 # Shows: inbox/processing/archive/_corrupt counts
 ```
 
@@ -274,7 +274,7 @@ Interpreting stats:
 Before launching remote Workers, verify:
 
 - [ ] **SSH connectivity**: `ssh <worker-host> echo ok` succeeds without interactive prompt
-- [ ] **CLI installed**: `ssh <worker-host> "which meshkit && meshkit --version"` returns expected version
+- [ ] **CLI installed**: `ssh <worker-host> "which postmesh && postmesh --version"` returns expected version
 - [ ] **Mailbox root exists**: `ssh <worker-host> "ls $MAILBOX_ROOT/<session-id>/"` shows expected directory structure (use the host's actual `MAILBOX_ROOT` or `resolve_root()`; never assume a fixed `.mailbox/` path)
 - [ ] **Roster registered**: `session.json` on Worker host includes the Worker's `agent_id` in agents list
 - [ ] **Execution mode consistent**: manifest declares correct `execution_mode` for this Worker
@@ -286,7 +286,7 @@ Before launching remote Workers, verify:
 
 ```bash
 # Manager checks Worker stats across hosts
-meshkit mailbox stats --session <session-id> --agent <worker-id> --host <worker-host>
+postmesh mailbox stats --session <session-id> --agent <worker-id> --host <worker-host>
 
 # STALE diagnosis: updated_at exceeds SLA
 # → check SSH connectivity, Worker process liveness, inbox count
@@ -295,10 +295,10 @@ meshkit mailbox stats --session <session-id> --agent <worker-id> --host <worker-
 
 ## 8. Runbook: 5-Worker Mixed Session
 
-> **Pre-conditions**: All commands below are verified against the installed CLI (`meshkit 0.2.5+`).
+> **Pre-conditions**: All commands below are verified against the installed CLI (`postmesh 0.2.5+`).
 > `create-session` requires `--manager` and `--members` flags (added by CLI fix subagent).
 > `swarm direct` requires `--run-id` / `--request-id` for envelope routing (added by CLI fix subagent).
-> Remote hosts MUST have `meshkit` in `PATH` and mailbox root directories writable by the SSH user.
+> Remote hosts MUST have `postmesh` in `PATH` and mailbox root directories writable by the SSH user.
 > Manager MUST have SSH access (`ControlMaster` preferred) to all worker hosts.
 
 Example: Manager on host `M` orchestrating 5 Workers across 3 remote hosts, using manager-pull return mode.
@@ -325,17 +325,17 @@ SID="run-$(date +%s)"
 # 1. Create session with roster
 #    --manager: the agent ID running on M
 #    --members: all agent IDs in this session (comma-separated)
-meshkit swarm create-session "$SID" \
+postmesh swarm create-session "$SID" \
   --manager manager \
   --members w-frontend,w-backend,w-reverse,w-docs,w-remote-analysis
 
 # 2. Register each worker's host + backend
 #    --backend: cli (mailbox-worker via CLI) or omp (OMP process)
-meshkit swarm register "$SID" --agent w-frontend        --host H1 --backend cli
-meshkit swarm register "$SID" --agent w-backend         --host H1 --backend cli
-meshkit swarm register "$SID" --agent w-reverse         --host H2 --backend cli
-meshkit swarm register "$SID" --agent w-docs            --host H2 --backend cli
-meshkit swarm register "$SID" --agent w-remote-analysis --host H3 --backend omp
+postmesh swarm register "$SID" --agent w-frontend        --host H1 --backend cli
+postmesh swarm register "$SID" --agent w-backend         --host H1 --backend cli
+postmesh swarm register "$SID" --agent w-reverse         --host H2 --backend cli
+postmesh swarm register "$SID" --agent w-docs            --host H2 --backend cli
+postmesh swarm register "$SID" --agent w-remote-analysis --host H3 --backend omp
 ```
 
 ---
@@ -345,15 +345,15 @@ meshkit swarm register "$SID" --agent w-remote-analysis --host H3 --backend omp
 ```bash
 # 1. Initialize mailbox session on each worker host
 #    Creates per-agent mailbox dirs + session.json on the remote host
-meshkit mailbox session-init --session "$SID" --manager manager \
+postmesh mailbox session-init --session "$SID" --manager manager \
   --agents w-frontend,w-backend --host H1
 
-meshkit mailbox session-init --session "$SID" --manager manager \
+postmesh mailbox session-init --session "$SID" --manager manager \
   --agents w-reverse,w-docs --host H2
 
 # 2. Preflight: SSH + CLI on all hosts
 for H in H1 H2 H3; do
-  ssh "$H" "meshkit --version" || echo "FAIL: $H missing meshkit"
+  ssh "$H" "postmesh --version" || echo "FAIL: $H missing postmesh"
 done
 
 # 3. Verify mailbox dirs exist on each host
@@ -373,20 +373,20 @@ INIT uses `mailbox send --host` for cross-host delivery, NOT `swarm direct` (whi
 
 ```bash
 # Push INIT TASK to each mailbox-worker on H1
-meshkit mailbox send --session "$SID" --from manager --to w-frontend \
+postmesh mailbox send --session "$SID" --from manager --to w-frontend \
   --kind TASK --subject "INIT" --body '{"agent_id":"w-frontend","role":"frontend-engineer"}' \
   --host H1
 
-meshkit mailbox send --session "$SID" --from manager --to w-backend \
+postmesh mailbox send --session "$SID" --from manager --to w-backend \
   --kind TASK --subject "INIT" --body '{"agent_id":"w-backend","role":"backend-engineer"}' \
   --host H1
 
 # Push INIT TASK to each mailbox-worker on H2
-meshkit mailbox send --session "$SID" --from manager --to w-reverse \
+postmesh mailbox send --session "$SID" --from manager --to w-reverse \
   --kind TASK --subject "INIT" --body '{"agent_id":"w-reverse","role":"reverse-engineer"}' \
   --host H2
 
-meshkit mailbox send --session "$SID" --from manager --to w-docs \
+postmesh mailbox send --session "$SID" --from manager --to w-docs \
   --kind TASK --subject "INIT" --body '{"agent_id":"w-docs","role":"docs-engineer"}' \
   --host H2
 
@@ -409,7 +409,7 @@ for H in H1 H2; do
       w-reverse|w-docs)     [ "$H" = "H2" ] || continue ;;
     esac
     echo "=== $W on $H ==="
-    meshkit mailbox stats --session "$SID" --agent "$W" --host "$H"
+    postmesh mailbox stats --session "$SID" --agent "$W" --host "$H"
   done
 done
 
@@ -425,22 +425,22 @@ done
 
 ```bash
 # 1. Push TASK to each mailbox-worker
-meshkit mailbox send --session "$SID" --from manager --to w-frontend \
+postmesh mailbox send --session "$SID" --from manager --to w-frontend \
   --kind TASK --subject "Implement login UI" \
   --body '{"task":"Build login form with OAuth2 buttons","run_id":"r1","request_id":"req1"}' \
   --host H1
 
-meshkit mailbox send --session "$SID" --from manager --to w-backend \
+postmesh mailbox send --session "$SID" --from manager --to w-backend \
   --kind TASK --subject "Auth API endpoints" \
   --body '{"task":"Implement /auth/login and /auth/callback","run_id":"r1","request_id":"req2"}' \
   --host H1
 
-meshkit mailbox send --session "$SID" --from manager --to w-reverse \
+postmesh mailbox send --session "$SID" --from manager --to w-reverse \
   --kind TASK --subject "Analyze binary X" \
   --body '{"task":"Reverse engineer /tmp/target.bin","run_id":"r1","request_id":"req3"}' \
   --host H2
 
-meshkit mailbox send --session "$SID" --from manager --to w-docs \
+postmesh mailbox send --session "$SID" --from manager --to w-docs \
   --kind TASK --subject "Write API docs" \
   --body '{"task":"Document /auth endpoints in OpenAPI 3.1","run_id":"r1","request_id":"req4"}' \
   --host H2
@@ -449,16 +449,16 @@ meshkit mailbox send --session "$SID" --from manager --to w-docs \
 
 # 2. Pull REPORT from each remote host
 #    Manager reads from its own inbox on the remote host (--agent manager --owner manager)
-meshkit mailbox read --session "$SID" --agent manager --owner manager --host H1 --json
-meshkit mailbox read --session "$SID" --agent manager --owner manager --host H2 --json
+postmesh mailbox read --session "$SID" --agent manager --owner manager --host H1 --json
+postmesh mailbox read --session "$SID" --agent manager --owner manager --host H2 --json
 
 # 3. Verify artifacts (if REPORT includes attachment refs)
-# meshkit artifact pull --host H1 --artifact-id <id> \
+# postmesh artifact pull --host H1 --artifact-id <id> \
 #   --relative-path output/result.tar.gz --size <bytes> --sha256 <hex> --dest ./artifacts/
 
 # 4. Finalize consumed messages on each host
-meshkit mailbox finalize --session "$SID" --agent manager --msg-id <report-msg-id> --owner manager --host H1
-meshkit mailbox finalize --session "$SID" --agent manager --msg-id <report-msg-id> --owner manager --host H2
+postmesh mailbox finalize --session "$SID" --agent manager --msg-id <report-msg-id> --owner manager --host H1
+postmesh mailbox finalize --session "$SID" --agent manager --msg-id <report-msg-id> --owner manager --host H2
 ```
 
 ---
@@ -488,10 +488,10 @@ The launcher reads `SessionManifest` (`session.json`) to extract the full worker
 For each host, the launcher creates mailbox dirs then sends INIT to every `mailbox-worker`:
 
 ```bash
-meshkit mailbox session-init --session "$SID" --manager manager \
+postmesh mailbox session-init --session "$SID" --manager manager \
   --agents w-frontend,w-backend --host H1
 
-meshkit mailbox send --session "$SID" --from manager --to w-frontend \
+postmesh mailbox send --session "$SID" --from manager --to w-frontend \
   --kind TASK --subject "INIT" --body '{"agent_id":"w-frontend","role":"..."}' --host H1
 
 # local-omp-mcp workers: launch omp-execd, no mailbox INIT
@@ -512,10 +512,10 @@ Once workers are IDLE, the launcher enters a pull loop per `manager-pull` host. 
 
 ```bash
 # Pull: claim pending messages from remote Manager inbox
-meshkit mailbox read --session "$SID" --agent manager --owner manager --host H1 --json
+postmesh mailbox read --session "$SID" --agent manager --owner manager --host H1 --json
 
 # Finalize after successful ingest
-meshkit mailbox finalize --session "$SID" --agent manager --msg-id <id> --owner manager --host H1
+postmesh mailbox finalize --session "$SID" --agent manager --msg-id <id> --owner manager --host H1
 ```
 
 Each poll cycle: `pull_remote` per host → `ingest` all returned messages → `replay` to reconstruct ordered history for in-flight requests. **Loop exits** when all workers report `state=DONE` and no remote Manager inboxes have unprocessed messages.

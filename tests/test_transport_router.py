@@ -275,7 +275,7 @@ class TestRelayTransportMailbox:
         argv = run_pty.call_args.args[0]
         assert argv[0] == "zsh"
         assert "base64 -d" in argv[2]
-        assert "codeagent-remote-exec" in argv[2]
+        assert "postmesh-remote-exec" in argv[2]
 
     def test_mailbox_relay_with_shell_prefix(self, tmp_path):
         """mailbox() includes shell_prefix in remote command."""

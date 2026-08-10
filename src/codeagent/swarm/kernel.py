@@ -893,7 +893,7 @@ class SwarmKernel:
             agent_mailbox_root = agent_loc.mailbox_root if agent_loc else ""
 
             cmd = [
-                "meshkit", "mailbox", "read",
+                "postmesh", "mailbox", "read",
                 "--session", session_id,
                 "--agent", manager_id,
                 "--owner", manager_id,
@@ -940,7 +940,7 @@ class SwarmKernel:
         if not msg_id:
             return
         finalize_cmd = [
-            "meshkit", "mailbox", "finalize",
+            "postmesh", "mailbox", "finalize",
             "--host", from_host,
             "--session", session_id,
             "--agent", manager_id,
@@ -967,7 +967,7 @@ class SwarmKernel:
     def release_remote(self, session_id: str, msg_id: str, from_host: str,
                        manager_id: str, mailbox_root: str = "") -> bool:
         """Release message back to remote inbox (on ingest/ACL failure)."""
-        cmd = ["meshkit", "mailbox", "release",
+        cmd = ["postmesh", "mailbox", "release",
                "--host", from_host, "--session", session_id,
                "--agent", manager_id, "--owner", manager_id,
                "--msg-id", msg_id]

@@ -65,11 +65,11 @@ def localhost_ssh() -> None:
 def _remote_exec_argv() -> list[str]:
     """Resolve the remote-exec helper for a localhost SSH session.
 
-    Prefers the installed ``codeagent-remote-exec`` entry point (its
+    Prefers the installed ``postmesh-remote-exec`` entry point (its
     shebang is absolute, so it works under the minimal PATH ssh
     provides); falls back to ``python -m codeagent.remote_exec``.
     """
-    entry = shutil.which("codeagent-remote-exec")
+    entry = shutil.which("postmesh-remote-exec")
     if entry:
         return [entry]
     return [sys.executable, "-m", "codeagent.remote_exec"]

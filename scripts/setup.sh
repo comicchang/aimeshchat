@@ -22,20 +22,20 @@ echo "  ✓ codeagent installed"
 
 # 2. Verify CLI
 echo "[2/3] Verifying CLI..."
-if ! codeagent --version >/dev/null 2>&1; then
-    echo "  ✗ codeagent not in PATH after install." >&2
+if ! postmesh --version >/dev/null 2>&1; then
+    echo "  ✗ postmesh not in PATH after install." >&2
     echo "  Run: export PATH=\"\$HOME/.local/bin:\$PATH\"" >&2
     exit 1
 fi
-echo "  ✓ $(codeagent --version)"
+echo "  ✓ $(postmesh --version)"
 
 # 3. Verify remote exec helper
 echo "[3/3] Verifying remote exec helper..."
-if ! codeagent-remote-exec --help >/dev/null 2>&1; then
-    echo "  ✗ codeagent-remote-exec not in PATH." >&2
+if ! postmesh-remote-exec --help >/dev/null 2>&1; then
+    echo "  ✗ postmesh-remote-exec not in PATH." >&2
     exit 1
 fi
-echo "  ✓ codeagent-remote-exec available"
+echo "  ✓ postmesh-remote-exec available"
 
 echo ""
 echo "=== Development setup complete ==="

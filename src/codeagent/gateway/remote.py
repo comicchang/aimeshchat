@@ -55,7 +55,7 @@ def remote_gateway_call(
         params=params or {},
     )
     prefix = shell_prefix or "export PATH=$HOME/.local/bin:$PATH"
-    remote_cmd = f"{prefix}; meshkit gateway rpc --stdio"
+    remote_cmd = f"{prefix}; postmesh gateway rpc --stdio"
     ssh_cmd = cm.ssh_cmd(remote_cmd)
 
     try:

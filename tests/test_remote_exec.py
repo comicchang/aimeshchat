@@ -360,13 +360,13 @@ class TestMainLoop:
         """--help must not hang the JSONL loop (dotai entrypoint check)."""
         main(["--help"])
         out = capsys.readouterr().out
-        assert "usage: codeagent-remote-exec" in out
+        assert "usage: postmesh-remote-exec" in out
 
     def test_main_version_exits_immediately(self, capsys):
         """--version prints package version without entering the loop."""
         main(["--version"])
         out = capsys.readouterr().out
-        assert out.strip().startswith("codeagent-remote-exec")
+        assert out.strip().startswith("postmesh-remote-exec")
 
     def test_main_no_args_sends_ready(self, monkeypatch, capsys):
         """Wire mode (no argv) still emits the ready banner."""

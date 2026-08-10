@@ -10,7 +10,7 @@ Unified CLI for executing AI code agents across local and remote machines, with 
 - **SSH transport**: Independent ControlMaster per host, no global ControlPersist changes
 - **Session persistence**: SQLite-backed registry, auto-resume by namespace key
 - **Topic routing**: repo-map.json maps topics to host/path, with local detection
-- **Remote helper**: `codeagent-remote-exec` console entrypoint, installed per host via `uv tool install`
+- **Remote helper**: `postmesh-remote-exec` console entrypoint, installed per host via `uv tool install`
 - **Mailbox IPC**: session-based direct-inbox for agent-to-agent communication (local + cross-host via SSH)
 - **Wire protocol**: JSONL over SSH stdin/stdout, no shell quoting issues
 - **Swarm IPC**: IRC-style kernel with session/roster/ACL/routing, delivery engine with durable outbox, real-time receiver (watch + stream modes), artifact transport
@@ -23,11 +23,11 @@ Zero runtime dependencies (stdlib only).
 ### One command
 
 ```bash
-uv tool install "git+https://github.com/comicchang/codeagent-py"
+uv tool install "git+https://github.com/comicchang/postmesh-py"
 ```
 
 Installs 5 entrypoints to `~/.local/bin` (ensure it's on your `PATH`).
-Only **two** matter: `codeagent` (the CLI) and `codeagent-remote-exec`
+Only **two** matter: `postmesh` (the CLI) and `postmesh-remote-exec`
 (the remote helper, auto-discovered over SSH on each host).
 `mailbox` / `mailbox-hook` / `mailbox-health` are authoritative mailbox
 management entrypoints (not shims).
@@ -38,7 +38,7 @@ no daemon, no shared filesystem, no service).
 ### Alternatives
 
 ```bash
-pip install "git+https://github.com/comicchang/codeagent-py"  # in a venv (PEP 668)
+pip install "git+https://github.com/comicchang/postmesh-py"  # in a venv (PEP 668)
 # or from source: git clone → uv tool install . --force
 ```
 
@@ -48,48 +48,48 @@ No config files needed — a swarm session is pure CLI:
 
 ```bash
 # 1. Start a session with 2 agents (manager + worker)
-codeagent swarm create-session s1 --manager mgr --members w1
-codeagent swarm register s1 --agent w1 --host __local__
+postmesh swarm create-session s1 --manager mgr --members w1
+postmesh swarm register s1 --agent w1 --host __local__
 
 # 2. Talk
-codeagent swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body "hello w1"
-codeagent swarm poll s1 --agent w1            # w1 reads its inbox
+postmesh swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body "hello w1"
+postmesh swarm poll s1 --agent w1            # w1 reads its inbox
 
 # 3. Broadcast / channel / notice / poll
-codeagent swarm broadcast s1 --from mgr --kind NOTICE --subject sync --body "everyone"
-codeagent swarm watch s1 --agent w1 --interval 2   # polling loop
+postmesh swarm broadcast s1 --from mgr --kind NOTICE --subject sync --body "everyone"
+postmesh swarm watch s1 --agent w1 --interval 2   # polling loop
 ```
 
 Cross-host: register the worker with its SSH host instead of `__local__`
 (`--host dev-server`) — delivery goes over SSH automatically, same commands.
 
 Optional: topic routing (`repo-map.json`) and model config (`models.json`)
-are only needed for `codeagent run`/`route` — see `examples/`.
+are only needed for `postmesh run`/`route` — see `examples/`.
 
 ## Usage
 
 ```bash
 # Local execution
-codeagent run "analyze the rendering pipeline"
+postmesh run "analyze the rendering pipeline"
 
 # SSH to remote host
-codeagent run "list all source files" ~/src/project --host dev-server
+postmesh run "list all source files" ~/src/project --host dev-server
 
 # Route via repo-map (topic → host → path)
-codeagent route MyTopic "analyze module X" --repo 0
-codeagent route list
-codeagent route where "MyTopic"
+postmesh route MyTopic "analyze module X" --repo 0
+postmesh route list
+postmesh route where "MyTopic"
 
 # Session management
-codeagent sessions list
-codeagent sessions show <key>
-codeagent sessions reset <key>
-codeagent sessions bind --key <k> --id <session-id>
+postmesh sessions list
+postmesh sessions show <key>
+postmesh sessions reset <key>
+postmesh sessions bind --key <k> --id <session-id>
 
 # SSH connection management
-codeagent ssh warm dev-server build-box
-codeagent ssh status
-codeagent ssh stop dev-server
+postmesh ssh warm dev-server build-box
+postmesh ssh status
+postmesh ssh stop dev-server
 ```
 
 ## Configuration
@@ -200,17 +200,17 @@ Sessions are auto-resumed by default. Key = `host:workdir:backend:agent`.
 
 ```bash
 # View all sessions
-codeagent sessions list
+postmesh sessions list
 
 # Filter by host or topic
-codeagent sessions list --host dev-server
-codeagent sessions list --topic MyTopic
+postmesh sessions list --host dev-server
+postmesh sessions list --topic MyTopic
 
 # Force new session (don't resume)
-codeagent run "start fresh analysis" --new-session
+postmesh run "start fresh analysis" --new-session
 
 # Manual session binding
-codeagent sessions bind --key "dev-server:/src:opencode:explore" --id abc123
+postmesh sessions bind --key "dev-server:/src:opencode:explore" --id abc123
 ```
 
 ## SSH Connection Management
@@ -219,15 +219,15 @@ ControlMaster sockets are managed independently per host:
 
 ```bash
 # Pre-establish connections (e.g., at session start)
-codeagent ssh warm dev-server build-box
+postmesh ssh warm dev-server build-box
 
 # Check status
-codeagent ssh status
+postmesh ssh status
 #   dev-server: alive (/run/user/1000/codeagent/ssh/abc123.sock)
 #   build-box: dead
 
 # Close connections
-codeagent ssh stop dev-server
+postmesh ssh stop dev-server
 ```
 
 Socket path: `$XDG_RUNTIME_DIR/codeagent/ssh/<host-hash>.sock`
@@ -268,16 +268,16 @@ Socket path: `$XDG_RUNTIME_DIR/codeagent/ssh/<host-hash>.sock`
 
 ## Remote Deployment
 
-Remote hosts only need `codeagent-remote-exec` on PATH.  Install it on each
+Remote hosts only need `postmesh-remote-exec` on PATH.  Install it on each
 machine the same way as locally (no agent-side daemon, no shared filesystem):
 
 ```bash
 # On each remote machine:
-git clone https://github.com/comicchang/codeagent-py
-cd codeagent-py
+git clone https://github.com/comicchang/postmesh-py
+cd postmesh-py
 uv tool install . --force
-codeagent --version        # verify the CLI
-codeagent-remote-exec --help   # verify the remote helper
+postmesh --version        # verify the CLI
+postmesh-remote-exec --help   # verify the remote helper
 ```
 
 That is the whole deployment: five console entrypoints via `uv tool install`,
@@ -291,7 +291,7 @@ To upgrade to a tagged release on all hosts:
 
 ```bash
 # On each remote machine:
-uv tool install --force git+https://github.com/comicchang/codeagent-py@v0.2.0
+uv tool install --force git+https://github.com/comicchang/postmesh-py@v0.2.0
 ```
 
 The `--force` flag replaces the existing installation in-place. No daemon
@@ -308,63 +308,63 @@ push over SSH (long-lived connection, no polling).
 
 ```bash
 # 1. Create a swarm session with manager + two workers
-codeagent swarm create-session s1 --manager mgr --members w1,w2
+postmesh swarm create-session s1 --manager mgr --members w1,w2
 
 # 2. Register agents (location = __local__ for co-located)
-codeagent swarm register s1 --agent mgr --host __local__
-codeagent swarm register s1 --agent w1  --host __local__
+postmesh swarm register s1 --agent mgr --host __local__
+postmesh swarm register s1 --agent w1  --host __local__
 
 # 3. Send a direct message
-codeagent swarm direct s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "check src/"
+postmesh swarm direct s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "check src/"
 
 # 4. Poll + ack lifecycle
-out=$(codeagent swarm poll s1 --agent w1)
+out=$(postmesh swarm poll s1 --agent w1)
 msg_id=$(echo "$out" | jq -r '.messages[0].msg_id')
-codeagent swarm ack s1 --agent w1 --msg-id "$msg_id" --phase consumed
+postmesh swarm ack s1 --agent w1 --msg-id "$msg_id" --phase consumed
 # --phase released returns the message to inbox for re-processing
 
 # 5. Watch for new messages (continuous, polling loop)
-codeagent swarm watch s1 --agent mgr --interval 2
+postmesh swarm watch s1 --agent mgr --interval 2
 
 # 6. Durable outbox (cross-host delivery with retry)
-codeagent swarm outbox pending              # list undelivered envelopes
-codeagent swarm outbox flush                 # retry all pending envelopes
-codeagent swarm outbox status                # show outbox summary counts
+postmesh swarm outbox pending              # list undelivered envelopes
+postmesh swarm outbox flush                 # retry all pending envelopes
+postmesh swarm outbox status                # show outbox summary counts
 ```
 
 ### Mailbox CLI
 
-`codeagent mailbox` provides the lower-level store operations used by the kernel:
+`postmesh mailbox` provides the lower-level store operations used by the kernel:
 
 ```bash
 # Session management
-codeagent mailbox session-init --session s1 --manager mgr --agents w1,w2
+postmesh mailbox session-init --session s1 --manager mgr --agents w1,w2
 
 # Send message
-codeagent mailbox send --session s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "..."
+postmesh mailbox send --session s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "..."
 
 # Send with attachments (repeat --attachment for multiple)
-codeagent mailbox send --session s1 --from mgr --to w1 --kind TASK \
+postmesh mailbox send --session s1 --from mgr --to w1 --kind TASK \
   --subject "results ready" --body "see attached" \
   --attachment '{"artifact_id":"art-1","source_host":"worker-1","remote_root":"/tmp/artifacts","relative_path":"out/result.json","size":1024,"sha256":"'$(printf 'a%.0s' {1..64})'"}'
 
 # Broadcast to every roster member except the sender
-codeagent mailbox send --session s1 --from mgr --to '*' --kind NOTICE --subject "standby" --body "..."
+postmesh mailbox send --session s1 --from mgr --to '*' --kind NOTICE --subject "standby" --body "..."
 
 # Peek inbox
-codeagent mailbox peek --session s1 --agent w1
+postmesh mailbox peek --session s1 --agent w1
 
 # Read (inbox→processing)
-codeagent mailbox read --session s1 --agent w1 --owner w1
+postmesh mailbox read --session s1 --agent w1 --owner w1
 
 # Finalize (processing→archive)
-codeagent mailbox finalize --session s1 --agent w1 --msg-id <id> --owner w1
+postmesh mailbox finalize --session s1 --agent w1 --msg-id <id> --owner w1
 
 # Status update
-codeagent mailbox status --session s1 --agent w1 --state BUSY --current-task "working"
+postmesh mailbox status --session s1 --agent w1 --state BUSY --current-task "working"
 
 # Canonical history (newest first; filters: --since/--before/--limit/--from/--kind)
-codeagent mailbox history --session s1 --json --kind TASK --limit 10
+postmesh mailbox history --session s1 --json --kind TASK --limit 10
 ```
 
 Sends land in the recipient's per-agent archive on finalize; the canonical
@@ -378,7 +378,7 @@ Attachments are specified via repeatable `--attachment` flags, each taking
 a JSON object:
 
 ```bash
-codeagent mailbox send --session s1 --from mgr --to w1 --kind EVIDENCE \
+postmesh mailbox send --session s1 --from mgr --to w1 --kind EVIDENCE \
   --subject "output" --body "attached" \
   --attachment '{"artifact_id":"art-1","source_host":"worker-1","remote_root":"/tmp/art","relative_path":"out/res.json","size":1024,"sha256":"'$(printf 'a%.0s' {1..64})'"}' \
   --attachment '{"artifact_id":"art-2","source_host":"worker-1","remote_root":"/tmp/art","relative_path":"out/log.txt","size":512,"sha256":"'$(printf 'b%.0s' {1..64})'","media_type":"text/plain"}'
@@ -405,8 +405,8 @@ existing SSH ControlMaster.
 Add `--host <host>` to execute on a remote host via SSH:
 
 ```bash
-codeagent mailbox send --session s1 --from mgr --to w1 --kind TASK ... --host dev-server
-codeagent mailbox peek --session s1 --agent w1 --host dev-server
+postmesh mailbox send --session s1 --from mgr --to w1 --kind TASK ... --host dev-server
+postmesh mailbox peek --session s1 --agent w1 --host dev-server
 ```
 
 ### Standalone CLI
@@ -421,7 +421,7 @@ mailbox-health --session s1 --agent w1
 
 ### OMP Plugin Environment Variables
 
-When launching agents via `codeagent run` or the OMP runner, these env vars
+When launching agents via `postmesh run` or the OMP runner, these env vars
 are injected so the mailbox plugin activates automatically:
 
 | Variable                    | Purpose                                                  |
@@ -438,19 +438,19 @@ launcher, not to the agent's reasoning.
 
 ## Relationship to code-route
 
-`codeagent` replaces `code_route.py` as the routing/execution layer. The Go `codeagent-wrapper` binary is preserved as-is for codex/claude/gemini/opencode backends.
+`postmesh` replaces `code_route.py` as the routing/execution layer. The Go `codeagent-wrapper` binary is preserved as-is for codex/claude/gemini/opencode backends.
 
 | Old command | New command |
 |-------------|-------------|
-| `python3 code_route.py list` | `codeagent route list` |
-| `python3 code_route.py where <topic>` | `codeagent route where <topic>` |
-| `echo task \| python3 code_route.py route <topic>` | `codeagent route <topic> <task>` |
+| `python3 code_route.py list` | `postmesh route list` |
+| `python3 code_route.py where <topic>` | `postmesh route where <topic>` |
+| `echo task \| python3 code_route.py route <topic>` | `postmesh route <topic> <task>` |
 
 ## Development
 
 ```bash
 uv run pytest tests/ -v    # Run all tests
-uv run codeagent --version # Verify CLI
+uv run postmesh --version # Verify CLI
 ```
 
 ## ACKNOWLEDGEMENTS

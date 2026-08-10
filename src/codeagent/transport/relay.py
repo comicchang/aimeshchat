@@ -110,7 +110,7 @@ class RelayTransport(Transport):
         wire_b64 = base64.b64encode(wire_line.encode("utf-8")).decode("ascii")
 
         # Build remote command
-        remote_cmd = f"printf '%s' {wire_b64} | base64 -d | codeagent-remote-exec"
+        remote_cmd = f"printf '%s' {wire_b64} | base64 -d | postmesh-remote-exec"
         if host.shell_prefix:
             remote_cmd = f"{host.shell_prefix}; {remote_cmd}"
 
@@ -135,14 +135,14 @@ class RelayTransport(Transport):
 
         Returns ``(exit_code, stdout, stderr)``.
         The mailbox request is base64-encoded and piped to
-        ``codeagent-remote-exec`` through the relay, just like
+        ``postmesh-remote-exec`` through the relay, just like
         regular execute requests.
         """
         req = make_mailbox_request(args=args, mailbox_root=mailbox_root)
         wire_line = json.dumps(req, ensure_ascii=False)
         wire_b64 = base64.b64encode(wire_line.encode("utf-8")).decode("ascii")
 
-        remote_cmd = f"printf '%s' {wire_b64} | base64 -d | codeagent-remote-exec"
+        remote_cmd = f"printf '%s' {wire_b64} | base64 -d | postmesh-remote-exec"
         if host.shell_prefix:
             remote_cmd = f"{host.shell_prefix}; {remote_cmd}"
 

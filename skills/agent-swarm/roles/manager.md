@@ -55,12 +55,12 @@ Before dispatching or waiting for any Worker, Manager MUST initialize its own id
 
 | Direction | Primary path | Purpose |
 |---|---|---|
-| Manager→Worker (local) | `meshkit swarm direct <session> --to <worker-id> --kind TASK ...` | formal INIT/TASK, supplementary materials |
-| Manager→Worker (remote) | `meshkit mailbox send ... --host <H>` | formal INIT/TASK when Worker is on a different host |
+| Manager→Worker (local) | `postmesh swarm direct <session> --to <worker-id> --kind TASK ...` | formal INIT/TASK, supplementary materials |
+| Manager→Worker (remote) | `postmesh mailbox send ... --host <H>` | formal INIT/TASK when Worker is on a different host |
 | Manager→Worker | `tmux send-keys` | post-INIT inbox check prompt or short steering; **never** carries formal task body |
-| Worker→Manager (local) | `meshkit swarm direct <session> --to manager --kind REPORT ...` | REPORT, PROGRESS, QUESTION, NOTICE |
-| Worker→Manager (remote) | Worker writes to host-local manager/inbox; Manager pulls via `meshkit mailbox read` (see below) | REPORT when Worker has no direct access to Manager host |
-| Worker→Worker | `meshkit mailbox send ... --host <H>` or `meshkit swarm direct <session> --to <peer> ...` | peer Q&A, evidence and review requests; Syncthing syncs directly |
+| Worker→Manager (local) | `postmesh swarm direct <session> --to manager --kind REPORT ...` | REPORT, PROGRESS, QUESTION, NOTICE |
+| Worker→Manager (remote) | Worker writes to host-local manager/inbox; Manager pulls via `postmesh mailbox read` (see below) | REPORT when Worker has no direct access to Manager host |
+| Worker→Worker | `postmesh mailbox send ... --host <H>` or `postmesh swarm direct <session> --to <peer> ...` | peer Q&A, evidence and review requests; Syncthing syncs directly |
 | Worker→all observers | `.mailbox/<session>/<agent>/status.json` | IDLE/BUSY/DONE/BLOCKED, current task, last conclusion |
 
 ### Manager-Pull Path (remote Worker → Manager)
@@ -69,17 +69,17 @@ When a Worker is on a remote host and cannot write directly to the Manager's mai
 
 1. Worker writes the message to its **host-local** manager inbox:
    ```bash
-   meshkit mailbox send --session <session-id> --from <worker-id> --to manager \
+   postmesh mailbox send --session <session-id> --from <worker-id> --to manager \
      --kind REPORT --subject "..." --body "..." --host <worker-host>
    ```
 2. Manager periodically **pulls** from each remote host:
    ```bash
-   meshkit mailbox read --session <session-id> --agent manager --owner manager --host <H>
+   postmesh mailbox read --session <session-id> --agent manager --owner manager --host <H>
    ```
-   This is the **only** correct cross-host read primitive. Neither `manager-poll` nor `swarm poll --host` exists — use `meshkit mailbox read --host <H>` instead.
+   This is the **only** correct cross-host read primitive. Neither `manager-poll` nor `swarm poll --host` exists — use `postmesh mailbox read --host <H>` instead.
 
 Notification reachability:
-- **Local Worker** (shared tmux socket): `meshkit swarm direct` is authoritative; `send-keys MAILBOX_PENDING` is optional wake.
+- **Local Worker** (shared tmux socket): `postmesh swarm direct` is authoritative; `send-keys MAILBOX_PENDING` is optional wake.
 - **Remote Worker**: Manager-pull is the complete path. `send-keys` is unavailable; never attempt it.
 - `send-keys` success proves neither delivery nor reading; only mailbox files and subsequent status/REPORT prove progress.
 
@@ -140,11 +140,11 @@ The Worker writes its identity JSON to this injected `$OMP_MAILBOX_IDENTITY_FILE
 ## 5. Dispatch and Polling
 
 1. After INIT handshake, verify recipient and target status from SessionManifest (or workers.toml fallback) and `.mailbox/<session>/session.json`. Do not guess IDs.
-2. Dispatch with `meshkit swarm direct <session-id> --to <worker-id> --kind TASK ...` (local) or `meshkit mailbox send ... --host <H>` (remote). Formal TASK requires completed INIT; subsequent local-only `send-keys` wake is optional.
+2. Dispatch with `postmesh swarm direct <session-id> --to <worker-id> --kind TASK ...` (local) or `postmesh mailbox send ... --host <H>` (remote). Formal TASK requires completed INIT; subsequent local-only `send-keys` wake is optional.
 3. Poll every 5 seconds: read target `status.json` and `mailbox stats` inbox count. When status transitions from `BUSY` to `DONE/BLOCKED`, drain Manager inbox to collect the corresponding `REPORT`.
 4. **Manager-pull polling** (for remote Workers): on each poll cycle, also run:
    ```bash
-   meshkit mailbox read --session <session-id> --agent manager --owner manager --host <H>
+   postmesh mailbox read --session <session-id> --agent manager --owner manager --host <H>
    ```
    for each remote host `<H>` that has active Workers. This is how remote REPORT/PROGRESS/QUESTION messages arrive. Process all returned messages before the next sleep.
 5. After each message is read and processed, `mailbox finalize` to archive. Then `mailbox clear` — only after task and receipt are fully handled.
@@ -205,21 +205,21 @@ If Worker fails to follow v2 protocol (hand-written JSON, no polling, no status 
 ### Manager 职责
 
 Manager 是 park 生命周期的权威：
-- **首轮 spawn 后**：调用 `meshkit park acquire <review_key> --agent-type <type> --peer-id <id>`
-- **每轮 follow-up 后**：调用 `meshkit park renew <review_key>`（续租 TTL）
-- **用户说"结束 review"时**：调用 `meshkit park release <review_key>`
-- **定期间隔**：调用 `meshkit park sweep` 驱逐过期实例
+- **首轮 spawn 后**：调用 `postmesh park acquire <review_key> --agent-type <type> --peer-id <id>`
+- **每轮 follow-up 后**：调用 `postmesh park renew <review_key>`（续租 TTL）
+- **用户说"结束 review"时**：调用 `postmesh park release <review_key>`
+- **定期间隔**：调用 `postmesh park sweep` 驱逐过期实例
 
 ### 与 mailbox status 的正交关系
 
 `mailbox status` 仅描述工作状态（IDLE/BUSY/DONE/BLOCKED）。
-Park 是独立的 lifecycle 概念，由 `meshkit park registry` 管理，不在 status.json 表达。
+Park 是独立的 lifecycle 概念，由 `postmesh park registry` 管理，不在 status.json 表达。
 Park 期间 agent 保持 IDLE 且 archive 受保护（`mailbox clear` 会检查 ParkRegistry）。
 
 ### 降级策略
 
 - **Hot revive**（同进程）：`hub send` 唤醒 parked agent，上下文完整保留
-- **Warm resume**（同 session-key）：`meshkit run --session-key <key>`（默认自动 resume）
+- **Warm resume**（同 session-key）：`postmesh run --session-key <key>`（默认自动 resume）
 - **Cold reconstruction**（新实例）：`build_cold_context(review_key)` 注入 snapshot
 
 ## 10. Error Handling

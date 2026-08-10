@@ -178,7 +178,7 @@ def cmd_gateway_ensure(args) -> int:
         cm = ControlMaster(host, ssh_bin="ssh")
         if not cm.is_alive():
             cm.create()
-        ssh_cmd = cm.ssh_cmd("export PATH=$HOME/.local/bin:$PATH; codeagent-remote-exec")
+        ssh_cmd = cm.ssh_cmd("export PATH=$HOME/.local/bin:$PATH; postmesh-remote-exec")
         proc = subprocess.Popen(ssh_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out_b, err_b = proc.communicate(input=encode_line(make_ping()), timeout=30)
         remote_ver = 0
@@ -211,7 +211,7 @@ def cmd_gateway_ensure(args) -> int:
         cm = ControlMaster(host, ssh_bin="ssh")
         if not cm.is_alive():
             cm.create()
-        start_cmd = "export PATH=$HOME/.local/bin:$PATH; meshkit gateway start"
+        start_cmd = "export PATH=$HOME/.local/bin:$PATH; postmesh gateway start"
         proc = subprocess.Popen(cm.ssh_cmd(start_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out_b, err_b = proc.communicate(timeout=60)
         out_text = out_b.decode("utf-8", errors="replace") if isinstance(out_b, bytes) else (out_b or "")
@@ -352,7 +352,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     """
     import argparse as _ap
 
-    p = _ap.ArgumentParser(prog="meshkit gateway", description="Local gateway control")
+    p = _ap.ArgumentParser(prog="postmesh gateway", description="Local gateway control")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("start", help="Start the local gateway (idempotent)")
     sub.add_parser("status", help="Show local gateway status")

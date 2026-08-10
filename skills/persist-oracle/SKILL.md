@@ -1,6 +1,6 @@
 ---
 name: persist-oracle
-description: 持久化多轮 Oracle review — 保留上下文。仅用 meshkit oracle start/ask/status/watch/release。OMP 用 omp-config memory + parked-revive，OpenCode 用原生 --session 续接；oh-my-openagent 不加额外 session 字段。
+description: 持久化多轮 Oracle review — 保留上下文。仅用 postmesh oracle start/ask/status/watch/release。OMP 用 omp-config memory + parked-revive，OpenCode 用原生 --session 续接；oh-my-openagent 不加额外 session 字段。
 ---
 
 # persist-oracle — 持久化多轮 Oracle Review
@@ -27,19 +27,19 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 meshkit 
 KEY='<project>:oracle:<domain>:<topic>[:<model_suffix>]'
 
 # 首轮：新建 review/session/runtime（hot 交互式，初始 prompt 即首轮任务）
-meshkit oracle start "$KEY" --agent oracle --prompt '初始问题'
+postmesh oracle start "$KEY" --agent oracle --prompt '初始问题'
 
 # 追加/追问：hot in-loop send（同 backend session，不新开进程）
-meshkit oracle ask "$KEY" '追加信息'
+postmesh oracle ask "$KEY" '追加信息'
 
 # 状态：聚合 receipt / progress / park / runtime health
-meshkit oracle status "$KEY"
+postmesh oracle status "$KEY"
 
 # 进度：cursor 可续的事件流
-meshkit oracle watch "$KEY" --cursor <last>
+postmesh oracle watch "$KEY" --cursor <last>
 
 # 终止：写 terminal + 停 runtime + 释放 park（唯一终止途径）
-meshkit oracle release "$KEY"
+postmesh oracle release "$KEY"
 ```
 
 - 同 review key 默认复用同一 backend session：首轮新开、追加不新开。
