@@ -65,37 +65,37 @@ class TestConfigDir:
     def test_default(self, monkeypatch):
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
         result = config_dir()
-        assert result == Path.home() / ".config" / "codeagent"
+        assert result == Path.home() / ".config" / "postmesh"
 
     def test_xdg_override(self, monkeypatch):
         monkeypatch.setenv("XDG_CONFIG_HOME", "/custom/config")
-        assert config_dir() == Path("/custom/config/codeagent")
+        assert config_dir() == Path("/custom/config/postmesh")
 
 
 class TestStateDir:
     def test_default(self, monkeypatch):
         monkeypatch.delenv("XDG_STATE_HOME", raising=False)
         result = state_dir()
-        assert result == Path.home() / ".local" / "state" / "codeagent"
+        assert result == Path.home() / ".local" / "state" / "postmesh"
 
     def test_xdg_override(self, monkeypatch):
         monkeypatch.setenv("XDG_STATE_HOME", "/custom/state")
-        assert state_dir() == Path("/custom/state/codeagent")
+        assert state_dir() == Path("/custom/state/postmesh")
 
 
 class TestRuntimeDir:
     def test_xdg_preferred(self, monkeypatch):
         monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
-        assert runtime_dir() == Path("/run/user/1000/codeagent")
+        assert runtime_dir() == Path("/run/user/1000/postmesh")
 
     def test_fallback_tmpdir(self, monkeypatch):
         monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
         monkeypatch.setenv("TMPDIR", "/tmp/custom")
         monkeypatch.setattr(os, "getuid", lambda: 1000)
-        assert runtime_dir() == Path("/tmp/custom/codeagent-1000")
+        assert runtime_dir() == Path("/tmp/custom/postmesh-1000")
 
     def test_fallback_no_tmpdir(self, monkeypatch):
         monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
         monkeypatch.delenv("TMPDIR", raising=False)
         monkeypatch.setattr(os, "getuid", lambda: 501)
-        assert runtime_dir() == Path("/tmp/codeagent-501")
+        assert runtime_dir() == Path("/tmp/postmesh-501")

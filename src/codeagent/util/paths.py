@@ -50,7 +50,7 @@ def config_dir() -> Path:
 
     ``$XDG_CONFIG_HOME/codeagent`` or ``~/.config/codeagent``.
     """
-    return _xdg_dir("XDG_CONFIG_HOME", ".config") / "codeagent"
+    return _xdg_dir("XDG_CONFIG_HOME", ".config") / "postmesh"
 
 
 def state_dir() -> Path:
@@ -58,7 +58,7 @@ def state_dir() -> Path:
 
     ``$XDG_STATE_HOME/codeagent`` or ``~/.local/state/codeagent``.
     """
-    return _xdg_dir("XDG_STATE_HOME", ".local/state") / "codeagent"
+    return _xdg_dir("XDG_STATE_HOME", ".local/state") / "postmesh"
 
 
 def runtime_dir() -> Path:
@@ -69,7 +69,7 @@ def runtime_dir() -> Path:
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
-        return Path(xdg) / "codeagent"
+        return Path(xdg) / "postmesh"
     tmpdir = os.environ.get("TMPDIR", "/tmp")
     uid = os.getuid()
-    return Path(tmpdir) / f"codeagent-{uid}"
+    return Path(tmpdir) / f"postmesh-{uid}"

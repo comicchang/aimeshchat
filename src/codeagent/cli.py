@@ -121,7 +121,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pull_p = art_sub.add_parser("pull", help="Pull an artifact from a remote host")
     pull_p.add_argument("--host", required=True, help="SSH alias for remote host")
     pull_p.add_argument("--artifact-id", required=True, help="Artifact identifier")
-    pull_p.add_argument("--remote-root", default="/tmp/codeagent-artifacts", help="Remote artifact root directory")
+    pull_p.add_argument("--remote-root", default="/tmp/postmesh-artifacts", help="Remote artifact root directory")
     pull_p.add_argument("--relative-path", required=True, help="Relative path within remote root")
     pull_p.add_argument("--size", type=int, required=True, help="Expected file size in bytes")
     pull_p.add_argument("--sha256", required=True, help="Expected SHA-256 hex digest")

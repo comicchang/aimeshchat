@@ -1,7 +1,7 @@
 """Per-key file locking via flock.
 
-Lock file path: $XDG_RUNTIME_DIR/codeagent/locks/<key-hash>.lock
-Fallback: ~/.local/runtime/codeagent/locks/<key-hash>.lock
+Lock file path: $XDG_RUNTIME_DIR/postmesh/locks/<key-hash>.lock
+Fallback: ~/.local/runtime/postmesh/locks/<key-hash>.lock
 
 The lock covers the entire agent turn — acquired before starting a run,
 released after the runner exits.  DB transactions are short; the lock is
@@ -34,8 +34,8 @@ def _runtime_dir() -> Path:
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
-        return Path(xdg) / "codeagent" / "locks"
-    return Path.home() / ".local" / "runtime" / "codeagent" / "locks"
+        return Path(xdg) / "postmesh" / "locks"
+    return Path.home() / ".local" / "runtime" / "postmesh" / "locks"
 
 
 def _lock_path(key: str) -> Path:

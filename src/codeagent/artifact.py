@@ -87,7 +87,7 @@ def pull_artifact(
     """Pull a single artifact from *host_alias* via SSH ControlMaster.
 
     *remote_root* is the absolute directory on the remote where artifacts
-    live (e.g. ``/tmp/codeagent-artifacts/<session>``).  *desc.relative_path*
+    live (e.g. ``/tmp/postmesh-artifacts/<session>``).  *desc.relative_path*
     is resolved underneath it.
 
     Uses ``scp`` over the existing ControlMaster socket for zero-auth,

@@ -1,6 +1,6 @@
 """SQLite session registry with per-key file locking.
 
-Storage: $XDG_STATE_HOME/codeagent/sessions.sqlite3 (fallback ~/.local/state/…)
+Storage: $XDG_STATE_HOME/postmesh/sessions.sqlite3 (fallback ~/.local/state/…)
 Schema:  sessions(key TEXT PK, session_id, backend, host, workdir,
                    agent, model, topic, status, created_at, updated_at)
 
@@ -34,10 +34,10 @@ T = TypeVar("T")
 
 
 def _state_dir() -> Path:
-    """$XDG_STATE_HOME/codeagent, defaulting to ~/.local/state/codeagent."""
+    """$XDG_STATE_HOME/postmesh, defaulting to ~/.local/state/postmesh."""
     xdg = os.environ.get("XDG_STATE_HOME")
     base = Path(xdg) if xdg else Path.home() / ".local" / "state"
-    return base / "codeagent"
+    return base / "postmesh"
 
 
 _CREATE_TABLE = """\
