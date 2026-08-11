@@ -59,9 +59,10 @@ class RuntimeRecord:
     runtime: str = ""  # "omp" | "opencode" | "generic"
     owner_pid: int = 0
     nonce: str = ""
-    status: str = "starting"  # starting | active | offline | stopped
+    status: str = "starting"  # starting | active | offline | stopped | unknown
     created_at: str = ""
     last_activity: float = 0.0
+    started_at: float = 0.0  # A12: epoch of process start (real elapsed baseline)
     spec: dict = field(default_factory=dict)
     initial_task: str = ""
 
@@ -113,6 +114,9 @@ class AgentGateway:
         self._sweep_stop = threading.Event()
         self._runtimes_lock = threading.RLock()
         self._sweep_thread: Optional[threading.Thread] = None
+        # A6: hourly retention sweep (EventStore.sweep + outbox TTL).
+        self._retention_sweep_interval: float = 3600.0
+        self._last_retention_sweep: float = 0.0
         self._start_sweep_loop()
         # P8.1 hub: peer ↔ swarm agent mapping for cross-device routing.
         self._peers: dict[str, _HubPeer] = {}
@@ -176,7 +180,14 @@ class AgentGateway:
             log.warning("hub peers restore failed: %s", exc)
 
     def _restore_runtimes_from_park(self) -> None:
-        """Rebuild in-memory runtime records from HOT_PARKED park manifests."""
+        """Rebuild in-memory runtime records from HOT_PARKED park manifests.
+
+        A2: restored records are PLACEHOLDERS, not live runtimes — they are
+        created with status='unknown' and last_activity=0 (no liveness
+        signal). Only a fresh plugin re-register (heartbeat NOT_FOUND →
+        plugin re-registers) flips them to active; until then probes report
+        not-alive instead of faking a hot runtime.
+        """
         try:
             from codeagent.park.registry import ParkRegistry
 
@@ -199,10 +210,11 @@ class AgentGateway:
                 review_key=m.review_key,
                 backend_session_id=m.backend_session_id,
                 host_alias=m.host or "__local__",
-                runtime="omp",
-                status="active",
+                runtime=m.agent_type or "omp",  # A2: read agent backend from manifest
+                status="unknown",  # A2: placeholder — not a live runtime
                 created_at=m.created_at and datetime.fromtimestamp(m.created_at, tz=timezone.utc).strftime(ISO_TIMESTAMP_FORMAT) or "",
-                last_activity=time.time(),
+                last_activity=0.0,  # A2: no heartbeat signal until re-register
+                started_at=m.created_at,  # A12: manifest created_at as start marker
             )
             restored += 1
         if restored:
@@ -226,8 +238,35 @@ class AgentGateway:
         while not self._sweep_stop.wait(self._sweep_interval):
             try:
                 self._sweep_once()
+                self._retention_sweep()
             except Exception as exc:
                 log.warning("gateway: sweep iteration failed: %s", exc)
+
+    def _retention_sweep(self) -> None:
+        """A6: hourly retention — EventStore.sweep() + outbox TTL sweep.
+
+        EventStore.sweep() prunes TOOL_* detail rows older than 7 days
+        (previously dead code); the DeliveryEngine outbox sweep removes
+        terminal delivered entries/markers past their TTL. Both are
+        time-throttled to once per hour per gateway process.
+        """
+        now = time.time()
+        if now - self._last_retention_sweep < self._retention_sweep_interval:
+            return
+        self._last_retention_sweep = now
+        try:
+            removed = self._events.sweep()
+            if removed:
+                log.info("gateway: events retention sweep removed %d row(s)", removed)
+        except Exception as exc:
+            log.warning("gateway: events retention sweep failed: %s", exc)
+        if self._engine is not None:
+            try:
+                cleaned = self._engine.sweep()
+                if cleaned:
+                    log.info("gateway: outbox retention sweep removed %d entry(ies)", cleaned)
+            except Exception as exc:
+                log.warning("gateway: outbox retention sweep failed: %s", exc)
 
     def _sweep_once(self) -> list[str]:
         """Mark active-but-stale runtimes offline; sync hub peers.
@@ -275,6 +314,17 @@ class AgentGateway:
                     ))
                 except Exception as exc:
                     log.warning("gateway: offline event append failed: %s", exc)
+            # A3: dropped stopped records — runtime_stop keeps the record
+            # briefly (so the stopping caller can read back the state), the
+            # sweep removes it so stopped runtimes never linger/aggregate.
+            for rid in [rid for rid, rec in list(self._runtimes.items()) if rec.status == "stopped"]:
+                self._runtimes.pop(rid, None)
+            # A9: prune expired session claims — _claims grows unboundedly
+            # otherwise (TTL 3600s default, takeover already handles expiry).
+            if self._claims:
+                expired = [k for k, c in self._claims.items() if c["expires_at"] <= now]
+                for k in expired:
+                    self._claims.pop(k, None)
         # P8.1 presence 联动：关联 hub peer 同步 offline（锁外，避免死锁）。
         if offline:
             with self._peers_lock:
@@ -376,6 +426,20 @@ class AgentGateway:
                 ERR_GENERATION_STALE,
                 f"generation {generation} < registered {existing.generation} for {runtime_id}",
             )
+        # A7: owner identity consistency — a SAME-generation re-registration
+        # must present the same owner_pid+nonce the gateway stored (the
+        # supervisor writes identity.json 0600 and the plugin echoes it back).
+        # A2/A2.3: a NEW generation (launcher restart after stop/removal) is
+        # allowed to take over with a fresh identity — recovery path.
+        if existing is not None and generation == existing.generation:
+            if (existing.owner_pid or existing.nonce) and (
+                existing.owner_pid != owner_pid or existing.nonce != nonce
+            ):
+                raise GatewayError(
+                    ERR_OWNER_MISMATCH,
+                    f"owner identity mismatch for {runtime_id}: "
+                    f"pid {existing.owner_pid} != {owner_pid} or nonce mismatch",
+                )
 
         # Roster membership (authoritative session.json).
         meta = self._store.read_session(session_id)
@@ -398,6 +462,7 @@ class AgentGateway:
             status="active",
             created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
             last_activity=time.time(),
+            started_at=time.time(),  # A12: real elapsed baseline
         )
         # Preserve spec/initial_task from a prior spawn of the same runtime.
         if existing is not None:
@@ -414,7 +479,9 @@ class AgentGateway:
 
                 registry = ParkRegistry()
                 m = registry.lookup(review_key)
-                if m is not None:
+                # A1: only warm up HOT_PARKED leases — a RELEASED manifest
+                # must NOT be resurrected by a plugin re-register.
+                if m is not None and m.lifecycle == Lifecycle.HOT_PARKED:
                     from dataclasses import replace
 
                     registry.update(review_key, replace(
@@ -502,6 +569,7 @@ class AgentGateway:
             status="active",
             created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
             last_activity=time.time(),
+            started_at=time.time(),  # A12: real elapsed baseline
             spec=params,
             initial_task=task,
         )
@@ -516,6 +584,10 @@ class AgentGateway:
 
     def runtime_heartbeat(self, params: dict) -> dict:
         runtime_id = params.get("runtime_id", "")
+        # A2.3: NOT_FOUND here is the RECOVERY trigger — the plugin treats it
+        # as "gateway lost me (restart/stop)" and re-registers with a NEW
+        # generation; runtime_register accepts the re-register (see A7/A2.3
+        # owner check — a newer generation takes over the runtime_id).
         record = self._require_runtime(runtime_id)
         with self._runtimes_lock:
             was_offline = record.status == "offline"
@@ -584,6 +656,19 @@ class AgentGateway:
     def runtime_event(self, params: dict) -> dict:
         """Append a producer event (plugin/supervisor) to the EventStore."""
         draft = RuntimeEventDraft.from_dict(params.get("event", {}) or {})
+        # A7: events are owner-scoped — the runtime must be registered and
+        # the event generation must match the registered generation
+        # (a stale/unknown producer must not append or refresh liveness).
+        with self._runtimes_lock:
+            record = self._runtimes.get(draft.runtime_id)
+            if record is None:
+                raise GatewayError(ERR_NOT_FOUND, f"unknown runtime: {draft.runtime_id}")
+            if draft.generation != record.generation:
+                raise GatewayError(
+                    ERR_GENERATION_STALE,
+                    f"generation {draft.generation} != registered {record.generation} "
+                    f"for {draft.runtime_id}",
+                )
         # Producers never number their own events — ignore host/sequence.
         ev = self._events.append_local(draft)
         # Any event is activity: keep the runtime's liveness window fresh
@@ -626,8 +711,16 @@ class AgentGateway:
 
             health = RuntimeRegistry().probe(runtime_id)
         except Exception as exc:
+            # A2: status='unknown' (park-restored placeholder) must NEVER
+            # report alive without a REAL probe — only genuinely registered
+            # runtimes (active + heartbeat) get the liveness fallback.
+            alive = (
+                record.status == "active"
+                and record.last_activity > 0
+                and (time.time() - record.last_activity) < 120
+            )
             health = {
-                "alive": record.status == "active" and (time.time() - record.last_activity) < 120,
+                "alive": alive,
                 "reason": f"registry probe unavailable: {exc}",
                 "status": record.status,
             }
@@ -648,6 +741,9 @@ class AgentGateway:
         except Exception as exc:
             log.warning("gateway: runtime stop failed (marking stopped anyway): %s", exc)
         record.status = "stopped"
+        # A3: the record stays in-memory (stopped) so the stopping caller can
+        # read back the state; the sweep removes it shortly after so stopped
+        # runtimes never linger or get aggregated by runtime_info.
         self._events.append_local(RuntimeEventDraft(
             runtime_id=runtime_id, generation=record.generation,
             session_id=record.session_id, agent_id=record.agent_id,
@@ -664,16 +760,23 @@ class AgentGateway:
         record = None
         if runtime_id:
             record = self._runtimes.get(runtime_id)
+            # A3: never report a stopped runtime as the answer — the sweep
+            # cleans stopped records; before it does, treat them as absent.
+            if record is not None and record.status == "stopped":
+                record = None
         elif review_key:
-            # Prefer the LIVE record (registered by plugin/adoption) over a
-            # park-restored placeholder: restored ids start with "park-" and
-            # carry no heartbeat, so the hot path must not pick them first.
+            # A3: prefer the LIVE record (registered by plugin/adoption) over
+            # stopped or park-restored placeholders: filter stopped records,
+            # then take the newest by last_activity desc (restored records
+            # carry last_activity=0 so a live registration wins naturally).
             candidates = [r for r in self._runtimes.values() if r.review_key == review_key]
-            live = [r for r in candidates if not r.runtime_id.startswith("park-")]
-            record = (live[0] if live else None) or (candidates[0] if candidates else None)
+            live = [r for r in candidates if r.status != "stopped"]
+            record = max(live, key=lambda r: r.last_activity) if live else None
         if record is None:
             raise GatewayError(ERR_NOT_FOUND, f"no runtime for review_key={review_key!r} runtime_id={runtime_id!r}")
-        agg = self._events.aggregate(record.runtime_id)
+        # A8: aggregate ONLY this generation's events — a re-registered
+        # runtime must not inherit the previous generation's stats.
+        agg = self._events.aggregate(record.runtime_id, record.generation)
         try:
             from codeagent.runtime.registry import RuntimeRegistry
 
@@ -681,11 +784,18 @@ class AgentGateway:
         except Exception as exc:
             # Plugin-registered runtimes have no registry handle — fall back
             # to the gateway record's own liveness signal (recent heartbeat).
+            # A2: status='unknown' (park-restored placeholder) must never
+            # report alive without a REAL probe.
+            alive = (
+                record.status == "active"
+                and record.last_activity > 0
+                and (time.time() - record.last_activity) < 120
+            )
             health = {
-                "alive": record.status == "active" and (time.time() - record.last_activity) < 120,
+                "alive": alive,
                 "reason": f"registry probe unavailable: {exc}",
                 "status": record.status,
-                "last_activity_s": int(time.time() - record.last_activity),
+                "last_activity_s": int(time.time() - record.last_activity) if record.last_activity > 0 else None,
             }
         return {
             "runtime_id": record.runtime_id,
@@ -695,7 +805,14 @@ class AgentGateway:
             "review_key": record.review_key,
             "backend_session_id": record.backend_session_id,
             "status": record.status,
-            "elapsed": max(0, int(time.time() - record.last_activity)),
+            # A12: elapsed is now the real runtime age (since started_at);
+            # idle seconds move to their own field. elapsed stays for
+            # compatibility with callers of the old (mislabeled) field.
+            "started_at": record.started_at,
+            "elapsed": max(0, int(time.time() - record.started_at)) if record.started_at else 0,
+            # A12: idle_s is only meaningful after a first activity signal —
+            # placeholders (last_activity=0) report None, like health.last_activity_s.
+            "idle_s": max(0, int(time.time() - record.last_activity)) if record.last_activity > 0 else None,
             "last_event": agg,
             "tool_stats": {"tool_count": agg.get("tool_count", 0), "error_count": agg.get("error_count", 0)},
             "runtime_health": health,

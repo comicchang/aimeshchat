@@ -100,6 +100,16 @@ def _build_parser() -> argparse.ArgumentParser:
     bind_p.add_argument("--key", required=True)
     bind_p.add_argument("--id", required=True, dest="session_id")
 
+    # session (storage lifecycle — A6)
+    ssl_p = sub.add_parser("session", help="Session storage lifecycle")
+    ssl_sub = ssl_p.add_subparsers(dest="session_cmd")
+    ssl_clean = ssl_sub.add_parser("clean", help="Delete whole sessions older than N days "
+                                                 "(history/archive/events/outbox)")
+    ssl_clean.add_argument("--older-than", type=int, required=True,
+                           help="Delete sessions older than this many days")
+    ssl_clean.add_argument("--json", action="store_true", dest="json_output",
+                           help="JSON output")
+
     # ssh
     ssh_p = sub.add_parser("ssh", help="Manage SSH connections")
     ssh_sub = ssh_p.add_subparsers(dest="ssh_cmd")
@@ -193,13 +203,24 @@ def _build_parser() -> argparse.ArgumentParser:
     ev_watch.add_argument("--session", default="", help="Filter by session_id")
     ev_watch.add_argument("--request-id", default="", help="Filter by request_id")
     ev_watch.add_argument("--runtime-id", default="", help="Filter by runtime_id")
-    ev_watch.add_argument("--cursor", default="0", help="Resume cursor (local event_id)")
+    ev_watch.add_argument("--cursor", default=None,
+                          help="Resume cursor (local event_id); defaults to the persisted "
+                               "watch cursor so reconnects resume automatically")
     ev_watch.add_argument("--filters", default="", help="Comma-separated event kinds")
     ev_watch.add_argument("--limit", type=int, default=200)
     ev_watch.add_argument("--interval", type=float, default=1.0)
     ev_watch.add_argument("--timeout", type=float, default=10.0,
                           help="Observation connection timeout (never the task timeout)")
+    ev_watch.add_argument("--exit-on", default="",
+                          help="A4: comma-separated terminal specs KIND.STATE (e.g. "
+                               "TASK_STATE.agent_end,RUNTIME_STATE.stopped); exit 0 on the first match")
+    ev_watch.add_argument("--max-events", type=int, default=0,
+                          help="A4: stop after this many events (0 = unlimited)")
+    ev_watch.add_argument("--duration", type=float, default=0.0,
+                          help="A4: stop after this many seconds (0 = unlimited)")
     ev_watch.add_argument("--jsonl", action="store_true", dest="jsonl", help="Emit one JSON event per line")
+    ev_watch.add_argument("--plain", action="store_true", dest="plain",
+                          help="Human-readable lines (default; mutually exclusive with --jsonl)")
 
     # ── runtime ─────────────────────────────────────────────────────────
     rt_p = sub.add_parser("runtime", help="Runtime supervision")
@@ -234,9 +255,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ora_watch = ora_sub.add_parser("watch", help="Watch runtime events (cursor-resumable)")
     ora_watch.add_argument("review_key")
-    ora_watch.add_argument("--cursor", default="0")
+    ora_watch.add_argument("--cursor", default=None,
+                          help="Resume cursor; defaults to the persisted watch cursor")
     ora_watch.add_argument("--interval", type=float, default=1.0)
     ora_watch.add_argument("--timeout", type=float, default=10.0)
+    ora_watch.add_argument("--exit-on", default="",
+                          help="A4: comma-separated terminal specs KIND.STATE (e.g. "
+                               "TASK_STATE.agent_end,RUNTIME_STATE.stopped); exit 0 on the first match")
+    ora_watch.add_argument("--max-events", type=int, default=0,
+                          help="A4: stop after this many events (0 = unlimited)")
+    ora_watch.add_argument("--duration", type=float, default=0.0,
+                          help="A4: stop after this many seconds (0 = unlimited)")
+    ora_watch.add_argument("--jsonl", action="store_true", dest="jsonl",
+                           help="Emit one JSON event per line (default: human-readable)")
+    ora_watch.add_argument("--plain", action="store_true", dest="plain",
+                           help="Human-readable lines (default)")
 
     ora_release = ora_sub.add_parser("release", help="Terminal state + release park + stop runtime")
     ora_release.add_argument("review_key")
@@ -244,6 +277,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_result = ora_sub.add_parser("result", help="Print the oracle's latest response (from session transcript)")
     ora_result.add_argument("review_key")
     ora_result.add_argument("--all", action="store_true", help="Print all assistant messages")
+    ora_result.add_argument("--strict", action="store_true",
+                            help="改进项5: fail instead of degrading to the best-effort "
+                                 "session-file scan when backend_session_id is missing/mismatched")
 
     return p
 
@@ -1839,6 +1875,34 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
     return handlers[cmd](args)
 
 
+def _cmd_session(args: argparse.Namespace) -> int:
+    """A6: session storage lifecycle — ``session clean --older-than N``.
+
+    Deletes whole sessions (history/archive/events/outbox) older than N
+    days via MailboxStore.clean_older_than; sessions with an active park
+    lease are skipped and reported.
+    """
+    cmd = getattr(args, "session_cmd", None)
+    if cmd is None:
+        print("error: specify a session subcommand. Try: postmesh session clean --older-than 30",
+              file=sys.stderr)
+        return 1
+    if cmd == "clean":
+        store = MailboxStore()
+        result = store.clean_older_than(args.older_than)
+        if getattr(args, "json_output", False):
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            for sid in result["removed"]:
+                print(f"removed {sid}")
+            for sid in result["skipped"]:
+                print(f"skipped {sid} (active park lease / locked)")
+            print(f"clean: removed {len(result['removed'])}, skipped {len(result['skipped'])}")
+        return 0
+    print(f"session: unknown subcommand {cmd!r}", file=sys.stderr)
+    return 1
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1851,6 +1915,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "run": _cmd_run,
         "route": _cmd_route,
         "sessions": _cmd_sessions,
+        "session": _cmd_session,
         "ssh": _cmd_ssh,
         "mailbox": _cmd_mailbox,
         "artifact": _cmd_artifact,

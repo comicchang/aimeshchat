@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
+
+log = logging.getLogger(__name__)
 
 from codeagent.gateway.client import GatewayClient
 from codeagent.gateway.events import control_socket_path
@@ -227,8 +230,12 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     sid = _review_sid(review_key)
     try:
         kernel.create_session(sid, "manager", [_ORACLE_AGENT])
-    except ValueError:
-        pass  # already exists (idempotent start)
+    except ValueError as exc:
+        # 改进项4: only swallow the idempotent "already exists" case; a real
+        # conflict (manager mismatch / corrupt session dir) must surface.
+        if "already exists" not in str(exc):
+            raise
+        log.debug("oracle start: swarm session %s already exists (idempotent)", sid)
     from codeagent.swarm.model import AgentLocation, ExecutionMode, ReturnMode
 
     try:
@@ -358,10 +365,12 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             }, indent=2))
             return 0
     except GatewayError as exc:
-        if exc.code not in ("NOT_FOUND", "GATEWAY_DOWN", "GATEWAY_CONNECT_FAILED", "REMOTE_*"):
-            pass  # fall through to warm/cold
-    except Exception:
-        pass
+        # 改进项3: the hot path always degrades to warm/cold — log WHY the
+        # in-loop send was skipped (gateway down, runtime gone, etc.).
+        log.debug("oracle ask: hot path skipped (%s: %s) — degrading to warm/cold",
+                  exc.code, exc.message)
+    except Exception as exc:
+        log.debug("oracle ask: hot path failed unexpectedly (%s) — degrading to warm/cold", exc)
 
     # ── Warm: native backend session resume ───────────────────────────
     registry = ParkRegistry()
@@ -501,8 +510,17 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
             "tool_stats": info.get("tool_stats", {}),
             "runtime_health": info.get("runtime_health", {}),
         }
+    except GatewayError as exc:
+        # 改进项2: gateway 不在时给结构化降级 + 修复提示，而不是裸 error 字符串。
+        if exc.code in ("GATEWAY_DOWN", "GATEWAY_CONNECT_FAILED"):
+            out["runtime"] = {
+                "status": "gateway_down",
+                "hint": "run 'postmesh gateway start'",
+            }
+        else:
+            out["runtime"] = {"status": "unavailable", "error": exc.message}
     except Exception as exc:
-        out["runtime"] = {"error": str(exc)}
+        out["runtime"] = {"status": "unavailable", "error": str(exc)}
 
     # Request ledger (terminal truth).
     store = MailboxStore()
@@ -668,8 +686,9 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     if backend_id:
         path = _find_session_file(backend_id)
 
-    # Degradation: backend_id empty or _find_session_file returned nothing
-    if path is None:
+    # 改进项5: --strict refuses the best-effort scan degradation.
+    strict = bool(getattr(args, "strict", False))
+    if path is None and not strict:
         try:
             path = _fallback_find_session_for_key(review_key)
         except Exception:  # pragma: no cover — defensive
@@ -679,7 +698,11 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
 
     if path is None:
         # Neither primary nor fallback found anything
-        if not backend_id:
+        if strict:
+            print(f"no session transcript found for review key {review_key!r} "
+                  "(strict mode — best-effort scan refused; "
+                  "backend_session_id={backend_id!r})", file=sys.stderr)
+        elif not backend_id:
             print(f"no backend session for review key {review_key!r} "
                   "(oracle start 后才有)", file=sys.stderr)
         else:
@@ -723,7 +746,12 @@ def cmd_oracle_watch(args: argparse.Namespace) -> int:
         limit=200,
         interval=args.interval,
         timeout=args.timeout,
-        jsonl=True,
+        # 改进项1: human-readable by default; --jsonl is opt-in.
+        jsonl=bool(getattr(args, "jsonl", False)),
+        plain=bool(getattr(args, "plain", False)),
+        exit_on=getattr(args, "exit_on", ""),
+        max_events=getattr(args, "max_events", 0),
+        duration=getattr(args, "duration", 0.0),
     )
     return cmd_events_watch(ns)
 

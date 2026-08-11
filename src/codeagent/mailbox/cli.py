@@ -119,6 +119,13 @@ def main(argv: list[str] | None = None) -> None:
     clr.add_argument("--agent", required=True)
     clr.add_argument("--prune-stale", action="store_true")
 
+    # A6: session-clean — whole-session retention cleanup
+    sc = sub.add_parser("session-clean", help="Delete whole sessions older than N days "
+                                              "(history/archive/events/outbox)")
+    sc.add_argument("--older-than", type=int, required=True,
+                    help="Delete sessions older than this many days")
+    sc.add_argument("--json", action="store_true", help="JSON output")
+
     # stats
     ss = sub.add_parser("stats")
     ss.add_argument("--session", required=True)
@@ -205,6 +212,17 @@ def main(argv: list[str] | None = None) -> None:
             print(store.write_status(args.session, args.agent, args.state, args.current_task, args.last_conclusion))
         elif args.cmd == "clear":
             print(store.clear(args.session, args.agent, prune_stale=args.prune_stale))
+        elif args.cmd == "session-clean":
+            result = store.clean_older_than(args.older_than)
+            if args.json:
+                json.dump(result, sys.stdout, ensure_ascii=False)
+            else:
+                for sid in result["removed"]:
+                    print(f"removed {sid}")
+                for sid in result["skipped"]:
+                    print(f"skipped {sid} (active park lease / locked)")
+                print(f"session-clean: removed {len(result['removed'])}, "
+                      f"skipped {len(result['skipped'])}")
         elif args.cmd == "stats":
             for d, c in store.stats(args.session, args.agent).items():
                 print(f"{d}: {c}")

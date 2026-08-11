@@ -95,6 +95,11 @@ class DeliveryEngine:
         # Top3 dead-letter: max attempts before a retryable entry is dead-lettered
         self._max_attempts = 5
         self._backoff_base_s = 5  # exponential: 5, 10, 20, 40, 80…
+        # A6: TTL retention for terminal outbox entries (delivered markers
+        # + status dirs + delivered envelopes) — swept lazily from flush().
+        self._retention_days = 7
+        self._sweep_interval_s = 3600.0
+        self._last_sweep_ts = 0.0
         # idempotency cache: msg_id → SendReceipt (process-lifetime)
         self._cache: dict[str, SendReceipt] = {}
         # host cache for _resolve_target (alias → HostSpec)
@@ -381,6 +386,9 @@ class DeliveryEngine:
 
     def flush(self, session_id: Optional[str] = None) -> int:
         """Retry all pending outbox entries. Returns count of newly delivered."""
+        # A6: lazy TTL sweep — terminal delivered entries/markers older than
+        # retention_days are removed before retrying (throttled hourly).
+        self._sweep_ttl_lazy()
         sessions = [session_id] if session_id else self._list_sessions()
         delivered_count = 0
 
@@ -503,6 +511,87 @@ class DeliveryEngine:
             if sd.is_dir():
                 delivered += len(list(sd.glob('.delivered-*')))
         return {'pending': pending_count, 'delivered': delivered}
+
+    # ── A6: retention sweep ────────────────────────────────────────────
+
+    def _sweep_ttl_lazy(self) -> None:
+        """A6: throttled lazy entry point for the outbox TTL sweep.
+
+        Called from ``flush()`` (every kernel/CLI startup); a long-running
+        process sweeps at most once per ``_sweep_interval_s``. Failures are
+        logged, never fatal to the flush itself.
+        """
+        now = time.time()
+        if now - self._last_sweep_ts < self._sweep_interval_s:
+            return
+        self._last_sweep_ts = now
+        try:
+            removed = self.sweep(retention_days=self._retention_days)
+            if removed:
+                log.info("DeliveryEngine: TTL sweep removed %d outbox entr%s",
+                         removed, "y" if removed == 1 else "ies")
+        except Exception as exc:
+            log.warning("DeliveryEngine: TTL sweep failed: %s", exc)
+
+    def sweep(self, retention_days: int = 7) -> int:
+        """A6: TTL cleanup for terminal outbox entries.
+
+        Per session dir under ``_outbox``, removes:
+          - ``.delivered-<msg_id>`` markers (and their envelope
+            ``<msg_id>.json``) older than *retention_days* — a delivered
+            entry's durable record is the session ``history/``, so the
+            outbox copy is disposable.
+          - ``.status-<msg_id>/`` dirs older than *retention_days*
+            (attempt metadata; pending entries keep fresh mtimes — the
+            dir's own mtime is taken as max with ``meta.json`` — and are
+            never touched).
+          - emptied session dirs afterwards.
+
+        Returns the number of files/dirs removed. Never touches pending
+        (undelivered) entries — those must survive until flush() delivers.
+        """
+        import shutil
+
+        cutoff = time.time() - retention_days * 86400
+        removed = 0
+        if not self._outbox.is_dir():
+            return 0
+        for sd in sorted(self._outbox.iterdir()):
+            if not sd.is_dir() or sd.name.startswith("."):
+                continue
+            try:
+                # Delivered markers + their envelopes (terminal).
+                for marker in sd.glob(".delivered-*"):
+                    try:
+                        if marker.stat().st_mtime >= cutoff:
+                            continue
+                        mid = marker.name[len(".delivered-"):]
+                        marker.unlink(missing_ok=True)
+                        removed += 1
+                        env = sd / f"{mid}.json"
+                        if env.exists():
+                            env.unlink(missing_ok=True)
+                            removed += 1
+                    except OSError:
+                        continue
+                # Status dirs (attempt/ack metadata).
+                for status_dir in sd.glob(".status-*"):
+                    try:
+                        age_mtime = status_dir.stat().st_mtime
+                        meta = status_dir / "meta.json"
+                        if meta.exists():
+                            age_mtime = max(age_mtime, meta.stat().st_mtime)
+                        if age_mtime < cutoff:
+                            shutil.rmtree(str(status_dir), ignore_errors=True)
+                            removed += 1
+                    except OSError:
+                        continue
+                # Collapse emptied session dirs.
+                if not any(sd.iterdir()):
+                    sd.rmdir()
+            except OSError:
+                continue
+        return removed
 
     def ack(
         self,

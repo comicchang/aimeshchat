@@ -241,28 +241,35 @@ class EventStore:
         next_cursor = events[-1].event_id if events else int(cursor)
         return events, next_cursor
 
-    def aggregate(self, runtime_id: str) -> dict[str, Any]:
-        """Aggregate per-runtime stats (last event / tool counts / errors)."""
+    def aggregate(self, runtime_id: str, generation: Optional[int] = None) -> dict[str, Any]:
+        """Aggregate per-runtime stats (last event / tool counts / errors).
+
+        A8: when *generation* is given, only events of that generation count —
+        a re-registered runtime must not inherit the previous generation's
+        stats. ``None`` (default) aggregates across all generations.
+        """
+        gen_where = " AND generation = ?" if generation is not None else ""
+        gen_args: tuple[Any, ...] = (generation,) if generation is not None else ()
         with self._connect() as conn:
             last = conn.execute(
                 "SELECT event_id, kind, created_at, payload FROM runtime_events "
-                "WHERE runtime_id = ? ORDER BY event_id DESC LIMIT 1",
-                (runtime_id,),
+                f"WHERE runtime_id = ?{gen_where} ORDER BY event_id DESC LIMIT 1",
+                (runtime_id, *gen_args),
             ).fetchone()
             tool_started = conn.execute(
                 "SELECT COUNT(*) FROM runtime_events "
-                "WHERE runtime_id = ? AND kind = 'TOOL_STARTED'",
-                (runtime_id,),
+                f"WHERE runtime_id = ?{gen_where} AND kind = 'TOOL_STARTED'",
+                (runtime_id, *gen_args),
             ).fetchone()[0]
             errors = conn.execute(
                 "SELECT COUNT(*) FROM runtime_events "
-                "WHERE runtime_id = ? AND kind = 'ERROR'",
-                (runtime_id,),
+                f"WHERE runtime_id = ?{gen_where} AND kind = 'ERROR'",
+                (runtime_id, *gen_args),
             ).fetchone()[0]
             first = conn.execute(
-                "SELECT created_at FROM runtime_events WHERE runtime_id = ? "
-                "ORDER BY event_id ASC LIMIT 1",
-                (runtime_id,),
+                "SELECT created_at FROM runtime_events "
+                f"WHERE runtime_id = ?{gen_where} ORDER BY event_id ASC LIMIT 1",
+                (runtime_id, *gen_args),
             ).fetchone()
         return {
             "tool_count": int(tool_started),

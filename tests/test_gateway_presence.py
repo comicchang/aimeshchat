@@ -87,12 +87,13 @@ class TestPresenceSweep:
         events, _ = gw._events.list_after(0, filters=["AGENT_STATUS"])
         assert any(e.payload.get("new_status") == "active" for e in events)
 
-    def test_stopped_not_swept(self, gw: AgentGateway):
+    def test_stopped_cleaned_by_sweep(self, gw: AgentGateway):
+        """A3: stopped records are REMOVED by the sweep (not marked offline)."""
         _register_active(gw)
         gw._runtimes["rt-1"].status = "stopped"
         gw._runtimes["rt-1"].last_activity = 0
         assert gw._sweep_once() == []
-        assert gw._runtimes["rt-1"].status == "stopped"
+        assert "rt-1" not in gw._runtimes
 
     def test_heartbeat_renews_and_keeps_active(self, gw: AgentGateway):
         _register_active(gw)
@@ -204,5 +205,8 @@ class TestGatewayRestore:
         restored = [r for r in gw2._runtimes.values() if r.review_key == "restore:key"]
         assert len(restored) == 1
         assert restored[0].backend_session_id == "backend-s1"
-        assert restored[0].status == "active"
+        # A2: park-restored records are placeholders — unknown status, no
+        # liveness signal — until the plugin re-registers.
+        assert restored[0].status == "unknown"
+        assert restored[0].last_activity == 0.0
         gw2.stop()

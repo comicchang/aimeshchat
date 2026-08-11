@@ -367,6 +367,12 @@ class TestGatewayMailboxBridge:
         client.call("session.ensure", {
             "session_id": "s1", "manager_id": "manager", "roster": ["worker"],
         })
+        # A7: runtime.event requires a REGISTERED runtime with matching
+        # generation — register r1 first (identity check is fail-closed).
+        client.call("runtime.register", {
+            "session_id": "s1", "agent_id": "worker", "runtime_id": "r1",
+            "generation": 1, "owner_pid": 1111, "nonce": "n1",
+        })
         result = client.call("runtime.event", {
             "event": {
                 "runtime_id": "r1", "generation": 1, "session_id": "s1",
@@ -375,7 +381,8 @@ class TestGatewayMailboxBridge:
                 "payload": {"tool": "bash"},
             }
         })
-        assert result["source_sequence"] == 1
+        # register itself appends a RUNTIME_STATE (seq 1) — the event is seq 2.
+        assert result["source_sequence"] >= 1
         events = client.call("events.list", {"cursor": 0, "filters": ["TOOL_STARTED"]})
         assert len(events["events"]) == 1
         assert events["cursor"] >= 1

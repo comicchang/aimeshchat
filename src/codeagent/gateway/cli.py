@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 from codeagent.constants import STREAM_HEARTBEAT_INTERVAL
 from codeagent.gateway.client import GatewayClient, rpc_stdio
@@ -303,19 +306,101 @@ def cmd_gateway_rpc(args) -> int:
 # ── events watch ───────────────────────────────────────────────────────
 
 
+def _watch_cursor_file(session_id: str, runtime_id: str) -> Optional[Path]:
+    """A4: persisted watch-cursor path.
+
+    ``$XDG_STATE_HOME/postmesh/watch-cursor-<key>.json`` (default
+    ``~/.local/state/postmesh/...``) where the key is the session_id when
+    filtering by session, else runtime_id, else None — an unfiltered
+    global stream is not persisted.
+    """
+    key = session_id or runtime_id or ""
+    if not key:
+        return None
+    base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+    return base / "postmesh" / f"watch-cursor-{key}.json"
+
+
+def _load_watch_cursor(session_id: str, runtime_id: str) -> int:
+    """A4: load the persisted cursor (0 when absent or corrupt)."""
+    path = _watch_cursor_file(session_id, runtime_id)
+    if path is None or not path.exists():
+        return 0
+    try:
+        return int(json.loads(path.read_text(encoding="utf-8")).get("cursor", 0))
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        return 0
+
+
+def _save_watch_cursor(session_id: str, runtime_id: str, cursor: int) -> None:
+    """A4: persist the cursor so a reconnect resumes where we left off."""
+    path = _watch_cursor_file(session_id, runtime_id)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"cursor": int(cursor)}), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        log.debug("events watch: cursor persist failed: %s", exc)
+
+
+def _parse_exit_on(raw: Optional[str]) -> list[tuple[str, str]]:
+    """A4: parse --exit-on specs — comma-separated ``KIND.STATE`` pairs.
+
+    A terminal event matches when ``ev.kind == KIND`` and
+    ``ev.payload.state == STATE`` (e.g. ``TASK_STATE.agent_end``,
+    ``RUNTIME_STATE.stopped``). Malformed specs are skipped with a
+    warning rather than failing the whole watch.
+    """
+    specs: list[tuple[str, str]] = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        kind, sep, state = item.partition(".")
+        if not sep or not kind or not state:
+            print(f"events: warning: ignoring malformed --exit-on spec {item!r}", file=sys.stderr)
+            continue
+        specs.append((kind.strip(), state.strip()))
+    return specs
+
+
 def cmd_events_watch(args) -> int:
     """Poll events.list; only the observation connection has a timeout.
 
-    The task itself has NO hard timeout (timeout=0) — cancel/release is the
-    only way to terminate the runtime; client exit / shell timeout / SSH
-    drop never kills the gateway or runtime.
+    The task itself has NO hard timeout unless bounded by --exit-on /
+    --max-events / --duration — cancel/release is otherwise the only way
+    to terminate the runtime; client exit / shell timeout / SSH drop
+    never kills the gateway or runtime.
+
+    A4: ``--exit-on KIND.STATE,...`` terminates with exit 0 on the first
+    terminal event. The cursor is persisted under
+    ``~/.local/state/postmesh/`` so a reconnect resumes automatically;
+    an explicit ``--cursor`` overrides the persisted value.
     """
     client = GatewayClient(timeout=args.timeout)
-    cursor = args.cursor
-    filters = args.filters.split(",") if args.filters else None
-    session_id = args.session
-    runtime_id = args.runtime_id
 
+    # A4: cursor — an explicit --cursor wins; otherwise resume from file.
+    session_id = getattr(args, "session", None) or ""
+    runtime_id = getattr(args, "runtime_id", None) or ""
+    explicit_cursor = getattr(args, "cursor", None) not in (None, "")
+    if explicit_cursor:
+        cursor = int(getattr(args, "cursor") or 0)
+    else:
+        cursor = _load_watch_cursor(session_id, runtime_id)
+
+    filters = getattr(args, "filters", None)
+    filters = filters.split(",") if filters else None
+    # 改进项1: human-readable output by default; --jsonl is opt-in.
+    jsonl = bool(getattr(args, "jsonl", False)) and not bool(getattr(args, "plain", False))
+    exit_on = _parse_exit_on(getattr(args, "exit_on", None))
+    max_events = int(getattr(args, "max_events", 0) or 0)
+    duration = float(getattr(args, "duration", 0) or 0)
+
+    started = time.monotonic()
+    seen = 0
     while True:
         try:
             result = client.call("events.list", {
@@ -326,19 +411,40 @@ def cmd_events_watch(args) -> int:
                 "runtime_id": runtime_id,
             })
         except GatewayError as exc:
-            if args.jsonl:
+            if jsonl:
                 print(json.dumps({"type": "error", "message": exc.message}))
             else:
                 print(f"events: error: {exc.message}", file=sys.stderr)
             return 1
         events = result.get("events", [])
         for ev in events:
-            if args.jsonl:
+            seen += 1
+            if jsonl:
                 print(json.dumps(ev, ensure_ascii=False))
             else:
                 print(f"[{ev.get('event_id')}] {ev.get('kind')} {ev.get('runtime_id')} {ev.get('created_at')}")
+            # A4: terminal event → exit 0.
+            if exit_on:
+                kind = ev.get("kind", "")
+                state = (ev.get("payload") or {}).get("state", "")
+                if (kind, state) in exit_on:
+                    try:
+                        _save_watch_cursor(session_id, runtime_id, int(result.get("cursor") or cursor or 0))
+                    except (TypeError, ValueError):
+                        pass
+                    return 0
         cursor = result.get("cursor", cursor)
+        # A4: persist after every poll so a reconnect resumes exactly here.
+        try:
+            _save_watch_cursor(session_id, runtime_id, int(cursor))
+        except (TypeError, ValueError):
+            pass
         sys.stdout.flush()
+        # A4: --max-events / --duration hard bounds (safety net).
+        if max_events and seen >= max_events:
+            return 0
+        if duration and time.monotonic() - started >= duration:
+            return 0
         try:
             time.sleep(args.interval)
         except KeyboardInterrupt:

@@ -820,6 +820,78 @@ class MailboxStore:
                 total += 1
         return f"purged {total}"
 
+    # ── A6: whole-session retention cleanup ────────────────────────────
+
+    def _session_has_active_park_lease(self, session_id: str) -> bool:
+        """True when any roster member of *session_id* holds a HOT_PARKED lease."""
+        if ParkRegistry is None:
+            return False
+        try:
+            from codeagent.domain.park import Lifecycle
+
+            registry = ParkRegistry()
+            meta = self.read_session(session_id) or {}
+            agents = set(meta.get("agents", [])) | {meta.get("manager", "")}
+            for aid in agents:
+                if not aid:
+                    continue
+                manifest = registry.lookup_by_field("mailbox_agent_id", aid)
+                if manifest is not None and manifest.lifecycle == Lifecycle.HOT_PARKED:
+                    return True
+        except Exception:
+            # Park registry unavailable or corrupt — never block cleanup on it.
+            return False
+        return False
+
+    def clean_older_than(self, days: int) -> dict:
+        """A6: delete whole sessions older than *days*.
+
+        A session is eligible when its ``session.json`` ``created_at`` is
+        older than the cutoff.  For each eligible session the ENTIRE
+        session dir (history/archive/events/per-agent inbox/processing/
+        status) is removed, plus the session's ``_outbox/<sid>`` and
+        ``_dead_letter/<sid>`` dirs under this store root.  Sessions with
+        an active park lease (HOT_PARKED) are skipped.
+
+        Returns ``{"removed": [session_id, ...], "skipped": [session_id, ...]}``.
+        """
+        import shutil
+
+        if days < 0:
+            raise ValueError("days must be non-negative")
+        cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+        removed: list[str] = []
+        skipped: list[str] = []
+        if not self.root.is_dir():
+            return {"removed": removed, "skipped": skipped}
+        for sd in sorted(self.root.iterdir()):
+            if not sd.is_dir() or sd.name.startswith(".") or sd.name.startswith("_"):
+                continue  # skip dot/private dirs (_outbox/_dead_letter/…)
+            sid = sd.name
+            try:
+                meta = self.read_session(sid)
+            except ValueError:
+                continue  # not a session dir (invalid id shape)
+            created_at = (meta or {}).get("created_at", "")
+            try:
+                ts = datetime.fromisoformat(created_at).timestamp() if created_at else time.time()
+            except ValueError:
+                ts = time.time()
+            if ts >= cutoff:
+                continue
+            # Park lease guard: never delete a session a hot runtime needs.
+            if self._session_has_active_park_lease(sid):
+                skipped.append(sid)
+                continue
+            try:
+                shutil.rmtree(str(sd), ignore_errors=True)
+                shutil.rmtree(str(self.root / "_outbox" / sid), ignore_errors=True)
+                shutil.rmtree(str(self.root / "_dead_letter" / sid), ignore_errors=True)
+                removed.append(sid)
+            except OSError:
+                skipped.append(sid)
+        return {"removed": removed, "skipped": skipped}
+
     # ── Check (legacy) ─────────────────────────────────────────────────
 
     def check(self, session_id: str, agent_id: str, max_messages: int = 0) -> list[dict]:
