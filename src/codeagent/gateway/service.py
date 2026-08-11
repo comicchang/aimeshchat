@@ -245,7 +245,19 @@ class AgentGateway:
                     continue
                 # Re-verify under the lock: a heartbeat/event may have
                 # refreshed last_activity since the initial scan.
-                if (now - record.last_activity) <= self._offline_timeout:
+                # Cold-start grace: double the timeout for runtimes < 3 min old
+                # so slow-starting processes aren't prematurely swept offline.
+                timeout = self._offline_timeout
+                if record.created_at:
+                    try:
+                        created_ts = datetime.fromisoformat(
+                            record.created_at
+                        ).timestamp()
+                        if (now - created_ts) < 180:
+                            timeout = self._offline_timeout * 2
+                    except (ValueError, OSError):
+                        pass
+                if (now - record.last_activity) <= timeout:
                     continue
                 record.status = "offline"
                 offline.append(rid)

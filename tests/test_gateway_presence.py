@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from codeagent.constants import ISO_TIMESTAMP_FORMAT
 from codeagent.gateway.events import EventStore
 from codeagent.gateway.model import RuntimeEventDraft
 from codeagent.gateway.service import AgentGateway
@@ -48,6 +50,10 @@ class TestPresenceSweep:
     def test_sweep_marks_offline(self, gw: AgentGateway):
         _register_active(gw)
         gw._runtimes["rt-1"].status = "active"
+        # runtime 已过冷启动期（>180s 注册），150s 无活动 > 120s 阈值 → 判 offline
+        gw._runtimes["rt-1"].created_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=200)
+        ).strftime(ISO_TIMESTAMP_FORMAT)
         gw._runtimes["rt-1"].last_activity = time.time() - 150  # > 120s
         offline = gw._sweep_once()
         assert "rt-1" in offline
@@ -55,6 +61,9 @@ class TestPresenceSweep:
 
     def test_sweep_writes_ag_status_event(self, gw: AgentGateway):
         _register_active(gw)
+        gw._runtimes["rt-1"].created_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=200)
+        ).strftime(ISO_TIMESTAMP_FORMAT)
         gw._runtimes["rt-1"].last_activity = time.time() - 150
         gw._sweep_once()
         events, _ = gw._events.list_after(0, filters=["AGENT_STATUS"])

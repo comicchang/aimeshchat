@@ -241,6 +241,11 @@ class TestHubPresenceSync:
             "generation": 1, "review_key": "k1", "owner_pid": 999999, "nonce": "n",
         })
         gw._runtimes["rt-1"].status = "active"
+        # runtime 已过冷启动期（>180s），150s 无活动 > 120s 阈值 → 判 offline
+        from datetime import datetime, timedelta, timezone
+        gw._runtimes["rt-1"].created_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=200)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
         gw._runtimes["rt-1"].last_activity = time.time() - 150
         gw._sweep_once()
         assert gw._runtimes["rt-1"].status == "offline"

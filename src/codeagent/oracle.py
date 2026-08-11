@@ -607,25 +607,84 @@ def _extract_assistant_messages(path: Path, max_messages: int = 1) -> list[str]:
     return msgs[-max_messages:]
 
 
+def _fallback_find_session_for_key(review_key: str) -> Optional[Path]:
+    """Best-effort scan of recent OMP session files when backend_session_id is missing.
+
+    Scans ~/.omp/agent/sessions/ for .jsonl files (newest first, max 5),
+    returning the first file whose content mentions ``oracle`` or a fragment
+    of *review_key* (the last ``:``-separated segment).  Returns ``None``
+    when nothing matches — caller should fall back to the original error.
+    """
+    sessions_root = Path.home() / ".omp" / "agent" / "sessions"
+    if not sessions_root.is_dir():
+        return None
+
+    # Collect all .jsonl session files across every subdirectory
+    all_files: list[Path] = []
+    for d in sessions_root.iterdir():
+        if d.is_dir():
+            all_files.extend(d.glob("*.jsonl"))
+    if not all_files:
+        return None
+
+    # Sort by mtime descending, keep the 5 most recent
+    all_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    recent = all_files[:5]
+
+    # Derive search tokens: literal "oracle" + the tail segment of the key
+    tail = review_key.rsplit(":", 1)[-1].strip()
+    tokens = ["oracle"]
+    if tail and tail != review_key:
+        tokens.append(tail)
+
+    for f in recent:
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lower = text.lower()
+        if any(tok.lower() in lower for tok in tokens):
+            return f
+    return None
+
+
 def cmd_oracle_result(args: argparse.Namespace) -> int:
     """Print the persist-oracle's latest response for a review key.
 
     Reads the OMP session transcript directly — no manual file extraction.
     ``--all`` prints every assistant message since the last checkpoint;
     default prints the latest one.
+
+    When ``backend_session_id`` is missing (legacy plugin era), the function
+    degrades gracefully by scanning recent session files for a match.
     """
     review_key = args.review_key
     manifest = ParkRegistry().lookup(review_key)
     backend_id = (manifest.backend_session_id if manifest else "") or ""
-    if not backend_id:
-        print(f"no backend session for review key {review_key!r} "
-              "(oracle start 后才有)", file=sys.stderr)
-        return 1
 
-    path = _find_session_file(backend_id)
+    recovered = False
+    path: Optional[Path] = None
+
+    if backend_id:
+        path = _find_session_file(backend_id)
+
+    # Degradation: backend_id empty or _find_session_file returned nothing
     if path is None:
-        print(f"session transcript not found for {backend_id} "
-              f"(under ~/.omp/agent/sessions/)", file=sys.stderr)
+        try:
+            path = _fallback_find_session_for_key(review_key)
+        except Exception:  # pragma: no cover — defensive
+            path = None
+        if path is not None:
+            recovered = True
+
+    if path is None:
+        # Neither primary nor fallback found anything
+        if not backend_id:
+            print(f"no backend session for review key {review_key!r} "
+                  "(oracle start 后才有)", file=sys.stderr)
+        else:
+            print(f"session transcript not found for {backend_id} "
+                  f"(under ~/.omp/agent/sessions/)", file=sys.stderr)
         return 1
 
     max_msgs = 0 if getattr(args, "all", False) else 1
@@ -636,6 +695,8 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     for m in msgs:
         print(m)
         print("\n" + "─" * 60 + "\n")
+    if recovered:
+        print("(recovered-from-session-log)", file=sys.stderr)
     return 0
 
 
