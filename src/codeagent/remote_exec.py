@@ -7,6 +7,7 @@ Delegates to OMPRunner locally on the remote machine.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import select
 import sys
@@ -240,6 +241,12 @@ def _dispatch_mailbox_direct(args: list[str], mailbox_root: str | None = None) -
         rs.add_argument("--session", required=True)
         rs.add_argument("--agent", required=True)
 
+        rn = sub.add_parser("renew")  # P2-10: lease renewal for long claims
+        rn.add_argument("--session", required=True)
+        rn.add_argument("--agent", required=True)
+        rn.add_argument("--msg-id", required=True)
+        rn.add_argument("--owner", required=True)
+
         st = sub.add_parser("status")
         st.add_argument("--session", required=True)
         st.add_argument("--agent", required=True)
@@ -321,6 +328,12 @@ def _dispatch_mailbox_direct(args: list[str], mailbox_root: str | None = None) -
             out = store.release(ns.session, ns.agent, ns.msg_id, ns.owner)
         elif cmd == "recover-stale":
             out = store.recover_stale(ns.session, ns.agent)
+        elif cmd == "renew":
+            if not store.renew_claim(ns.session, ns.agent, ns.msg_id, ns.owner):
+                raise ValueError(
+                    f"claim not renewable: {ns.msg_id} (missing / owner mismatch)"
+                )
+            out = f"renewed claim {ns.msg_id}"
         elif cmd == "status":
             out = store.write_status(ns.session, ns.agent, ns.state, ns.current_task, ns.last_conclusion)
         elif cmd == "clear":
@@ -600,7 +613,14 @@ def _split_cursor(cursor: str) -> tuple[str, int]:
     try:
         from codeagent.wire.protocol import split_composite_cursor
         return split_composite_cursor(cursor)
+    except ImportError:
+        return cursor, 0
     except Exception:
+        # P3-n: warn on unexpected parse failure (ImportError is expected
+        # if wire module is unavailable in minimal deployments).
+        logging.getLogger(__name__).warning(
+            "_split_cursor: failed to parse cursor %r, falling back", cursor[:64]
+        )
         return cursor, 0
 
 

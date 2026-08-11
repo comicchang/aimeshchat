@@ -14,6 +14,7 @@ import os
 import socket
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -47,7 +48,10 @@ class GatewayServer:
         self._socket_path = socket_path or control_socket_path()
         self._gateway = gateway or AgentGateway()
         self._sock: Optional[socket.socket] = None
-        self._threads: list[threading.Thread] = []
+        # P3-c: use deque for bounded thread tracking; finished threads are
+        # trimmed periodically to prevent unbounded growth.
+        self._threads: deque[threading.Thread] = deque()
+        self._threads_lock = threading.Lock()
         self._shutdown = threading.Event()
 
     # ── lifecycle ──────────────────────────────────────────────────────
@@ -78,6 +82,8 @@ class GatewayServer:
         except OSError:
             pass
         self._sock = sock
+        # P3-b: track that THIS process owns the socket we just bound.
+        self._owned_socket = True
         log.info("gateway listening on %s", self._socket_path)
 
         while not self._shutdown.is_set():
@@ -87,10 +93,13 @@ class GatewayServer:
                 break
             t = threading.Thread(target=self._handle_connection, args=(conn,), daemon=True)
             t.start()
-            self._threads.append(t)
+            with self._threads_lock:
+                self._threads.append(t)
+                # P3-c: trim finished threads to prevent unbounded growth.
+                self._trim_threads()
 
     def stop(self) -> None:
-        """Signal shutdown and close the listening socket."""
+        """Signal shutdown, close the listening socket, and join threads."""
         self._shutdown.set()
         if self._sock is not None:
             try:
@@ -98,11 +107,27 @@ class GatewayServer:
             except OSError:
                 pass
             self._sock = None
-        if self._socket_path.exists():
+        # P3-b: only unlink the socket if THIS process owns it — prevents
+        # deleting an active socket from a different gateway process.
+        if getattr(self, "_owned_socket", False) and self._socket_path.exists():
             try:
                 self._socket_path.unlink()
             except OSError:
                 pass
+        # P3-c: join all connection handler threads so stop() is a clean
+        # shutdown barrier (no orphaned threads leaking past teardown).
+        with self._threads_lock:
+            threads = list(self._threads)
+            self._threads.clear()
+        for t in threads:
+            t.join(timeout=2)
+
+    # ── thread management ──────────────────────────────────────────────
+
+    def _trim_threads(self) -> None:
+        """P3-c: remove finished threads from the deque (caller holds lock)."""
+        while self._threads and not self._threads[0].is_alive():
+            self._threads.popleft()
 
     # ── connection handling ────────────────────────────────────────────
 

@@ -100,6 +100,13 @@ def main(argv: list[str] | None = None) -> None:
     rl.add_argument("--msg-id", required=True)
     rl.add_argument("--owner", required=True)
 
+    # renew (P2-10: lease renewal for long-running claims)
+    rn = sub.add_parser("renew")
+    rn.add_argument("--session", required=True)
+    rn.add_argument("--agent", required=True)
+    rn.add_argument("--msg-id", required=True)
+    rn.add_argument("--owner", required=True)
+
     # recover-stale
     rs = sub.add_parser("recover-stale")
     rs.add_argument("--session", required=True)
@@ -208,6 +215,12 @@ def main(argv: list[str] | None = None) -> None:
             print(store.release(args.session, args.agent, args.msg_id, args.owner))
         elif args.cmd == "recover-stale":
             print(store.recover_stale(args.session, args.agent))
+        elif args.cmd == "renew":
+            if not store.renew_claim(args.session, args.agent, args.msg_id, args.owner):
+                raise ValueError(
+                    f"claim not renewable: {args.msg_id} (missing / owner mismatch)"
+                )
+            print(f"renewed claim {args.msg_id}")
         elif args.cmd == "status":
             print(store.write_status(args.session, args.agent, args.state, args.current_task, args.last_conclusion))
         elif args.cmd == "clear":

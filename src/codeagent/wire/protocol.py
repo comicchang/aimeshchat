@@ -19,6 +19,7 @@ Other messages:
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -201,7 +202,8 @@ def encode_request(command: str, **kwargs: Any) -> str:
                 f"got {type(kwargs[field]).__name__}"
             )
     obj: dict[str, Any] = {"wire_version": WIRE_VERSION, "command": command, **kwargs}
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    # P3-m: append newline to produce a valid JSONL line (str, not bytes).
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
 def decode_request(line: str | bytes) -> dict[str, Any]:
@@ -481,5 +483,9 @@ def split_composite_cursor(cursor: str) -> tuple[str, int]:
         if obj.get("v") == COMPOSITE_CURSOR_VERSION:
             return str(obj.get("mailbox", "0")), int(obj.get("runtime", 0))
     except Exception:
-        pass
+        # P3-n: warn on parse failure instead of silent degradation
+        logging.getLogger(__name__).warning(
+            "split_composite_cursor: failed to parse composite cursor %r, "
+            "falling back to plain mailbox cursor", cursor[:64]
+        )
     return cursor, 0

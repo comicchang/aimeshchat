@@ -41,6 +41,7 @@ from codeagent.wire.protocol import (
     WIRE_VERSION,
     decode_line,
     make_mailbox_request,
+    make_request,
 )
 
 log = logging.getLogger(__name__)
@@ -89,22 +90,29 @@ class RelayTransport(Transport):
         session_id: Optional[str] = None,
     ) -> RunResult:
         """Execute via relay-login with base64-encoded wire request."""
-        # Build wire request
-        wire_req = {
-            "wire_version": WIRE_VERSION,
-            "command": "run",
-            "task": request.task,
-            "workdir": workdir,
-            "backend": request.backend or "opencode",
-            "skip_permissions": request.skip_permissions,
-            "timeout": request.timeout,
-        }
-        if request.agent:
-            wire_req["agent"] = request.agent
-        if request.model:
-            wire_req["model"] = request.model
-        if session_id:
-            wire_req["resume_session_id"] = session_id
+        # P2-15: 补全 v2 wire 字段（session_key/request_id/run_id/review_key/
+        # require_ack/capabilities）——走 make_request() 与 ssh/local transport
+        # 完全一致，否则 Manager 侧 correlation 字段在 relay 主机上丢失
+        # （remote_exec 已按 v2 读取这些字段）。保留 relay 特有默认：
+        # backend 为空时用 "opencode"。
+        wire_req = make_request(
+            command="run",
+            task=request.task,
+            workdir=workdir or request.workdir,
+            backend=request.backend or "opencode",
+            agent=request.agent,
+            model=request.model,
+            skills=request.skills,
+            session_id=session_id,
+            skip_permissions=request.skip_permissions,
+            timeout=request.timeout,
+            session_key=request.session_key,
+            request_id=request.request_id,
+            run_id=request.run_id,
+            review_key=request.review_key,
+            require_ack=request.require_ack,
+            capabilities=request.capabilities,
+        )
 
         wire_line = json.dumps(wire_req, ensure_ascii=False)
         wire_b64 = base64.b64encode(wire_line.encode("utf-8")).decode("ascii")

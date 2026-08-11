@@ -104,12 +104,21 @@ class DeliveryEngine:
         self._cache: dict[str, SendReceipt] = {}
         # host cache for _resolve_target (alias → HostSpec)
         self._host_cache: dict[str, Any] = {}
-        # session-ensure cache: (session_id, host_alias) → True
-        self._ensured_sessions: set[tuple[str, str]] = set()
-        # full roster cache: session_id → sorted list of agent_ids
-        self._session_rosters: dict[str, list[str]] = {}
+        # session-ensure cache: (session_id, host_alias) → ensured_at (epoch)
+        # P2-14: TTL'd — a stale ensure would hide newly-joined agents from the
+        # remote session (cross-host delivery to them would fail).
+        self._ensured_sessions: dict[tuple[str, str], float] = {}
+        # full roster cache: session_id → (cached_at, sorted list of agent_ids)
+        # P2-14: TTL'd — a stale roster never sees agents added after the cache
+        # fill, so remote session-init would miss them.
+        self._session_rosters: dict[str, tuple[float, list[str]]] = {}
         # capability cache: host_alias → set of capability strings
         self._host_capabilities: dict[str, set[str]] = {}
+        # P2-14: TTLs for roster/ensure caches (seconds).  Fresh caches skip
+        # the remote session-init round-trip; expired ones re-sync so roster
+        # changes (new agents) propagate to remote hosts.
+        self._roster_ttl_s = 300.0
+        self._ensure_ttl_s = 300.0
 
     @staticmethod
     def _history_entry(envelope: dict[str, Any], msg_id: str) -> dict[str, Any]:
@@ -159,9 +168,24 @@ class DeliveryEngine:
         if not msg_id:
             return SendReceipt(status="failed", error="envelope missing msg_id")
 
+        # ── Local-target detection (before idempotency / outbox write) ─
+        host_alias = getattr(target, "host_alias", None) or getattr(target, "ssh_alias", "")
+        from codeagent.domain import HostSpec, resolve_is_local
+        is_local_host = isinstance(target, HostSpec) and resolve_is_local(target)
+        if not host_alias or is_local_host:
+            # P1-2: 本地投递的 durable outbox 条目必须带 _target_host——
+            # 否则 flush() 的 `no target host` 检查会永久跳过该条目
+            # （不重试/不死信/不扫描）。'__local__' 让 flush() 走本地
+            # 重试分支（LocalTransport 直写本地 inbox）。
+            envelope.setdefault("_target_host", "__local__")
+
         # ── Idempotency check ──────────────────────────────────────────
         cached = self._check_idempotency(sid, msg_id)
         if cached is not None:
+            # P1-2: 幂等重放——本地条目若仍缺 _target_host（旧版本写盘），
+            # 补标记使 flush 能重试/死信而非永久跳过。
+            if envelope.get("_target_host") == "__local__":
+                self._stamp_outbox_target_host(sid, msg_id)
             return cached
 
         # ── 1. Durable outbox write (fsync before transport) ───────────
@@ -175,9 +199,6 @@ class DeliveryEngine:
         self._cache[msg_id] = accepted
 
         # ── 2. Route to remote transport ───────────────────────────────
-        host_alias = getattr(target, "host_alias", None) or getattr(target, "ssh_alias", "")
-        from codeagent.domain import HostSpec, resolve_is_local
-        is_local_host = isinstance(target, HostSpec) and resolve_is_local(target)
         if not host_alias or is_local_host:
             # Local delivery: 统一走 LocalTransport.mailbox()（内部复用
             # mailbox.cli.main，与远程 SSH transport 共用同一 args 构造），
@@ -198,6 +219,9 @@ class DeliveryEngine:
             except Exception as exc:
                 log.warning("DeliveryEngine: local inbox write failed: %s", exc)
                 self._write_status(sid, msg_id, "local_delivery_failed", str(exc))
+                # P1-2: 兜底——确保 durable 条目带 _target_host（旧条目或
+                # 并发幂等路径可能缺），使 flush 可重试/死信而非永久跳过。
+                self._stamp_outbox_target_host(sid, msg_id)
                 return accepted
             self._mark_delivered(sid, msg_id)
             delivered = SendReceipt(status="delivered", msg_id=msg_id)
@@ -268,7 +292,9 @@ class DeliveryEngine:
                     a.to_dict() if hasattr(a, "to_dict") else a for a in atts
                 ]
         else:
-            env_dict = dict(envelope) if not isinstance(envelope, dict) else envelope
+            # P3-p: always shallow-copy the caller's dict to avoid
+            # mutating it with internal keys (_target_agent, etc.).
+            env_dict = dict(envelope)
             env_dict.setdefault("msg_id", msg_id)
             env_dict.setdefault("created_at", created_at)
             env_dict.setdefault("session_id", session_id)
@@ -295,8 +321,23 @@ class DeliveryEngine:
         self._host_cache[agent_id] = host
 
     def cache_roster(self, session_id: str, roster: list[str]) -> None:
-        """Store full roster for a session (called by kernel wiring or CLI)."""
-        self._session_rosters[session_id] = sorted(set(roster))
+        """Store full roster for a session (called by kernel wiring or CLI).
+
+        P2-14: a roster CHANGE (new agent joined) invalidates the
+        ``_ensured_sessions`` cache for this session so the next delivery
+        re-runs remote session-init with the new agent list — otherwise the
+        remote session never learns about the new agent and cross-host
+        delivery to it fails.  Repeated identical calls stay no-ops.
+        """
+        new_roster = sorted(set(roster))
+        prev = self._session_rosters.get(session_id)
+        if prev is not None and prev[1] != new_roster:
+            log.debug(
+                "DeliveryEngine: roster changed for %s — invalidating ensure cache",
+                session_id,
+            )
+            self._invalidate_ensured(session_id)
+        self._session_rosters[session_id] = (time.time(), new_roster)
 
     def _check_capability(self, host: Any) -> None:
         """Fail-closed if host transport lacks 'mailbox' capability.
@@ -314,8 +355,15 @@ class DeliveryEngine:
         if caps is None:
             try:
                 caps = self._router.capabilities(host)
-            except Exception:
-                caps = {"mailbox"}  # assume capable on check failure
+            except Exception as exc:
+                # P2-18: fail-closed——能力探测失败时不得假设 host 具备
+                # 'mailbox'（旧代码 fail-open 静默跳过检查，消息可能被投到
+                # 不支持 mailbox 的 transport 而丢失）。能力未知 → 拒绝
+                # 投递，消息留在 outbox 等 flush 重试。
+                raise RuntimeError(
+                    f"cannot verify 'mailbox' capability for host "
+                    f"'{host_alias}': {exc}"
+                ) from exc
             self._host_capabilities[host_alias] = caps
 
         if "mailbox" not in caps:
@@ -340,7 +388,8 @@ class DeliveryEngine:
         """
         host_alias = getattr(host, "ssh_alias", None) or getattr(host, "name", None) or ""
         cache_key = (session_id, host_alias)
-        if cache_key in self._ensured_sessions:
+        ensured_at = self._ensured_sessions.get(cache_key)
+        if ensured_at is not None and time.time() - ensured_at < self._ensure_ttl_s:
             return
 
         if transport is None:
@@ -368,7 +417,14 @@ class DeliveryEngine:
                 f"remote session-init failed (exit {init_code}): {init_err or init_out}"
             )
 
-        self._ensured_sessions.add(cache_key)
+        self._ensured_sessions[cache_key] = time.time()
+
+    def _invalidate_ensured(self, session_id: str) -> None:
+        """P2-14: drop ensure-cache entries for *session_id* so the remote
+        session is re-initialized with the current roster on next delivery."""
+        stale_keys = [k for k in self._ensured_sessions if k[0] == session_id]
+        for k in stale_keys:
+            self._ensured_sessions.pop(k, None)
 
     def _local_session_acl(self, session_id: str) -> Optional[dict]:
         """Read the local session.json ACL (authority/policy/allowed_senders).
@@ -428,7 +484,10 @@ class DeliveryEngine:
                     continue
 
                 from codeagent.domain import HostSpec, resolve_is_local
-                if resolve_is_local(target):
+                # P1-2: '__local__' 标记（本地投递失败条目）同样走本地重试
+                # 分支——否则 _resolve_target('__local__') 无法解析为本机，
+                # 会错误落到 _remote_send。
+                if host_alias == "__local__" or resolve_is_local(target):
                     # 本机 target（repo-map host 的 hostnames 匹配本机，如
                     # mac=OA-MIANYIN-MAC）：统一走 LocalTransport.mailbox()
                     # 直写本地 inbox（与 deliver() 同路径；msg_id 幂等）。
@@ -448,10 +507,17 @@ class DeliveryEngine:
                         self._handle_flush_failure(sid, mid, exc)
                         continue
                     self._mark_delivered(sid, mid)
-                    try:
-                        self._store.append_history(sid, self._history_entry(envelope, mid))
-                    except Exception as exc:
-                        log.warning("DeliveryEngine: flush history append failed: %s", exc)
+                    # P2-17: 本地分支的 LocalTransport.mailbox() → store.send()
+                    # 已在成功路径 append 了 canonical history（同 msg_id）。
+                    # 这里再 append 会撞 "history entry already exists"（无实际
+                    # 双份记录，但每次 flush 产生告警噪音）。改为检测已写——
+                    # history 记录存在则跳过，避免重复写/告警。
+                    history_file = self._store.history_dir(sid) / f"{mid}.json"
+                    if not history_file.exists():
+                        try:
+                            self._store.append_history(sid, self._history_entry(envelope, mid))
+                        except Exception as exc:
+                            log.warning("DeliveryEngine: flush history append failed: %s", exc)
                     self._cache[mid] = SendReceipt(status="delivered", msg_id=mid)
                     delivered_count += 1
                     continue
@@ -650,6 +716,32 @@ class DeliveryEngine:
         os.replace(str(tmp), str(dest))
         return dest
 
+    def _stamp_outbox_target_host(self, session_id: str, msg_id: str) -> None:
+        """P1-2: ensure the durable outbox entry carries ``_target_host``.
+
+        Rewrites the entry with ``_target_host="__local__"`` when missing so
+        flush() can retry/dead-letter it instead of skipping it forever.
+        Uses the same tmp + fsync + atomic-replace pattern as _write_outbox.
+        """
+        sd = self._outbox / session_id
+        dest = sd / f"{msg_id}.json"
+        if not dest.exists():
+            return
+        try:
+            entry = json.loads(dest.read_bytes())
+        except (json.JSONDecodeError, OSError):
+            return
+        if entry.get("_target_host"):
+            return
+        entry["_target_host"] = "__local__"
+        tmp = sd / f".tmp-{msg_id}.json"
+        payload = json.dumps(entry, indent=2, ensure_ascii=False)
+        with open(tmp, "w") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(dest))
+
     # ── Transport routing ──────────────────────────────────────────────
 
     def _remote_send(self, target: Any, envelope: dict[str, Any]) -> None:
@@ -673,15 +765,22 @@ class DeliveryEngine:
         # ── Capability check (fail-closed) ────────────────────────────
         self._check_capability(host)
 
-        # ── Ensure remote session (idempotent, cached) ───────────────
+        # ── Ensure remote session (idempotent, TTL-cached) ────────────
         sid = envelope.get("session_id", "")
         manager = envelope.get("from", "")
-        roster = self._session_rosters.get(sid)
+        # P2-14: roster 缓存带 TTL——过期后重新从 store 读权威定义，否则
+        # 新增 agent 永远进不了缓存（跨主机投递新 agent 失败）。
+        cached = self._session_rosters.get(sid)
+        roster: Optional[list[str]] = None
+        if cached is not None:
+            cached_at, cached_roster = cached
+            if time.time() - cached_at < self._roster_ttl_s:
+                roster = cached_roster
         if roster is None:
-            # 进程内缓存为空（CLI 每次新进程）：从本地 store 读 create-session
-            # 持久化的权威定义（完整 roster + manager）——degraded from/to
-            # fallback 会漏掉 roster 成员，导致远程 session 元数据残缺
-            # （后续 "sender not in roster" 误拒绝）。
+            # 进程内缓存为空或已过期（CLI 每次新进程）：从本地 store 读
+            # create-session 持久化的权威定义（完整 roster + manager）——
+            # degraded from/to fallback 会漏掉 roster 成员，导致远程 session
+            # 元数据残缺（后续 "sender not in roster" 误拒绝）。
             meta = None
             try:
                 meta = self._store.read_session(sid)
@@ -690,6 +789,7 @@ class DeliveryEngine:
             if meta and meta.get("agents"):
                 roster = sorted(set(meta["agents"]))
                 manager = meta.get("manager") or manager
+                self._session_rosters[sid] = (time.time(), roster)
         if roster is None:
             # Degraded: no cached roster — build from envelope from/to
             roster = sorted({envelope.get("from", ""), envelope.get("to", "")})

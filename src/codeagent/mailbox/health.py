@@ -55,7 +55,11 @@ def diagnose(store: MailboxStore, session_id: str, agent_id: str) -> dict:
         checks["identity_file_set"] = True
         p = Path(identity_file)
         checks["identity_file_exists"] = p.exists()
-        checks["identity_file_writable"] = p.parent.is_dir()
+        # 改进项2: test actual write access to the parent directory, not just
+        # directory existence.  p.parent.is_dir() does not catch read-only
+        # mounts, permission errors, or immutable directory flags.
+        parent = p.parent
+        checks["identity_file_writable"] = parent.is_dir() and os.access(parent, os.W_OK)
     else:
         checks["identity_file_set"] = False
         checks["identity_file_writable"] = None

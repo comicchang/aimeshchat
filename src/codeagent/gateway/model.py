@@ -20,8 +20,10 @@ EVENT_KINDS = frozenset({
     "ASSISTANT_PROGRESS", "TOOL_STARTED", "TOOL_UPDATED", "TOOL_FINISHED",
     "USAGE", "TASK_STATE", "ERROR", "AGENT_STATUS",
 })
-# Tool update detail kinds — pruned by gateway sweep after 7 days.
-EVENT_KIND_TOOL_UPDATE = frozenset({"TOOL_STARTED", "TOOL_UPDATED", "TOOL_FINISHED"})
+# P2-4: Tool update DETAIL kind — pruned by gateway sweep after 7 days.
+# Lifecycle kinds (TOOL_STARTED / TOOL_FINISHED) are RETAINED so per-runtime
+# tool_count never resets to zero after 7 days (regression A6).
+EVENT_KIND_TOOL_UPDATE = frozenset({"TOOL_UPDATED"})
 # Kinds retained after runtime release.
 EVENT_KIND_TERMINAL = frozenset({"TASK_STATE", "MESSAGE_READ", "ERROR"})
 

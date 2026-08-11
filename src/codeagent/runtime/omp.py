@@ -178,6 +178,15 @@ class OMPRuntimeAdapter(RuntimeAdapter):
         # Warm resume: new pane with --resume <backend_session_id>.
         from codeagent.runtime.supervisor import RuntimeSpec, spawn_runtime
 
+        # P0-7: carry owner identity on warm resume. The gateway A7
+        # owner-scoped check (runtime.register) rejects a re-registration
+        # whose owner_pid+nonce differ from the stored identity; a spec
+        # without them yields identity.json nonce="" and skips
+        # OMP_MAILBOX_NONCE, so the plugin registers with an empty
+        # identity and warm resume fails back to cold. A fresh nonce is
+        # safe: resume bumps the generation and A2/A2.3 lets a new
+        # generation take over with a fresh identity (same as the cold
+        # path, which generates a new nonce per launch).
         spec = RuntimeSpec(
             runtime_id=f"omp-{uuid4().hex[:10]}",
             session_id=handle.extra.get("session_id", ""),
@@ -189,6 +198,8 @@ class OMPRuntimeAdapter(RuntimeAdapter):
             workdir=handle.extra.get("workdir", ""),
             task=prompt,
             gateway_socket=handle.extra.get("gateway_socket", ""),
+            owner_pid=os.getpid(),
+            nonce=uuid4().hex[:12],
             mode="interactive_plugin",
             host_alias=handle.host_alias,
             capabilities=list(_FULL_CAPS),

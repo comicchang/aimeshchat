@@ -54,7 +54,9 @@ def revive_or_spawn(review_key: str, prompt: str = "") -> ReviveResult:
             prompt=prompt,
         )
 
-    if manifest and manifest.lifecycle in (Lifecycle.COLD_RESUMABLE, Lifecycle.RELEASED):
+    # P0-4: 只有 COLD_RESUMABLE 可 warm-revivable；RELEASED 是终态，
+    # 不应再恢复 backend session（终态过滤），一律走 cold reconstruction。
+    if manifest and manifest.lifecycle == Lifecycle.COLD_RESUMABLE:
         if manifest.backend_session_id:
             return ReviveResult(
                 success=True,

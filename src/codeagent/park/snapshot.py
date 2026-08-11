@@ -67,7 +67,12 @@ def load_snapshot(review_key: str, round_num: int) -> Optional[ReviewSnapshot]:
 def latest_snapshot(review_key: str) -> Optional[ReviewSnapshot]:
     """加载最新轮次的 snapshot。"""
     d = _snapshot_dir(review_key)
-    rounds = sorted(d.glob("round_*.json"))
+    # P0-1: 按整数轮次排序（int(stem)），而非文件名字典序——
+    # 字符串比较会把 round_10 排在 round_9 之前，导致 latest 选错轮。
+    rounds = sorted(
+        d.glob("round_*.json"),
+        key=lambda p: int(p.stem.split("_", 1)[1]),
+    )
     if not rounds:
         return None
     with open(rounds[-1]) as f:

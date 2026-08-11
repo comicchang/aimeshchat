@@ -236,6 +236,27 @@ class TestMailboxHealth:
         assert checks["identity_file_set"] is True
         assert checks["identity_file_exists"] is False
 
+    def test_identity_file_not_writable_dir(self, tmp_path, monkeypatch):
+        # 改进项2: verify that a read-only parent directory is detected as
+        # non-writable, even though the directory itself exists.
+        store = self._healthy_store(tmp_path)
+        ro_dir = tmp_path / "ro"
+        ro_dir.mkdir()
+        identity = ro_dir / "identity.json"
+        monkeypatch.setenv("OMP_MAILBOX_IDENTITY_FILE", str(identity))
+        # Simulate read-only directory by revoking write permission.
+        try:
+            ro_dir.chmod(0o555)
+        except (OSError, PermissionError):
+            pytest.skip("cannot revoke write permission in this environment")
+        try:
+            checks = mailbox_health.diagnose(store, "s1", "w1")
+            assert checks["identity_file_set"] is True
+            assert checks["identity_file_writable"] is False
+        finally:
+            # Restore permissions for cleanup.
+            ro_dir.chmod(0o755)
+
 
 class TestMailboxHook:
     def test_hook_empty(self, tmp_path, monkeypatch, capsys):

@@ -401,12 +401,13 @@ def test_apply_message_first_progress_running(ledger: RequestLedger) -> None:
 
 def test_apply_message_report_terminal_cas(ledger: RequestLedger) -> None:
     ledger.apply_message(_task())
-    ledger.apply_message({
+    # P2-11: a REPORT is the task's final outcome → terminal DONE.
+    assert ledger.apply_message({
         "kind": "REPORT", "run_id": "r1", "request_id": "q1", "msg_id": "rep1",
         "reply_to": "m1", "from": "worker",
-    })
-    # terminal DONE recorded once; a second terminal is rejected
-    assert ledger.record_event("q1", "r1", "DONE", {}) is True
+    }) == "DONE"
+    # A second terminal is rejected (CAS — REPORT already closed the request)
+    assert ledger.record_event("q1", "r1", "DONE", {}) is False
     assert ledger.record_event("q1", "r1", "BLOCKED", {}) is False
     assert ledger.get_terminal("q1", "r1") == "DONE"
     # conflict recorded

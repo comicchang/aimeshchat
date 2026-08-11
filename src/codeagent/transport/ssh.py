@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import shlex
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -46,6 +47,9 @@ if TYPE_CHECKING:
     from codeagent.domain import HostSpec, RunRequest
 
 log = logging.getLogger(__name__)
+
+# P1-6: how long to wait for the SSHStream ready banner before giving up.
+SSHSTREAM_READY_TIMEOUT = 10.0
 
 # SSH error patterns that indicate a connection-level failure (exit 255).
 _SSH_ERROR_PATTERNS = (
@@ -276,7 +280,12 @@ class SSHTransport(Transport):
             # as SSH aliases), but quote the fixed segment so a compromised
             # prefix cannot smuggle extra commands via the appended part.
             remote_cmd_str = f"{host.shell_prefix}; {shlex.quote(remote_exec)}"
-            remote_cmd = ["sh", "-c", remote_cmd_str]
+            # P1-5: single string arg — OpenSSH joins argv[4:] with spaces,
+            # so ["sh","-c",cmd] loses the env from shell_prefix (the remote
+            # shell only sees the first word after -c) and the appended
+            # remote_exec runs without the prefix → command not found.
+            # A single string is executed as-is remotely (same as mailbox()).
+            remote_cmd = [remote_cmd_str]
         else:
             remote_cmd = ["postmesh-remote-exec"]
 
@@ -708,17 +717,45 @@ class SSHStream:
         except FileNotFoundError as exc:
             raise TransportError(f"ssh binary not found: {cmd[0]}") from exc
 
-        # Wait for ready banner
+        # P1-6: drain stderr on a daemon thread so a full stderr pipe can't
+        # deadlock the ready-banner handshake below (ssh -v noise or remote
+        # banner spam can fill the pipe buffer while we wait on stdout).
+        assert self._proc.stderr is not None
+        threading.Thread(
+            target=self._drain_stderr,
+            args=(self._proc.stderr,),
+            daemon=True,
+            name="sshstream-stderr-drain",
+        ).start()
+
+        # P1-6: ready banner read with a timeout — a hung ssh must fail
+        # fast instead of blocking open() forever on readline().
         assert self._proc.stdout is not None
-        ready_line = self._proc.stdout.readline()
-        if not ready_line:
-            rc = self._proc.wait()
+        ready_line = self._readline(SSHSTREAM_READY_TIMEOUT)
+        if ready_line is None:
+            if self._proc.poll() is None:
+                # Process still alive → timed out waiting for the banner.
+                self._proc.kill()
+                rc = self._proc.wait()
+                raise TransportError(
+                    f"SSHStream: no ready banner within {SSHSTREAM_READY_TIMEOUT:.0f}s "
+                    f"(exit {rc})"
+                )
+            rc = self._proc.returncode
             raise TransportError(f"SSHStream: no ready banner (exit {rc})")
         try:
             ready_msg = decode_line(ready_line)
             if ready_msg.type != MSG_READY:
                 raise TransportError(
                     f"SSHStream: expected ready, got {ready_msg.type}"
+                )
+            # P1-6: validate wire version (same check as _run_ssh_wire /
+            # _run_ssh_mailbox) — a stale remote would desync the stream.
+            remote_ver = ready_msg.payload.get("wire_version", 0)
+            if remote_ver != WIRE_VERSION:
+                raise TransportError(
+                    f"wire version mismatch: remote={remote_ver}, local={WIRE_VERSION}. "
+                    f"Update codeagent-py on the remote host."
                 )
         except ValueError as exc:
             raise TransportError(f"SSHStream: bad ready banner: {exc}") from exc
@@ -741,6 +778,19 @@ class SSHStream:
         self._proc.stdin.flush()
 
         self._last_event_time = time.monotonic()
+
+    @staticmethod
+    def _drain_stderr(stream: Any) -> None:
+        """Read stderr to EOF so the pipe buffer never fills (P1-6).
+
+        Runs on a daemon thread; exits as soon as the remote closes stderr
+        (process exit) or the read side is torn down (close/reconnect).
+        """
+        try:
+            while stream.read(4096):
+                pass
+        except (OSError, ValueError):
+            pass
 
     def _readline(self, timeout: float) -> str | None:
         """Read one line from stdout with timeout. Returns None on timeout/EOF."""

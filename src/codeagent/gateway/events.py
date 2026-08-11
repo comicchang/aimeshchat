@@ -172,28 +172,54 @@ class EventStore:
         if kind not in EVENT_KINDS:
             raise ValueError(f"invalid event kind {kind!r}")
 
+        # P2-1: BEGIN IMMEDIATE takes the write lock BEFORE the SELECT so a
+        # concurrent ingest for the same 4-tuple cannot slip an INSERT between
+        # our check and ours — prevents lastrowid==0 → ValueError. The
+        # re-query after INSERT OR IGNORE is defence-in-depth.
         with self._connect() as conn:
-            existing = conn.execute(
-                "SELECT event_id FROM runtime_events "
-                "WHERE source_host = ? AND runtime_id = ? AND generation = ? AND source_sequence = ?",
-                (host, runtime_id, generation, seq),
-            ).fetchone()
-            if existing is not None:
-                return self._row_to_event(self._fetch_by_id(int(existing[0])))
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO runtime_events "
-                "(source_host, runtime_id, generation, source_sequence, session_id, "
-                " agent_id, request_id, run_id, kind, created_at, payload) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    host, runtime_id, generation, seq,
-                    event.get("session_id", ""), event.get("agent_id", ""),
-                    event.get("request_id", ""), event.get("run_id", ""),
-                    kind, event.get("created_at", ""),
-                    json.dumps(event.get("payload", {}) or {}, ensure_ascii=False),
-                ),
-            )
-            event_id = int(cur.lastrowid)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT event_id FROM runtime_events "
+                    "WHERE source_host = ? AND runtime_id = ? AND generation = ? AND source_sequence = ?",
+                    (host, runtime_id, generation, seq),
+                ).fetchone()
+                if existing is not None:
+                    event_id = int(existing[0])
+                else:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO runtime_events "
+                        "(source_host, runtime_id, generation, source_sequence, session_id, "
+                        " agent_id, request_id, run_id, kind, created_at, payload) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            host, runtime_id, generation, seq,
+                            event.get("session_id", ""), event.get("agent_id", ""),
+                            event.get("request_id", ""), event.get("run_id", ""),
+                            kind, event.get("created_at", ""),
+                            json.dumps(event.get("payload", {}) or {}, ensure_ascii=False),
+                        ),
+                    )
+                    if cur.lastrowid and cur.lastrowid > 0:
+                        event_id = int(cur.lastrowid)
+                    else:
+                        # P2-1: defence-in-depth — re-query after INSERT OR IGNORE no-op.
+                        row = conn.execute(
+                            "SELECT event_id FROM runtime_events "
+                            "WHERE source_host = ? AND runtime_id = ? "
+                            "AND generation = ? AND source_sequence = ?",
+                            (host, runtime_id, generation, seq),
+                        ).fetchone()
+                        if row is None:
+                            raise ValueError(
+                                f"ingest_remote failed to persist event for "
+                                f"{host}/{runtime_id}/{generation}/{seq}"
+                            )
+                        event_id = int(row[0])
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
         return self._row_to_event(self._fetch_by_id(event_id))
 
     # ── query ──────────────────────────────────────────────────────────
@@ -286,8 +312,10 @@ class EventStore:
     def sweep(self, now: Optional[float] = None) -> int:
         """Prune tool-update detail events older than 7 days.
 
-        Terminal/receipt/error events are retained past release — only
-        TOOL_STARTED/TOOL_UPDATED/TOOL_FINISHED detail rows expire.
+        P2-4: TOOL_STARTED/TOOL_FINISHED are RETAINED (lifecycle kinds) so
+        per-runtime tool_count never resets to zero after 7 days (regression
+        A6). Only TOOL_UPDATED detail rows expire.
+        Terminal/receipt/error events are retained past release.
         Returns the number of deleted rows.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(days=TOOL_UPDATE_RETENTION_DAYS)

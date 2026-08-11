@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, Protocol
 from uuid import uuid4
@@ -85,6 +86,20 @@ class LocalDeliverySink:
 # ── SwarmKernel ────────────────────────────────────────────────────────
 
 
+def _synchronized(method: Callable) -> Callable:
+    """P1-4: Serialize a kernel public method behind its instance RLock.
+
+    Gateway threads call kernel methods concurrently; without serialization,
+    dict mutations during iteration raise ``RuntimeError``.  ``RLock`` (not
+    plain ``Lock``) allows re-entrant calls (e.g. ``send`` → ``direct``).
+    """
+    def _wrapper(self, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+    _wrapper.__wrapped__ = method          # type: ignore[attr-defined]
+    return _wrapper
+
+
 class SwarmKernel:
     """Protocol kernel — owns session/roster/ACL/routing, not transport.
 
@@ -99,6 +114,8 @@ class SwarmKernel:
     def __init__(self, store: MailboxStore, sink: Optional[DeliverySink] = None):
         self._store = store
         self._sink = sink or LocalDeliverySink(store)
+        # P1-4: 串行化 kernel 状态访问（gateway 多线程并发防 dict RuntimeError 崩溃）。
+        self._lock = threading.RLock()
         # session_id → Session
         self._sessions: dict[str, Session] = {}
         # (session_id, agent_id) → AgentLocation
@@ -208,6 +225,7 @@ class SwarmKernel:
 
     # ── Session lifecycle ──────────────────────────────────────────────
 
+    @_synchronized  # P1-4
     def create_session(
         self,
         session_id: str,
@@ -291,6 +309,7 @@ class SwarmKernel:
 
     # ── Register / Unregister ──────────────────────────────────────────
 
+    @_synchronized  # P1-4
     def register(self, location: AgentLocation, session_id: str,
                  token: str = "") -> Registration:
         """Register an agent's location in the routing table.
@@ -328,6 +347,7 @@ class SwarmKernel:
             location=location,
         )
 
+    @_synchronized  # P1-4
     def set_agent_card(self, session_id: str, agent_id: str,
                        card: dict) -> None:
         """P2 (oracle): 持久化 agent_card（每 agent 一张，与 ACL/权限解耦）。
@@ -367,6 +387,7 @@ class SwarmKernel:
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return {}
 
+    @_synchronized  # P1-4
     def unregister(self, session_id: str, agent_id: str) -> None:
         """Remove an agent from the routing table."""
         self._require_session(session_id)
@@ -408,6 +429,7 @@ class SwarmKernel:
 
     # ── Channel management ─────────────────────────────────────────────
 
+    @_synchronized  # P1-4
     def create_channel(
         self,
         session_id: str,
@@ -524,6 +546,7 @@ class SwarmKernel:
     def _gen_created_at(self) -> str:
         return datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT)
 
+    @_synchronized  # P1-4
     def send(self, session_id: str, sender: str, target: Address,
              envelope: Envelope) -> SendReceipt:
         """Route a message according to its Address kind.
@@ -577,6 +600,7 @@ class SwarmKernel:
         else:
             raise ValueError(f"unknown address kind: {target.kind}")
 
+    @_synchronized  # P1-4
     def direct(self, session_id: str, sender: str, to_agent: str,
                envelope: Envelope) -> SendReceipt:
         """Send a direct message to one recipient. No fanout."""
@@ -592,6 +616,7 @@ class SwarmKernel:
                            session_id=session_id, target=to_agent,
                            queued=getattr(sink_receipt, "queued", False))
 
+    @_synchronized  # P1-4
     def broadcast(self, session_id: str, sender: str,
                   envelope: Envelope) -> list[DeliveryReceipt]:
         """Broadcast to all room members except sender.
@@ -620,6 +645,7 @@ class SwarmKernel:
             ))
         return receipts
 
+    @_synchronized  # P1-4
     def channel(self, session_id: str, sender: str, channel_id: str,
                 envelope: Envelope) -> list[DeliveryReceipt]:
         """Send to a channel (fan out to channel members except sender)."""
@@ -646,6 +672,7 @@ class SwarmKernel:
             ))
         return receipts
 
+    @_synchronized  # P1-4
     def notice(self, session_id: str, sender: str, topic: str,
                envelope: Envelope, ttl: int = 0) -> list[DeliveryReceipt]:
         """Send a notice, fanning out to topic subscribers (or session).
@@ -678,6 +705,7 @@ class SwarmKernel:
             ))
         return receipts
 
+    @_synchronized  # P1-4
     def trace(self, session_id: str, trace_id: str) -> dict:
         """Top4: 按 trace_id 聚合 canonical history —— 跨主机消息链 +
         每 leaf 投递状态（delivered/consumed/无）。
@@ -724,14 +752,24 @@ class SwarmKernel:
 
     # ── Poll ───────────────────────────────────────────────────────────
 
+    @_synchronized  # P1-4
     def poll(self, session_id: str, agent_id: str,
              cursor: str = "", limit: int = 50) -> PollResult:
         """Read messages from agent inbox, filtering by cursor.
 
-        Cursor is the created_at of the last consumed message.
-        Also fires any registered subscription callbacks for new messages.
+        P1-7: Cursor is a composite key ``"created_at|msg_id"`` so that
+        messages arriving in the same second are never skipped.  Old-format
+        cursors (bare ``created_at`` without ``|``) are still accepted —
+        they compare as ``(ts, "")`` which correctly includes all same-second
+        messages.
         """
         self._require_session(session_id)
+
+        # P1-7: parse composite cursor into (timestamp, msg_id) tuple.
+        if cursor and "|" in cursor:
+            cursor_ts, cursor_id = cursor.rsplit("|", 1)
+        else:
+            cursor_ts, cursor_id = cursor, ""
 
         inbox = self._store.agent_subdir(session_id, agent_id, "inbox")
 
@@ -746,13 +784,23 @@ class SwarmKernel:
                 msg = json.loads(f.read_bytes())
             except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
-            if cursor and msg.get("created_at", "") <= cursor:
-                continue
+            # P1-7: composite (created_at, msg_id) comparison — strict >
+            # ensures same-second messages with different ids are all returned.
+            if cursor:
+                msg_ts = msg.get("created_at", "")
+                msg_id = msg.get("msg_id", "")
+                if (msg_ts, msg_id) <= (cursor_ts, cursor_id):
+                    continue
             messages.append(msg)
             if len(messages) >= limit:
                 break
 
-        new_cursor = messages[-1]["created_at"] if messages else cursor
+        # P1-7: new cursor includes msg_id for same-second safety.
+        if messages:
+            last = messages[-1]
+            new_cursor = f"{last['created_at']}|{last['msg_id']}"
+        else:
+            new_cursor = cursor
         has_more = len(messages) == limit
 
         # Fire subscription callbacks for new messages
@@ -780,6 +828,7 @@ class SwarmKernel:
 
     # ── Subscribe ──────────────────────────────────────────────────────
 
+    @_synchronized  # P1-4
     def attach_receiver(self, receiver: Any) -> None:
         """Attach a SwarmReceiver for push-mode callback routing.
 
@@ -788,6 +837,7 @@ class SwarmKernel:
         """
         self._receiver = receiver
 
+    @_synchronized  # P1-4
     def subscribe(
         self,
         session_id: str,
@@ -829,16 +879,26 @@ class SwarmKernel:
 
     # ── Ack ────────────────────────────────────────────────────────────
 
+    @_synchronized  # P1-4
     def ack(self, session_id: str, agent_id: str, msg_id: str,
             phase: str = "consumed") -> str:
         """Acknowledge a message — finalize or release based on phase.
 
         phase="consumed" → finalize (move to archive)
         phase="released" → release (move back to inbox)
+
+        P3-o: try finalize() first (requires claim file from two-phase
+        read); on failure fall back to finalize_from_inbox() (no claim
+        needed — covers auto-consumed messages from SwarmReceiver).
         """
         self._require_session(session_id)
         if phase == "consumed":
-            return self._store.finalize(session_id, agent_id, msg_id, owner=agent_id)
+            try:
+                return self._store.finalize(session_id, agent_id, msg_id, owner=agent_id)
+            except ValueError:
+                # P3-o: no claim file → message was auto-consumed (inbox→
+                # archive directly).  Use finalize_from_inbox instead.
+                return self._store.finalize_from_inbox(session_id, agent_id, msg_id, owner=agent_id)
         elif phase == "released":
             return self._store.release(session_id, agent_id, msg_id, owner=agent_id)
         else:
@@ -846,14 +906,17 @@ class SwarmKernel:
 
     # ── Accessors ──────────────────────────────────────────────────────
 
+    @_synchronized  # P1-4
     def get_session(self, session_id: str) -> Optional[Session]:
         return self._sessions.get(session_id)
 
+    @_synchronized  # P1-4
     def get_location(self, session_id: str, agent_id: str) -> Optional[AgentLocation]:
         return self._routing.get((session_id, agent_id))
 
     # ── Manager-pull: pull_remote / ingest / replay ─────────────────
 
+    @_synchronized  # P1-4
     def pull_remote(self, session_id: str, from_host: str) -> list[dict]:
         """Pull messages from the Manager inbox on a remote worker host.
 
@@ -980,6 +1043,7 @@ class SwarmKernel:
         except (subprocess.TimeoutExpired, OSError):
             return False
 
+    @_synchronized  # P1-4
     def ingest(self, session_id: str, messages: list[dict]) -> list[str]:
         """Validate and persist messages into canonical history.
 
@@ -1019,6 +1083,7 @@ class SwarmKernel:
                             msg.get("msg_id", "?"), exc)
         return persisted
 
+    @_synchronized  # P1-4
     def replay(self, session_id: str, request_id: str) -> list[dict]:
         """Return history entries for *request_id* in chronological order.
 

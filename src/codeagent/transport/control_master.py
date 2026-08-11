@@ -179,6 +179,27 @@ class ControlMaster:
             log.debug("master already alive for %s", self.alias)
             return
 
+        # P2-13: 清理陈旧 socket——is_alive() 为 False 但 socket 文件残留时
+        # （master 被 kill/crash 后未走 stop() 清理），ssh -M -N -f 会因
+        # ControlPath 已存在而失败（"ControlPath ... already exists"），
+        # 造成永久 TransportError。创建前 unlink 残留 socket + companion .meta。
+        if self._socket.exists():
+            log.info(
+                "removing stale socket %s before create for %s",
+                self._socket, self.alias,
+            )
+            try:
+                self._socket.unlink(missing_ok=True)
+            except OSError as exc:
+                raise TransportError(
+                    f"failed to remove stale socket {self._socket}: {exc}"
+                ) from exc
+            meta = self._socket.with_suffix(".meta")
+            try:
+                meta.unlink(missing_ok=True)
+            except OSError:
+                pass
+
         ssh = shutil.which(self._ssh)
         if not ssh:
             raise TransportError(f"ssh binary not found: {self._ssh}")

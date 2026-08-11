@@ -306,24 +306,33 @@ def cmd_gateway_rpc(args) -> int:
 # ── events watch ───────────────────────────────────────────────────────
 
 
-def _watch_cursor_file(session_id: str, runtime_id: str) -> Optional[Path]:
+def _watch_cursor_file(session_id: str, runtime_id: str, filters: Optional[list[str]] = None) -> Optional[Path]:
     """A4: persisted watch-cursor path.
 
     ``$XDG_STATE_HOME/postmesh/watch-cursor-<key>.json`` (default
     ``~/.local/state/postmesh/...``) where the key is the session_id when
     filtering by session, else runtime_id, else None — an unfiltered
     global stream is not persisted.
+
+    P2-4: include a short hash of the filter set in the filename so that
+    watchers on the same session with different filters do NOT clobber
+    each other's cursor.
     """
     key = session_id or runtime_id or ""
     if not key:
         return None
+    # P2-4: partition cursor file by (session|runtime, filters).
+    if filters:
+        import hashlib
+        fhash = hashlib.sha256(",".join(sorted(filters)).encode("utf-8")).hexdigest()[:12]
+        key = f"{key}-f{fhash}"
     base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
     return base / "postmesh" / f"watch-cursor-{key}.json"
 
 
-def _load_watch_cursor(session_id: str, runtime_id: str) -> int:
+def _load_watch_cursor(session_id: str, runtime_id: str, filters: Optional[list[str]] = None) -> int:
     """A4: load the persisted cursor (0 when absent or corrupt)."""
-    path = _watch_cursor_file(session_id, runtime_id)
+    path = _watch_cursor_file(session_id, runtime_id, filters)
     if path is None or not path.exists():
         return 0
     try:
@@ -332,15 +341,34 @@ def _load_watch_cursor(session_id: str, runtime_id: str) -> int:
         return 0
 
 
-def _save_watch_cursor(session_id: str, runtime_id: str, cursor: int) -> None:
-    """A4: persist the cursor so a reconnect resumes where we left off."""
-    path = _watch_cursor_file(session_id, runtime_id)
+def _save_watch_cursor(session_id: str, runtime_id: str, cursor: int, filters: Optional[list[str]] = None) -> None:
+    """A4: persist the cursor so a reconnect resumes where we left off.
+
+    改进项1: include filter hash and watcher identity in the cursor JSON so
+    a reader can validate that the persisted cursor belongs to the same
+    filter set and watcher (hostname+pid). The filename itself already
+    partitions by filter hash (P2-4); this adds content-level provenance.
+    """
+    path = _watch_cursor_file(session_id, runtime_id, filters)
     if path is None:
         return
     try:
+        import hashlib as _hashlib
+        import socket as _socket
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"cursor": int(cursor)}), encoding="utf-8")
+        # 改进项1: build provenance record
+        fhash = ""
+        if filters:
+            fhash = _hashlib.sha256(",".join(sorted(filters)).encode("utf-8")).hexdigest()[:12]
+        data = {
+            "cursor": int(cursor),
+            "filters": filters or [],
+            "filter_hash": fhash,
+            "watcher_id": f"{_socket.gethostname()}:{os.getpid()}",
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
     except OSError as exc:
         log.debug("events watch: cursor persist failed: %s", exc)
@@ -385,14 +413,15 @@ def cmd_events_watch(args) -> int:
     # A4: cursor — an explicit --cursor wins; otherwise resume from file.
     session_id = getattr(args, "session", None) or ""
     runtime_id = getattr(args, "runtime_id", None) or ""
+    # P2-4: compute filters BEFORE cursor load so the filter-partitioned
+    # cursor file can be located correctly.
+    filters = getattr(args, "filters", None)
+    filters = filters.split(",") if filters else None
     explicit_cursor = getattr(args, "cursor", None) not in (None, "")
     if explicit_cursor:
         cursor = int(getattr(args, "cursor") or 0)
     else:
-        cursor = _load_watch_cursor(session_id, runtime_id)
-
-    filters = getattr(args, "filters", None)
-    filters = filters.split(",") if filters else None
+        cursor = _load_watch_cursor(session_id, runtime_id, filters)
     # 改进项1: human-readable output by default; --jsonl is opt-in.
     jsonl = bool(getattr(args, "jsonl", False)) and not bool(getattr(args, "plain", False))
     exit_on = _parse_exit_on(getattr(args, "exit_on", None))
@@ -429,14 +458,14 @@ def cmd_events_watch(args) -> int:
                 state = (ev.get("payload") or {}).get("state", "")
                 if (kind, state) in exit_on:
                     try:
-                        _save_watch_cursor(session_id, runtime_id, int(result.get("cursor") or cursor or 0))
+                        _save_watch_cursor(session_id, runtime_id, int(result.get("cursor") or cursor or 0), filters)
                     except (TypeError, ValueError):
                         pass
                     return 0
         cursor = result.get("cursor", cursor)
         # A4: persist after every poll so a reconnect resumes exactly here.
         try:
-            _save_watch_cursor(session_id, runtime_id, int(cursor))
+            _save_watch_cursor(session_id, runtime_id, int(cursor), filters)
         except (TypeError, ValueError):
             pass
         sys.stdout.flush()

@@ -153,9 +153,10 @@ class TestHubSend:
     def test_send_offline_peer_fails_fast(self, gw: AgentGateway):
         _register_peer(gw)
         gw._peers["remote-dev"].status = "offline"
-        result = gw.hub_send({"peer_id": "remote-dev", "from": "hub", "content": "hi"})
-        assert result["status"] == "offline"
-        assert result["msg_id"] == ""
+        # P3-f: offline peer → fail-closed raise（不假返回 ok=True 无 msg_id）
+        with pytest.raises(GatewayError) as ei:
+            gw.hub_send({"peer_id": "remote-dev", "from": "hub", "content": "hi"})
+        assert ei.value.code == "NOT_FOUND"
         # nothing delivered
         inbox = gw._store.list_messages(gw._store.agent_subdir("s1", "w1", "inbox"))
         assert len(inbox) == 0

@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -225,6 +226,20 @@ class SwarmReceiver:
         # Fire callbacks (notification only — no ack)
         self._fire_callbacks(event)
 
+    # P1-3: msg_id 必须匹配 [A-Za-z0-9_-]+，禁止路径穿越（/、\\、..）覆盖任意 .json。
+    _RE_MSG_ID = re.compile(r'^[A-Za-z0-9_-]+$')
+
+    @staticmethod
+    def _validate_msg_id(msg_id: str) -> None:
+        """Reject msg_ids that could traverse directories (P1-3).
+
+        A valid msg_id contains only alphanumerics, hyphens, and underscores.
+        Characters like ``/``, ``\\``, and ``..`` are forbidden to prevent
+        path traversal attacks that could overwrite arbitrary ``.json`` files.
+        """
+        if not SwarmReceiver._RE_MSG_ID.match(msg_id):
+            raise ValueError(f"invalid msg_id (P1-3 path traversal guard): {msg_id!r}")
+
     def _write_to_inbox(self, event: dict[str, Any]) -> None:
         """Write a stream event as a message file in the local inbox.
 
@@ -232,6 +247,12 @@ class SwarmReceiver:
         (reply_to, run_id, request_id, trace_id, causation_id, attachments).
         """
         msg_id = event.get("msg_id", "")
+        # P1-3: 校验 wire msg_id，拒绝路径穿越，不写入非法文件。
+        try:
+            self._validate_msg_id(msg_id)
+        except ValueError:
+            log.warning("SwarmReceiver: dropping event with invalid msg_id=%r", msg_id)
+            return
         inbox = self._store.agent_subdir(self._session_id, self._agent_id, "inbox")
         inbox.mkdir(parents=True, exist_ok=True)
 

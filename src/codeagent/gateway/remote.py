@@ -69,6 +69,9 @@ def remote_gateway_call(
             input=(req.to_json() + "\n").encode("utf-8"), timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
+        # P2-5: kill the SSH child process on timeout to prevent leaks.
+        proc.kill()
+        proc.wait()
         raise GatewayError("REMOTE_RPC_TIMEOUT", f"remote gateway rpc timed out: {exc}") from exc
     except OSError as exc:
         raise GatewayError("REMOTE_RPC_FAILED", f"remote gateway rpc failed: {exc}") from exc

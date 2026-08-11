@@ -17,12 +17,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 from codeagent.constants import ISO_TIMESTAMP_FORMAT
 from codeagent.gateway.events import EventStore, control_socket_path
@@ -130,6 +132,8 @@ class AgentGateway:
         # Cross-device write merge bookkeeping (session_id, target_path) →
         # artifact_sha256 — persisted so conflict detection survives restarts.
         self._merges: dict[tuple[str, str], str] = {}
+        # P2-2: RLock for merges dict concurrent access.
+        self._merges_lock = threading.RLock()
         self._restore_merges()
         # A3: gateway restart recovery — rebuild runtime records from the
         # park registry so hot detection / presence survive a restart even
@@ -144,12 +148,14 @@ class AgentGateway:
         """Persist hub peers atomically (survive gateway restarts)."""
         try:
             self._peers_file.parent.mkdir(parents=True, exist_ok=True)
-            data = [{
-                "peer_id": p.peer_id, "session_id": p.session_id,
-                "agent_id": p.agent_id, "host_alias": p.host_alias,
-                "mailbox_root": p.mailbox_root, "status": p.status,
-                "registered_at": p.registered_at,
-            } for p in self._peers.values()]
+            # P2-2: snapshot peers under lock; write file outside lock.
+            with self._peers_lock:
+                data = [{
+                    "peer_id": p.peer_id, "session_id": p.session_id,
+                    "agent_id": p.agent_id, "host_alias": p.host_alias,
+                    "mailbox_root": p.mailbox_root, "status": p.status,
+                    "registered_at": p.registered_at,
+                } for p in self._peers.values()]
             tmp = self._peers_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
             tmp.replace(self._peers_file)
@@ -162,20 +168,22 @@ class AgentGateway:
             if not self._peers_file.exists():
                 return
             data = json.loads(self._peers_file.read_text(encoding="utf-8"))
-            for d in data:
-                peer = _HubPeer(
-                    peer_id=d.get("peer_id", ""),
-                    session_id=d.get("session_id", ""),
-                    agent_id=d.get("agent_id", ""),
-                    host_alias=d.get("host_alias", ""),
-                    mailbox_root=d.get("mailbox_root", ""),
-                    status=d.get("status", "unknown"),
-                    registered_at=d.get("registered_at", 0.0),
-                )
-                if peer.peer_id:
-                    self._peers[peer.peer_id] = peer
-            if self._peers:
-                log.info("gateway: restored %d hub peer(s)", len(self._peers))
+            # P2-2: lock peer writes during restore.
+            with self._peers_lock:
+                for d in data:
+                    peer = _HubPeer(
+                        peer_id=d.get("peer_id", ""),
+                        session_id=d.get("session_id", ""),
+                        agent_id=d.get("agent_id", ""),
+                        host_alias=d.get("host_alias", ""),
+                        mailbox_root=d.get("mailbox_root", ""),
+                        status=d.get("status", "unknown"),
+                        registered_at=d.get("registered_at", 0.0),
+                    )
+                    if peer.peer_id:
+                        self._peers[peer.peer_id] = peer
+                if self._peers:
+                    log.info("gateway: restored %d hub peer(s)", len(self._peers))
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("hub peers restore failed: %s", exc)
 
@@ -196,27 +204,36 @@ class AgentGateway:
             log.warning("gateway: park restore unavailable: %s", exc)
             return
         restored = 0
-        for m in manifests:
-            if not m.swarm_session_id or not m.backend_session_id:
-                continue
-            runtime_id = f"park-{m.review_key.replace(':', '-')[-12:]}"
-            if runtime_id in self._runtimes:
-                continue
-            self._runtimes[runtime_id] = RuntimeRecord(
-                runtime_id=runtime_id,
-                session_id=m.swarm_session_id,
-                agent_id=m.mailbox_agent_id or "oracle",
-                generation=int(m.round or 0) + 1,
-                review_key=m.review_key,
-                backend_session_id=m.backend_session_id,
-                host_alias=m.host or "__local__",
-                runtime=m.agent_type or "omp",  # A2: read agent backend from manifest
-                status="unknown",  # A2: placeholder — not a live runtime
-                created_at=m.created_at and datetime.fromtimestamp(m.created_at, tz=timezone.utc).strftime(ISO_TIMESTAMP_FORMAT) or "",
-                last_activity=0.0,  # A2: no heartbeat signal until re-register
-                started_at=m.created_at,  # A12: manifest created_at as start marker
-            )
-            restored += 1
+        # P2-2: lock runtime writes during park restore.
+        with self._runtimes_lock:
+            for m in manifests:
+                if not m.swarm_session_id or not m.backend_session_id:
+                    continue
+                # P3-g: use full review_key suffix (up to 32 chars) to avoid
+                # collision from 12-char truncation; prefix with random hex if
+                # key is still very short.
+                _rk_slug = m.review_key.replace(':', '-')
+                if len(_rk_slug) >= 24:
+                    runtime_id = f"park-{_rk_slug[-24:]}"
+                else:
+                    runtime_id = f"park-{_rk_slug}-{secrets.token_hex(4)}"
+                if runtime_id in self._runtimes:
+                    continue
+                self._runtimes[runtime_id] = RuntimeRecord(
+                    runtime_id=runtime_id,
+                    session_id=m.swarm_session_id,
+                    agent_id=m.mailbox_agent_id or "oracle",
+                    generation=int(m.round or 0) + 1,
+                    review_key=m.review_key,
+                    backend_session_id=m.backend_session_id,
+                    host_alias=m.host or "__local__",
+                    runtime=m.agent_type or "omp",  # A2: read agent backend from manifest
+                    status="unknown",  # A2: placeholder — not a live runtime
+                    created_at=m.created_at and datetime.fromtimestamp(m.created_at, tz=timezone.utc).strftime(ISO_TIMESTAMP_FORMAT) or "",
+                    last_activity=0.0,  # A2: no heartbeat signal until re-register
+                    started_at=m.created_at,  # A12: manifest created_at as start marker
+                )
+                restored += 1
         if restored:
             log.info("gateway: restored %d runtime(s) from park registry", restored)
 
@@ -326,16 +343,21 @@ class AgentGateway:
                 for k in expired:
                     self._claims.pop(k, None)
         # P8.1 presence 联动：关联 hub peer 同步 offline（锁外，避免死锁）。
+        # P2-2: snapshot rid→(session_id, agent_id) under runtimes lock FIRST,
+        # then sync peers under peers lock without touching _runtimes.
         if offline:
-            with self._peers_lock:
+            offline_meta: dict[str, tuple[str, str]] = {}
+            with self._runtimes_lock:
                 for rid in offline:
                     record = self._runtimes.get(rid)
-                    if record is None:
-                        continue
+                    if record is not None:
+                        offline_meta[rid] = (record.session_id, record.agent_id)
+            with self._peers_lock:
+                for rid, (sid, aid) in offline_meta.items():
                     for peer in self._peers.values():
-                        if peer.agent_id == record.agent_id and peer.session_id == record.session_id:
+                        if peer.agent_id == aid and peer.session_id == sid:
                             peer.status = "offline"
-                if offline:
+                if offline_meta:
                     self._save_peers()
         return offline
 
@@ -418,57 +440,59 @@ class AgentGateway:
         if not session_id or not agent_id or not runtime_id:
             raise GatewayError(ERR_NOT_AUTHORIZED, "runtime.register requires session_id/agent_id/runtime_id")
 
-        # Generation staleness: a registration for an OLDER generation of a
-        # known runtime_id is rejected (fail closed).
-        existing = self._runtimes.get(runtime_id)
-        if existing is not None and generation < existing.generation:
-            raise GatewayError(
-                ERR_GENERATION_STALE,
-                f"generation {generation} < registered {existing.generation} for {runtime_id}",
-            )
-        # A7: owner identity consistency — a SAME-generation re-registration
-        # must present the same owner_pid+nonce the gateway stored (the
-        # supervisor writes identity.json 0600 and the plugin echoes it back).
-        # A2/A2.3: a NEW generation (launcher restart after stop/removal) is
-        # allowed to take over with a fresh identity — recovery path.
-        if existing is not None and generation == existing.generation:
-            if (existing.owner_pid or existing.nonce) and (
-                existing.owner_pid != owner_pid or existing.nonce != nonce
-            ):
+        # P2-2: lock the entire check-then-set for runtimes dict.
+        with self._runtimes_lock:
+            # Generation staleness: a registration for an OLDER generation of a
+            # known runtime_id is rejected (fail closed).
+            existing = self._runtimes.get(runtime_id)
+            if existing is not None and generation < existing.generation:
                 raise GatewayError(
-                    ERR_OWNER_MISMATCH,
-                    f"owner identity mismatch for {runtime_id}: "
-                    f"pid {existing.owner_pid} != {owner_pid} or nonce mismatch",
+                    ERR_GENERATION_STALE,
+                    f"generation {generation} < registered {existing.generation} for {runtime_id}",
                 )
+            # A7: owner identity consistency — a SAME-generation re-registration
+            # must present the same owner_pid+nonce the gateway stored (the
+            # supervisor writes identity.json 0600 and the plugin echoes it back).
+            # A2/A2.3: a NEW generation (launcher restart after stop/removal) is
+            # allowed to take over with a fresh identity — recovery path.
+            if existing is not None and generation == existing.generation:
+                if (existing.owner_pid or existing.nonce) and (
+                    existing.owner_pid != owner_pid or existing.nonce != nonce
+                ):
+                    raise GatewayError(
+                        ERR_OWNER_MISMATCH,
+                        f"owner identity mismatch for {runtime_id}: "
+                        f"pid {existing.owner_pid} != {owner_pid} or nonce mismatch",
+                    )
 
-        # Roster membership (authoritative session.json).
-        meta = self._store.read_session(session_id)
-        if meta is None:
-            raise GatewayError(ERR_NOT_AUTHORIZED, f"session not found: {session_id}")
-        roster = {meta.get("manager", "")} | set(meta.get("agents", []))
-        if agent_id not in roster:
-            raise GatewayError(ERR_NOT_AUTHORIZED, f"agent {agent_id!r} not in session roster")
+            # Roster membership (authoritative session.json).
+            meta = self._store.read_session(session_id)
+            if meta is None:
+                raise GatewayError(ERR_NOT_AUTHORIZED, f"session not found: {session_id}")
+            roster = {meta.get("manager", "")} | set(meta.get("agents", []))
+            if agent_id not in roster:
+                raise GatewayError(ERR_NOT_AUTHORIZED, f"agent {agent_id!r} not in session roster")
 
-        record = RuntimeRecord(
-            runtime_id=runtime_id,
-            session_id=session_id,
-            agent_id=agent_id,
-            generation=generation,
-            review_key=review_key,
-            backend_session_id=backend_session_id,
-            runtime=runtime,
-            owner_pid=owner_pid,
-            nonce=nonce,
-            status="active",
-            created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
-            last_activity=time.time(),
-            started_at=time.time(),  # A12: real elapsed baseline
-        )
-        # Preserve spec/initial_task from a prior spawn of the same runtime.
-        if existing is not None:
-            record.spec = existing.spec
-            record.initial_task = existing.initial_task
-        self._runtimes[runtime_id] = record
+            record = RuntimeRecord(
+                runtime_id=runtime_id,
+                session_id=session_id,
+                agent_id=agent_id,
+                generation=generation,
+                review_key=review_key,
+                backend_session_id=backend_session_id,
+                runtime=runtime,
+                owner_pid=owner_pid,
+                nonce=nonce,
+                status="active",
+                created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
+                last_activity=time.time(),
+                started_at=time.time(),  # A12: real elapsed baseline
+            )
+            # Preserve spec/initial_task from a prior spawn of the same runtime.
+            if existing is not None:
+                record.spec = existing.spec
+                record.initial_task = existing.initial_task
+            self._runtimes[runtime_id] = record
 
         # Sync the real backend session id into the park manifest so warm
         # resume survives a gateway restart (in-memory record lost).
@@ -573,7 +597,9 @@ class AgentGateway:
             spec=params,
             initial_task=task,
         )
-        self._runtimes[handle.runtime_id] = record
+        # P2-2: lock runtimes dict write.
+        with self._runtimes_lock:
+            self._runtimes[handle.runtime_id] = record
         return {
             "runtime_id": handle.runtime_id,
             "generation": handle.generation,
@@ -590,6 +616,11 @@ class AgentGateway:
         # owner check — a newer generation takes over the runtime_id).
         record = self._require_runtime(runtime_id)
         with self._runtimes_lock:
+            # P3-d: re-read record under lock to avoid stale-dict read after
+            # a concurrent runtime_register replaced the record object.
+            record = self._runtimes.get(runtime_id)
+            if record is None:
+                raise GatewayError(ERR_NOT_FOUND, f"runtime disappeared during heartbeat: {runtime_id}")
             was_offline = record.status == "offline"
             record.last_activity = time.time()
             # P8.3: heartbeat restores an offline runtime.
@@ -638,7 +669,10 @@ class AgentGateway:
         """List registered runtimes and their presence status."""
         session_id = params.get("session_id", "")
         results = []
-        for rid, rec in self._runtimes.items():
+        # P2-2: snapshot runtimes under lock to avoid dict resize during iteration.
+        with self._runtimes_lock:
+            snapshot = list(self._runtimes.items())
+        for rid, rec in snapshot:
             if session_id and rec.session_id != session_id:
                 continue
             results.append({
@@ -656,9 +690,9 @@ class AgentGateway:
     def runtime_event(self, params: dict) -> dict:
         """Append a producer event (plugin/supervisor) to the EventStore."""
         draft = RuntimeEventDraft.from_dict(params.get("event", {}) or {})
-        # A7: events are owner-scoped — the runtime must be registered and
-        # the event generation must match the registered generation
-        # (a stale/unknown producer must not append or refresh liveness).
+        # P3-h: hold the lock across generation check + append + liveness
+        # update so a concurrent runtime_register cannot swap the record
+        # between the check and the append (TOCTOU on generation).
         with self._runtimes_lock:
             record = self._runtimes.get(draft.runtime_id)
             if record is None:
@@ -669,14 +703,11 @@ class AgentGateway:
                     f"generation {draft.generation} != registered {record.generation} "
                     f"for {draft.runtime_id}",
                 )
-        # Producers never number their own events — ignore host/sequence.
-        ev = self._events.append_local(draft)
-        # Any event is activity: keep the runtime's liveness window fresh
-        # (hot detection + park renew cadence).
-        with self._runtimes_lock:
-            record = self._runtimes.get(draft.runtime_id)
-            if record is not None:
-                record.last_activity = time.time()
+            # Producers never number their own events — ignore host/sequence.
+            ev = self._events.append_local(draft)
+            # Any event is activity: keep the runtime's liveness window fresh
+            # (hot detection + park renew cadence).
+            record.last_activity = time.time()
         return {"event_id": ev.event_id, "source_sequence": ev.source_sequence}
 
     def runtime_send(self, params: dict) -> dict:
@@ -711,6 +742,8 @@ class AgentGateway:
 
             health = RuntimeRegistry().probe(runtime_id)
         except Exception as exc:
+            # P3-a: log probe fallback so sink assembly failures aren't silent.
+            log.warning("gateway: runtime_probe registry probe failed for %s: %s", runtime_id, exc)
             # A2: status='unknown' (park-restored placeholder) must NEVER
             # report alive without a REAL probe — only genuinely registered
             # runtimes (active + heartbeat) get the liveness fallback.
@@ -740,7 +773,9 @@ class AgentGateway:
             RuntimeRegistry().stop(runtime_id, reason)
         except Exception as exc:
             log.warning("gateway: runtime stop failed (marking stopped anyway): %s", exc)
-        record.status = "stopped"
+        # P2-2: lock status mutation.
+        with self._runtimes_lock:
+            record.status = "stopped"
         # A3: the record stays in-memory (stopped) so the stopping caller can
         # read back the state; the sweep removes it shortly after so stopped
         # runtimes never linger or get aggregated by runtime_info.
@@ -757,21 +792,23 @@ class AgentGateway:
         """Aggregate runtime observability for park info (by review_key or id)."""
         runtime_id = params.get("runtime_id", "")
         review_key = params.get("review_key", "")
-        record = None
-        if runtime_id:
-            record = self._runtimes.get(runtime_id)
-            # A3: never report a stopped runtime as the answer — the sweep
-            # cleans stopped records; before it does, treat them as absent.
-            if record is not None and record.status == "stopped":
-                record = None
-        elif review_key:
-            # A3: prefer the LIVE record (registered by plugin/adoption) over
-            # stopped or park-restored placeholders: filter stopped records,
-            # then take the newest by last_activity desc (restored records
-            # carry last_activity=0 so a live registration wins naturally).
-            candidates = [r for r in self._runtimes.values() if r.review_key == review_key]
-            live = [r for r in candidates if r.status != "stopped"]
-            record = max(live, key=lambda r: r.last_activity) if live else None
+        # P2-2: snapshot record under lock to avoid dict resize during iteration.
+        with self._runtimes_lock:
+            record = None
+            if runtime_id:
+                record = self._runtimes.get(runtime_id)
+                # A3: never report a stopped runtime as the answer — the sweep
+                # cleans stopped records; before it does, treat them as absent.
+                if record is not None and record.status == "stopped":
+                    record = None
+            elif review_key:
+                # A3: prefer the LIVE record (registered by plugin/adoption) over
+                # stopped or park-restored placeholders: filter stopped records,
+                # then take the newest by last_activity desc (restored records
+                # carry last_activity=0 so a live registration wins naturally).
+                candidates = [r for r in self._runtimes.values() if r.review_key == review_key]
+                live = [r for r in candidates if r.status != "stopped"]
+                record = max(live, key=lambda r: r.last_activity) if live else None
         if record is None:
             raise GatewayError(ERR_NOT_FOUND, f"no runtime for review_key={review_key!r} runtime_id={runtime_id!r}")
         # A8: aggregate ONLY this generation's events — a re-registered
@@ -782,6 +819,8 @@ class AgentGateway:
 
             health = RuntimeRegistry().probe(record.runtime_id)
         except Exception as exc:
+            # P3-a: log probe fallback so receipt fallback isn't silent.
+            log.warning("gateway: runtime_info probe failed for %s: %s", record.runtime_id, exc)
             # Plugin-registered runtimes have no registry handle — fall back
             # to the gateway record's own liveness signal (recent heartbeat).
             # A2: status='unknown' (park-restored placeholder) must never
@@ -864,6 +903,7 @@ class AgentGateway:
         outcome = self._svc.read(
             params.get("session_id", ""), params.get("agent", ""),
             params.get("owner", ""),
+            msg_id=params.get("msg_id", ""),  # P1-8: targeted claim
         )
         if outcome.status == ACK_ROUTE_UNRESOLVED:
             raise GatewayError(ERR_NOT_AUTHORIZED, outcome.error or "ack route unresolved")
@@ -991,7 +1031,9 @@ class AgentGateway:
             status="online",
             registered_at=time.time(),
         )
-        self._peers[peer_id] = peer
+        # P2-2: lock peers dict write.
+        with self._peers_lock:
+            self._peers[peer_id] = peer
         # Register in the kernel routing so delivery resolves the remote host.
         try:
             from codeagent.swarm.model import AgentLocation, ExecutionMode
@@ -1052,14 +1094,16 @@ class AgentGateway:
         through protocol v2.
         """
         peer_id = params.get("peer_id", "")
-        peer = self._peers.get(peer_id)
+        # P2-2: lock peers dict read.
+        with self._peers_lock:
+            peer = self._peers.get(peer_id)
         if peer is None:
             raise GatewayError(ERR_NOT_FOUND, f"unknown peer: {peer_id}")
         if peer.status == "offline":
-            return {"msg_id": "", "status": "offline", "error": "peer is offline"}
+            # P3-f: raise instead of returning ok=True for unreachable peer.
+            raise GatewayError(ERR_NOT_FOUND, f"peer {peer_id} is offline")
 
         from codeagent.swarm.model import Envelope
-        from uuid import uuid4
 
         env = Envelope(
             subject=params.get("subject", "hub-message"),
@@ -1081,7 +1125,9 @@ class AgentGateway:
         """Query peer presence (one peer or all)."""
         peer_id = params.get("peer_id", "")
         if peer_id:
-            peer = self._peers.get(peer_id)
+            # P2-2: lock peers dict read.
+            with self._peers_lock:
+                peer = self._peers.get(peer_id)
             if peer is None:
                 raise GatewayError(ERR_NOT_FOUND, f"unknown peer: {peer_id}")
             return {
@@ -1089,17 +1135,22 @@ class AgentGateway:
                 "host_alias": peer.host_alias,
                 "session_id": peer.session_id, "agent_id": peer.agent_id,
             }
+        # P2-2: snapshot peers under lock to avoid dict resize during iteration.
+        with self._peers_lock:
+            snapshot = list(self._peers.values())
         return {"peers": [
             {"peer_id": p.peer_id, "status": p.status, "host_alias": p.host_alias,
              "session_id": p.session_id, "agent_id": p.agent_id}
-            for p in self._peers.values()
+            for p in snapshot
         ]}
 
     def hub_unregister(self, params: dict) -> dict:
         peer_id = params.get("peer_id", "")
-        if peer_id not in self._peers:
-            raise GatewayError(ERR_NOT_FOUND, f"unknown peer: {peer_id}")
-        peer = self._peers.pop(peer_id)
+        # P2-2: lock peers dict check-then-pop.
+        with self._peers_lock:
+            if peer_id not in self._peers:
+                raise GatewayError(ERR_NOT_FOUND, f"unknown peer: {peer_id}")
+            peer = self._peers.pop(peer_id)
         self._save_peers()
         # Clean the kernel routing entry too (unregister from the session).
         try:
@@ -1124,6 +1175,13 @@ class AgentGateway:
         ttl = float(params.get("ttl", 3600))
         if not session_id or not agent_id or not owner:
             raise GatewayError("PROTOCOL", "session.claim requires session_id/agent_id/owner")
+        # P3-e: TTL bounds — must be positive and within sane upper limit.
+        _CLAIM_TTL_MAX = 86400  # 24h upper bound
+        if ttl <= 0 or ttl > _CLAIM_TTL_MAX:
+            raise GatewayError(
+                ERR_PROTOCOL,
+                f"session.claim ttl must be in (0, {_CLAIM_TTL_MAX}]; got {ttl}",
+            )
         now = time.time()
         claim_key = f"{session_id}:{agent_id}"
         with self._runtimes_lock:
@@ -1137,9 +1195,11 @@ class AgentGateway:
                     )
                 # expired claim → takeover allowed
             self._claims[claim_key] = {"owner": owner, "claimed_at": now, "expires_at": now + ttl}
+            # P3-e: lock read — return the persisted claim, not a stale dict ref.
+            persisted = self._claims[claim_key]
         return {
             "session_id": session_id, "agent_id": agent_id,
-            "owner": owner, "expires_at": self._claims[claim_key]["expires_at"],
+            "owner": owner, "expires_at": persisted["expires_at"],
         }
 
     def session_release(self, params: dict) -> dict:
@@ -1199,14 +1259,17 @@ class AgentGateway:
                 "write.merge requires session_id, target_path, artifact_sha256",
             )
         key = (session_id, target_path)
-        existing = self._merges.get(key)
-        if existing is not None and existing != artifact_sha256:
-            raise GatewayError(
-                ERR_PROTOCOL_CONFLICT,
-                f"conflict on {target_path!r}: existing sha256={existing!r} "
-                f"!= incoming sha256={artifact_sha256!r}",
-            )
-        self._merges[key] = artifact_sha256
+        # P2-3: lock check-then-set to prevent concurrent conflict writes
+        # both seeing no conflict and both writing (last-write-wins).
+        with self._merges_lock:
+            existing = self._merges.get(key)
+            if existing is not None and existing != artifact_sha256:
+                raise GatewayError(
+                    ERR_PROTOCOL_CONFLICT,
+                    f"conflict on {target_path!r}: existing sha256={existing!r} "
+                    f"!= incoming sha256={artifact_sha256!r}",
+                )
+            self._merges[key] = artifact_sha256
         self._save_merges()
         return {"merged": True}
 
@@ -1214,8 +1277,10 @@ class AgentGateway:
         """Persist merge records (conflict detection survives restarts)."""
         try:
             self._peers_file.parent.mkdir(parents=True, exist_ok=True)
-            data = [{"session_id": s, "target_path": t, "artifact_sha256": h}
-                    for (s, t), h in self._merges.items()]
+            # P2-2: snapshot merges under lock; write file outside lock.
+            with self._merges_lock:
+                data = [{"session_id": s, "target_path": t, "artifact_sha256": h}
+                        for (s, t), h in self._merges.items()]
             tmp = self._peers_file.with_name("merges.json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
             tmp.replace(self._peers_file.with_name("merges.json"))
@@ -1228,19 +1293,23 @@ class AgentGateway:
             if not p.exists():
                 return
             data = json.loads(p.read_text(encoding="utf-8"))
-            for d in data:
-                sid = d.get("session_id", "")
-                tgt = d.get("target_path", "")
-                h = d.get("artifact_sha256", "")
-                if sid and tgt and h:
-                    self._merges[(sid, tgt)] = h
+            # P2-2: lock merges dict writes during restore.
+            with self._merges_lock:
+                for d in data:
+                    sid = d.get("session_id", "")
+                    tgt = d.get("target_path", "")
+                    h = d.get("artifact_sha256", "")
+                    if sid and tgt and h:
+                        self._merges[(sid, tgt)] = h
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("merges restore failed: %s", exc)
 
     # ── internals ──────────────────────────────────────────────────────
 
     def _require_runtime(self, runtime_id: str) -> RuntimeRecord:
-        record = self._runtimes.get(runtime_id)
+        # P2-2: lock runtime dict read.
+        with self._runtimes_lock:
+            record = self._runtimes.get(runtime_id)
         if record is None:
             raise GatewayError(ERR_NOT_FOUND, f"unknown runtime: {runtime_id}")
         return record

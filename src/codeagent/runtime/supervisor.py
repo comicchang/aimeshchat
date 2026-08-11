@@ -208,6 +208,9 @@ def _build_agent_argv(spec: RuntimeSpec) -> list[str]:
     - OMP warm: ``omp --resume <backend_session_id> --cwd <workdir>``
     - OMP short_task: ``omp --print --mode json --cwd <workdir> @<prompt-file>``
       (only for explicit bounded short tasks — no hot/in-loop claims)
+    - opencode: ``opencode run --format json --dir <workdir>
+      [--agent <agent_id>] [--session <backend_session_id>] <task>``
+      (task is a positional prompt — required for a real run)
     """
     if spec.runtime == "omp":
         argv = [_OMP_BINARY]
@@ -230,6 +233,11 @@ def _build_agent_argv(spec: RuntimeSpec) -> list[str]:
             argv += ["--agent", spec.agent_id]
         if spec.backend_session_id:
             argv += ["--session", spec.backend_session_id]
+        # P0-6: append the task as a positional prompt (mirrors
+        # OpenCodeRuntimeAdapter.spawn) — previously the task was dropped
+        # from argv, so a supervised opencode run started with no instruction.
+        if spec.task:
+            argv.append(spec.task)
         return argv
     if spec.runtime == "generic":
         # Configured argv (never shell-interpreted) via profile_args.

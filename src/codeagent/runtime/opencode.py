@@ -103,6 +103,16 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
                     break
         stderr_tail = ""
         stdout_text = "".join(stdout_buf)
+        # P0-5: keep a persistent reference to the spawned process on the
+        # handle so stop()/probe() can reach it. Without this the opencode
+        # child is unreferenced after spawn returns and leaks — nothing can
+        # ever terminate it. The registry holds the handle for the runtime's
+        # lifetime, so the proc stays reachable.
+        handle_extra = {
+            "proc": proc,
+            "cwd": cwd,
+            "agent": agent,
+        }
         if found_session:
             # Session established — keep the process handle for warm resume.
             return RuntimeHandle(
@@ -115,7 +125,7 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
                 supervisor="process",
                 mode="warm" if session_id else "first_run",
                 extra={
-                    "cwd": cwd, "agent": agent,
+                    **handle_extra,
                     "result": {"returncode": None, "stdout": stdout_text, "stderr": stderr_tail},
                 },
             )
@@ -131,7 +141,7 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
             capabilities=_CAPS,
             supervisor="process",
             mode="first_run",
-            extra={"cwd": cwd, "agent": agent, "result": {"returncode": None, "stdout": stdout_text}},
+            extra={**handle_extra, "result": {"returncode": None, "stdout": stdout_text}},
         )
 
     def send(self, handle: RuntimeHandle, message: dict) -> dict:
@@ -160,8 +170,12 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
         raise NotImplementedError("subscribe: use events watch / gateway events.list")
 
     def probe(self, handle: RuntimeHandle) -> dict:
+        # P0-5: report real liveness from the retained proc reference when
+        # present; legacy handles without one stay optimistic (alive).
+        proc = handle.extra.get("proc")
+        alive = True if proc is None else proc.poll() is None
         return {
-            "alive": True,
+            "alive": alive,
             "runtime": RUNTIME_OPENCODE,
             "backend_session_id": handle.backend_session_id,
             "in_loop_messages": False,
@@ -181,5 +195,17 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
         })
 
     def stop(self, handle: RuntimeHandle, reason: str) -> None:
-        # The opencode process is bounded per-run; nothing persistent to stop.
-        return
+        # P0-5: terminate the opencode child via the retained proc reference
+        # (SIGTERM → grace → SIGKILL). Previously a no-op, which leaked the
+        # process. Handles without a proc reference stay a no-op.
+        proc = handle.extra.get("proc")
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass

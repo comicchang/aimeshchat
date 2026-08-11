@@ -1022,7 +1022,7 @@ class TestSSHTransport:
         mock_cm.is_alive.return_value = True
         mock_cm.ssh_cmd.return_value = [
             "ssh", "-S", "/tmp/s.sock", "host",
-            "sh", "-c", "source ~/.zshrc &&; python3 -m codeagent.remote_exec",
+            "source ~/.zshrc &&; postmesh-remote-exec",
         ]
         mock_cm_cls.return_value = mock_cm
 
@@ -1039,13 +1039,15 @@ class TestSSHTransport:
         req = _make_run_request()
         transport.execute(req, host, "/workdir")
 
-        # Verify shell_prefix was wrapped in sh -c for remote expansion
+        # P1-5: shell_prefix is inlined into a SINGLE remote command string —
+        # OpenSSH joins argv[4:] with spaces, so ["sh","-c",cmd] drops the
+        # prefix env and the appended exec fails with command-not-found.
         mock_cm.ssh_cmd.assert_called_once()
         args = mock_cm.ssh_cmd.call_args[0]
-        assert args[0] == "sh"
-        assert args[1] == "-c"
-        assert "source ~/.zshrc &&" in args[2]
-        assert "postmesh-remote-exec" in args[2]
+        assert len(args) == 1
+        assert args[0] == "source ~/.zshrc &&; postmesh-remote-exec"
+        assert "source ~/.zshrc &&" in args[0]
+        assert "postmesh-remote-exec" in args[0]
 
     @patch("codeagent.transport.ssh.ControlMaster")
     @patch("subprocess.Popen")
