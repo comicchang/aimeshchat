@@ -705,20 +705,22 @@ def _extract_assistant_messages(path: Path, max_messages: int = 1) -> list[str]:
 def _fallback_find_session_for_key(review_key: str) -> Optional[Path]:
     """Best-effort scan of recent OMP session files when backend_session_id is missing.
 
-    Scans ~/.omp/agent/sessions/ for .jsonl files (newest first, max 5),
-    returning the first file whose content mentions ``oracle`` or a fragment
-    of *review_key* (the last ``:``-separated segment).  Returns ``None``
-    when nothing matches — caller should fall back to the original error.
+    Recursively scans ~/.omp/agent/sessions/ for .jsonl files (newest first,
+    max 5), returning the first file whose content mentions a fragment of
+    *review_key* (the last ``:``-separated segment) — oracle sessions live in
+    per-session subdirectories (e.g. ``<session>/__advisor.jsonl``), so a
+    shallow top-level scan misses them.  Returns ``None`` when nothing
+    matches — caller should fall back to the original error.
     """
     sessions_root = Path.home() / ".omp" / "agent" / "sessions"
     if not sessions_root.is_dir():
         return None
 
-    # Collect all .jsonl session files across every subdirectory
+    # Recursively collect all .jsonl session files across every subdirectory
     all_files: list[Path] = []
     for d in sessions_root.iterdir():
         if d.is_dir():
-            all_files.extend(d.glob("*.jsonl"))
+            all_files.extend(d.rglob("*.jsonl"))
     if not all_files:
         return None
 
@@ -726,11 +728,11 @@ def _fallback_find_session_for_key(review_key: str) -> Optional[Path]:
     all_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
     recent = all_files[:5]
 
-    # Derive search tokens: literal "oracle" + the tail segment of the key
+    # Derive search tokens: prefer exact tail (review_key fragment), fall back
+    # to generic "oracle" only if no tail exists (avoids matching unrelated
+    # historical oracle sessions).
     tail = review_key.rsplit(":", 1)[-1].strip()
-    tokens = ["oracle"]
-    if tail and tail != review_key:
-        tokens.append(tail)
+    search_tokens = [tail] if tail and tail != review_key else ["oracle"]
 
     for f in recent:
         try:
@@ -738,7 +740,7 @@ def _fallback_find_session_for_key(review_key: str) -> Optional[Path]:
         except OSError:
             continue
         lower = text.lower()
-        if any(tok.lower() in lower for tok in tokens):
+        if any(tok.lower() in lower for tok in search_tokens):
             return f
     return None
 
