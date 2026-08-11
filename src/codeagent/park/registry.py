@@ -169,9 +169,12 @@ class ParkRegistry:
                     return
                 d = json.loads(row[0])
                 d["lifecycle"] = "released"
+                # P3-16: release 时更新 last_activity=now —— released 行保留
+                # 窗口从 release 时刻起算（sweep 按 last_activity 清理旧行）。
                 conn.execute(
-                    "UPDATE park_leases SET lifecycle = 'released', manifest_json = ? WHERE key = ?",
-                    (json.dumps(d), review_key),
+                    "UPDATE park_leases SET lifecycle = 'released', "
+                    "manifest_json = ?, last_activity = ? WHERE key = ?",
+                    (json.dumps(d), time.time(), review_key),
                 )
                 conn.commit()
 
@@ -217,7 +220,12 @@ class ParkRegistry:
         1. TTL 过期（soft_expires / hard_expires）→ cold_resumable
         2. 超过 max_hot_parked 上限 → LRU（最久未使用优先）
         3. 超过 max_rounds 上限 → 强制释放
+        4. RELEASED 终态行清理（超过保留窗口的旧行删除）
         驱逐前若存在 snapshot 则保留；不存在则跳过。
+
+        P3-16: LRU 驱逐改为单条 SELECT 批量取超额头部（O(n) 一次扫描），
+        不再 while 循环逐条扫描（原 O(n²)）。RELEASED 行按保留窗口
+        （hard_limit_seconds）清理，防止表无限增长。
         """
         import logging
         log = logging.getLogger(__name__)
@@ -241,17 +249,16 @@ class ParkRegistry:
                 if self._evict_one(key, mj, "cold_resumable"):
                     evicted.append(key)
 
-            # 2. LRU 驱逐（超限）
+            # 2. LRU 驱逐（超限）——P3-16: 一次查询取超额 LRU 头部，
+            # 替代原 while 循环逐条查询驱逐（O(n²) → O(n)）。
             max_hot = PARK_DEFAULTS["max_hot_parked"]
-            while True:
-                with self._connect() as conn:
-                    active = conn.execute(
-                        "SELECT key, manifest_json, last_activity FROM park_leases "
-                        "WHERE lifecycle = 'hot_parked' ORDER BY last_activity ASC",
-                    ).fetchall()
-                if len(active) <= max_hot:
-                    break
-                key, mj, _ = active[0]  # 最久未使用
+            with self._connect() as conn:
+                active = conn.execute(
+                    "SELECT key, manifest_json, last_activity FROM park_leases "
+                    "WHERE lifecycle = 'hot_parked' ORDER BY last_activity ASC",
+                ).fetchall()
+            excess = active[:max(len(active) - max_hot, 0)]
+            for key, mj, _last_act in excess:
                 log.warning("park sweep LRU: evicting %s", key)
                 if self._evict_one(key, mj, "cold_resumable"):
                     evicted.append(key)
@@ -269,6 +276,23 @@ class ParkRegistry:
                     log.warning("park sweep max_rounds: releasing %s (round=%d)", key, d.get("round", 0))
                     if self._evict_one(key, mj, "cold_resumable"):
                         evicted.append(key)
+
+            # 4. P3-16: RELEASED 终态行清理——超过保留窗口（hard_limit_seconds）
+            # 的 released 行直接删除，防止表无限增长。保留窗口内的 released
+            # 行仍保留（acquire 的 RELEASED→HOT_PARKED 重启路径需要读取）。
+            released_ttl = PARK_DEFAULTS["hard_limit_seconds"]
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM park_leases WHERE lifecycle = 'released' "
+                    "AND last_activity < ?",
+                    (now - released_ttl,),
+                )
+                conn.commit()
+                if cur.rowcount:
+                    log.info(
+                        "park sweep: purged %d released rows (older than %.0fs)",
+                        cur.rowcount, released_ttl,
+                    )
 
         return evicted
 

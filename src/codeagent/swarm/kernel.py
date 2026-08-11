@@ -5,10 +5,12 @@ Does NOT own transport I/O — that is delegated to a DeliverySink.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import json
 import logging
 import os
+import shlex
 import subprocess
 import threading
 from datetime import datetime, timezone
@@ -92,6 +94,10 @@ def _synchronized(method: Callable) -> Callable:
     Gateway threads call kernel methods concurrently; without serialization,
     dict mutations during iteration raise ``RuntimeError``.  ``RLock`` (not
     plain ``Lock``) allows re-entrant calls (e.g. ``send`` → ``direct``).
+
+    P1-6: 投递类方法（send/direct/broadcast/channel/notice）不使用本装饰器。
+    它们改为两阶段——锁内只做路由决策（快速路径），锁外做 transport 往返
+    （SSH 60s 量级），避免 kernel 全局 RLock 持锁跨网络 I/O 串行化网关。
     """
     def _wrapper(self, *args: Any, **kwargs: Any) -> Any:
         with self._lock:
@@ -111,10 +117,19 @@ class SwarmKernel:
         Pluggable delivery backend (LocalDeliverySink for tests, C2 for prod).
     """
 
+    # P1-6: broadcast 并行投递阈值——fan-out ≥ 4 才上 ThreadPoolExecutor；
+    # 小 fan-out 保持顺序投递（线程池唤醒开销 > 并行收益，且 sink 调用
+    # 顺序确定，mock/测试依赖该顺序语义）。
+    _BROADCAST_PARALLEL_MIN = 4
+    # P1-6: 并行投递 worker 上限——避免大 roster 一次性打爆 N 个 SSH 往返。
+    _BROADCAST_MAX_WORKERS = 8
+
     def __init__(self, store: MailboxStore, sink: Optional[DeliverySink] = None):
         self._store = store
         self._sink = sink or LocalDeliverySink(store)
         # P1-4: 串行化 kernel 状态访问（gateway 多线程并发防 dict RuntimeError 崩溃）。
+        # P1-6: 该锁只保护路由决策（session/roster/ACL/channels 等状态），
+        # 绝不跨 sink 投递持锁——transport 往返在锁外执行（见 direct/broadcast）。
         self._lock = threading.RLock()
         # session_id → Session
         self._sessions: dict[str, Session] = {}
@@ -128,6 +143,8 @@ class SwarmKernel:
         self._topic_subscriptions: dict[str, dict[str, set[str]]] = {}
         # Optional receiver for push-mode delivery (D2).
         self._receiver: Any = None
+        # P3-11: per-agent registration tokens — {(session_id, agent_id): token}.
+        self._registration_tokens: dict[tuple[str, str], str] = {}
 
         # Restore persisted sessions so each CLI invocation (new process,
         # new kernel) sees sessions created by earlier invocations.
@@ -206,6 +223,9 @@ class SwarmKernel:
                             mailbox_root=rdata.get("mailbox_root", ""),
                             return_mode=ReturnMode(rm_raw) if rm_raw else None,
                         )
+                    # P3-11: load persisted registration tokens.
+                    for aid, tok in (meta.get("registration_tokens") or {}).items():
+                        self._registration_tokens[(sid, aid)] = tok
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                     chans = {}
 
@@ -317,10 +337,33 @@ class SwarmKernel:
         The agent must be in the session's roster.  The mapping is
         persisted to swarm-meta.json so later CLI processes (one per
         subcommand) resolve the host for cross-host delivery.
+
+        P3-11: When a token is registered for this agent (via
+        set_registration_token), the caller-supplied token must match.
+        Cross-host re-registration logs a warning (last-wins, but visible).
         """
         session = self._require_session(session_id)
         if location.agent_id not in session.roster:
             raise ValueError(f"agent not in roster: {location.agent_id}")
+
+        # P3-11: token validation — check against stored expected token.
+        key = (session_id, location.agent_id)
+        expected_token = self._registration_tokens.get(key)
+        if expected_token and token != expected_token:
+            raise PermissionError(
+                f"registration token mismatch for agent {location.agent_id}"
+            )
+
+        # P3-11: conflict detection — warn when same agent re-registers
+        # from a different host (last-wins but the change is logged).
+        existing = self._routing.get(key)
+        if existing is not None and existing.host_alias != location.host_alias:
+            log.warning(
+                "P3-11: agent %s re-registered from host %s → %s "
+                "(last-wins, previous location overwritten)",
+                location.agent_id, existing.host_alias, location.host_alias,
+            )
+
         self._routing[(session_id, location.agent_id)] = location
         self._persist_routing(session_id)
 
@@ -386,6 +429,39 @@ class SwarmKernel:
             return meta.get("agent_cards", {})
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return {}
+
+    @_synchronized  # P1-4
+    def set_registration_token(self, session_id: str, agent_id: str,
+                               token: str) -> None:
+        """P3-11: Register an expected token for an agent.
+
+        When set, subsequent register() calls for this agent must supply
+        the matching token.  Persisted to swarm-meta.json for cross-process
+        visibility.
+        """
+        self._require_session(session_id)
+        if agent_id not in self._sessions[session_id].roster:
+            raise ValueError(f"agent not in roster: {agent_id}")
+        self._registration_tokens[(session_id, agent_id)] = token
+
+        def _update(meta: dict) -> None:
+            tokens = meta.setdefault("registration_tokens", {})
+            tokens[agent_id] = token
+
+        self._persist_meta(session_id, _update)
+
+    def _load_registration_tokens(self, session_id: str) -> None:
+        """P3-11: Load persisted registration tokens from swarm-meta.json."""
+        try:
+            meta_path = self._store.session_dir(session_id) / "swarm-meta.json"
+            if not meta_path.exists():
+                return
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            tokens = meta.get("registration_tokens", {})
+            for agent_id, tok in tokens.items():
+                self._registration_tokens[(session_id, agent_id)] = tok
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            pass
 
     @_synchronized  # P1-4
     def unregister(self, session_id: str, agent_id: str) -> None:
@@ -546,7 +622,9 @@ class SwarmKernel:
     def _gen_created_at(self) -> str:
         return datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT)
 
-    @_synchronized  # P1-4
+    # P1-6: send 是纯派发器（只读 target.kind，不触碰共享状态），不持锁。
+    # 各分支（direct/broadcast/channel/notice）自己两阶段：锁内路由决策、
+    # 锁外投递——若 send 整体持锁会把锁跨过内层方法的 transport 往返。
     def send(self, session_id: str, sender: str, target: Address,
              envelope: Envelope) -> SendReceipt:
         """Route a message according to its Address kind.
@@ -600,23 +678,30 @@ class SwarmKernel:
         else:
             raise ValueError(f"unknown address kind: {target.kind}")
 
-    @_synchronized  # P1-4
+    # P1-6: 两阶段投递——锁内只做路由决策（session/ACL/trace/msg_id 装配，
+    # 快速路径），锁外做 sink 投递（durable outbox 写 + transport 往返）。
+    # 修复：kernel 全局 RLock 持锁跨网络 I/O 会让网关全局串行化。
     def direct(self, session_id: str, sender: str, to_agent: str,
                envelope: Envelope) -> SendReceipt:
         """Send a direct message to one recipient. No fanout."""
-        session = self._require_session(session_id)
-        self._check_direct(session, sender, to_agent)
+        with self._lock:
+            session = self._require_session(session_id)
+            self._check_direct(session, sender, to_agent)
 
-        self._ensure_trace_id(envelope)
-        msg_id = self._gen_msg_id()
-        created_at = self._gen_created_at()
+            self._ensure_trace_id(envelope)
+            msg_id = self._gen_msg_id()
+            created_at = self._gen_created_at()
 
+        # P1-6 阶段 2：锁外投递——sink.deliver 可能含 SSH 往返（60s 量级），
+        # 不得占着全局 RLock。
         sink_receipt = self._sink.deliver(session_id, to_agent, envelope, msg_id, created_at, sender)
         return SendReceipt(msg_id=msg_id, status=sink_receipt.status,
                            session_id=session_id, target=to_agent,
                            queued=getattr(sink_receipt, "queued", False))
 
-    @_synchronized  # P1-4
+    # P1-6: 两阶段投递 + 并行 fan-out。路由决策（roster 快照 + msg_id 装配）
+    # 锁内完成；sink 投递（transport 往返）锁外执行——broadcast 是 N 个
+    # 独立 SSH 往返，串行投递会按 N 倍阻塞网关，必须并行。
     def broadcast(self, session_id: str, sender: str,
                   envelope: Envelope) -> list[DeliveryReceipt]:
         """Broadcast to all room members except sender.
@@ -627,43 +712,62 @@ class SwarmKernel:
         fan-out copy is actually sent).  Per-recipient ids keep every
         copy durable and deliverable across hosts.
         """
-        session = self._require_session(session_id)
-        self._check_broadcast(session, sender)
+        with self._lock:
+            session = self._require_session(session_id)
+            self._check_broadcast(session, sender)
 
-        self._ensure_trace_id(envelope)
-        created_at = self._gen_created_at()
-        recipients = session.roster.without(sender)
+            self._ensure_trace_id(envelope)
+            created_at = self._gen_created_at()
+            recipients = session.roster.without(sender)
+            # msg_id 在锁内统一装配（uuid4 线程安全，但集中生成保持 trace
+            # 语义与确定性）；envelope 只读共享给各 worker（deliver_sink
+            # 内部浅拷贝，不 mutate 原 envelope）。
+            msg_ids = [self._gen_msg_id() for _ in recipients]
 
-        receipts = []
-        for r in recipients:
-            msg_id = self._gen_msg_id()
-            sink_receipt = self._sink.deliver(session_id, r, envelope, msg_id, created_at, sender)
-            receipts.append(DeliveryReceipt(
-                msg_id=msg_id, recipient=r,
+        def _deliver_one(recipient: str, msg_id: str) -> DeliveryReceipt:
+            # P1-6 阶段 2：锁外投递——每个接收方独立的 transport 往返。
+            sink_receipt = self._sink.deliver(
+                session_id, recipient, envelope, msg_id, created_at, sender
+            )
+            return DeliveryReceipt(
+                msg_id=msg_id, recipient=recipient,
                 status=sink_receipt.status,
                 error=getattr(sink_receipt, "error", ""),
-            ))
-        return receipts
+            )
 
-    @_synchronized  # P1-4
+        # P1-6: 并行投递（ThreadPoolExecutor）——pool.map 结果按 roster 顺序
+        # 返回，调用方聚合逻辑（send 的 max-status）不受影响。小 fan-out
+        # 保持顺序：线程池唤醒开销 > 并行收益，且 sink 调用顺序确定
+        # （顺序 side_effect 的 mock 依赖该语义）。
+        if len(recipients) >= self._BROADCAST_PARALLEL_MIN:
+            workers = min(len(recipients), self._BROADCAST_MAX_WORKERS)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                return list(pool.map(_deliver_one, recipients, msg_ids))
+        return [_deliver_one(r, m) for r, m in zip(recipients, msg_ids)]
+
+    # P1-6: 与 direct/broadcast 相同的两阶段——锁内路由决策（channel 查表 +
+    # 成员快照 + msg_id 装配），锁外投递（transport 往返不占全局 RLock）。
     def channel(self, session_id: str, sender: str, channel_id: str,
                 envelope: Envelope) -> list[DeliveryReceipt]:
         """Send to a channel (fan out to channel members except sender)."""
-        session = self._require_session(session_id)
-        channels = self._channels.get(session_id, {})
-        if channel_id not in channels:
-            raise ValueError(f"channel not found: {channel_id}")
-        ch = channels[channel_id]
-        self._check_channel(session, ch, sender)
+        with self._lock:
+            session = self._require_session(session_id)
+            channels = self._channels.get(session_id, {})
+            if channel_id not in channels:
+                raise ValueError(f"channel not found: {channel_id}")
+            ch = channels[channel_id]
+            self._check_channel(session, ch, sender)
 
-        self._ensure_trace_id(envelope)
-        created_at = self._gen_created_at()
+            self._ensure_trace_id(envelope)
+            created_at = self._gen_created_at()
+            members = [m for m in ch.members if m != sender]
+            # per-recipient msg_id: no delivery short-circuit
+            msg_ids = [self._gen_msg_id() for _ in members]
 
+        # P1-6 阶段 2：锁外投递。channel 成员通常较少，顺序投递即可——
+        # 关键是不再占着全局锁。
         receipts = []
-        for member in ch.members:
-            if member == sender:
-                continue
-            msg_id = self._gen_msg_id()  # per-recipient: no delivery short-circuit
+        for member, msg_id in zip(members, msg_ids):
             sink_receipt = self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
             receipts.append(DeliveryReceipt(
                 msg_id=msg_id, recipient=member,
@@ -672,7 +776,8 @@ class SwarmKernel:
             ))
         return receipts
 
-    @_synchronized  # P1-4
+    # P1-6: 与 direct/broadcast 相同的两阶段——锁内路由决策（topic 订阅者
+    # 快照 + msg_id 装配），锁外投递（transport 往返不占全局 RLock）。
     def notice(self, session_id: str, sender: str, topic: str,
                envelope: Envelope, ttl: int = 0) -> list[DeliveryReceipt]:
         """Send a notice, fanning out to topic subscribers (or session).
@@ -680,23 +785,27 @@ class SwarmKernel:
         If agents subscribed to *topic*, the notice goes only to them.
         Otherwise it falls back to all room members (session-wide notice).
         """
-        session = self._require_session(session_id)
-        self._check_notice(session, sender)
+        with self._lock:
+            session = self._require_session(session_id)
+            self._check_notice(session, sender)
 
-        self._ensure_trace_id(envelope)
-        created_at = self._gen_created_at()
+            self._ensure_trace_id(envelope)
+            created_at = self._gen_created_at()
 
-        # Topic-based fan-out: subscribers of this topic only.
-        topic_members = self._topic_subscriptions.get(session_id, {}).get(topic, set())
-        if topic_members:
-            targets = topic_members
-        else:
-            targets = set(session.acl.room_members)
-        targets.discard(sender)
+            # Topic-based fan-out: subscribers of this topic only.
+            topic_members = self._topic_subscriptions.get(session_id, {}).get(topic, set())
+            if topic_members:
+                targets = topic_members
+            else:
+                targets = set(session.acl.room_members)
+            targets.discard(sender)
+            targets = sorted(targets)
+            # per-recipient msg_id: no delivery short-circuit
+            msg_ids = [self._gen_msg_id() for _ in targets]
 
+        # P1-6 阶段 2：锁外投递。
         receipts = []
-        for member in sorted(targets):
-            msg_id = self._gen_msg_id()  # per-recipient: no delivery short-circuit
+        for member, msg_id in zip(targets, msg_ids):
             sink_receipt = self._sink.deliver(session_id, member, envelope, msg_id, created_at, sender)
             receipts.append(DeliveryReceipt(
                 msg_id=msg_id, recipient=member,
@@ -704,6 +813,29 @@ class SwarmKernel:
                 error=getattr(sink_receipt, "error", ""),
             ))
         return receipts
+
+    def _history_filtered(self, session_id: str, field_name: str,
+                          field_value: str) -> list[dict]:
+        """P3-14: Scan history files filtering by a single field.
+
+        Unlike read_history() (full validation + all fields), this reads
+        each file once and filters immediately — O(files) I/O but skips
+        the validate_message overhead and does not buffer unrelated msgs.
+        """
+        hdir = self._store.history_dir(session_id)
+        if not hdir.is_dir():
+            return []
+        result = []
+        for f in sorted(hdir.iterdir()):
+            if not f.is_file() or f.suffix != ".json":
+                continue
+            try:
+                msg = json.loads(f.read_bytes())
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                continue
+            if msg.get(field_name) == field_value:
+                result.append(msg)
+        return result
 
     @_synchronized  # P1-4
     def trace(self, session_id: str, trace_id: str) -> dict:
@@ -712,10 +844,13 @@ class SwarmKernel:
 
         trace_id 由 kernel 入口生成（direct/broadcast/channel/notice），
         fan-out 各 msg_id 共用同一 trace；causation_id 表达转发关系。
+
+        P3-14: 使用 _history_filtered 按 trace_id 索引，避免全量
+        read_history（跳过 validate_message + 不相关消息的读取）。
         """
         self._require_session(session_id)
-        history = self._store.read_history(session_id)
-        msgs = [m for m in history if m.get("trace_id") == trace_id]
+        # P3-14: targeted scan instead of full read_history.
+        msgs = self._history_filtered(session_id, "trace_id", trace_id)
         if not msgs:
             raise ValueError(f"no messages with trace_id: {trace_id}")
 
@@ -950,11 +1085,18 @@ class SwarmKernel:
 
         messages: list[dict] = []
         manager_id = session.manager_id
-        for agent_id in pull_agents:
-            # Look up mailbox_root for this agent from routing table.
-            agent_loc = self._routing.get((session_id, agent_id))
-            agent_mailbox_root = agent_loc.mailbox_root if agent_loc else ""
 
+        # P3-13: every pull_agent read targets the SAME manager inbox on
+        # from_host, differing only by mailbox_root.  Group by root so N
+        # agents on one host cost one ``postmesh mailbox read`` subprocess
+        # instead of N.
+        by_root: dict[str, list[str]] = {}
+        for agent_id in pull_agents:
+            agent_loc = self._routing.get((session_id, agent_id))
+            root = agent_loc.mailbox_root if agent_loc else ""
+            by_root.setdefault(root, []).append(agent_id)
+
+        for agent_mailbox_root, root_agents in by_root.items():
             cmd = [
                 "postmesh", "mailbox", "read",
                 "--session", session_id,
@@ -971,8 +1113,8 @@ class SwarmKernel:
                 )
                 if result.returncode != 0:
                     log.warning(
-                        "pull_remote: mailbox read failed for agent=%s host=%s: %s",
-                        agent_id, from_host, result.stderr.strip(),
+                        "pull_remote: mailbox read failed for agents=%s host=%s: %s",
+                        root_agents, from_host, result.stderr.strip(),
                     )
                     continue
                 raw = result.stdout.strip()
@@ -990,8 +1132,8 @@ class SwarmKernel:
                     messages.extend(msg)
             except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
                 log.warning(
-                    "pull_remote: error reading from agent=%s host=%s: %s",
-                    agent_id, from_host, exc,
+                    "pull_remote: error reading from agents=%s host=%s: %s",
+                    root_agents, from_host, exc,
                 )
         return messages
 
@@ -1043,6 +1185,89 @@ class SwarmKernel:
         except (subprocess.TimeoutExpired, OSError):
             return False
 
+    def _batch_remote_mailbox(self, from_host: str, subcmd: str,
+                              session_id: str, manager_id: str,
+                              msg_ids: list[str],
+                              mailbox_root: str = "") -> bool:
+        """P3-13: Run one mailbox subcommand for many msg_ids in ONE SSH call.
+
+        Reuses the host's ControlMaster socket (same connection the
+        transport layer multiplexes) so the whole batch costs a single
+        subprocess + SSH session instead of one per msg_id.  The remote
+        side runs plain local mailbox ops (no ``--host`` — postmesh's
+        ``--host`` would re-dispatch through the router and double-hop).
+
+        Returns True if every command in the chain exited 0 (aggregate —
+        the remote ``postmesh`` per-msg exit codes are not individually
+        surfaced).
+        """
+        if not msg_ids:
+            return True
+        # Remote shell prefix: same PATH fix the SSHTransport.mailbox path
+        # applies (non-interactive SSH omits ~/.local/bin), plus MAILBOX_ROOT
+        # so the remote store resolves to the same root as the single-msg
+        # finalize_remote/release_remote calls.
+        parts = ["export PATH=$HOME/.local/bin:$PATH"]
+        if mailbox_root:
+            parts.append(f"export MAILBOX_ROOT={shlex.quote(mailbox_root)}")
+        for mid in msg_ids:
+            cmd_parts = ["postmesh", "mailbox", subcmd,
+                         "--session", session_id,
+                         "--agent", manager_id,
+                         "--owner", manager_id,
+                         "--msg-id", mid]
+            parts.append(" ".join(shlex.quote(p) for p in cmd_parts))
+        remote_cmd = "; ".join(parts)
+        try:
+            from codeagent.transport.control_master import ControlMaster
+            cm = ControlMaster(from_host)
+            if not cm.is_alive():
+                cm.create()
+            ssh_cmd = cm.ssh_cmd(remote_cmd)
+            result = subprocess.run(
+                ssh_cmd, capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                log.warning(
+                    "P3-13: batch %s host=%s rc=%d stderr=%s",
+                    subcmd, from_host, result.returncode,
+                    result.stderr.strip()[:200],
+                )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, OSError, ImportError) as exc:
+            log.warning(
+                "P3-13: batch %s host=%s error: %s",
+                subcmd, from_host, exc,
+            )
+            return False
+
+    def batch_finalize_remote(self, from_host: str, session_id: str,
+                              manager_id: str, msg_ids: list[str],
+                              mailbox_root: str = "") -> None:
+        """P3-13: Finalize multiple messages in a single SSH call.
+
+        Replaces N ``postmesh mailbox finalize`` subprocesses (one per
+        msg_id) with a single ControlMaster-reusing SSH invocation.
+        """
+        self._batch_remote_mailbox(
+            from_host, "finalize", session_id, manager_id,
+            list(msg_ids), mailbox_root,
+        )
+
+    def batch_release_remote(self, session_id: str, msg_ids: list[str],
+                             from_host: str, manager_id: str,
+                             mailbox_root: str = "") -> dict[str, bool]:
+        """P3-13: Release multiple messages in a single SSH call.
+
+        Returns {msg_id: ok} — all ids share the aggregate exit code
+        (the remote chain runs every release even if one fails).
+        """
+        ok = self._batch_remote_mailbox(
+            from_host, "release", session_id, manager_id,
+            list(msg_ids), mailbox_root,
+        )
+        return {mid: ok for mid in msg_ids}
+
     @_synchronized  # P1-4
     def ingest(self, session_id: str, messages: list[dict]) -> list[str]:
         """Validate and persist messages into canonical history.
@@ -1091,9 +1316,12 @@ class SwarmKernel:
         returns matching messages sorted oldest-first (``created_at``
         ascending) so callers can reconstruct the request→response
         timeline.
+
+        P3-14: 使用 _history_filtered 按 request_id 索引，避免全量
+        read_history（跳过 validate_message + 不相关消息的读取）。
         """
         self._require_session(session_id)
-        history = self._store.read_history(session_id)
-        filtered = [m for m in history if m.get("request_id") == request_id]
+        # P3-14: targeted scan instead of full read_history.
+        filtered = self._history_filtered(session_id, "request_id", request_id)
         filtered.sort(key=lambda m: (m.get("created_at", ""), m.get("msg_id", "")))
         return filtered

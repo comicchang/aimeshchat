@@ -32,6 +32,12 @@ KIND_CONDITIONAL_REQUIRED: dict[str, frozenset[str]] = {
 }
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+# P1-2: request_id/run_id/reply_to are used verbatim as filesystem path
+# components (RequestLedger._events_dir builds <agent>/events/<request_id>).
+# A crafted value with path separators, ".." or glob metacharacters would
+# write JSONL outside the agent's events tree. Restrict to a conservative
+# safe charset (same family as AGENT_ID_RE, plus dots and longer ids).
+PATH_SAFE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 # "*" is a reserved recipient meaning broadcast to every roster member except the sender.
 BROADCAST_TO = "*"
 DEFAULT_MEDIA_TYPE = "application/octet-stream"
@@ -211,6 +217,20 @@ def validate_agent_id(aid: str) -> None:
         raise ValueError(f"invalid agent id: {aid!r}")
 
 
+def validate_path_component(value: str, field_name: str) -> None:
+    """Reject values unsafe to embed in a filesystem path component.
+
+    Applies to request_id/run_id/reply_to, which the request ledger uses
+    as directory names. Raises :class:`ValueError` on unsafe values so
+    callers can defend even when a message bypassed ``validate_message``
+    (P1-2 defense-in-depth). Exact ``.``/``..`` are rejected too — as a
+    single path component they resolve to the events dir itself / its
+    parent, escaping the per-request subdir.
+    """
+    if not isinstance(value, str) or value in (".", "..") or not PATH_SAFE_RE.match(value):
+        raise ValueError(f"invalid {field_name}: {value!r}")
+
+
 def attachment_error(att: dict) -> Optional[str]:
     """Return a human-readable reason if an attachment ref dict is invalid, else None."""
     if not isinstance(att, dict):
@@ -295,6 +315,18 @@ def validate_message(msg: dict, expected_session_id: Optional[str] = None,
         return False, f"msg_id mismatch: {msg['msg_id']} vs {filename}"
     if "/" in msg["msg_id"] or "\\" in msg["msg_id"]:
         return False, f"invalid msg_id (path separator): {msg['msg_id']}"
+    # P1-2: request_id/run_id/reply_to become directory names in the
+    # RequestLedger events tree — reject path separators, ".." and glob
+    # metacharacters (PATH_SAFE_RE) so a crafted message cannot escape the
+    # events root. Absent/empty values stay allowed (v1 compat); present
+    # values must be path-safe. Exact "."/".." are also rejected: as a
+    # single path component they resolve to the events dir / its parent.
+    for field_name in ("request_id", "run_id", "reply_to"):
+        val = msg.get(field_name, "")
+        if val and not isinstance(val, str):
+            return False, f"{field_name} must be string"
+        if val and (val in (".", "..") or not PATH_SAFE_RE.match(val)):
+            return False, f"invalid {field_name} (unsafe path component): {val!r}"
     if "attachments" in msg:
         atts = msg["attachments"]
         if not isinstance(atts, list):

@@ -9,11 +9,13 @@ from codeagent.constants import DEFAULT_EXEC_TIMEOUT
 from codeagent.domain import LOCAL_HOST_MARKER, RunResult
 from codeagent.transport.base import Transport, TransportError
 from codeagent.wire.protocol import (
+    MAX_CONSECUTIVE_BAD_FRAMES,
     MSG_ACCEPTED,
     MSG_ERROR,
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
+    NO_TERMINAL_FRAME_MSG,
     WIRE_VERSION,
     decode_line,
     encode_line,
@@ -155,6 +157,12 @@ def _run_wire(
     result_stdout = ""
     result_stderr = ""
     exit_code = -1
+    # P1-3: got_terminal invariant — a one-shot exchange MUST end with a
+    # terminal frame (result/error/mailbox_result); EOF without one is a
+    # failure, never a silent success.
+    got_terminal = False
+    # P1-4: consecutive unparseable frames counter (abort on N).
+    consecutive_bad = 0
 
     try:
         stdout, stderr = proc.communicate(input=payload, timeout=timeout)
@@ -176,10 +184,22 @@ def _run_wire(
         if not raw_line:
             continue
         try:
-            msg = decode_line(raw_line)
+            # P1-4: strict=False — a v1 remote's bare {"type":"ready"}
+            # decodes with wire_version 0 so the version check below
+            # reports a mismatch instead of the frame being skipped.
+            msg = decode_line(raw_line, strict=False)
         except ValueError:
-            # Non-JSON noise — treat as stdout.
+            # P1-4: N consecutive bad frames → give up loudly instead of
+            # skipping garbage (which could hide a dropped terminal frame).
+            consecutive_bad += 1
+            if consecutive_bad >= MAX_CONSECUTIVE_BAD_FRAMES:
+                log.warning(
+                    "_run_wire: %d consecutive bad frames from helper; aborting parse",
+                    consecutive_bad,
+                )
+                break
             continue
+        consecutive_bad = 0
 
         if msg.type == MSG_READY:
             # Check wire version compatibility
@@ -195,13 +215,27 @@ def _run_wire(
         if msg.type == MSG_SESSION:
             session_id = msg.session_id
         elif msg.type == MSG_RESULT:
+            got_terminal = True
             result_stdout = msg.stdout
             result_stderr = msg.stderr
             exit_code = msg.exit_code
         elif msg.type == MSG_ERROR:
             # Wire-level error: propagate as non-zero exit.
+            got_terminal = True
             result_stderr = msg.message
             exit_code = -1
+
+    # P1-3: got_terminal invariant — EOF without a terminal frame (frame
+    # dropped by the >1MiB guard, truncated output, garbage-only stream)
+    # must not fall back to the process exit code when that code is 0:
+    # zero + no terminal is a wire-level failure, with a diagnostic.
+    if not got_terminal and exit_code == -1 and (proc.returncode is None or proc.returncode == 0):
+        if not result_stderr and stderr_str:
+            result_stderr = stderr_str
+        if result_stderr:
+            result_stderr += "\n"
+        result_stderr += NO_TERMINAL_FRAME_MSG
+        exit_code = 1
 
     # If the helper produced no structured output, fall back to raw stderr.
     if not result_stderr and stderr_str:

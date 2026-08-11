@@ -173,13 +173,17 @@ class TestOracleAsk:
         with patch("codeagent.oracle._gateway", return_value=gw), \
              patch("codeagent.oracle.RuntimeRegistry.spawn",
                    return_value=_handle("rt-3", backend_session_id="b3")) as spawn, \
-             patch("codeagent.oracle.park_revive") as revive:
-            revive.return_value = MagicMock(method="cold", context="snapshot ctx")
+             patch("codeagent.oracle.build_cold_context",
+                   return_value="snapshot ctx") as bcc:
             code = cmd_oracle_ask(ns)
 
         assert code == 0
         out = json.loads(capsys.readouterr().out)
         assert out["method"] == "cold"
+        # P1-7: cold 上下文直接来自 build_cold_context（snapshot 注入），
+        # 不经过 park_revive 的决策层 context（stale HOT_PARKED 会返回
+        # 路由提示而非 snapshot 上下文）。
+        bcc.assert_called_once_with("k1")
         # cold prompt = snapshot context + user prompt
         req = spawn.call_args[0][1]
         assert "snapshot ctx" in req["task"]

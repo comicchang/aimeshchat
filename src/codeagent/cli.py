@@ -737,15 +737,20 @@ def _swarm_ack(kernel: SwarmKernel, args: argparse.Namespace) -> int:
     # from the read result to avoid losing the wrong message.  If they differ,
     # release the message back to inbox and report the mismatch.
     if args.phase == "consumed":
-        store = kernel._store
-        msg = store.read(args.session_id, args.agent, owner=args.agent)
-        if msg is None:
-            print(f"error: no message to ack: {args.msg_id}", file=sys.stderr)
+        # P2-6: use MailboxService.read() instead of store.read() so the claim
+        # goes through the service's per-agent lock (P2-12), ack-route-unresolved
+        # parking (P1-1), and READ receipt emission — store.read() bypasses all
+        # three, causing the sender's ledger to stay stuck at DISPATCHED.
+        from codeagent.mailbox.service import MailboxService
+        svc = MailboxService(kernel._store, kernel=kernel)
+        outcome = svc.read(args.session_id, args.agent, owner=args.agent, msg_id=args.msg_id)
+        if outcome.message is None:
+            print(f"error: no message to ack: {args.msg_id} (status={outcome.status})", file=sys.stderr)
             return 1
-        actual_id = msg.get("msg_id", "")
+        actual_id = outcome.message.get("msg_id", "")
         if actual_id != args.msg_id:
             # Release the message back to inbox so it is not lost.
-            store.release(args.session_id, args.agent, actual_id, owner=args.agent)
+            kernel._store.release(args.session_id, args.agent, actual_id, owner=args.agent)
             print(
                 f"error: msg_id mismatch: requested={args.msg_id} "
                 f"actual={actual_id}. Message released back to inbox.",

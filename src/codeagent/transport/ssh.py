@@ -26,8 +26,15 @@ from codeagent.constants import (
 )
 from codeagent.domain import RunResult
 from codeagent.transport.base import Transport, TransportError
-from codeagent.transport.control_master import ControlMaster, list_sockets, stop_by_alias, stop_all
+from codeagent.transport.control_master import (
+    HOST_KEY_OPTS,
+    ControlMaster,
+    list_sockets,
+    stop_by_alias,
+    stop_all,
+)
 from codeagent.wire.protocol import (
+    MAX_CONSECUTIVE_BAD_FRAMES,
     MSG_ACCEPTED,
     MSG_ERROR,
     MSG_MAILBOX_RESULT,
@@ -36,6 +43,7 @@ from codeagent.wire.protocol import (
     MSG_RESULT,
     MSG_SESSION,
     MSG_STREAM_EVENT,
+    NO_TERMINAL_FRAME_MSG,
     WIRE_VERSION,
     decode_line,
     encode_line,
@@ -50,6 +58,12 @@ log = logging.getLogger(__name__)
 
 # P1-6: how long to wait for the SSHStream ready banner before giving up.
 SSHSTREAM_READY_TIMEOUT = 10.0
+
+# P3-15: cap on _seen_msg_ids — the dedup set must not grow unbounded.
+# When it exceeds this many entries, the oldest half is dropped.  Cursor
+# resume on reconnect makes this safe (server replays from cursor, so
+# dropping old ids cannot lose dedup coverage for messages we re-receive).
+_SEEN_IDS_MAX_SIZE = 10_000
 
 # SSH error patterns that indicate a connection-level failure (exit 255).
 _SSH_ERROR_PATTERNS = (
@@ -356,6 +370,12 @@ def _run_ssh_wire(
     result_stdout = ""
     result_stderr = ""
     exit_code = -1
+    # P1-3: got_terminal invariant — a one-shot exchange MUST end with a
+    # terminal frame (result/error/mailbox_result); EOF without one is a
+    # failure, never a silent success.
+    got_terminal = False
+    # P1-4: consecutive unparseable frames counter (abort on N).
+    consecutive_bad = 0
 
     try:
         stdout, stderr = proc.communicate(input=payload, timeout=timeout)
@@ -377,10 +397,22 @@ def _run_ssh_wire(
         if not raw_line:
             continue
         try:
-            msg = decode_line(raw_line)
+            # P1-4: strict=False — a v1 remote's bare {"type":"ready"}
+            # decodes with wire_version 0 so the version check below
+            # reports a mismatch instead of the frame being skipped.
+            msg = decode_line(raw_line, strict=False)
         except ValueError:
-            # Non-JSON noise — skip.
+            # P1-4: N consecutive bad frames → give up loudly instead of
+            # skipping garbage (which could hide a dropped terminal frame).
+            consecutive_bad += 1
+            if consecutive_bad >= MAX_CONSECUTIVE_BAD_FRAMES:
+                log.warning(
+                    "_run_ssh_wire: %d consecutive bad frames from remote; aborting parse",
+                    consecutive_bad,
+                )
+                break
             continue
+        consecutive_bad = 0
 
         if msg.type == MSG_READY:
             # Check wire version compatibility
@@ -396,12 +428,26 @@ def _run_ssh_wire(
         if msg.type == MSG_SESSION:
             session_id = msg.session_id
         elif msg.type == MSG_RESULT:
+            got_terminal = True
             result_stdout = msg.stdout
             result_stderr = msg.stderr
             exit_code = msg.exit_code
         elif msg.type == MSG_ERROR:
+            got_terminal = True
             result_stderr = msg.message
             exit_code = -1
+
+    # P1-3: got_terminal invariant — EOF without a terminal frame (frame
+    # dropped by the >1MiB guard, truncated output, garbage-only stream)
+    # must not fall back to the SSH exit code when that code is 0: zero +
+    # no terminal is a wire-level failure, with a diagnostic.
+    if not got_terminal and exit_code == -1 and (proc.returncode is None or proc.returncode == 0):
+        if not result_stderr and ssh_stderr:
+            result_stderr = ssh_stderr
+        if result_stderr:
+            result_stderr += "\n"
+        result_stderr += NO_TERMINAL_FRAME_MSG
+        exit_code = 1
 
     # If we got no structured result, use the SSH stderr as a diagnostic.
     if exit_code == -1 and not result_stderr and ssh_stderr:
@@ -450,6 +496,12 @@ def _run_ssh_mailbox(
     result_stderr = ""
     exit_code = -1
     invalid_mailbox_result = False
+    # P1-3: got_terminal invariant — a one-shot mailbox exchange MUST end
+    # with a terminal frame (mailbox_result/error); EOF without one is a
+    # failure, never a silent success.
+    got_terminal = False
+    # P1-4: consecutive unparseable frames counter (abort on N).
+    consecutive_bad = 0
 
     try:
         stdout, stderr = proc.communicate(input=payload, timeout=timeout)
@@ -469,11 +521,24 @@ def _run_ssh_mailbox(
         if not raw_line:
             continue
         try:
-            msg = decode_line(raw_line)
+            # P1-4: strict=False — a v1 remote's bare {"type":"ready"}
+            # decodes with wire_version 0 so the version check below
+            # reports a mismatch instead of the frame being skipped.
+            msg = decode_line(raw_line, strict=False)
         except ValueError:
             if "mailbox_result" in raw_line:
                 invalid_mailbox_result = True
+            # P1-4: N consecutive bad frames → give up loudly instead of
+            # skipping garbage (which could hide a dropped terminal frame).
+            consecutive_bad += 1
+            if consecutive_bad >= MAX_CONSECUTIVE_BAD_FRAMES:
+                log.warning(
+                    "_run_ssh_mailbox: %d consecutive bad frames from remote; aborting parse",
+                    consecutive_bad,
+                )
+                break
             continue
+        consecutive_bad = 0
 
         if msg.type == MSG_READY:
             remote_ver = msg.payload.get("wire_version", 0)
@@ -484,6 +549,7 @@ def _run_ssh_mailbox(
                 )
             continue
         if msg.type == MSG_MAILBOX_RESULT:
+            got_terminal = True
             stdout_value = msg.payload.get("stdout")
             stderr_value = msg.payload.get("stderr")
             exit_value = msg.payload.get("exit_code")
@@ -498,6 +564,7 @@ def _run_ssh_mailbox(
             result_stderr = stderr_value
             exit_code = exit_value
         elif msg.type == MSG_ERROR:
+            got_terminal = True
             result_stderr = msg.message
             exit_code = 1
 
@@ -506,6 +573,18 @@ def _run_ssh_mailbox(
             result_stderr = "invalid mailbox_result response from remote helper"
         if exit_code in (-1, 0):
             exit_code = 1
+
+    # P1-3: got_terminal invariant — EOF without a terminal frame must not
+    # fall back to the SSH exit code when that code is 0: zero + no
+    # terminal is a wire-level failure, with a diagnostic.
+    if not got_terminal and exit_code == -1 and (proc.returncode is None or proc.returncode == 0):
+        ssh_stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
+        if not result_stderr and ssh_stderr:
+            result_stderr = ssh_stderr
+        if result_stderr:
+            result_stderr += "\n"
+        result_stderr += NO_TERMINAL_FRAME_MSG
+        exit_code = 1
 
     # Fallback: use SSH process exit code if no structured result
     if exit_code == -1:
@@ -569,6 +648,9 @@ class SSHStream:
         self._last_event_time: float = 0.0
         self._closed = False
         self._seen_msg_ids: set[str] = set()
+        # P3-15: insertion order of seen msg_ids — used to prune the
+        # oldest entries when the set exceeds _SEEN_IDS_MAX_SIZE.
+        self._seen_ids_order: list[str] = []
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -630,6 +712,28 @@ class SSHStream:
                     if deadline:
                         deadline = time.monotonic() + timeout
                     continue
+                # P1-5: heartbeat watchdog — if the remote has sent NOTHING
+                # (no events, no heartbeat pong) for > 3× the heartbeat
+                # interval, the connection is stale (hung remote / dead
+                # network path).  Kill and reconnect with cursor resume
+                # instead of waiting forever; _reconnect() does the kill +
+                # backoff + resubscribe.
+                stale_since = time.monotonic() - self._last_event_time
+                if (
+                    self._proc is not None
+                    and stale_since > 3 * self._heartbeat_interval
+                ):
+                    log.warning(
+                        "SSHStream: stale — no frames for %.0fs (> %.0fs), "
+                        "killing and reconnecting (cursor=%s)",
+                        stale_since,
+                        3 * self._heartbeat_interval,
+                        self._cursor,
+                    )
+                    self._reconnect()
+                    if deadline:
+                        deadline = time.monotonic() + timeout
+                    continue
                 break
 
             try:
@@ -657,6 +761,8 @@ class SSHStream:
                     continue
                 if msg_id:
                     self._seen_msg_ids.add(msg_id)
+                    self._seen_ids_order.append(msg_id)
+                    self._prune_seen_ids()
                 # Adopt the server cursor (opaque — mailbox "epoch/seq" OR
                 # base64url composite for stream_kind="all"). The client
                 # stores and returns it verbatim; it never parses it.
@@ -678,6 +784,22 @@ class SSHStream:
                 self._proc.kill()
                 self._proc.wait()
             self._proc = None
+
+    def _prune_seen_ids(self) -> None:
+        """P3-15: bound the dedup set to _SEEN_IDS_MAX_SIZE entries.
+
+        Drops the oldest half of seen msg_ids.  Safe because the server
+        resumes from the cursor on reconnect — old ids beyond the window
+        are either consumed (cursor advanced past them) or replayed from
+        cursor (re-added on receipt).
+        """
+        if len(self._seen_ids_order) <= _SEEN_IDS_MAX_SIZE:
+            return
+        drop_count = len(self._seen_ids_order) // 2
+        dropped = self._seen_ids_order[:drop_count]
+        del self._seen_ids_order[:drop_count]
+        for mid in dropped:
+            self._seen_msg_ids.discard(mid)
 
     @property
     def cursor(self) -> str:
@@ -704,7 +826,11 @@ class SSHStream:
         remote_cmd = [
             "export PATH=$HOME/.local/bin:$PATH; postmesh-remote-exec",
         ]
-        cmd = list(self._ssh_cmd) + remote_cmd
+        # P2-16: SSHStream spawns a raw `ssh` process — splice in the same
+        # explicit host-key policy ControlMaster uses, so a direct stream
+        # cannot inherit a ~/.ssh/config that disables host-key checking.
+        # Options are placed before the host (after the binary) so they win.
+        cmd = [self._ssh_cmd[0], *HOST_KEY_OPTS, *self._ssh_cmd[1:]] + remote_cmd
 
         log.debug("SSHStream: spawning %s", " ".join(cmd))
         try:
@@ -744,7 +870,10 @@ class SSHStream:
             rc = self._proc.returncode
             raise TransportError(f"SSHStream: no ready banner (exit {rc})")
         try:
-            ready_msg = decode_line(ready_line)
+            # P1-4: strict=False — a v1 remote's bare {"type":"ready"}
+            # decodes with wire_version 0 so the version check below
+            # reports a mismatch instead of a generic banner error.
+            ready_msg = decode_line(ready_line, strict=False)
             if ready_msg.type != MSG_READY:
                 raise TransportError(
                     f"SSHStream: expected ready, got {ready_msg.type}"

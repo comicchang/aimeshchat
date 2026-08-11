@@ -112,6 +112,34 @@ def resolve_agent_profile(agent_name: str) -> AgentProfile:
     )
 
 
+def _write_identity_file(identity_dir: Path, payload: dict) -> Path:
+    """Persist a mailbox identity file with 0600 permissions.
+
+    P2-15: the identity file carries OMP_MAILBOX_NONCE — the gateway
+    ownership-handshake secret. A world-readable file (default umask
+    0644) leaks the nonce to any local user, who could then impersonate
+    the runtime. Mirrors runtime/supervisor.py's atomic 0600 write:
+    tmp file → chmod 0600 → fsync → rename → chmod 0600. The identity
+    directory is tightened to 0700 as well.
+    """
+    identity_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        identity_dir.chmod(0o700)
+    except OSError:
+        pass
+    token = f"{int(_time.time())}_{secrets.token_hex(4)}"
+    path = identity_dir / f"{token}.json"
+    tmp = identity_dir / f".tmp-{token}.json"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(str(tmp), str(path))
+    os.chmod(path, 0o600)
+    return path
+
+
 class OMPRunner(BaseRunner):
     """Runs tasks through the local ``omp`` CLI."""
 
@@ -428,18 +456,15 @@ class OMPRunner(BaseRunner):
                 worker_id = getattr(run_ctx, "mailbox_agent_id", "") or "oracle"
                 mailbox_root = getattr(run_ctx, "mailbox_root", "") or ""
 
-                # Generate identity file
-                token = f"{int(_time.time())}_{secrets.token_hex(4)}"
+                # Generate identity file (P2-15: 0600 — nonce must not leak)
                 identity_dir = Path.home() / ".omp" / "mailbox-identity"
-                identity_dir.mkdir(parents=True, exist_ok=True)
-                identity_path = identity_dir / f"{token}.json"
                 nonce = secrets.token_hex(8)
-                identity_path.write_text(json.dumps({
+                identity_path = _write_identity_file(identity_dir, {
                     "session_id": swarm_sid,
                     "worker_id": worker_id,
                     "owner_pid": os.getpid(),
                     "nonce": nonce,
-                }))
+                })
                 self._identity_path = identity_path
 
                 return {
@@ -460,23 +485,21 @@ class OMPRunner(BaseRunner):
         if not swarm_sid:
             return None
 
-        token = f"{int(_time.time())}_{secrets.token_hex(4)}"
         identity_dir = Path.home() / ".omp" / "mailbox-identity"
-        identity_dir.mkdir(parents=True, exist_ok=True)
-        identity_path = identity_dir / f"{token}.json"
         # Oracle 验证：identity 的 worker_id 必须非空——插件 readIdentityFile 拒绝
         # 空 worker_id，activate 永不进入（现场 64/64 identity 曾为空）。
         worker_id = os.environ.get("OMP_WORKER_ID", "")
         if not worker_id:
             worker_id = "worker"  # 缺省非空（调用方应显式设 OMP_WORKER_ID）
         # Backward-compat identity file for plugins that still read it
+        # (P2-15: 0600 — nonce must not leak)
         nonce = secrets.token_hex(8)
-        identity_path.write_text(json.dumps({
+        identity_path = _write_identity_file(identity_dir, {
             "session_id": swarm_sid,
             "worker_id": worker_id,
             "owner_pid": os.getpid(),
             "nonce": nonce,
-        }))
+        })
         self._identity_path = identity_path
 
         return {

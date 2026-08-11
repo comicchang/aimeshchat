@@ -132,6 +132,14 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
         # No session id yet — the process is still thinking. Return a handle
         # WITHOUT killing it; warm resume will re-attach via --session when
         # the id becomes known (ParkManifest).
+        # P2-11: the extraction window closed without a session id — warn so
+        # the caller knows this handle carries no backend session to persist
+        # (it must NOT overwrite a previously known id with "").
+        log.warning(
+            "opencode spawn: session id extraction window elapsed without a session id "
+            "(runtime_id=%s); handle returned with empty backend_session_id",
+            runtime_id,
+        )
         return RuntimeHandle(
             runtime_id=runtime_id,
             runtime=RUNTIME_OPENCODE,

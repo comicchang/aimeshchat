@@ -53,6 +53,8 @@ class GatewayServer:
         self._threads: deque[threading.Thread] = deque()
         self._threads_lock = threading.Lock()
         self._shutdown = threading.Event()
+        # P3-12: cap concurrent UDS connections to prevent thread explosion.
+        self._conn_semaphore = threading.Semaphore(64)
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -91,7 +93,21 @@ class GatewayServer:
                 conn, _addr = sock.accept()
             except OSError:
                 break
-            t = threading.Thread(target=self._handle_connection, args=(conn,), daemon=True)
+            # P3-12: reject connection when at concurrency cap (64).
+            if not self._conn_semaphore.acquire(timeout=0):
+                try:
+                    resp = GatewayResponse(
+                        v=GATEWAY_PROTOCOL_VERSION, id="", ok=False,
+                        error={"code": "SERVICE_BUSY",
+                               "message": "too many concurrent connections (limit 64)",
+                               "context": {}},
+                    )
+                    _write_frame(conn, resp.to_json())
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            t = threading.Thread(target=self._run_connection, args=(conn,), daemon=True)
             t.start()
             with self._threads_lock:
                 self._threads.append(t)
@@ -181,6 +197,13 @@ class GatewayServer:
                 conn.close()
             except OSError:
                 pass
+
+    def _run_connection(self, conn: socket.socket) -> None:
+        """P3-12: semaphore-releasing wrapper around _handle_connection."""
+        try:
+            self._handle_connection(conn)
+        finally:
+            self._conn_semaphore.release()
 
 
 # ── framing helpers ────────────────────────────────────────────────────

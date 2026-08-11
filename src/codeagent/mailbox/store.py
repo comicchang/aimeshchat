@@ -1,17 +1,22 @@
 """Mailbox store — filesystem operations for session-based direct-inbox."""
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
+import logging
 import os
+import re
 import string
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 from codeagent.constants import (
     ISO_TIMESTAMP_FORMAT,
+    LEASE_CLOCK_TOLERANCE_S,
     LEASE_TIMEOUT_S,
     MAX_ATTACHMENT_SIZE,
     MAX_MAILBOX_BODY,
@@ -30,7 +35,10 @@ from codeagent.mailbox.protocol import (
     attachment_error,
     validate_agent_id,
     validate_message,
+    validate_path_component,
 )
+
+log = logging.getLogger(__name__)
 
 
 def resolve_root(root: Optional[Path] = None) -> Path:
@@ -50,8 +58,38 @@ def gen_msg_id(sender: str) -> str:
     return f"{sender}_{ts}_{suffix}"
 
 
+def _attachments_eq(a: list, b: list) -> bool:
+    """P3-2: order-insensitive attachment comparison.
+
+    Two attachment lists are equal when they contain the same refs in any
+    order. Each ref is normalized to a sorted ``(key, value)`` tuple so
+    dict key order never matters.
+    """
+    def _norm(ref) -> tuple:
+        if isinstance(ref, dict):
+            return tuple(sorted((k, str(v)) for k, v in ref.items()))
+        if isinstance(ref, AttachmentRef):
+            return tuple(sorted((k, str(v)) for k, v in ref.to_dict().items()))
+        return (str(ref),)
+
+    return len(a) == len(b) and {_norm(x) for x in a} == {_norm(x) for x in b}
+
+
 class ParkLeaseActiveError(Exception):
     """Cannot clear mailbox while a park lease is active."""
+
+
+class StatusFileCorruptError(Exception):
+    """P2-5: status.json exists but is corrupt/unparseable.
+
+    Raised by ``read_status(..., strict=True)`` so callers can tell a
+    corrupt status file apart from an absent one (which yields ``None``).
+    """
+
+    def __init__(self, path: Path, reason: str):
+        self.path = str(path)
+        self.reason = reason
+        super().__init__(f"corrupt status file {self.path}: {reason}")
 
 
 try:
@@ -65,6 +103,60 @@ class MailboxStore:
 
     def __init__(self, root: Optional[Path] = None):
         self.root = resolve_root(root)
+
+    # ── Durability / mutual-exclusion helpers ─────────────────────────
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        """P2-4: fsync a directory so a rename inside it survives power loss.
+
+        ``os.replace`` only updates the directory entry — without a parent
+        directory fsync the rename may be lost on power failure.
+        """
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except OSError:
+            return  # dir gone or not openable (e.g. Windows) — nothing to persist
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass  # some filesystems refuse dir fsync — best effort
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _claim_lock(processing: Path, msg_id: str, owner: str):
+        """P2-2: exclusive per-claim flock across claim read-decide-move cycles.
+
+        Held by ``recover_stale()``, ``renew_claim()`` and ``read()``'s reap
+        path so a lease-boundary TOCTOU cannot recycle an actively renewed
+        task. Uses a stable lock file (``.claimlock-{msg_id}-{owner}.lock``)
+        that is never ``os.replace()``d — the claim file itself is swapped in
+        place by ``renew_claim()``, which would invalidate an flock on its
+        inode. On platforms without flock (ImportError/OSError) it degrades
+        to no exclusion, matching the codebase's existing degrade pattern.
+        """
+        lock_path = processing / f".claimlock-{msg_id}-{owner}.lock"
+        fd = None
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        except OSError:
+            fd = None  # cannot create lock file — proceed without exclusion
+        try:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except (ImportError, OSError):
+                    pass  # non-POSIX / flock unavailable — degrade
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except (ImportError, OSError):
+                    pass
+                os.close(fd)
 
     # ── Park lease guard ────────────────────────────────────────────
 
@@ -132,22 +224,22 @@ class MailboxStore:
             validate_agent_id(aid)
 
         sd = self.session_dir(session_id)
-
-        # ── Idempotent: merge new agents into existing session ────────
-        if sd.exists():
-            # P3-l: lock session.json read-modify-write to prevent
-            # concurrent session_init() calls from losing merges.
-            lock_fd = os.open(str(sd / ".session.lock"), os.O_CREAT | os.O_RDWR)
+        # P3-3: ONE lock serializes both the merge and the fresh-creation
+        # paths. The dir is created up front (exist_ok) so the lock file has
+        # a home, and the lock is acquired BEFORE any existence check — a
+        # merger can no longer beat a creator into the same dir and crash on
+        # a missing session.json, nor can two creators double-write it.
+        sd.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(str(sd / ".session.lock"), os.O_CREAT | os.O_RDWR)
+        try:
             try:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                except (ImportError, OSError):
-                    pass  # non-POSIX — degrade to atomic replace
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass  # non-POSIX — degrade to atomic replace
 
-                existing = self.read_session(session_id)
-                if existing is None:
-                    raise ValueError(f"session dir exists but session.json missing: {session_id}")
-
+            existing = self.read_session(session_id)
+            if existing is not None:
+                # ── Idempotent: merge new agents into existing session ────
                 old_manager = existing.get("manager", "")
                 if old_manager and old_manager != manager_id:
                     raise ValueError(
@@ -192,48 +284,48 @@ class MailboxStore:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(str(tmp), str(sd / "session.json"))
-            finally:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                except (ImportError, OSError):
-                    pass
-                os.close(lock_fd)
+                self._fsync_dir(sd)  # P2-4
 
-            if added:
-                return f"session {session_id} ok (merged {len(added)} agents)"
-            return f"session {session_id} ok (acl updated)"
+                if added:
+                    return f"session {session_id} ok (merged {len(added)} agents)"
+                return f"session {session_id} ok (acl updated)"
 
-        # ── Fresh creation ─────────────────────────────────────────────
-        sd.mkdir(parents=True)
+            # ── Fresh creation ─────────────────────────────────────────────
+            meta = {
+                "protocol_version": "2",
+                "session_id": session_id,
+                "manager": manager_id,
+                "agents": sorted(set(agent_ids)),
+                "manifest_revision": 1,
+                "created_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
+            }
+            if acl is not None:
+                meta["acl"] = acl
+            if execution_modes is not None:
+                meta["execution_modes"] = execution_modes
+            if return_modes is not None:
+                meta["return_modes"] = return_modes
+            tmp = sd / ".tmp-session.json"
+            with open(tmp, "w") as f:
+                f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(sd / "session.json"))
+            self._fsync_dir(sd)  # P2-4
 
-        meta = {
-            "protocol_version": "2",
-            "session_id": session_id,
-            "manager": manager_id,
-            "agents": sorted(set(agent_ids)),
-            "manifest_revision": 1,
-            "created_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
-        }
-        if acl is not None:
-            meta["acl"] = acl
-        if execution_modes is not None:
-            meta["execution_modes"] = execution_modes
-        if return_modes is not None:
-            meta["return_modes"] = return_modes
-        tmp = sd / ".tmp-session.json"
-        with open(tmp, "w") as f:
-            f.write(json.dumps(meta, indent=2, ensure_ascii=False))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(str(tmp), str(sd / "session.json"))
-
-        for aid in meta["agents"]:
+            for aid in meta["agents"]:
+                for sub in ("inbox", "processing", "archive", "_corrupt"):
+                    self.agent_subdir(session_id, aid, sub).mkdir(parents=True, exist_ok=True)
             for sub in ("inbox", "processing", "archive", "_corrupt"):
-                self.agent_subdir(session_id, aid, sub).mkdir(parents=True, exist_ok=True)
-        for sub in ("inbox", "processing", "archive", "_corrupt"):
-            self.agent_subdir(session_id, manager_id, sub).mkdir(parents=True, exist_ok=True)
+                self.agent_subdir(session_id, manager_id, sub).mkdir(parents=True, exist_ok=True)
 
-        return f"session {session_id} created: manager={manager_id}, agents={meta['agents']}"
+            return f"session {session_id} created: manager={manager_id}, agents={meta['agents']}"
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            os.close(lock_fd)
 
     def read_session(self, session_id: str) -> Optional[dict]:
         """Read session.json metadata."""
@@ -319,15 +411,17 @@ class MailboxStore:
             # succeeds (idempotent); conflicting payload → raise.
             hd = sd / "history"
             existing: Optional[dict] = None
+            # P3-2: scan ALL recipient inboxes, not just the first — a crash
+            # between per-recipient writes can leave the message in a later
+            # inbox only; the old `break` missed it and replayed a duplicate.
             for rid in recipients:
                 inbox = self.agent_subdir(session_id, rid, "inbox")
                 p = inbox / f"{msg_id}.json"
-                if p.exists():
+                if p.exists() and existing is None:
                     try:
                         existing = json.loads(p.read_bytes())
                     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                         existing = {}
-                    break
             if existing is None:
                 hp = hd / f"{msg_id}.json"
                 if hp.exists():
@@ -354,7 +448,11 @@ class MailboxStore:
                     and existing.get("causation_id", "") == (causation_id or "")
                     and bool(existing.get("require_ack", False)) == bool(require_ack)
                     and existing.get("receipt_type", "") == (receipt_type or "")
-                    and existing.get("attachments", []) == [a.to_dict() for a in refs]
+                    # P3-2: compare attachments as unordered sets — the same
+                    # attachment list in a different order is semantically
+                    # identical, and the old == was order-sensitive.
+                    and _attachments_eq(existing.get("attachments", []),
+                                        [a.to_dict() for a in refs])
                 )
                 if not same:
                     raise ValueError(f"msg_id already exists with different payload: {msg_id}")
@@ -376,6 +474,9 @@ class MailboxStore:
                         os.fsync(f.fileno())
                     os.replace(str(tmp), str(dest))
                     backfilled += 1
+                # P2-4: backfilled envelopes durable before returning.
+                for rid in recipients:
+                    self._fsync_dir(self.agent_subdir(session_id, rid, "inbox"))
                 if not (hd / f"{msg_id}.json").exists():
                     self.append_history(session_id, existing)
                 return f"sent → {to_id}/inbox/{msg_id}.json (idempotent replay, backfilled {backfilled})"
@@ -421,6 +522,10 @@ class MailboxStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(str(tmp), str(dest))
+        # P2-4: envelope renames must be durable before the cursor — which
+        # readers trust for ordering — is committed.
+        for rid in recipients:
+            self._fsync_dir(self.agent_subdir(session_id, rid, "inbox"))
 
         # P3-k: cursor committed only after envelopes are durable
         payload['_cursor'] = self.advance_cursor(session_id)
@@ -433,6 +538,9 @@ class MailboxStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(str(tmp), str(dest))
+        # P2-4: cursor-stamped envelopes durable before history is appended.
+        for rid in recipients:
+            self._fsync_dir(self.agent_subdir(session_id, rid, "inbox"))
 
         self.append_history(session_id, payload)
 
@@ -494,6 +602,7 @@ class MailboxStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(str(tmp), str(cursor_file))
+            self._fsync_dir(sd)  # P2-4
         finally:
             try:
                 import fcntl
@@ -562,6 +671,7 @@ class MailboxStore:
         except FileExistsError:
             raise ValueError(f"history entry already exists: {message['msg_id']}")
         os.replace(str(tmp), str(dest))
+        self._fsync_dir(hd)  # P2-4
         return f"history: {message['msg_id']}"
 
     def read_history(
@@ -695,6 +805,25 @@ class MailboxStore:
                 os.replace(str(target), str(corrupt_dir / target.name))
                 continue
 
+            # P2-17: reject messages whose sender is not in the authoritative
+            # session roster (manager ∪ agents) — the same authority
+            # kernel.ingest uses. A forged message (spoofed ``from``) could
+            # otherwise be claimed here and, when it demands an ack, drive a
+            # forged READ receipt back at the impersonated sender. Roster
+            # members always pass; non-members are quarantined like other
+            # invalid messages so one forged file cannot block the queue head.
+            meta = self.read_session(session_id)
+            roster = {meta.get("manager", "")} | set(meta.get("agents", [])) if meta else set()
+            if msg.get("from", "") not in roster:
+                log.warning(
+                    "read: quarantining message %s from non-roster sender %r "
+                    "(session %s, agent %s)",
+                    target.name, msg.get("from", ""), session_id, agent_id,
+                )
+                corrupt_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(str(target), str(corrupt_dir / target.name))
+                continue
+
             processing.mkdir(parents=True, exist_ok=True)
             dest = processing / target.name
             # Unique tmp claim to avoid concurrent collision
@@ -728,12 +857,20 @@ class MailboxStore:
                 # written + fsynced before the link, so the claim never
                 # appears partially written).
                 os.link(str(tmp_claim), str(claim_file))
-                os.unlink(str(tmp_claim))
+                # P1-1: the tmp claim copy is unlinked only AFTER the message
+                # move (below) — keeping the crash window between claim
+                # publish and message move as short as possible. A crash in
+                # between leaves a fully written claim + a message still in
+                # inbox, which recover_stale()/read() reap as an orphan claim.
             except FileExistsError:
-                # The claim already exists — another claimant (same-owner
-                # re-claim racing) is handling this message. Drop our copy
-                # and move on to other candidates instead of spinning.
+                # The claim already exists — either a peer is actively
+                # handling this message, or the previous claimant crashed.
+                # P1-1: when the existing claim's lease has expired, reap it
+                # (its owner is gone) and retry claiming this message; a
+                # fresh claim is genuinely contested — skip it.
                 tmp_claim.unlink(missing_ok=True)
+                if self._reap_expired_claim(claim_file, inbox, processing):
+                    continue  # claim removed — re-scan and retry
                 contested.add(target.stem)
                 continue
             except OSError:
@@ -746,6 +883,10 @@ class MailboxStore:
                         fc.flush()
                         os.fsync(fc.fileno())
                 except FileExistsError:
+                    tmp_claim.unlink(missing_ok=True)
+                    # P1-1: same expired-claim reap as the os.link path above.
+                    if self._reap_expired_claim(claim_file, inbox, processing):
+                        continue  # claim removed — re-scan and retry
                     contested.add(target.stem)
                     continue
 
@@ -756,13 +897,86 @@ class MailboxStore:
                 claim_file.unlink(missing_ok=True)
                 continue
 
+            # P1-1: the move succeeded — only now drop the tmp claim copy.
+            tmp_claim.unlink(missing_ok=True)
+            # P2-4: make the inbox → processing rename durable before the
+            # claim is considered authoritative.
+            self._fsync_dir(inbox)
+            self._fsync_dir(processing)
+
             return msg
+
+    def _reap_expired_claim(self, claim_file: Path, inbox: Path, processing: Path) -> bool:
+        """P1-1: reap a claim whose lease expired so read() can retry.
+
+        Called when a claim file blocks our own claim (contested). When the
+        existing claim is older than ``LEASE_TIMEOUT_S`` the previous
+        claimant crashed: the claim is deleted and — if the message already
+        reached processing/ — moved back to inbox. Returns True when the
+        claim was removed (caller retries); False when the claim is fresh
+        (genuinely contested) or unreadable (P2-1).
+
+        P2-7: adds ``LEASE_CLOCK_TOLERANCE_S`` to the cutoff so that
+        cross-device wall-clock skew (up to the tolerance) does not cause
+        a fresh claim to be falsely reaped.  Operators MUST ensure NTP is
+        configured on every swarm host.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        # P2-7: extend cutoff by clock tolerance for cross-device skew
+        cutoff = now - LEASE_TIMEOUT_S + LEASE_CLOCK_TOLERANCE_S
+        try:
+            claim = json.loads(claim_file.read_bytes())
+            claimed_at_s = claim.get("claimed_at", "")
+            if not claimed_at_s:
+                return False  # P2-1: no timestamp — treat as contested
+            claimed_ts = datetime.fromisoformat(claimed_at_s).timestamp()
+        except (json.JSONDecodeError, UnicodeDecodeError,
+                ValueError, TypeError, OSError):  # P2-1
+            return False
+        if claimed_ts >= cutoff:
+            return False  # fresh claim — owner is actively working
+        msg_id = claim.get("msg_id")
+        if not msg_id:
+            # P3-4: regex fallback is ambiguous when owner contains dashes
+            # (.claim-foo-bar-alice-smith: is owner "alice-smith" or "smith"?).
+            # Use the owner from JSON to strip the known suffix reliably.
+            owner_raw = claim.get("owner", "")
+            prefix = ".claim-"
+            suffix = f"-{owner_raw}" if owner_raw else ""
+            stem = claim_file.stem
+            if stem.startswith(prefix) and suffix and stem.endswith(suffix):
+                msg_id = stem[len(prefix):-len(suffix)]
+            else:
+                msg_id = stem
+        owner = claim.get("owner", "")
+        # P2-2: same per-claim flock as renew_claim()/recover_stale() — never
+        # reap a claim that a running task just renewed.
+        with self._claim_lock(processing, msg_id, owner):
+            try:
+                cur = json.loads(claim_file.read_bytes())
+                cur_ts = datetime.fromisoformat(cur.get("claimed_at", "")).timestamp()
+            except (json.JSONDecodeError, UnicodeDecodeError,
+                    ValueError, TypeError, OSError):  # P2-1
+                cur_ts = claimed_ts
+            if cur_ts >= cutoff:
+                return False  # renewed while we waited — still active
+            msg_file = processing / f"{msg_id}.json"
+            if msg_file.exists():
+                os.replace(str(msg_file), str(inbox / msg_file.name))
+                self._fsync_dir(inbox)  # P2-4
+            claim_file.unlink(missing_ok=True)
+            self._fsync_dir(processing)  # P2-4
+            return True
 
     # ── Finalize ───────────────────────────────────────────────────────
 
     @staticmethod
     def _validate_msg_id(msg_id: str) -> None:
-        if "/" in msg_id or "\\" in msg_id or ".." in msg_id:
+        # P2-3: strict whitelist (same charset as agent ids, 64-char cap).
+        # The old path-separator check let ".tmp-"-prefixed ids, "..", and
+        # glob metacharacters ("[", "*") through — those could break file
+        # layout assumptions or broaden claim/finalize glob patterns.
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", msg_id):
             raise ValueError(f"invalid msg_id: {msg_id}")
 
     def finalize(self, session_id: str, agent_id: str, msg_id: str, owner: str) -> str:
@@ -788,6 +1002,9 @@ class MailboxStore:
         archive.mkdir(parents=True, exist_ok=True)
         os.replace(str(target), str(archive / target.name))
         claim_file.unlink(missing_ok=True)
+        # P2-4: processing → archive rename durable before returning.
+        self._fsync_dir(processing)
+        self._fsync_dir(archive)
         return f"finalized → archive/{target.name}"
 
     def finalize_from_inbox(self, session_id: str, agent_id: str, msg_id: str, owner: str) -> str:
@@ -837,6 +1054,9 @@ class MailboxStore:
 
         archive.mkdir(parents=True, exist_ok=True)
         os.replace(str(src), str(archive / src.name))
+        # P2-4: inbox/processing → archive rename durable before returning.
+        self._fsync_dir(src.parent)
+        self._fsync_dir(archive)
         return f"finalized → archive/{src.name}"
 
     # ── Release ────────────────────────────────────────────────────────
@@ -862,6 +1082,9 @@ class MailboxStore:
         os.replace(str(target), str(inbox / target.name))
         if claim_file:
             claim_file.unlink(missing_ok=True)
+        # P2-4: processing → inbox rename durable before returning.
+        self._fsync_dir(processing)
+        self._fsync_dir(inbox)
         return f"released → inbox/{target.name}"
 
     # ── Recover stale ──────────────────────────────────────────────────
@@ -889,31 +1112,46 @@ class MailboxStore:
         if len(claim_files) != 1:
             return False
         claim_file = claim_files[0]
-        try:
-            claim = json.loads(claim_file.read_bytes())
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            return False
-        if claim.get("owner") != owner:
-            return False
-        now = datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT)
-        claim["claimed_at"] = now
-        claim["renewed_at"] = now
-        tmp = processing / f".tmp-renew-{msg_id}-{owner}.json"
-        try:
-            with open(tmp, "w") as f:
-                f.write(json.dumps(claim, indent=2, ensure_ascii=False))
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(str(tmp), str(claim_file))
-        except OSError:
-            tmp.unlink(missing_ok=True)
-            return False
-        # Self-heal a finalize/recover race: if the message left processing/
-        # between the check and the replace, remove the resurrected claim.
-        if not target.exists():
-            claim_file.unlink(missing_ok=True)
-            return False
-        return True
+        # P2-2: same per-claim flock as recover_stale()/read() reap — renew
+        # must not interleave with a recover that is reaping this claim, or
+        # the freshly renewed claim would be moved back to inbox behind us.
+        with self._claim_lock(processing, msg_id, owner):
+            # Re-check under the lock: recover_stale() may have removed the
+            # claim (and moved the message) while we waited.
+            if not target.exists():
+                return False
+            claim_files = sorted(processing.glob(f".claim-{msg_id}-*.json"))
+            if len(claim_files) != 1:
+                return False
+            claim_file = claim_files[0]
+            try:
+                claim = json.loads(claim_file.read_bytes())
+            except (json.JSONDecodeError, UnicodeDecodeError,
+                    ValueError, TypeError, OSError):
+                return False
+            if claim.get("owner") != owner:
+                return False
+            now = datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT)
+            claim["claimed_at"] = now
+            claim["renewed_at"] = now
+            tmp = processing / f".tmp-renew-{msg_id}-{owner}.json"
+            try:
+                with open(tmp, "w") as f:
+                    f.write(json.dumps(claim, indent=2, ensure_ascii=False))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(str(tmp), str(claim_file))
+                self._fsync_dir(processing)  # P2-4
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                return False
+            # Self-heal a finalize/recover race: if the message left
+            # processing/ between the check and the replace, remove the
+            # resurrected claim.
+            if not target.exists():
+                claim_file.unlink(missing_ok=True)
+                return False
+            return True
 
     def recover_stale(self, session_id: str, agent_id: str) -> str:
         processing_dir = self.agent_subdir(session_id, agent_id, "processing")
@@ -925,31 +1163,98 @@ class MailboxStore:
         # P2-10: the lease basis is the claim's claimed_at, which renew_claim()
         # refreshes — an actively renewed claim (task still running) is never
         # older than the cutoff, so it is not recycled.
-        cutoff = datetime.now(timezone.utc).timestamp() - LEASE_TIMEOUT_S
+        # P2-7: extend cutoff by clock tolerance for cross-device skew.
+        # NTP MUST be configured on every swarm host.
+        cutoff = datetime.now(timezone.utc).timestamp() - LEASE_TIMEOUT_S + LEASE_CLOCK_TOLERANCE_S
+        # P1-1: orphan-claim age gate — a claim whose message is missing from
+        # processing/ is only reaped once it is older than this, so a
+        # claimant that is between os.link (claim publish) and os.replace
+        # (message move) is never disturbed (that window is microseconds, and
+        # read()'s P1-1 reorder removed every interruptible step from it).
+        orphan_age_gate = datetime.now(timezone.utc).timestamp() - 30.0
         for cf in sorted(processing_dir.glob(".claim-*.json")):
             try:
                 claim = json.loads(cf.read_bytes())
                 claimed_at_s = claim.get("claimed_at", "")
-                if claimed_at_s:
-                    claimed_ts = datetime.fromisoformat(claimed_at_s).timestamp()
-                    if claimed_ts < cutoff:
-                        # P3-i: extract msg_id robustly — claim stem is
-                        # .claim-{msg_id}-{owner} where msg_id may contain
-                        # dashes.  Prefer the JSON field; fall back to
-                        # regex that strips the leading ".claim-" prefix
-                        # and the trailing "-{owner}" suffix.
-                        msg_id = claim.get("msg_id")
-                        if not msg_id:
-                            import re as _re
-                            m = _re.match(r"^\.claim-(.+)-[^-]+$", cf.stem)
-                            msg_id = m.group(1) if m else cf.stem
-                        msg_file = processing_dir / f"{msg_id}.json"
-                        if msg_file.exists():
-                            os.replace(str(msg_file), str(inbox / msg_file.name))
-                            cf.unlink()
-                            recovered += 1
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                if not claimed_at_s:
+                    continue  # P2-1: missing timestamp — leave untouched
+                claimed_ts = datetime.fromisoformat(claimed_at_s).timestamp()
+                # P3-i: extract msg_id robustly — claim stem is
+                # .claim-{msg_id}-{owner} where msg_id may contain dashes.
+                # Prefer the JSON field; fall back to a regex that strips the
+                # leading ".claim-" prefix and the trailing "-{owner}" suffix.
+                msg_id = claim.get("msg_id")
+                if not msg_id:
+                    # P3-4: regex fallback is ambiguous when owner contains
+                    # dashes (.claim-foo-bar-alice-smith: is owner "alice-smith"
+                    # or "smith"?). Use the owner from JSON to strip the known
+                    # suffix reliably.
+                    owner_for_parse = claim.get("owner", "")
+                    prefix = ".claim-"
+                    suffix = f"-{owner_for_parse}" if owner_for_parse else ""
+                    if cf.stem.startswith(prefix) and suffix and cf.stem.endswith(suffix):
+                        msg_id = cf.stem[len(prefix):-len(suffix)]
+                    else:
+                        msg_id = cf.stem
+                owner = claim.get("owner", "")
+                msg_file = processing_dir / f"{msg_id}.json"
+                # P2-2: hold the per-claim flock across the whole
+                # read-decide-move — renew_claim() takes the same lock, so a
+                # lease-boundary TOCTOU (recover reaps a claim that a running
+                # task just renewed) cannot recycle active work.
+                with self._claim_lock(processing_dir, msg_id, owner):
+                    # Re-read under the lock: a racing renew_claim() that won
+                    # has bumped claimed_at — skip claims refreshed meanwhile.
+                    try:
+                        cur = json.loads(cf.read_bytes())
+                        cur_ts = datetime.fromisoformat(cur.get("claimed_at", "")).timestamp()
+                    except (json.JSONDecodeError, UnicodeDecodeError,
+                            ValueError, TypeError, OSError):  # P2-1
+                        cur_ts = claimed_ts
+                    if not msg_file.exists():
+                        # P1-1: orphan claim — claim exists but no message in
+                        # processing/. Either the claimant crashed between
+                        # os.link (claim publish) and os.replace (message
+                        # move) — the message is still in inbox, re-readable —
+                        # or it was already finalized/recovered. Both cases:
+                        # drop the claim so the message is not stranded. Not
+                        # counted as "recovered": no message was moved.
+                        if cur_ts >= orphan_age_gate:
+                            continue  # too fresh — possibly mid-move
+                        cf.unlink()
+                        self._fsync_dir(processing_dir)  # P2-4
+                        continue
+                    if cur_ts >= cutoff:
+                        continue  # active (possibly renewed) — leave it
+                    os.replace(str(msg_file), str(inbox / msg_file.name))
+                    cf.unlink()
+                    # P2-4: processing → inbox rename durable before returning.
+                    self._fsync_dir(processing_dir)
+                    self._fsync_dir(inbox)
+                    recovered += 1
+            except (json.JSONDecodeError, UnicodeDecodeError,
+                    ValueError, TypeError, OSError):  # P2-1
                 pass
+
+        # P3-1: sweep orphaned tmp-claim files. read() writes
+        # .tmp-claim-{msg_id}-{owner}-{nonce}.json BEFORE publishing the
+        # claim via os.link, then unlinks it after the message move. A crash
+        # between write and link (or between link and unlink) leaves the tmp
+        # file behind forever — the main claim loop above only sees
+        # ".claim-*.json", so these orphans were never cleaned. A tmp-claim
+        # older than the orphan age gate is never part of a live handshake
+        # (that window is microseconds), so it is safe to drop.
+        for tc in sorted(processing_dir.glob(".tmp-claim-*.json")):
+            try:
+                if tc.is_symlink():
+                    tc.unlink(missing_ok=True)
+                    continue
+                if tc.stat().st_mtime >= orphan_age_gate:
+                    continue  # possibly mid-write — leave it
+                tc.unlink(missing_ok=True)
+            except OSError:
+                continue  # vanished while sweeping — fine
+        self._fsync_dir(processing_dir)  # P2-4
         return f"recovered {recovered} stale claim(s)"
 
     # ── Status ─────────────────────────────────────────────────────────
@@ -971,15 +1276,29 @@ class MailboxStore:
             updated_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
         )
         dest = ad / "status.json"
-        tmp = ad / ".tmp-status.json"
+        # P2-5: unique tmp name per writer (pid + uuid, aligned with
+        # _persist_meta's -{pid}-{uuid} pattern) — concurrent write_status()
+        # calls previously shared .tmp-status.json and could publish each
+        # other's partial writes, corrupting status.json.
+        tmp = ad / f".tmp-status-{os.getpid()}-{uuid4().hex[:8]}.json"
         with open(tmp, "w") as f:
             f.write(json.dumps(status.to_dict(), indent=2, ensure_ascii=False))
             f.flush()
             os.fsync(f.fileno())
         os.replace(str(tmp), str(dest))
+        self._fsync_dir(ad)  # P2-4
         return f"status: {state}"
 
-    def read_status(self, session_id: str, agent_id: str) -> Optional[StatusSnapshot]:
+    def read_status(self, session_id: str, agent_id: str, *, strict: bool = False) -> Optional[StatusSnapshot]:
+        """Read status.json; ``None`` when absent or invalid.
+
+        P2-5: with ``strict=True`` a present-but-corrupt status file raises
+        :class:`StatusFileCorruptError` — a structured error carrying the
+        path and reason — instead of collapsing into ``None``, so callers can
+        distinguish "no status" from "status lost to a crash". The default
+        (non-strict) keeps the historical ``None`` contract for existing
+        callers/tests.
+        """
         status_file = self.agent_dir(session_id, agent_id) / "status.json"
         try:
             if not status_file.exists():
@@ -988,15 +1307,29 @@ class MailboxStore:
             # Strict validation: exactly 5 required keys, all strings
             required = {"session_id", "state", "current_task", "last_conclusion", "updated_at"}
             if not isinstance(d, dict) or set(d.keys()) != required:
+                if strict:
+                    raise StatusFileCorruptError(status_file, "missing or extra keys")
                 return None
             if not all(isinstance(d[k], str) for k in required):
+                if strict:
+                    raise StatusFileCorruptError(status_file, "non-string field value")
                 return None
             if d["state"] not in VALID_STATES:
+                if strict:
+                    raise StatusFileCorruptError(status_file, f"invalid state {d['state']!r}")
                 return None
             if d["session_id"] != session_id:
+                if strict:
+                    raise StatusFileCorruptError(status_file, f"session mismatch: {d['session_id']!r}")
                 return None
             return StatusSnapshot.from_dict(d)
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # P2-5: unparseable content — the concurrent-write corruption
+            # signature. Structured error in strict mode; None otherwise.
+            if strict:
+                raise StatusFileCorruptError(status_file, str(exc)) from exc
+            return None
+        except OSError:
             return None
 
     # ── Stats / Clear ──────────────────────────────────────────────────
@@ -1071,21 +1404,27 @@ class MailboxStore:
             ad = self.agent_dir(session_id, aid)
             inbox = ad / "inbox"
             if inbox.is_dir() and any(
-                f.is_file() and f.suffix == ".json" and not f.name.startswith(".")
+                # P3-6: symlinks must not count as pending work
+                f.is_file() and not f.is_symlink() and f.suffix == ".json" and not f.name.startswith(".")
                 for f in inbox.iterdir()
             ):
                 return True  # pending, not yet claimed
             proc = ad / "processing"
             if proc.is_dir():
                 if any(
-                    f.is_file() and f.suffix == ".json" and not f.name.startswith(".")
+                    # P3-6: symlinks must not count as in-flight work
+                    f.is_file() and not f.is_symlink() and f.suffix == ".json" and not f.name.startswith(".")
                     for f in proc.iterdir()
                 ):
                     return True  # in-flight, claimed but not finalized
                 # A fresh claim lease = active claim (message may have been
                 # moved already; the lease itself marks liveness).
                 now = datetime.now(timezone.utc).timestamp()
+                # P2-7: extend cutoff by clock tolerance for cross-device skew
+                claim_cutoff = now - LEASE_TIMEOUT_S + LEASE_CLOCK_TOLERANCE_S
                 for cf in proc.glob(".claim-*.json"):
+                    if cf.is_symlink():
+                        continue  # P3-6: never treat a symlink as a lease
                     try:
                         claim = json.loads(cf.read_bytes())
                         claimed_ts = datetime.fromisoformat(
@@ -1094,11 +1433,14 @@ class MailboxStore:
                     except (json.JSONDecodeError, UnicodeDecodeError,
                             ValueError, TypeError, OSError):
                         continue
-                    if claimed_ts >= now - LEASE_TIMEOUT_S:
+                    if claimed_ts >= claim_cutoff:
                         return True
         # Queued cross-host outbox entries are unfinished deliveries.
         outbox = self.root / "_outbox" / session_id
-        if outbox.is_dir() and any(outbox.iterdir()):
+        if outbox.is_dir() and any(
+            e.is_file() and not e.is_symlink()  # P3-6: symlink entries are not deliveries
+            for e in outbox.iterdir()
+        ):
             return True
         return False
 
@@ -1212,7 +1554,14 @@ class RequestLedger:
     # -- internal paths ---------------------------------------------------
 
     def _events_dir(self, request_id: str) -> Path:
-        """Directory holding the JSONL event log for *request_id*."""
+        """Directory holding the JSONL event log for *request_id*.
+
+        P1-2 defense-in-depth: *request_id* becomes a directory name —
+        re-validate it here even though ``validate_message`` covers inbox
+        messages, because the ledger is also driven directly by gateway
+        API params (artifact.verify) and other callers.
+        """
+        validate_path_component(request_id, "request_id")
         return self._session_dir / self._agent_id / "events" / request_id
 
     def _events_file(self, request_id: str) -> Path:

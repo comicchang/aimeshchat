@@ -1304,6 +1304,36 @@ class AgentGateway:
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("merges restore failed: %s", exc)
 
+    # P2-13: merge_reset — clear stale merge latches so (session, path)
+    # pairs don't accumulate indefinitely.  The manager calls this after
+    # confirming the merge was written to the repo, or when abandoning
+    # a merge attempt.
+    def merge_reset(self, params: dict) -> dict:
+        """Clear merge conflict records.
+
+        Params: {session_id, target_path?}
+        If ``target_path`` is given, clears only that (session, path) pair.
+        Otherwise clears all records for the session.
+        Returns ``{reset: <count>}``.
+        """
+        session_id = params.get("session_id", "")
+        target_path = params.get("target_path", "")
+        if not session_id:
+            raise GatewayError(ERR_NOT_FOUND, "merge.reset requires session_id")
+        removed = 0
+        with self._merges_lock:
+            if target_path:
+                if self._merges.pop((session_id, target_path), None) is not None:
+                    removed = 1
+            else:
+                keys = [k for k in self._merges if k[0] == session_id]
+                for k in keys:
+                    del self._merges[k]
+                    removed += 1
+        if removed:
+            self._save_merges()
+        return {"reset": removed}
+
     # ── internals ──────────────────────────────────────────────────────
 
     def _require_runtime(self, runtime_id: str) -> RuntimeRecord:
@@ -1346,6 +1376,7 @@ class AgentGateway:
             "session.claim": self.session_claim,
             "session.release": self.session_release,
             "write.merge": self.write_merge,
+            "write.merge_reset": self.merge_reset,  # P2-13
             "artifact.verify": self.artifact_verify,
         }
         handler = handlers.get(method)

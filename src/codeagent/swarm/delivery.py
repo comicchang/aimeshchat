@@ -464,6 +464,14 @@ class DeliveryEngine:
                     phase = status_dir / "phase"
                     if phase.exists() and phase.read_text().strip() == "consumed":
                         continue
+                # P2-8: skip paused (wire-mismatch) entries; periodically
+                # re-probe so they resume after the remote host is upgraded.
+                if self._is_paused(sid, mid):
+                    self._reprobe_paused(sid, mid)
+                    # If still paused (not due yet), skip; otherwise fall
+                    # through to the normal retry path.
+                    if self._is_paused(sid, mid):
+                        continue
                 # Top3 backoff: skip entries whose retry is not due yet
                 if not self._attempt_due(sid, mid):
                     continue
@@ -946,6 +954,11 @@ class DeliveryEngine:
             "body exceeds",
             "invalid attachment",
             "sender not in allowed_senders",
+            # P2-8: wire version mismatch is permanent until the remote host
+            # is upgraded — retrying immediately wastes attempts.  Classified
+            # as terminal so _handle_flush_failure pauses the entry instead of
+            # dead-lettering it after max_attempts.
+            "wire version mismatch",
         )
         return any(m in msg for m in markers)
 
@@ -1116,6 +1129,13 @@ class DeliveryEngine:
     ) -> None:
         """Top3: record attempt, classify; dead-letter terminal or exhausted."""
         terminal = self._is_terminal_error(exc)
+        # P2-8: wire version mismatch is terminal but NOT dead-letter — pause
+        # the entry so periodic _reprobe_paused() can retry after the remote
+        # host is upgraded.  Preserves the outbox entry and does not count
+        # toward the max_attempts budget.
+        if terminal and "wire version mismatch" in str(exc):
+            self._pause_for_upgrade(session_id, msg_id, str(exc))
+            return
         attempt = self._record_attempt(
             session_id, msg_id, str(exc), terminal=terminal,
         )
@@ -1124,6 +1144,92 @@ class DeliveryEngine:
             return
         if attempt >= self._max_attempts:
             self._dead_letter(session_id, msg_id, f"max attempts ({self._max_attempts}) exceeded: {exc}"[:300])
+
+    # P2-8: wire version mismatch — pause/reprobe lifecycle ─────────────
+
+    # Re-probe interval: how often to retry paused (wire-mismatch) entries.
+    _REPROBE_INTERVAL_S = 600  # 10 minutes
+
+    def _pause_for_upgrade(
+        self, session_id: str, msg_id: str, reason: str,
+    ) -> None:
+        """P2-8: mark an outbox entry as paused due to wire version mismatch.
+
+        The entry is NOT dead-lettered and NOT counted toward max_attempts.
+        _reprobe_paused() will periodically retry it.
+        """
+        sd = self._outbox / session_id
+        status_dir = sd / f".status-{msg_id}"
+        status_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = status_dir / "meta.json"
+        meta: dict[str, Any] = {}
+        try:
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            meta = {}
+        now_iso = datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT)
+        meta["paused_for_upgrade"] = True
+        meta["pause_reason"] = reason[:300]
+        meta["paused_at"] = now_iso
+        meta["next_reprobe_at"] = time.time() + self._REPROBE_INTERVAL_S
+        meta["terminal"] = False  # not dead-letter — will be retried
+        tmp = status_dir / ".tmp-meta.json"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(meta_path))
+        log.info(
+            "DeliveryEngine: paused %s for wire upgrade (reprobe in %ds)",
+            msg_id, self._REPROBE_INTERVAL_S,
+        )
+
+    def _is_paused(self, session_id: str, msg_id: str) -> bool:
+        """P2-8: True if the entry is paused for a wire version mismatch."""
+        sd = self._outbox / session_id
+        meta_path = sd / f".status-{msg_id}" / "meta.json"
+        try:
+            if not meta_path.exists():
+                return False
+            meta = json.loads(meta_path.read_bytes())
+            return bool(meta.get("paused_for_upgrade"))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return False
+
+    def _reprobe_paused(
+        self, session_id: str, msg_id: str,
+    ) -> bool:
+        """P2-8: check if a paused entry is due for re-probe.  If so, clear
+        the pause flag so the next flush() retry will attempt delivery.
+        Returns True if the entry was un-paused.
+        """
+        sd = self._outbox / session_id
+        meta_path = sd / f".status-{msg_id}" / "meta.json"
+        try:
+            if not meta_path.exists():
+                return False
+            meta = json.loads(meta_path.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return False
+        if not meta.get("paused_for_upgrade"):
+            return False
+        nxt = meta.get("next_reprobe_at")
+        if nxt is not None and time.time() < float(nxt):
+            return False  # not due yet
+        # Clear pause — next flush() will retry
+        meta["paused_for_upgrade"] = False
+        meta.pop("pause_reason", None)
+        meta.pop("paused_at", None)
+        meta.pop("next_reprobe_at", None)
+        tmp = sd / f".status-{msg_id}" / ".tmp-meta.json"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(meta, indent=2, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(meta_path))
+        log.info("DeliveryEngine: re-probing paused entry %s", msg_id)
+        return True
 
     # ── Idempotency ────────────────────────────────────────────────────
 

@@ -18,6 +18,14 @@ STARTUP_TIMEOUT = 15  # how long to wait for a helper subprocess to start
 
 # ── session / lease timeouts (seconds) ─────────────────────────────────
 LEASE_TIMEOUT_S = 300  # mailbox claim lease — stale after 5 minutes
+# P2-7: cross-device clock skew tolerance.  When the claimant and reaper
+# live on different hosts, their wall clocks may diverge.  The lease
+# comparison uses the LOCAL filesystem mtime of the claim file (set by
+# os.link) rather than the claimant's claimed_at timestamp; the tolerance
+# covers the window between the claimant's write and the reaper's stat().
+# NTP should keep skew < 1 s; 30 s is generous.  Operators MUST ensure NTP
+# is configured on every swarm host.
+LEASE_CLOCK_TOLERANCE_S = 30
 
 # ── size limits ────────────────────────────────────────────────────────
 MAX_LINE_LENGTH = 1_048_576  # 1 MiB — wire JSONL frame limit

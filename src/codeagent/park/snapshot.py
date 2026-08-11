@@ -2,12 +2,23 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from codeagent.park.constants import park_data_dir
+
+log = logging.getLogger(__name__)
+
+# P2-14: review_key becomes a filesystem directory under snapshots/ — a
+# crafted key ("../", "/abs", "a/../../b", glob) could read/write snapshot
+# JSON outside the snapshots root. Whitelist before pathing; topic-style
+# keys like "proj:oracle:arch:storage" (colons) are legal.
+_REVIEW_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 @dataclass
@@ -28,13 +39,18 @@ class ReviewSnapshot:
 
 
 def _snapshot_dir(review_key: str) -> Path:
+    # P2-14: reject traversal/glob keys before they become a path component.
+    # Exact "."/".." are rejected too: as a single component they resolve to
+    # the snapshots root / its parent, escaping the per-review subdir.
+    if not isinstance(review_key, str) or review_key in (".", "..") or not _REVIEW_KEY_RE.match(review_key):
+        raise ValueError(f"invalid review_key: {review_key!r}")
     d = park_data_dir() / "snapshots" / review_key
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def save_snapshot(snapshot: ReviewSnapshot) -> Path:
-    """持久化 snapshot。"""
+    """持久化 snapshot (atomic: tmp → fsync → rename)."""
     path = _snapshot_dir(snapshot.review_key) / f"round_{snapshot.round}.json"
     data = {
         "review_key": snapshot.review_key,
@@ -50,14 +66,25 @@ def save_snapshot(snapshot: ReviewSnapshot) -> Path:
         "artifact_refs": snapshot.artifact_refs,
         "generated_at": snapshot.generated_at or time.time(),
     }
-    with open(path, "w") as f:
+    # P3-10: atomic write — tmp+fsync+rename prevents half-written JSON on crash.
+    tmp_path = path.with_suffix(".tmp")
+    with open(tmp_path, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp_path.rename(path)
     return path
 
 
 def load_snapshot(review_key: str, round_num: int) -> Optional[ReviewSnapshot]:
     """按轮次加载 snapshot。"""
-    path = _snapshot_dir(review_key) / f"round_{round_num}.json"
+    try:
+        path = _snapshot_dir(review_key) / f"round_{round_num}.json"
+    except ValueError as exc:
+        # P2-14: invalid key → no valid snapshot (registry sweep calls this
+        # with DB-stored keys and must not crash).
+        log.warning("load_snapshot: %s", exc)
+        return None
     if not path.exists():
         return None
     with open(path) as f:
@@ -66,11 +93,16 @@ def load_snapshot(review_key: str, round_num: int) -> Optional[ReviewSnapshot]:
 
 def latest_snapshot(review_key: str) -> Optional[ReviewSnapshot]:
     """加载最新轮次的 snapshot。"""
-    d = _snapshot_dir(review_key)
+    try:
+        d = _snapshot_dir(review_key)
+    except ValueError as exc:
+        # P2-14: invalid key → no valid snapshot (registry sweep path).
+        log.warning("latest_snapshot: %s", exc)
+        return None
     # P0-1: 按整数轮次排序（int(stem)），而非文件名字典序——
-    # 字符串比较会把 round_10 排在 round_9 之前，导致 latest 选错轮。
+    # P3-10: tolerate non-integer stems (e.g. round_backup.json) by filtering.
     rounds = sorted(
-        d.glob("round_*.json"),
+        (p for p in d.glob("round_*.json") if p.stem.split("_", 1)[1].isdigit()),
         key=lambda p: int(p.stem.split("_", 1)[1]),
     )
     if not rounds:

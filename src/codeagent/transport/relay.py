@@ -38,6 +38,7 @@ from codeagent.wire.protocol import (
     MSG_READY,
     MSG_RESULT,
     MSG_SESSION,
+    NO_TERMINAL_FRAME_MSG,
     WIRE_VERSION,
     decode_line,
     make_mailbox_request,
@@ -181,6 +182,12 @@ class RelayTransport(Transport):
         session_id: Optional[str] = None
         exit_code: Optional[int] = None  # None = no wire result received yet
         version_mismatch = False
+        # P1-3: got_terminal invariant — any output at all followed by EOF
+        # without a terminal frame (result/error/mailbox_result) is a
+        # failure, never a silent success (a truncated/oversized frame may
+        # have been dropped).  An entirely silent child that exits 0 keeps
+        # its exit code (no evidence of a dropped frame).
+        got_any_output = False
         master_fd: Optional[int] = None
         slave_fd: Optional[int] = None
         parse_state = "init"
@@ -327,6 +334,7 @@ class RelayTransport(Transport):
                         _set_state("eof")
                         break
 
+                    got_any_output = True
                     text = data.decode("utf-8", errors="replace")
                     buffer += text
                     _set_state("collecting")
@@ -340,7 +348,12 @@ class RelayTransport(Transport):
 
                         # Try to parse as wire protocol JSON
                         try:
-                            msg = decode_line(line)
+                            # P1-4: strict=False — a v1 remote's bare
+                            # {"type":"ready"} must decode (version 0) so
+                            # the version-mismatch branch fires below
+                            # instead of the frame being treated as UI
+                            # noise on stderr.
+                            msg = decode_line(line, strict=False)
                             msg_type = msg.type
                             payload = msg.payload
 
@@ -408,6 +421,13 @@ class RelayTransport(Transport):
             # No wire result received — use process exit code or default to error
             if exit_code is None:
                 exit_code = proc.returncode if proc.returncode is not None else 1
+                # P1-3: got_terminal invariant — the child produced output
+                # but never a terminal frame (result/error/mailbox_result):
+                # the response was lost or truncated, so a zero exit must
+                # not be returned as success.  Append a diagnostic.
+                if got_any_output and exit_code == 0:
+                    stderr_chunks.append(NO_TERMINAL_FRAME_MSG)
+                    exit_code = 1
 
         except Exception as e:
             stderr_chunks.append(f"relay execution error: {e}")

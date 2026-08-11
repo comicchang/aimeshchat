@@ -25,6 +25,8 @@ from codeagent.constants import (
 from codeagent.domain import RunRequest
 from codeagent.wire.protocol import WIRE_VERSION, decode_request
 
+log = logging.getLogger(__name__)
+
 SUPPORTED_COMMANDS = {"run", "ping", "capabilities", "mailbox", "stream"}
 
 
@@ -49,8 +51,30 @@ def _read_request() -> dict | None:
 
 
 def _send(obj: dict) -> None:
-    """Write one JSON line to stdout."""
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    """Write one JSON line to stdout.
+
+    P1-3: never emit a frame longer than MAX_LINE_LENGTH — clients reject
+    oversized lines as unparseable and would silently drop a terminal
+    frame (result/error/mailbox_result), making the exchange end without
+    a result.  Replace such a frame with an error frame instead: error is
+    still a terminal frame, so the client's got_terminal invariant sees a
+    completed (failed) exchange.
+    """
+    text = json.dumps(obj, ensure_ascii=False)
+    if len(text) > MAX_LINE_LENGTH:
+        logging.getLogger(__name__).warning(
+            "remote_exec: response frame (type=%r) exceeds %d bytes; sending error instead",
+            obj.get("type"),
+            MAX_LINE_LENGTH,
+        )
+        text = json.dumps({
+            "type": "error",
+            "message": (
+                f"response frame (type={obj.get('type', '?')}) exceeds "
+                f"{MAX_LINE_LENGTH} bytes"
+            ),
+        }, ensure_ascii=False)
+    sys.stdout.write(text + "\n")
     sys.stdout.flush()
 
 
@@ -455,6 +479,11 @@ class _StreamSubscription:
     last_heartbeat: float = field(default_factory=time.monotonic)
     stream_kind: str = "mailbox"  # mailbox | runtime | all
     runtime_id: str = ""
+    # P1-8: per-subscription stat cache for incremental mailbox polls —
+    # maps "agent_id/filename" → (st_mtime_ns, st_size). Files whose sig is
+    # unchanged since the last scan are skipped WITHOUT parsing, so a quiet
+    # inbox costs one stat per file per poll instead of a full json.loads.
+    mailbox_stat_cache: dict = field(default_factory=dict)
 
 
 def _cursor_gt(a: str, b: str) -> bool:
@@ -533,7 +562,21 @@ def _poll_mailbox(sub: _StreamSubscription, store: MailboxStore) -> None:
         try:
             inbox = store.agent_subdir(sub.session_id, agent_id, "inbox")
             files = store.list_messages(inbox)
+            # P1-8: incremental scan — reuse the swarm/receiver.py _stat_cache
+            # pattern: remember (mtime_ns, size) per file and skip the parse +
+            # cursor comparison for files unchanged since the last poll.
+            seen: set[str] = set()
             for f in files:
+                seen.add(f.name)
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue  # claimed/moved between glob and stat
+                sig = (st.st_mtime_ns, st.st_size)
+                cache_key = f"{agent_id}/{f.name}"
+                if sub.mailbox_stat_cache.get(cache_key) == sig:
+                    continue
+                sub.mailbox_stat_cache[cache_key] = sig
                 try:
                     msg = json.loads(f.read_bytes())
                 except (json.JSONDecodeError, UnicodeDecodeError, OSError):
@@ -567,6 +610,13 @@ def _poll_mailbox(sub: _StreamSubscription, store: MailboxStore) -> None:
                     event['payload']['trace_id'] = msg['trace_id']
                 _send(event)
                 last_cursor = msg_cursor
+            # P1-8: drop cache entries for files that were claimed/moved out
+            # of the inbox — keeps the per-subscription cache bounded over
+            # long streams instead of accumulating one entry per message ever.
+            stale = [k for k in sub.mailbox_stat_cache
+                     if k.startswith(f"{agent_id}/") and k.rsplit("/", 1)[1] not in seen]
+            for k in stale:
+                del sub.mailbox_stat_cache[k]
         except Exception:
             # Don't let one subscription's error kill the loop
             pass
@@ -592,14 +642,23 @@ def _poll_runtime_events(sub: _StreamSubscription) -> None:
             runtime_id=sub.runtime_id,
         )
         for ev in events:
-            _send({
-                'type': 'stream_event',
-                'request_id': sub.request_id,
-                'session_id': sub.session_id,
-                'cursor': _advance_cursor(sub, runtime_event_id=ev.event_id),
-                'payload': ev.to_dict(),
-                'source': 'runtime',
-            })
+            # P2-9: handle individual event errors so one bad event does not
+            # block the cursor.  Always advance past the event (even on
+            # failure) to prevent an infinite re-fetch loop.
+            try:
+                _send({
+                    'type': 'stream_event',
+                    'request_id': sub.request_id,
+                    'session_id': sub.session_id,
+                    'cursor': _advance_cursor(sub, runtime_event_id=ev.event_id),
+                    'payload': ev.to_dict(),
+                    'source': 'runtime',
+                })
+            except Exception:
+                log.warning(
+                    "_poll_runtime_events: failed to emit event %s, advancing cursor",
+                    ev.event_id,
+                )
             last_event_id = ev.event_id
     except Exception:
         # EventStore unavailable — the runtime leg simply yields nothing.

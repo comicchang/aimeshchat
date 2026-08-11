@@ -23,6 +23,27 @@ from codeagent.transport.base import TransportError
 
 log = logging.getLogger(__name__)
 
+def _known_hosts_file() -> str:
+    """Explicit known_hosts path for postmesh SSH connections.
+
+    P2-16: pointing UserKnownHostsFile explicitly (instead of leaving it
+    to ~/.ssh/config) guarantees a config file cannot silently redirect
+    host-key state to /dev/null or a per-host file that postmesh does not
+    expect. ``POSTMESH_KNOWN_HOSTS`` overrides for testing/containers.
+    """
+    return os.environ.get("POSTMESH_KNOWN_HOSTS") or os.path.expanduser("~/.ssh/known_hosts")
+
+
+# P2-16: explicit host-key verification policy. The SSH default inherits
+# ~/.ssh/config, where ``StrictHostKeyChecking=no`` would silently accept a
+# MITM key. accept-new keeps TOFU for first-time hosts (key is added to
+# known_hosts) but REJECTS a changed key — protecting against spoofed or
+# rekeyed hosts. Command-line -o beats any config value.
+HOST_KEY_OPTS: list[str] = [
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "UserKnownHostsFile=" + _known_hosts_file(),
+]
+
 # SSH options applied to every master creation.
 _MASTER_OPTS: list[str] = [
     "-o", "ControlMaster=yes",
@@ -32,6 +53,7 @@ _MASTER_OPTS: list[str] = [
     "-o", "ForwardX11=no",
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=10",
+    *HOST_KEY_OPTS,
 ]
 
 

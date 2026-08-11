@@ -45,6 +45,20 @@ TERMINAL_TYPES = frozenset({MSG_RESULT, MSG_ERROR, MSG_MAILBOX_RESULT})
 LIFECYCLE_TYPES = frozenset({MSG_READY, MSG_ACCEPTED, MSG_SESSION, MSG_RESULT, MSG_ERROR, MSG_MAILBOX_RESULT})
 STREAM_TYPES = frozenset({MSG_STREAM_EVENT})
 
+# P1-3: one-shot transports must not report success when an exchange ends
+# (EOF) without a terminal frame — the frame may have been dropped by the
+# 1 MiB line guard or truncated mid-stream.  Shared diagnostic for the
+# got_terminal invariant.
+NO_TERMINAL_FRAME_MSG = (
+    "wire error: no terminal frame (result/error/mailbox_result) received; "
+    "the helper's response was lost or truncated"
+)
+
+# P1-4: consecutive unparseable frames beyond this count abort a one-shot
+# parse loop instead of skipping garbage silently (which could hide the
+# loss of the terminal frame).
+MAX_CONSECUTIVE_BAD_FRAMES = 5
+
 # ── command constants ───────────────────────────────────────────────────
 CMD_RUN = "run"
 CMD_PING = "ping"
@@ -119,6 +133,10 @@ def encode_line(obj: dict[str, Any]) -> bytes:
 # ── required-field schema per response message type ────────────────────
 _RESPONSE_REQUIRED: dict[str, dict[str, type]] = {
     MSG_ACCEPTED:      {"wire_version": int},
+    # P1-4: wire_version is enforced under strict decoding.  One-shot
+    # transports pass strict=False so a v1 remote's bare {"type":"ready"}
+    # decodes with version 0 and the caller's version check reports a
+    # mismatch instead of the frame being silently skipped.
     MSG_READY:         {"wire_version": int},
     MSG_SESSION:       {"id": str},
     MSG_RESULT:        {"exit_code": int, "stdout": str, "stderr": str},
@@ -130,8 +148,17 @@ _RESPONSE_REQUIRED: dict[str, dict[str, type]] = {
 }
 
 
-def decode_line(line: str | bytes) -> WireMessage:
+def decode_line(line: str | bytes, *, strict: bool = True) -> WireMessage:
     """Parse a JSONL line into a validated ``WireMessage``.
+
+    Args:
+        strict: when True (default), the full required-field schema is
+            enforced, including ``wire_version`` on ready frames.  When
+            False (one-shot transports), a ``ready`` frame missing
+            ``wire_version`` is tolerated and decoded with version 0 —
+            v1 remotes send a bare ``{"type":"ready"}`` and the frame
+            must reach the caller's version check so a mismatch is
+            reported instead of the frame being silently skipped.
 
     Raises:
         ValueError: on empty input, non-dict JSON, missing ``type``,
@@ -161,6 +188,12 @@ def decode_line(line: str | bytes) -> WireMessage:
     if schema is not None:
         for field, expected_type in schema.items():
             if field not in obj:
+                # P1-4: lenient mode — a v1 ready frame has no
+                # wire_version; decode it as 0 so the caller's version
+                # check reports a mismatch instead of dropping the frame.
+                if not strict and msg_type == MSG_READY and field == "wire_version":
+                    obj[field] = 0
+                    continue
                 raise ValueError(f"{msg_type!r} message missing required field {field!r}")
             if not isinstance(obj[field], expected_type):
                 raise ValueError(

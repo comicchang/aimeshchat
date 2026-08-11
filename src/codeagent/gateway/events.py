@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any, Generator, Optional
 
 from codeagent.gateway.model import (
+    EVENT_KIND_TERMINAL,
     EVENT_KIND_TOOL_UPDATE,
     EVENT_KINDS,
     RuntimeEvent,
@@ -35,6 +37,10 @@ from codeagent.gateway.model import (
 log = logging.getLogger(__name__)
 
 TOOL_UPDATE_RETENTION_DAYS = 7
+# P2-10: terminal/receipt/error events retained for 90 days before sweep.
+TERMINAL_RETENTION_DAYS = 90
+# P2-10: total event count cap — oldest rows pruned when exceeded.
+MAX_TOTAL_EVENTS = 100_000
 
 
 def gateway_state_dir() -> Path:
@@ -89,22 +95,36 @@ class EventStore:
         except OSError:
             pass
         self._source_host = source_host or _local_hostname()
+        # P2-10: process-level singleton connection — WAL multi-read
+        # single-write; PRAGMAs set once, not per-operation.
+        # check_same_thread=False: the _lock serialises all access; the
+        # connection is created in __init__ but used by server threads.
+        self._conn = sqlite3.connect(str(self._db_path), timeout=10,
+                                     check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._lock = threading.Lock()
         self._init_db()
 
+    # P2-10: singleton connection — no per-operation open/close.
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(str(self._db_path), timeout=10)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            yield conn
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        with self._lock:
+            try:
+                yield self._conn
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def close(self) -> None:
+        """Close the singleton connection (idempotent)."""
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -122,6 +142,9 @@ class EventStore:
         BEGIN IMMEDIATE takes the write lock before SELECT MAX so two
         concurrent appends for the same runtime cannot compute the same
         sequence (UNIQUE race).
+
+        P2-10: constructs RuntimeEvent from lastrowid directly — no
+        extra _fetch_by_id round-trip on the singleton connection.
         """
         draft.validate()
         with self._connect() as conn:
@@ -150,15 +173,32 @@ class EventStore:
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
-        return self._row_to_event(self._fetch_by_id(event_id))
+        # P2-10: return directly from draft + lastrowid, no extra fetch.
+        return RuntimeEvent(
+            event_id=event_id,
+            source_host=self._source_host,
+            runtime_id=draft.runtime_id,
+            generation=draft.generation,
+            source_sequence=seq,
+            session_id=draft.session_id,
+            agent_id=draft.agent_id,
+            request_id=draft.request_id,
+            run_id=draft.run_id,
+            kind=draft.kind,
+            created_at=draft.created_at,
+            payload=draft.payload,
+        )
 
     # ── remote ingest ──────────────────────────────────────────────────
 
-    def ingest_remote(self, event: dict) -> RuntimeEvent:
+    def ingest_remote(self, event: dict) -> Optional[RuntimeEvent]:
         """Ingest a remotely-produced event, keeping ITS source_sequence.
 
         Idempotent on (source_host, runtime_id, generation, source_sequence):
         a duplicate insert is a no-op returning the existing row.
+
+        P2-9: returns None for unknown event kinds (logged + skipped) so the
+        caller can advance the cursor past the event.
         """
         host = event.get("source_host", "")
         runtime_id = event.get("runtime_id", "")
@@ -169,13 +209,28 @@ class EventStore:
         if seq <= 0:
             raise ValueError("ingest_remote requires source_sequence > 0")
         kind = event.get("kind", "")
+        # P2-9: skip unknown event kinds instead of raising — a newer remote
+        # may send kinds this host doesn't recognise.  Log a warning and return
+        # None so the caller can advance the cursor past the skipped event.
         if kind not in EVENT_KINDS:
-            raise ValueError(f"invalid event kind {kind!r}")
+            log.warning(
+                "ingest_remote: skipping unknown event kind %r "
+                "(host=%s, runtime=%s, seq=%s)",
+                kind, host, runtime_id, seq,
+            )
+            return None
 
         # P2-1: BEGIN IMMEDIATE takes the write lock BEFORE the SELECT so a
         # concurrent ingest for the same 4-tuple cannot slip an INSERT between
         # our check and ours — prevents lastrowid==0 → ValueError. The
         # re-query after INSERT OR IGNORE is defence-in-depth.
+        # P2-10: snapshot payload once for both insert and return value.
+        snap_session = event.get("session_id", "")
+        snap_agent = event.get("agent_id", "")
+        snap_request = event.get("request_id", "")
+        snap_run = event.get("run_id", "")
+        snap_created = event.get("created_at", "")
+        snap_payload = event.get("payload", {}) or {}
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -194,10 +249,9 @@ class EventStore:
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             host, runtime_id, generation, seq,
-                            event.get("session_id", ""), event.get("agent_id", ""),
-                            event.get("request_id", ""), event.get("run_id", ""),
-                            kind, event.get("created_at", ""),
-                            json.dumps(event.get("payload", {}) or {}, ensure_ascii=False),
+                            snap_session, snap_agent, snap_request, snap_run,
+                            kind, snap_created,
+                            json.dumps(snap_payload, ensure_ascii=False),
                         ),
                     )
                     if cur.lastrowid and cur.lastrowid > 0:
@@ -220,7 +274,21 @@ class EventStore:
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
-        return self._row_to_event(self._fetch_by_id(event_id))
+        # P2-10: return directly from input + event_id, no extra fetch.
+        return RuntimeEvent(
+            event_id=event_id,
+            source_host=host,
+            runtime_id=runtime_id,
+            generation=generation,
+            source_sequence=seq,
+            session_id=snap_session,
+            agent_id=snap_agent,
+            request_id=snap_request,
+            run_id=snap_run,
+            kind=kind,
+            created_at=snap_created,
+            payload=snap_payload,
+        )
 
     # ── query ──────────────────────────────────────────────────────────
 
@@ -310,24 +378,51 @@ class EventStore:
     # ── retention ──────────────────────────────────────────────────────
 
     def sweep(self, now: Optional[float] = None) -> int:
-        """Prune tool-update detail events older than 7 days.
+        """Prune events by age and total count.
 
         P2-4: TOOL_STARTED/TOOL_FINISHED are RETAINED (lifecycle kinds) so
         per-runtime tool_count never resets to zero after 7 days (regression
-        A6). Only TOOL_UPDATED detail rows expire.
-        Terminal/receipt/error events are retained past release.
+        A6). Only TOOL_UPDATED detail rows expire after 7 days.
+        P2-10: terminal events (TASK_STATE, MESSAGE_READ, ERROR) expire after
+        90 days; total row count capped at MAX_TOTAL_EVENTS (oldest first).
         Returns the number of deleted rows.
         """
-        cutoff = datetime.now(timezone.utc) - timedelta(days=TOOL_UPDATE_RETENTION_DAYS)
-        cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
-        placeholders = ",".join("?" * len(EVENT_KIND_TOOL_UPDATE))
+        cutoff_tool = datetime.now(timezone.utc) - timedelta(days=TOOL_UPDATE_RETENTION_DAYS)
+        cutoff_tool_iso = cutoff_tool.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # P2-10: 90-day retention for terminal/receipt/error events.
+        cutoff_terminal = datetime.now(timezone.utc) - timedelta(days=TERMINAL_RETENTION_DAYS)
+        cutoff_terminal_iso = cutoff_terminal.strftime("%Y-%m-%dT%H:%M:%SZ")
+        placeholders_tool = ",".join("?" * len(EVENT_KIND_TOOL_UPDATE))
+        placeholders_term = ",".join("?" * len(EVENT_KIND_TERMINAL))
         with self._connect() as conn:
+            # 1. Prune old TOOL_UPDATED (>7 days).
             cur = conn.execute(
-                f"DELETE FROM runtime_events WHERE kind IN ({placeholders}) "
+                f"DELETE FROM runtime_events WHERE kind IN ({placeholders_tool}) "
                 "AND created_at < ?",
-                (*sorted(EVENT_KIND_TOOL_UPDATE), cutoff_iso),
+                (*sorted(EVENT_KIND_TOOL_UPDATE), cutoff_tool_iso),
             )
-        return int(cur.rowcount)
+            removed = int(cur.rowcount)
+            # 2. P2-10: Prune old terminal events (>90 days).
+            cur = conn.execute(
+                f"DELETE FROM runtime_events WHERE kind IN ({placeholders_term}) "
+                "AND created_at < ?",
+                (*sorted(EVENT_KIND_TERMINAL), cutoff_terminal_iso),
+            )
+            removed += int(cur.rowcount)
+            # 3. P2-10: Total row count cap — evict oldest rows.
+            count = conn.execute(
+                "SELECT COUNT(*) FROM runtime_events"
+            ).fetchone()[0]
+            if count > MAX_TOTAL_EVENTS:
+                excess = count - MAX_TOTAL_EVENTS
+                cur = conn.execute(
+                    "DELETE FROM runtime_events WHERE event_id IN "
+                    "(SELECT event_id FROM runtime_events "
+                    "ORDER BY event_id ASC LIMIT ?)",
+                    (excess,),
+                )
+                removed += int(cur.rowcount)
+        return removed
 
     # ── internals ──────────────────────────────────────────────────────
 

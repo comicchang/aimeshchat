@@ -33,7 +33,7 @@ from codeagent.gateway.events import control_socket_path
 from codeagent.gateway.model import GatewayError
 from codeagent.mailbox.store import MailboxStore, RequestLedger, resolve_root
 from codeagent.park.registry import ParkRegistry
-from codeagent.park.router import park_revive
+from codeagent.park.inject import build_cold_context
 from codeagent.domain.park import Lifecycle, ParkManifest
 from codeagent.runtime.base import CAP_WARM_RESUME
 from codeagent.runtime.registry import RuntimeRegistry
@@ -133,7 +133,7 @@ def _parse_flat_yaml(path: Path) -> dict:
 
 
 def _merge_flat_yaml(path: Path, ensure: dict[str, dict[str, str]]) -> bool:
-    """Append missing sections to a flat YAML file (with backup).
+    """Insert missing keys under their correct YAML sections (with backup).
 
     Only appends keys that are entirely absent — never overwrites an
     existing value. Returns True when a merge happened.
@@ -142,24 +142,60 @@ def _merge_flat_yaml(path: Path, ensure: dict[str, dict[str, str]]) -> bool:
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     body = "\n".join(lines)
     merged = False
-    additions: list[str] = []
+
+    # P3-9: index section boundaries so missing keys insert at the end of
+    # their owning section rather than being appended at file end.
+    section_end: dict[str, int] = {}
+    current_section = ""
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in stripped:
+            continue
+        key_part, _, _ = stripped.partition(":")
+        key_part = key_part.strip()
+        if not (line.startswith("  ") or line.startswith("\t")):
+            if current_section:
+                section_end[current_section] = i
+            current_section = key_part
+    if current_section:
+        section_end[current_section] = len(lines)
+
+    # Build insertion plan: per-existing-section lines + trailing new sections.
+    section_inserts: dict[str, list[str]] = {}
+    new_section_lines: list[str] = []
     for section, kv in ensure.items():
-        for key, val in kv.items():
-            if f"{key}:" in body:
-                continue  # already present — do not overwrite
-            if section not in body:
-                if additions and additions[-1].startswith(section + ":"):
-                    pass
-                else:
-                    additions.append(f"{section}: ")
-            additions.append(f"  {key}: {val}")
-            merged = True
+        missing = {k: v for k, v in kv.items() if f"{k}:" not in body}
+        if not missing:
+            continue
+        merged = True
+        if section in section_end:
+            for k, v in missing.items():
+                section_inserts.setdefault(section, []).append(f"  {k}: {v}")
+        else:
+            if not new_section_lines:
+                new_section_lines.append(f"{section}:")
+            for k, v in missing.items():
+                new_section_lines.append(f"  {k}: {v}")
+
     if not merged:
         return False
+
+    # P3-9: apply inserts bottom-up so line indices remain valid.
+    new_lines = list(lines)
+    for section, insert_lines in sorted(
+        section_inserts.items(), key=lambda x: section_end[x[0]], reverse=True,
+    ):
+        pos = section_end[section]
+        for j, text in enumerate(insert_lines):
+            new_lines.insert(pos + j, text)
+    new_lines.extend(new_section_lines)
+
     if path.exists():
         path.rename(backup)
     with open(path, "w") as f:
-        f.write(body + ("\n" if body else "") + "\n".join(additions) + "\n")
+        f.write("\n".join(new_lines) + "\n")
     return True
 
 
@@ -250,8 +286,11 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             ),
             session_id=sid,
         )
-    except ValueError:
-        pass
+    except ValueError as exc:
+        # P3-7: only swallow duplicate-registration; real errors must surface.
+        if "already" not in str(exc).lower() and "exist" not in str(exc).lower():
+            raise
+        log.debug("oracle start: agent %s already registered (idempotent)", _ORACLE_AGENT)
 
     # ── Park (idempotent; backend session filled after spawn) ─────────
     registry = ParkRegistry()
@@ -376,6 +415,10 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     registry = ParkRegistry()
     manifest = registry.lookup(review_key)
     if manifest and manifest.backend_session_id:
+        # P2-12: registry is created up front so a failed warm spawn can be
+        # stopped from the except handler before degrading to cold.
+        reg = RuntimeRegistry()
+        warm_handle = None
         try:
             # Enqueue the prompt as a TASK FIRST so the resumed runtime's
             # plugin picks it up as the initial task (not a stale one).
@@ -396,8 +439,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:
                 print(f"warning: warm task enqueue failed: {exc}", file=sys.stderr)
-            reg = RuntimeRegistry()
-            handle = reg.spawn(_resolve_backend(args.agent, args.backend), {
+            warm_handle = reg.spawn(_resolve_backend(args.agent, args.backend), {
                 "session_id": sid,
                 "agent_id": _ORACLE_AGENT,
                 "review_key": review_key,
@@ -410,6 +452,17 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "nonce": uuid4().hex[:12],
                 "short_task": False,
             })
+            # P2-11: never overwrite the manifest's known backend session id
+            # with an empty one — the opencode extraction window may close
+            # before the session id is known, and clobbering it would destroy
+            # the resume point (next warm attempt degrades to cold).
+            new_backend_session_id = warm_handle.backend_session_id or manifest.backend_session_id
+            if not warm_handle.backend_session_id:
+                print(
+                    f"warning: warm: backend session id extraction window failed — "
+                    f"preserving previous id {manifest.backend_session_id!r}",
+                    file=sys.stderr,
+                )
             # Update manifest backend id + lifecycle (in-place, no UNIQUE clash).
             registry.update(review_key, ParkManifest(
                 review_key=review_key,
@@ -419,22 +472,35 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 host=manifest.host,
                 workdir=manifest.workdir,
                 lifecycle=Lifecycle.HOT_PARKED,
-                backend_session_id=handle.backend_session_id,
+                backend_session_id=new_backend_session_id,
                 round=manifest.round + 1,
                 created_at=manifest.created_at,
                 last_activity_at=time.time(),
             ))
-            _adopt_runtime(review_key, sid, handle, _resolve_backend(args.agent, args.backend))
+            _adopt_runtime(review_key, sid, warm_handle, _resolve_backend(args.agent, args.backend))
             print(json.dumps({
                 "method": "warm",
                 "review_key": review_key,
-                "runtime_id": handle.runtime_id,
+                "runtime_id": warm_handle.runtime_id,
                 "old_backend_session_id": manifest.backend_session_id,
-                "new_backend_session_id": handle.backend_session_id,
-                "note": "native backend session resumed (OMP --resume / opencode --session)",
+                "new_backend_session_id": new_backend_session_id,
+                "note": (
+                    "native backend session resumed (OMP --resume / opencode --session)"
+                    if new_backend_session_id else
+                    "warm runtime spawned; session id pending — previous id preserved"
+                ),
             }, indent=2))
             return 0
         except Exception as exc:
+            # P2-12: the warm runtime was already spawned — if a later step
+            # (registry.update / _adopt_runtime) raised, stop it before the
+            # cold path, or the resumed process leaks.
+            if warm_handle is not None:
+                try:
+                    reg.stop(warm_handle.runtime_id, "warm-failed-degrade-cold")
+                except Exception as stop_exc:
+                    log.debug("oracle ask: warm runtime stop failed (%s): %s",
+                              warm_handle.runtime_id, stop_exc)
             print(json.dumps({
                 "method": "warm_failed",
                 "review_key": review_key,
@@ -443,7 +509,12 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             }, indent=2), file=sys.stderr)
 
     # ── Cold: snapshot reconstruction ─────────────────────────────────
-    rv = park_revive(review_key, prompt)
+    # P1-7: cold 分支必须注入 snapshot 上下文（build_cold_context），不能
+    # 信 park_revive 返回的 rv.context——stale HOT_PARKED manifest 会让
+    # revive_or_spawn 返回 method="hot" 的路由提示（"use hub send to
+    # peer_agent_id=..."），round3 起该提示被当成首轮 prompt 注入重建
+    # 实例（回归）。这里直接生成 snapshot 上下文，忽略决策层的 context。
+    cold_context = build_cold_context(review_key)
     try:
         reg = RuntimeRegistry()
         handle = reg.spawn(_resolve_backend(args.agent, args.backend), {
@@ -451,7 +522,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             "agent_id": _ORACLE_AGENT,
             "review_key": review_key,
             "workdir": manifest.workdir if manifest else os.getcwd(),
-            "task": rv.context + "\n\n" + prompt,
+            "task": cold_context + "\n\n" + prompt,
             "model": (manifest.model if manifest else "") or (getattr(args, "model", "") or ""),
             "gateway_socket": str(control_socket_path()),
             "owner_pid": os.getpid(),
@@ -539,10 +610,16 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
                             "run_id": run_id,
                             "states": [e["event"] for e in evs],
                             "terminal": next((e["event"] for e in evs if e["event"] in {"DONE", "BLOCKED", "CANCELLED", "EXPIRED", "UNKNOWN_STALE"}), ""),
+                            "_mtime": req_dir.stat().st_mtime,
                         })
         except Exception:
             reqs = []
-    out["requests"] = reqs[-5:]  # most recent
+    # P3-8: sort by filesystem mtime (creation/modification order), not
+    # request_id lexicographic order — hex IDs don't sort chronologically.
+    reqs.sort(key=lambda r: r.get("_mtime", 0))
+    for r in reqs:
+        r.pop("_mtime", None)
+    out["requests"] = reqs[-5:]  # most recent by time
 
     # Latest READ receipt / progress from history.
     if manifest and manifest.swarm_session_id:

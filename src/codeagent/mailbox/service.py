@@ -332,7 +332,10 @@ class MailboxService:
         d = self._ack_unresolved_dir(session_id, agent_id)
         if not d.exists():
             return set()
-        return {p.stem for p in d.glob("*.json")}
+        return {
+            p.stem for p in d.glob("*.json")
+            if not p.is_symlink()  # P3-6: symlink markers must not be trusted
+        }
 
     def _ack_unresolved_marker(
         self, session_id: str, agent_id: str, msg_id: str,
