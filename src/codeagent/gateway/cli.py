@@ -567,13 +567,18 @@ def _parse_exit_on(raw: Optional[str]) -> list[tuple[str, str]]:
     ``RUNTIME_STATE.stopped``). Malformed specs are skipped with a
     warning rather than failing the whole watch.
     """
-    specs: list[tuple[str, str]] = []
+    specs: list[tuple[str, Optional[str]]] = []
     for item in (raw or "").split(","):
         item = item.strip()
         if not item:
             continue
         kind, sep, state = item.partition(".")
         if not sep or not kind or not state:
+            # A4b: kind-only spec (no ".state") — matches ANY event of that
+            # kind (e.g. `ASSISTANT_PROGRESS` fires on every new output).
+            if kind and not sep:
+                specs.append((kind.strip(), None))
+                continue
             print(f"events: warning: ignoring malformed --exit-on spec {item!r}", file=sys.stderr)
             continue
         specs.append((kind.strip(), state.strip()))
@@ -641,7 +646,7 @@ def cmd_events_watch(args) -> int:
             if exit_on:
                 kind = ev.get("kind", "")
                 state = (ev.get("payload") or {}).get("state", "")
-                if (kind, state) in exit_on:
+                if any(k == kind and (s is None or state == s) for k, s in exit_on):
                     try:
                         _save_watch_cursor(session_id, runtime_id, int(result.get("cursor") or cursor or 0), filters)
                     except (TypeError, ValueError):

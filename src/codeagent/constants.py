@@ -17,7 +17,7 @@ READY_TIMEOUT = 15  # how long to wait for the remote helper to print ``ready``
 STARTUP_TIMEOUT = 15  # how long to wait for a helper subprocess to start
 
 # ── session / lease timeouts (seconds) ─────────────────────────────────
-LEASE_TIMEOUT_S = 300  # mailbox claim lease — stale after 5 minutes
+LEASE_TIMEOUT_S = 3600  # mailbox claim lease — stale after 1 hour (covers oracle single-turn 30–60min); 300s was < oracle turn → claim expired → "no claim file" on finalize
 # P2-7: cross-device clock skew tolerance.  When the claimant and reaper
 # live on different hosts, their wall clocks may diverge.  The lease
 # comparison uses the LOCAL filesystem mtime of the claim file (set by

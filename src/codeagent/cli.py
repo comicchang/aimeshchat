@@ -281,6 +281,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_ask.add_argument("--agent", default=_DEFAULT_ORACLE_AGENT)
     ora_ask.add_argument("--backend", default="omp")
     ora_ask.add_argument("--model", default="")
+    ora_ask.add_argument("--wait-binding", action="store_true", default=False,
+                        help="Block until backend session binding completes (≤60s) before "
+                             "steering; avoids the binding_pending silent-drop window")
 
     ora_status = ora_sub.add_parser("status", help="Aggregate receipt/progress/park")
     ora_status.add_argument("review_key")
@@ -1945,9 +1948,19 @@ def _cmd_park(args: argparse.Namespace) -> int:
             ]
             if rv.method == "cold":
                 cmd_list.insert(cmd_list.index("run") + 1, "--new-session")
-            r = subprocess.run(cmd_list, capture_output=True, text=True, timeout=3600)
-            out["revive_output"] = r.stdout[-500:]
-            out["revive_returncode"] = r.returncode
+            try:
+                # No hard timeout: oracle single turn can run 30–60min and the
+                # skill promises explicit-release termination, not a kill. A
+                # fixed timeout=3600 cut long tasks (TimeoutExpired was also
+                # uncaught → crash). wait --timeout is the observation bound.
+                r = subprocess.run(cmd_list, capture_output=True, text=True)
+            except (subprocess.TimeoutExpired, Exception) as e:  # noqa: BLE001
+                out["revive_error"] = f"{type(e).__name__}: {e}"
+                out["revive_output"] = (getattr(e, "stdout", b"") or b"")[-500:]
+                out["revive_returncode"] = -1
+            else:
+                out["revive_output"] = r.stdout[-500:]
+                out["revive_returncode"] = r.returncode
         print(json.dumps(out, indent=2))
 
     elif cmd == "acquire":

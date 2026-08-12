@@ -21,6 +21,30 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
   （opencode issue #13910/#35222）→ 走 cold snapshot 兜底。
 - generic（无 warm）仅在显式指定时允许。
 
+## 模型一致性（防漂移，2026-08 design 结论）
+
+模型单一决定源 = OMP agent 定义（`agents/oracle*.md` 的 `model:` 字段）。
+**oracle 语义（review/验收/咨询）禁止依赖默认 `modelRoles.task`（= mimo）**，
+调用方必须显式 `--agent oracle | oracle-lite | oracle-opus`，否则 oracle.md 的
+模型不生效。
+
+改模型需三处同步（校验命令，三处各出一行即一致）：
+```bash
+grep -rE 'ppio/pa/gpt-5.6-sol|claude-opus-4-8|deepseek-v4-pro' \
+  ~/.omp/agent/config.yml ~/.omp/agent/agents/oracle*.md \
+  ~/.config/opencode/oh-my-openagent.json
+```
+- oracle / oracle-opus / oracle-lite 三个 agent 配置已全部一致（scout 实锤历史状态）。
+- 默认未指定 agent → `modelRoles.task = mimo` 保持（task 通用执行者语义），不改。
+
+## 绑定语义（A1，2026-08-12 修复）
+
+`oracle start` 同步轮询 backend session id ≤60s；慢启动 oracle（full/opus 读配置、
+长首轮）超时则返回 `binding=pending`，**runtime 保持存活**（不 SIGTERM——那曾误杀
+健康 advisor，exit 143）。backend_session_id 后续由 gateway `runtime.register`
+异步回写 park manifest，warm resume 仍收敛。status 显示 `binding: pending` 属正常，
+不等同失败。
+
 ## CLI 契约（唯一工作流）
 
 ```
@@ -29,8 +53,11 @@ KEY='<project>:oracle:<domain>:<topic>[:<model_suffix>]'
 # 首轮：新建 review/session/runtime（hot 交互式，初始 prompt 即首轮任务）
 aimeshchat oracle start "$KEY" --agent oracle --prompt '初始问题'
 
-# 追加/追问：hot in-loop send（同 backend session，不新开进程）
+# 追加/追问：hot in-loop send（同 backend session，不新开进程）。
+#   binding pending（sid 空）时 ask 返回 status=binding_pending 退出码 1（静默丢弃保护）；
+#   慢启动首轮后立即 ask 用 --wait-binding 阻塞至绑定（≤60s）再投递。
 aimeshchat oracle ask "$KEY" '追加信息'
+aimeshchat oracle ask "$KEY" '首轮后立即追加' --wait-binding
 
 # 状态：聚合 receipt / progress / park / runtime health
 aimeshchat oracle status "$KEY"
@@ -38,10 +65,14 @@ aimeshchat oracle status "$KEY"
 # 列表：所有 park review（lifecycle / round / backend session）
 aimeshchat oracle list
 
-# 进度：cursor 可续的事件流
+# 进度：cursor 可续的事件流；--exit-on ASSISTANT_PROGRESS 在产出时退出
 aimeshchat oracle watch "$KEY" --cursor <last>
+aimeshchat oracle watch "$KEY" --exit-on ASSISTANT_PROGRESS
 
-# 等待：阻塞到 agent_end 事件，内联打印最终回答（超时建议转 result）
+# 等待：阻塞到【新的 ASSISTANT_PROGRESS 产出】（parked oracle 产出后 runtime 保持
+#   active，agent_end 不触发）或 agent_end 兜底，内联打印最终回答。
+#   生命周期：hot/warm 统一等新产出；cold(无 runtime) → 报错提示 revive；
+#   binding pending → 提示但不阻塞。
 aimeshchat oracle wait "$KEY" --timeout 300
 
 # 结果：从 session 转录 / mailbox REPORT / FS 扫描提取最新回答

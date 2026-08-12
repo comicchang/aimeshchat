@@ -271,7 +271,13 @@ def main(argv: list[str] | None = None) -> None:
                     print(f"SUBJECT: {msg['subject']}")
                     print(f"BODY: {msg['body']}")
         elif args.cmd == "finalize":
-            print(store.finalize(args.session, args.agent, args.msg_id, args.owner))
+            # P3-o fallback: claim may have expired/recovered for long oracle
+            # turns → finalize_from_inbox archives from inbox instead of
+            # raising "no claim file" (aligned with kernel.ack).
+            try:
+                print(store.finalize(args.session, args.agent, args.msg_id, args.owner))
+            except ValueError:
+                print(store.finalize_from_inbox(args.session, args.agent, args.msg_id, args.owner))
         elif args.cmd == "release":
             print(store.release(args.session, args.agent, args.msg_id, args.owner))
         elif args.cmd == "recover-stale":

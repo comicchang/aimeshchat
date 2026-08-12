@@ -771,23 +771,22 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     # Poll the runtime log (≤60s) for the native backend session id so the
     # review's warm resume point is known BEFORE start returns, then persist
     # it to ~/.omp/oracle/<review_key>/meta.json for revive/ask reuse.
+    # NOTE: slow-starting oracle (oracle-full/opus reads config, long first
+    # turn) may exceed the window — binding MUST NOT kill the runtime (that
+    # caused SIGTERM 143 on healthy advisors). On timeout we return success
+    # with binding="pending"; the gateway syncs backend_session_id into the
+    # park manifest later via runtime.register (existing A2/P2-11 path), so
+    # warm resume still converges without killing the advisor.
     bound_session_id = _poll_backend_session_id(handle)
-    if not bound_session_id:
-        # A1: binding failure must NOT report success — stop the runtime to
-        # avoid a leak and return non-zero.
-        try:
-            reg.stop(handle.runtime_id, "session-id-binding-timeout")
-        except Exception as stop_exc:
-            log.debug("oracle start: runtime stop after binding timeout failed (%s)", stop_exc)
-        # U3: error output is JSON to stderr (consistent with ask/revive).
-        print(json.dumps({
-            "error": "session_id_binding_timeout",
-            "review_key": review_key,
-            "runtime_id": handle.runtime_id,
-            "detail": "no 'session_id='/backend_session=' marker in the runtime "
-                      "log within 60s",
-        }, indent=2), file=sys.stderr)
-        return 1
+    binding_pending = not bound_session_id
+    if binding_pending:
+        # Do NOT reg.stop() — the oracle is alive and reasoning; only the
+        # session-id binding hasn't surfaced yet. Report success with
+        # binding=pending so callers know warm-resume isn't ready yet.
+        log.debug(
+            "oracle start: backend session binding pending for %s "
+            "(runtime kept alive; will sync via runtime.register)", review_key,
+        )
 
     # Persist backend session into the park manifest (authoritative).
     # NOTE: manifest.model stores the EXPLICIT override only (args.model).
@@ -828,7 +827,10 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         registry.acquire(review_key, manifest)
 
     # A1: persist the bound-session meta (backend_session_id/bound_at/status).
-    _write_oracle_meta(review_key, bound_session_id, "bound", swarm_session_id=sid)
+    # binding_pending → status "pending" (runtime kept alive; warm-resume point
+    # syncs later via gateway runtime.register).
+    _write_oracle_meta(review_key, bound_session_id,
+                       "pending" if binding_pending else "bound", swarm_session_id=sid)
 
     # Adopt the runtime into the LOCAL gateway so presence/status work even
     # for runtimes without a plugin handshake (opencode/generic).
@@ -842,7 +844,8 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "runtime_id": handle.runtime_id,
         "backend": backend,
         "backend_session_id": bound_session_id,
-        "bound": True,
+        "bound": not binding_pending,
+        "binding": "pending" if binding_pending else "bound",
         "adopted": adopted,
         "meta_path": str(_oracle_meta_path(review_key)),
         "generation": handle.generation,
@@ -882,6 +885,43 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
         info = _gateway().call("runtime.info", {"review_key": review_key})
         health = info.get("runtime_health", {})
         if info.get("status") == "active" and health.get("alive"):
+            # B: steer needs a bound backend session to inject into the
+            # session JSONL — with sid empty the message reaches the mailbox
+            # but is silently dropped (mailbox-delivery ≠ session-injection).
+            # Fail fast (exit 1) instead of pretending success; --wait-binding
+            # polls until binding completes so a single call still delivers.
+            if not info.get("backend_session_id", ""):
+                if not getattr(args, "wait_binding", False):
+                    print(json.dumps({
+                        "status": "binding_pending",
+                        "method": "blocked",
+                        "review_key": review_key,
+                        "detail": "runtime alive but backend session binding pending — "
+                                  "steer cannot locate the session; message would be "
+                                  "silently dropped",
+                        "suggestion": "retry shortly, or pass --wait-binding",
+                    }, indent=2), file=sys.stderr)
+                    return 1
+                # B: --wait-binding — poll the gateway's authoritative binding
+                # state (runtime.info.backend_session_id) up to 60s instead of
+                # scanning log files (ask has no handle).
+                deadline = time.monotonic() + 60.0
+                sid = ""
+                while time.monotonic() < deadline:
+                    pinfo = _gateway().call("runtime.info", {"review_key": review_key})
+                    sid = pinfo.get("backend_session_id", "")
+                    if sid:
+                        break
+                    time.sleep(1.0)
+                if not sid:
+                    print(json.dumps({
+                        "status": "binding_pending",
+                        "method": "blocked",
+                        "review_key": review_key,
+                        "detail": "backend session did not bind within --wait-binding "
+                                  "window; steer would be silently dropped",
+                    }, indent=2), file=sys.stderr)
+                    return 1
             result = _gateway().call("runtime.send", {
                 "runtime_id": info["runtime_id"],
                 "from": "manager",
@@ -1686,13 +1726,15 @@ def _wait_final_text(review_key: str) -> Optional[str]:
 
 
 def cmd_oracle_wait(args: argparse.Namespace) -> int:
-    """B1: block until the review's runtime emits a TASK_STATE.agent_end event.
+    """B1+A3: block until NEW assistant output (or agent_end), print final text.
 
     Polls the gateway event stream every ``--interval`` (default 5s) up to
-    ``--timeout`` (default 300s).  On agent_end, prints the final assistant
-    text inline (same transcript sources as ``oracle result``) and exits 0.
-    On timeout, emits ``{status: timeout, suggestion: "use oracle result"}``
-    and returns 1 so callers can fall back to ``oracle result``.
+    ``--timeout`` (default 300s).  Waits for a NEW ``ASSISTANT_PROGRESS``
+    event (parked oracle emits this on each produced turn while staying
+    active — agent_end never fires because auto-exit/park keep the runtime
+    alive) or a terminal ``TASK_STATE.agent_end``.  On output, prints the
+    final assistant text inline and exits 0.  On timeout, emits
+    ``{status: timeout, suggestion: "use oracle result"}`` and returns 1.
     """
     review_key = args.review_key
     interval = max(0.1, float(getattr(args, "interval", 5.0) or 5.0))
@@ -1709,8 +1751,22 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
     if not runtime_id:
         print(json.dumps({"status": "error", "error": "NO_RUNTIME",
                           "message": f"no active runtime for review key {review_key!r} "
-                                     "(use 'oracle start' first)"}, indent=2))
+                                     "(use 'oracle revive' first)"}, indent=2))
         return 1
+
+    # A3: lifecycle dispatch — cold → fail fast; binding pending → hint but
+    # keep waiting (sid may bind shortly); hot/warm → wait for new output.
+    health = info.get("runtime_health", {})
+    if info.get("status") != "active" or not health.get("alive"):
+        print(json.dumps({"status": "error", "error": "NOT_ACTIVE",
+                          "message": "runtime not alive — use 'oracle revive' first"},
+                         indent=2))
+        return 1
+    if not info.get("backend_session_id", ""):
+        print(json.dumps({"status": "binding_pending", "method": "wait",
+                          "detail": "runtime alive but backend session binding pending — "
+                                    "will wait for new output regardless"}, indent=2))
+        # non-fatal: keep waiting (binding may complete; ASSISTANT_PROGRESS still fires)
 
     # P1-1: start from the current high-water cursor rather than 0 — avoids
     # replaying the full event history on every poll iteration.  Do one
@@ -1741,7 +1797,9 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
         try:
             result = _gateway().call("events.list", {
                 "cursor": cursor,
-                "filters": ["TASK_STATE"],
+                # A3: pull ASSISTANT_PROGRESS (new-output signal) alongside
+                # TASK_STATE (agent_end fallback).
+                "filters": ["TASK_STATE", "ASSISTANT_PROGRESS"],
                 "limit": 200,
                 "session_id": session_id,
                 "runtime_id": runtime_id,
@@ -1751,7 +1809,16 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
                               "message": exc.message}, indent=2))
             return 1
         for ev in result.get("events", []):
-            if ev.get("kind") == "TASK_STATE" and (ev.get("payload") or {}).get("state") == "agent_end":
+            kind = ev.get("kind")
+            payload = ev.get("payload") or {}
+            # A3: new assistant output → return final text (parked oracle
+            # stays active, so this is the primary completion signal).
+            if kind == "ASSISTANT_PROGRESS":
+                final = _wait_final_text(review_key)
+                if final is not None:
+                    print(final)
+                return 0
+            if kind == "TASK_STATE" and payload.get("state") == "agent_end":
                 final = _wait_final_text(review_key)
                 if final is not None:
                     print(final)  # B1: inline final text, like `oracle result`
