@@ -42,13 +42,29 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
         cwd = request.get("workdir", "") or os.getcwd()
         agent = request.get("agent_id", "") or request.get("agent", "") or ""
         session_id = request.get("backend_session_id", "") or ""
+        model = request.get("model", "") or ""
+        variant = request.get("variant", "") or ""
         runtime_id = f"opencode-{uuid4().hex[:10]}"
+
+        # 子进程环境 = 当前进程环境 + request 内嵌 env（含 OMP_MODEL_FALLBACK_CHAIN
+        # 等模型回退链变量）；与 supervisor 的 spec.env 合并逻辑一致（字符串化）。
+        spawn_env = os.environ.copy()
+        for k, v in (request.get("env", {}) or {}).items():
+            spawn_env[str(k)] = str(v)
 
         argv = ["opencode", "run", "--format", "json", "--dir", cwd]
         if agent:
             argv += ["--agent", agent]
         if session_id:
             argv += ["--session", session_id]
+        # 对齐 OMP 分支（supervisor._build_agent_argv: --model）：
+        # request 含 model → 透传给 opencode 的 --model。
+        if model:
+            argv += ["--model", model]
+        # variant（reasoning/thinking 等）映射到 opencode 原生 --variant
+        # （provider 特定推理档位，opencode 1.18+ 支持独立参数）。
+        if variant:
+            argv += ["--variant", variant]
         task = request.get("task", "") or request.get("prompt", "")
         if task:
             argv.append(task)  # positional prompt — required for a real run
@@ -56,7 +72,7 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
         try:
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, cwd=cwd,
+                text=True, cwd=cwd, env=spawn_env,
             )
         except (OSError, FileNotFoundError) as exc:
             raise RuntimeError(f"opencode spawn failed: {exc}") from exc
@@ -112,6 +128,9 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
             "proc": proc,
             "cwd": cwd,
             "agent": agent,
+            "model": model,
+            "variant": variant,
+            "env": spawn_env,
         }
         if found_session:
             # Session established — keep the process handle for warm resume.
@@ -197,6 +216,9 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
         return self.spawn({
             "workdir": handle.extra.get("cwd", ""),
             "agent_id": handle.extra.get("agent", ""),
+            "model": handle.extra.get("model", ""),
+            "variant": handle.extra.get("variant", ""),
+            "env": handle.extra.get("env", {}) or {},
             "backend_session_id": handle.backend_session_id,
             "generation": handle.generation + 1,
             "host_alias": handle.host_alias,

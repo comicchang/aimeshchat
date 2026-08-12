@@ -235,6 +235,10 @@ def _build_agent_argv(spec: RuntimeSpec) -> list[str]:
             argv += ["--agent", spec.agent_id]
         if spec.backend_session_id:
             argv += ["--session", spec.backend_session_id]
+        # 对齐 OMP 分支：spec.model → --model（此前 opencode 分支同样缺失，
+        # 导致 supervised opencode 的 ExecutionSpec model 丢到 argv 之外）。
+        if spec.model:
+            argv += ["--model", spec.model]
         # P0-6: append the task as a positional prompt (mirrors
         # OpenCodeRuntimeAdapter.spawn) — previously the task was dropped
         # from argv, so a supervised opencode run started with no instruction.

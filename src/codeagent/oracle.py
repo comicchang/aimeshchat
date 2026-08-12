@@ -823,6 +823,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         # 非 omp 后端（opencode argv 位置参数）经 task 传递 prompt。
         "task": prompt if backend != "omp" else "",
         "model": primary_model,
+        "variant": spec.variant,  # Q5: ExecutionSpec 变体 → opencode --variant（omp 由 plugin 经 execution-context 消费）
         "gateway_socket": str(control_socket_path()),
         "owner_pid": os.getpid(),
         "nonce": uuid4().hex[:12],
@@ -1093,6 +1094,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 # mailbox TASK 作为首任务——与 start 一致。
                 "task": "",
                 "model": ask_primary,
+                "variant": manifest.variant if manifest else "",  # Q5: start 时落盘的 variant，warm 恢复保持一致
                 "backend_session_id": bound_sid,
                 "gateway_socket": str(control_socket_path()),
                 "owner_pid": os.getpid(),
@@ -1195,6 +1197,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             "workdir": manifest.workdir if manifest else os.getcwd(),
             "task": cold_context + "\n\n" + prompt,
             "model": cold_primary,
+            "variant": (manifest.variant if manifest else ""),  # Q5: 冷启动重建时沿用 manifest 落盘 variant
             "gateway_socket": str(control_socket_path()),
             "owner_pid": os.getpid(),
             "nonce": uuid4().hex[:12],
