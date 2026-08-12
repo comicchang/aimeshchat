@@ -263,13 +263,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_p = sub.add_parser("oracle", help="Persistent-context advisory sessions")
     ora_sub = ora_p.add_subparsers(dest="ora_cmd")
 
-    ora_start = ora_sub.add_parser("start", help="Create review/session/runtime")
+    ora_start = ora_sub.add_parser("start", help="Create review/session/runtime（含 A1 绑定窗口）")
     ora_start.add_argument("review_key", help="Review key (e.g. project:oracle:domain:topic)")
     ora_start.add_argument("--agent", default=_DEFAULT_ORACLE_AGENT, help="Oracle agent profile")
     ora_start.add_argument("--backend", default="omp", help="Runtime backend (omp|opencode)")
     ora_start.add_argument("--workdir", default="", help="Working directory")
     ora_start.add_argument("--model", default="", help="Model override")
-    ora_start.add_argument("--prompt", default="", help="Initial prompt (default empty — first TASK comes via ask)")
+    ora_start.add_argument("--prompt", default="", help="Initial prompt (default empty — first TASK comes via ask)（初始 prompt；oracle 慢启动时 backend session 绑定需 ≤60s，绑定超时返回 binding=pending 不杀 runtime）")
     ora_start.add_argument("--apply-memory-config", action="store_true", dest="apply_memory_config",
                            help="D4: auto-merge missing OMP memory config keys (default: detect + warn only)")
 
@@ -284,6 +284,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_ask.add_argument("--wait-binding", action="store_true", default=False,
                         help="Block until backend session binding completes (≤60s) before "
                              "steering; avoids the binding_pending silent-drop window")
+    # A15: 投递成功后阻塞等新产出内联返回（复用 wait 的 baseline 过滤逻辑）
+    ora_ask.add_argument("--wait", action="store_true", default=False,
+                        help="投递成功后阻塞等新产出内联返回")
 
     ora_status = ora_sub.add_parser("status", help="Aggregate receipt/progress/park")
     ora_status.add_argument("review_key")

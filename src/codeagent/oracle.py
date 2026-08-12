@@ -984,6 +984,11 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "note": "in-loop send to live runtime (plugin steer)",
                 "hint": _ask_retrieve_hint(review_key),  # E1
             }, indent=2))
+            # A15: --wait — 投递成功后阻塞等新产出内联返回
+            if getattr(args, "wait", False):
+                return _wait_for_new_output(
+                    review_key, info["runtime_id"], info.get("session_id", ""),
+                )
             return 0
         # Runtime not alive: if it died of quota exhaustion, say so
         # EXPLICITLY before silently degrading to warm/cold.
@@ -1044,7 +1049,12 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "agent_id": _ORACLE_AGENT,
                 "review_key": review_key,
                 "workdir": manifest.workdir or os.getcwd(),
-                "task": prompt,
+                # U2 对齐：prompt 已由上方 mailbox enqueue（body=prompt, TASK）
+                # 单通道投递；spawn task 置空避免 runtime 收到两次同一 prompt。
+                # omp interactive_plugin 模式下 spawn task 仅写 spec.json 不进
+                # argv，plugin 通过 gateway handshake 的 pi.sendUserMessage 消费
+                # mailbox TASK 作为首任务——与 start 一致。
+                "task": "",
                 "model": ask_primary,
                 "backend_session_id": bound_sid,
                 "gateway_socket": str(control_socket_path()),
@@ -1092,6 +1102,11 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 ),
                 "hint": _ask_retrieve_hint(review_key),  # E1
             }, indent=2))
+            # A15: --wait — 投递成功后阻塞等新产出内联返回
+            if getattr(args, "wait", False):
+                return _wait_for_new_output(
+                    review_key, warm_handle.runtime_id, sid,
+                )
             return 0
         except Exception as exc:
             # P2-12: the warm runtime was already spawned — if a later step
@@ -1174,6 +1189,11 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
         "note": "snapshot reconstruction (no live/hot session)",
         "hint": _ask_retrieve_hint(review_key),  # E1
     }, indent=2))
+    # A15: --wait — 投递成功后阻塞等新产出内联返回
+    if getattr(args, "wait", False):
+        return _wait_for_new_output(
+            review_key, handle.runtime_id, _review_sid(review_key),
+        )
     return 0
 
 
@@ -1780,6 +1800,80 @@ def _wait_final_text(review_key: str) -> Optional[str]:
     return msgs[-1] if msgs else None
 
 
+def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
+                         timeout: float = 300.0, interval: float = 5.0) -> int:
+    """A15: 等待 oracle 新产出并内联打印——供 cmd_oracle_wait 和 ask --wait 共用。
+
+    复用 cmd_oracle_wait 的 baseline 过滤逻辑：baseline = ask 前主会话最新
+    assistant 文本，轮询 gateway events.list 的 ASSISTANT_PROGRESS（新产出，
+    取 _wait_final_text，与 baseline 相同则继续）或 agent_end 兜底。
+
+    返回 0 = 命中新产出并打印, 1 = 超时, 130 = KeyboardInterrupt。
+    """
+    baseline_text = _wait_final_text(review_key) or ""
+    cursor: int = 0
+    deadline = time.monotonic() + timeout
+
+    # P1-1: 初始全量 drain——先检查是否已有 agent_end 事件落地
+    try:
+        boot = _gateway().call("events.list", {
+            "cursor": 0,
+            "filters": ["TASK_STATE"],
+            "limit": 10_000,
+            "session_id": session_id,
+            "runtime_id": runtime_id,
+        })
+        for ev in boot.get("events", []):
+            if ev.get("kind") == "TASK_STATE" and (ev.get("payload") or {}).get("state") == "agent_end":
+                final = _wait_final_text(review_key)
+                if final is not None:
+                    print(final)
+                return 0
+        cursor = int(boot.get("cursor") or 0)
+    except GatewayError:
+        pass  # 落入主循环重试
+
+    # 主轮询循环：TASK_STATE + ASSISTANT_PROGRESS 双 filter
+    while True:
+        try:
+            result = _gateway().call("events.list", {
+                "cursor": cursor,
+                "filters": ["TASK_STATE", "ASSISTANT_PROGRESS"],
+                "limit": 200,
+                "session_id": session_id,
+                "runtime_id": runtime_id,
+            })
+        except GatewayError as exc:
+            print(json.dumps({"status": "error", "error": exc.code,
+                              "message": exc.message}, indent=2))
+            return 1
+        for ev in result.get("events", []):
+            kind = ev.get("kind")
+            payload = ev.get("payload") or {}
+            if kind == "ASSISTANT_PROGRESS":
+                # __advisor 也会发 ASSISTANT_PROGRESS，但写的是独立
+                # __advisor.jsonl——主会话文本不变。baseline 比对过滤噪声。
+                final = _wait_final_text(review_key)
+                if final is not None and final != baseline_text:
+                    print(final)
+                    return 0
+                continue  # advisor 噪声或无新主输出——继续等
+            if kind == "TASK_STATE" and payload.get("state") == "agent_end":
+                final = _wait_final_text(review_key)
+                if final is not None:
+                    print(final)  # B1: 内联最终文本
+                return 0
+        cursor = int(result.get("cursor") or cursor or 0)
+        if time.monotonic() >= deadline:
+            print(json.dumps({"status": "timeout",
+                              "suggestion": "use oracle result"}, indent=2))
+            return 1
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            return 130
+
+
 def cmd_oracle_wait(args: argparse.Namespace) -> int:
     """B1+A3: block until NEW assistant output (or agent_end), print final text.
 
@@ -1823,81 +1917,9 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
                                     "will wait for new output regardless"}, indent=2))
         # non-fatal: keep waiting (binding may complete; ASSISTANT_PROGRESS still fires)
 
-    # P1-1: start from the current high-water cursor rather than 0 — avoids
-    # replaying the full event history on every poll iteration.  Do one
-    # initial full drain (cursor 0, large limit) to catch an agent_end
-    # that already landed; subsequent iterations only see NEW events.
-    # Root-cause fix (2026-08-12): baseline = current main-session text; a
-    # wait started AFTER the oracle already answered must not return that
-    # old answer, and advisor meta-comments must not short-circuit it.
-    baseline_text = _wait_final_text(review_key) or ""
-    cursor: int = 0
-    deadline = time.monotonic() + timeout
-    try:
-        boot = _gateway().call("events.list", {
-            "cursor": 0,
-            "filters": ["TASK_STATE"],
-            "limit": 10_000,
-            "session_id": session_id,
-            "runtime_id": runtime_id,
-        })
-        for ev in boot.get("events", []):
-            if ev.get("kind") == "TASK_STATE" and (ev.get("payload") or {}).get("state") == "agent_end":
-                final = _wait_final_text(review_key)
-                if final is not None:
-                    print(final)
-                return 0
-        # P1-1: advance cursor to the high-water mark so the main loop
-        # only polls for genuinely new events.
-        cursor = int(boot.get("cursor") or 0)
-    except GatewayError:
-        pass  # fall through — will retry in the main loop
-    while True:
-        try:
-            result = _gateway().call("events.list", {
-                "cursor": cursor,
-                # A3: pull ASSISTANT_PROGRESS (new-output signal) alongside
-                # TASK_STATE (agent_end fallback).
-                "filters": ["TASK_STATE", "ASSISTANT_PROGRESS"],
-                "limit": 200,
-                "session_id": session_id,
-                "runtime_id": runtime_id,
-            })
-        except GatewayError as exc:
-            print(json.dumps({"status": "error", "error": exc.code,
-                              "message": exc.message}, indent=2))
-            return 1
-        for ev in result.get("events", []):
-            kind = ev.get("kind")
-            payload = ev.get("payload") or {}
-            # A3: new assistant output → return final text (parked oracle
-            # stays active, so this is the primary completion signal).
-            if kind == "ASSISTANT_PROGRESS":
-                # Root-cause fix (2026-08-12): __advisor (monitor session)
-                # ALSO emits ASSISTANT_PROGRESS into this event stream, but it
-                # writes a SEPARATE __advisor.jsonl — the main session text is
-                # unchanged. Compare against the baseline: only a genuinely new
-                # main-session output counts, so advisor meta-comments can't
-                # short-circuit wait with a stale/wrong answer.
-                final = _wait_final_text(review_key)
-                if final is not None and final != baseline_text:
-                    print(final)
-                    return 0
-                continue  # advisor noise or no new main output — keep waiting
-            if kind == "TASK_STATE" and payload.get("state") == "agent_end":
-                final = _wait_final_text(review_key)
-                if final is not None:
-                    print(final)  # B1: inline final text, like `oracle result`
-                return 0
-        cursor = int(result.get("cursor") or cursor or 0)
-        if time.monotonic() >= deadline:
-            print(json.dumps({"status": "timeout",
-                              "suggestion": "use oracle result"}, indent=2))
-            return 1
-        try:
-            time.sleep(interval)
-        except KeyboardInterrupt:
-            return 130
+    # A15: 委托给共享的 _wait_for_new_output 辅助函数
+    return _wait_for_new_output(review_key, runtime_id, session_id,
+                                timeout=timeout, interval=interval)
 
 
 # ── release ────────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from codeagent.mailbox.protocol import VALID_KINDS, VALID_STATES, AttachmentRef
-from codeagent.mailbox.store import MailboxStore
+from codeagent.mailbox.store import MailboxStore, resolve_root
 
 
 def _parse_attachment_args(raw: list[str]) -> list[AttachmentRef]:
@@ -121,10 +121,12 @@ def main(argv: list[str] | None = None) -> None:
     pk.add_argument("--max-subject", type=int, default=80)
 
     # read
+    # A17: --session/--agent 缺省时走自描述分支，列候选目录 + 引导提示，
+    #      而非直接 argparse usage 错误（worker 不知该填什么）。
     rd = sub.add_parser("read")
-    rd.add_argument("--session", required=True)
-    rd.add_argument("--agent", required=True)
-    rd.add_argument("--owner", required=True)
+    rd.add_argument("--session", required=False, default=None)
+    rd.add_argument("--agent", required=False, default=None)
+    rd.add_argument("--owner", required=False, default=None)
     rd.add_argument("--json", action="store_true", help="output full JSON")
 
     # finalize
@@ -253,6 +255,62 @@ def main(argv: list[str] | None = None) -> None:
             result = store.peek(args.session, args.agent, args.max_messages, args.max_subject)
             json.dump(result, sys.stdout, ensure_ascii=False)
         elif args.cmd == "read":
+            # A17: 缺 --session/--agent 时走自描述分支，帮助 worker
+            # 发现可用会话，而非 argparse 直接报 usage 错误。
+            if not args.session or not args.agent:
+                mailbox_root = resolve_root(
+                    Path(args.mailbox_root) if args.mailbox_root else None,
+                )
+                hint_lines = [
+                    "mailbox read: --session 和 --agent 均为必填参数。",
+                    f"mailbox root: {mailbox_root}",
+                ]
+                if mailbox_root.is_dir():
+                    sessions = sorted(
+                        d.name for d in mailbox_root.iterdir()
+                        if d.is_dir() and not d.name.startswith("_")
+                    )
+                    if sessions:
+                        hint_lines.append("")
+                        hint_lines.append("可用会话：")
+                        for sid in sessions:
+                            agents = []
+                            session_path = mailbox_root / sid
+                            if session_path.is_dir():
+                                agents = sorted(
+                                    a.name for a in session_path.iterdir()
+                                    if a.is_dir() and not a.name.startswith(".")
+                                )
+                            if agents:
+                                hint_lines.append(
+                                    f"  {sid}  (agents: {', '.join(agents)})"
+                                )
+                            else:
+                                hint_lines.append(f"  {sid}")
+                        hint_lines.append("")
+                        hint_lines.append(
+                            "提示：指定 --session <会话名> --agent <worker 目录名>"
+                        )
+                        hint_lines.append(
+                            "  例: mailbox read --session "
+                            f"{sessions[0]} --agent <agent> --owner <owner>"
+                        )
+                    else:
+                        hint_lines.append("")
+                        hint_lines.append("mailbox root 下无会话目录。")
+                        hint_lines.append(
+                            "提示: 先用 mailbox session-init --session <id> "
+                            "--manager <mgr> --agents <a1,a2> 初始化。"
+                        )
+                else:
+                    hint_lines.append("")
+                    hint_lines.append("mailbox root 目录不存在。")
+                    hint_lines.append(
+                        "提示: 设置环境变量 MAILBOX_ROOT 指向有效目录，"
+                        "或先用 session-init 创建会话。"
+                    )
+                print("\n".join(hint_lines), file=sys.stderr)
+                raise ValueError("read 缺少 --session 或 --agent（见上方可用会话列表）")
             # v2: claim via MailboxService — emits RECEIPT(READ) for
             # require_ack messages; never consumes when the ack route is
             # unresolved.
