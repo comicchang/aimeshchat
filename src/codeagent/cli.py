@@ -324,6 +324,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_result.add_argument("--strict", action="store_true",
                             help="改进项5: fail instead of degrading to the best-effort "
                                  "session-file scan when backend_session_id is missing/mismatched")
+    ora_result.add_argument("--raw", action="store_true",
+                            help="P0: print only the last assistant message as plain text "
+                                 "(default: JSON with source/confidence/messages/meta)")
 
     # P2: unified attach entry — hot send (HOT_PARKED) or revive (released/cold)
     ora_attach = ora_sub.add_parser("attach", help="Attach to an existing oracle session (hot send or revive)")

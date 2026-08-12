@@ -113,6 +113,10 @@ class AgentGateway:
         # P8.3 presence: heartbeat timeout → offline sweep.
         # A4: 120s → 300s to cover slow networks; cold-start grace below
         # (timeout * 2) is unchanged.
+        # P2: 300s trades liveness detection speed for resilience on
+        # unreliable networks / slow-starting runtimes (e.g. remote SSH
+        # tunnel flaps, OMP cold-start).  Shorter timeouts catch genuine
+        # failures faster but cause false positives on transient pauses.
         self._offline_timeout: float = 300.0
         self._sweep_interval: float = 30.0
         self._sweep_stop = threading.Event()

@@ -152,6 +152,12 @@ def _parse_retry_fallback_chains(path: Path) -> dict[str, list[str]]:
     This targeted parser reads only the ``retry`` section, extracts
     ``fallbackChains.*`` sub-keys as list[str].  Returns e.g.
     ``{"default": ["model-a", "model-b"], "slow": ["model-c"]}``.
+
+    P2: format-sensitive — relies on the exact YAML indentation layout
+    (``retry:`` at col 0, ``fallbackChains:`` indented, list items 2-space
+    further).  Non-standard formatting or comments inside the ``retry``
+    block may cause early exit; safe because OMP's config writer uses
+    canonical indentation.
     """
     chains: dict[str, list[str]] = {}
     try:
@@ -1202,7 +1208,7 @@ def _fallback_find_session_for_key(review_key: str, since: Optional[float] = Non
         """A2: word-boundary containment — 'proj:oracle:gfx:blur' must NOT
         match 'proj:oracle:gfx:blur2' (substring false positive). Empty
         before/after (string start/end) counts as a boundary."""
-        _alpha = "abcdefghijklmnopqrstuvwxyz_"
+        _alpha = "abcdefghijklmnopqrstuvwxyz_0123456789"
         idx = 0
         while True:
             idx = lower.find(needle, idx)
@@ -1306,12 +1312,21 @@ def _scan_mailbox_report(review_key: str, manifest) -> Optional[str]:
         except Exception:
             continue
     # Fallback: bounded recursive scan of every session history directory.
+    # P2: cap at 200 files to prevent runaway scans on large mailboxes.
     try:
         candidates: list[tuple[float, dict]] = []
+        file_count = 0
+        scan_done = False
         for dirpath, _dirs, files in os.walk(resolve_root()):
+            if scan_done:
+                break
             if Path(dirpath).name != "history":
                 continue
             for name in files:
+                file_count += 1
+                if file_count > 200:
+                    scan_done = True
+                    break
                 if not name.endswith(".json"):
                     continue
                 p = Path(dirpath) / name
@@ -1349,6 +1364,7 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     review_key = args.review_key
     strict = bool(getattr(args, "strict", False))
     want_all = bool(getattr(args, "all", False))
+    raw_mode = bool(getattr(args, "raw", False))
     manifest = ParkRegistry().lookup(review_key)
     start_since = _review_start_ts(review_key, manifest)
     max_msgs = 10**6 if want_all else 1
@@ -1375,7 +1391,10 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
                     "messages": msgs,
                 })
                 out["meta"]["path"] = str(path)
-                print(json.dumps(out, indent=2))
+                if raw_mode:
+                    print(msgs[-1])
+                else:
+                    print(json.dumps(out, indent=2))
                 return 0
 
     # ── ② mailbox REPORT（reply_to == review_key 的终端信封）─────────
@@ -1386,7 +1405,10 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
             "confidence": 0.9,
             "messages": [report],
         })
-        print(json.dumps(out, indent=2))
+        if raw_mode:
+            print(report)
+        else:
+            print(json.dumps(out, indent=2))
         return 0
 
     # ── ③ filesystem（递归 + 精确 key + start 后时间窗）──────────────
@@ -1405,7 +1427,10 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
                 })
                 out["meta"]["path"] = str(path)
                 out["meta"]["since"] = start_since
-                print(json.dumps(out, indent=2))
+                if raw_mode:
+                    print(msgs[-1])
+                else:
+                    print(json.dumps(out, indent=2))
                 return 0
 
     # ── Nothing found ─────────────────────────────────────────────────
@@ -1504,10 +1529,31 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
                                      "(use 'oracle start' first)"}, indent=2))
         return 1
 
-    # B1: replay from cursor 0 — the agent_end may already be in the store
-    # (terminal events are retained 90 days), so a missed poll never wedges.
-    cursor = 0
+    # P1-1: start from the current high-water cursor rather than 0 — avoids
+    # replaying the full event history on every poll iteration.  Do one
+    # initial full drain (cursor 0, large limit) to catch an agent_end
+    # that already landed; subsequent iterations only see NEW events.
+    cursor: int = 0
     deadline = time.monotonic() + timeout
+    try:
+        boot = _gateway().call("events.list", {
+            "cursor": 0,
+            "filters": ["TASK_STATE"],
+            "limit": 10_000,
+            "session_id": session_id,
+            "runtime_id": runtime_id,
+        })
+        for ev in boot.get("events", []):
+            if ev.get("kind") == "TASK_STATE" and (ev.get("payload") or {}).get("state") == "agent_end":
+                final = _wait_final_text(review_key)
+                if final is not None:
+                    print(final)
+                return 0
+        # P1-1: advance cursor to the high-water mark so the main loop
+        # only polls for genuinely new events.
+        cursor = int(boot.get("cursor") or 0)
+    except GatewayError:
+        pass  # fall through — will retry in the main loop
     while True:
         try:
             result = _gateway().call("events.list", {
@@ -1567,7 +1613,7 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
                 if msg.get("kind") == "REPORT":
                     unread_reports += 1
             if unread_reports > 0 and not getattr(args, "force", False):
-                answer = input(f"有 {unread_reports} 条未读 REPORT，确认释放？(y/N) ").strip().lower()
+                answer = input(f"有 {unread_reports} 条未读 REPORT，确认释放？(y/N，或 use --force to skip) ").strip().lower()
                 if answer not in ("y", "yes"):
                     print(json.dumps({
                         "review_key": review_key,
