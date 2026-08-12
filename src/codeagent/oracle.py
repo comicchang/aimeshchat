@@ -285,35 +285,99 @@ def _parse_retry_fallback_chains(path: Path) -> dict[str, list[str]]:
     return chains
 
 
-def _resolve_oracle_model_chain(agent_type: str, explicit_model: str) -> list[str]:
-    """Resolve the fallback model chain for an oracle agent.
+def _read_agent_model(agent_type: str) -> str:
+    """Read an OMP agent profile's ``model:`` field (agents/<agent_type>.md).
 
-    - ``explicit_model`` non-empty → single-element ``[explicit_model]``
-      (user override, never replaced).
-    - Otherwise read ``retry.fallbackChains`` from the OMP config and
-      select by *agent_type*:
-        - oracle / oracle-opus → ``slow`` (or ``default``)
-        - oracle-lite → ``default``
-    - No config / no matching chain → return ``[]`` (keep existing behaviour).
+    Returns "" when the profile or its model field is absent.
+    """
+    base = Path.home() / ".omp" / "agent" / "agents"
+    profile = base / f"{agent_type}.md"
+    if not profile.exists():
+        return ""
+    try:
+        for line in profile.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("model:") or line.startswith("model="):
+                return line.split(":", 1)[1].strip() if ":" in line else line.split("=", 1)[1].strip()
+    except OSError:
+        return ""
+    return ""
+
+
+def _normalize_oracle_agent(agent_type: str) -> str:
+    """未显式指定 agent 时给明确默认（oracle），不再静默回落 default/mimo。
+
+    空值 / ``default``（旧 fallbackChains 的默认链名）归一为 ``oracle``
+    （与 CLI ``--agent`` 默认值一致），并打 warning 提示；其余类型原样透传。
+    """
+    if not agent_type or agent_type == "default":
+        log.warning("oracle: no explicit agent specified — defaulting to %r "
+                    "(agent profile model: is the single authority)", _ORACLE_AGENT)
+        return _ORACLE_AGENT
+    return agent_type
+
+
+def _resolve_oracle_model_chain(agent_type: str, explicit_model: str) -> list[str]:
+    """Resolve the primary model chain for an oracle agent（M-model）。
+
+    Agent profile（agents/<agent_type>.md 的 ``model:``）是模型唯一权威源，
+    不再依赖 config.yml 的 retry.fallbackChains YAML 子集解析：
+
+    - ``explicit_model`` 非空 → 单元素 ``[explicit_model]``（用户显式
+      --model，永远优先，不被 profile 覆盖）。
+    - 否则读 agent profile 的 model:（oracle → gpt-5.6-sol、oracle-lite →
+      v4-pro、oracle-opus → claude-opus；以 profile 实际值为准，如
+      ``Mify-ppio/ppio/pa/gpt-5.6-sol``）。
+    - 空/未知 agent → ``_normalize_oracle_agent`` 归一为明确默认 oracle，
+      不再静默取 config 的 default 链（mimo）。
+    - profile model 缺失时弱化回退 ``retry.fallbackChains``（保持旧依赖
+      兼容），仅作兜底、不再是优先来源。
+    - 全部缺失 → ``[]``（调用方显式处理，不静默降级）。
     """
     if explicit_model:
         return [explicit_model]
 
+    agent_type = _normalize_oracle_agent(agent_type)
+    m = _read_agent_model(agent_type)
+    if m:
+        return [m]
+
+    # 弱化回退：仅当 profile model 缺失时读取 retry.fallbackChains（兼容旧调用）。
     for cfg_path in _omp_config_paths():
         chains = _parse_retry_fallback_chains(cfg_path)
         if not chains:
             continue
 
-        # Map agent_type → preferred chain name
+        # 映射 agent_type → 优先 chain 名（旧兼容逻辑）。
         if agent_type in ("oracle", "oracle-opus"):
             chain = chains.get("slow") or chains.get("default")
-        else:  # oracle-lite or anything else
+        else:
             chain = chains.get("default")
 
         if chain:
             return list(chain)
 
     return []
+
+
+def _model_chain_from_manifest(agent_type: str, manifest, explicit_override: str = "") -> list[str]:
+    """M-model: 从 manifest 读已落盘模型，revive/ask 不再重推导。
+
+    优先级：
+    1. ``manifest.model``（start 时显式 --model 的持久化）或
+       ``explicit_override``（调用方本次 --model）→ 单元素 ``[该模型]``
+       （显式覆盖永远优先）。
+    2. ``manifest.primary_model``（start 落盘的 chain[0]，agent profile
+       权威结果）→ 单元素 ``[primary_model]``。
+    3. 旧 manifest 无 primary_model（升级前创建）→ 现场解析一次
+       （_resolve_oracle_model_chain），迁移兼容；不写回 manifest。
+    """
+    explicit = (manifest.model if manifest else "") or explicit_override
+    if explicit:
+        return [explicit]
+    if manifest is not None and manifest.primary_model:
+        return [manifest.primary_model]
+    return _resolve_oracle_model_chain(agent_type, "")
 
 
 def _looks_like_quota(text: str) -> bool:
@@ -696,7 +760,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         }, indent=2), file=sys.stderr)
         return 1
     review_key = args.review_key
-    backend = _resolve_backend(args.agent, args.backend)
+    # M-model: 未显式 --agent 时归一为明确默认（oracle），不再静默回落。
+    agent = _normalize_oracle_agent(args.agent)
+    backend = _resolve_backend(agent, args.backend)
     workdir = args.workdir or os.getcwd()
 
     # ── OMP native memory config (B1): verify/merge autoRecall + handoff ──
@@ -717,8 +783,8 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         )
     memory_env = {"OMP_MEMORY_CONFIG_PATH": memory_report["config_path"]} if memory_report["config_path"] else {}
 
-    # ── Model fallback chain (reuse retry.fallbackChains from OMP config) ──
-    model_chain = _resolve_oracle_model_chain(args.agent, args.model or "")
+    # ── M-model: agent profile model: 为唯一权威源（显式 --model 仍覆盖）──
+    model_chain = _resolve_oracle_model_chain(agent, args.model or "")
     primary_model = model_chain[0] if model_chain else (args.model or "")
     chain_env: dict[str, str] = {}
     if model_chain:
@@ -833,10 +899,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         )
 
     # Persist backend session into the park manifest (authoritative).
-    # NOTE: manifest.model stores the EXPLICIT override only (args.model).
-    # The resolved primary (chain[0]) is used for spawn, but persisting it
-    # here would make revive treat it as an explicit override and collapse
-    # the fallback chain to one element.
+    # M-model: manifest.model 仅存显式覆盖（args.model）；primary_model 存
+    # start 时解析出的 chain[0]（agent profile 权威结果）。revive/ask 直接
+    # 读 primary_model，不再重推导；显式覆盖优先于 primary_model。
     if existing is not None:
         # D3: restart path — preserve every untouched field via replace()
         # instead of copying 15+ fields manually. created_at is kept from
@@ -844,8 +909,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         manifest = replace(
             existing,
             swarm_session_id=sid,
-            agent_type=args.agent,
+            agent_type=agent,
             model=args.model or "",
+            primary_model=primary_model,
             host="__local__",
             workdir=workdir,
             lifecycle=Lifecycle.HOT_PARKED,
@@ -859,8 +925,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         manifest = ParkManifest(
             review_key=review_key,
             swarm_session_id=sid,
-            agent_type=args.agent,
+            agent_type=agent,
             model=args.model or "",
+            primary_model=primary_model,
             host="__local__",
             workdir=workdir,
             lifecycle=Lifecycle.HOT_PARKED,
@@ -896,6 +963,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "mode": handle.mode,
         "capabilities": sorted(handle.capabilities),
         "model_chain": model_chain,
+        "primary_model": primary_model,  # M-model: manifest 落盘的 chain[0]
     }, indent=2))
     return 0
 
@@ -1038,8 +1106,11 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:
                 print(f"warning: warm task enqueue failed: {exc}", file=sys.stderr)
-            # Model fallback chain (same resolution as start/revive).
-            ask_model_chain = _resolve_oracle_model_chain(args.agent, manifest.model or "")
+            # M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导；
+            # 显式 --model / manifest.model 覆盖仍优先。
+            ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
+            ask_model_chain = _model_chain_from_manifest(
+                ask_agent_type, manifest, explicit_override=getattr(args, "model", "") or "")
             ask_primary = ask_model_chain[0] if ask_model_chain else (manifest.model or "")
             ask_chain_env: dict[str, str] = {}
             if ask_model_chain:
@@ -1139,11 +1210,13 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     # peer_agent_id=..."），round3 起该提示被当成首轮 prompt 注入重建
     # 实例（回归）。这里直接生成 snapshot 上下文，忽略决策层的 context。
     cold_context = build_cold_context(review_key)
-    # Model fallback chain (same resolution as start/revive; explicit
-    # --model / manifest override wins).
-    cold_explicit = (manifest.model if manifest else "") or (getattr(args, "model", "") or "")
-    ask_model_chain = _resolve_oracle_model_chain(args.agent, cold_explicit)
-    cold_primary = ask_model_chain[0] if ask_model_chain else cold_explicit
+    # M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导；
+    # 显式 --model / manifest.model 覆盖仍优先。
+    ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
+    ask_model_chain = _model_chain_from_manifest(
+        ask_agent_type, manifest, explicit_override=getattr(args, "model", "") or "")
+    cold_primary = ask_model_chain[0] if ask_model_chain else (
+        (manifest.model if manifest else "") or (getattr(args, "model", "") or ""))
     cold_chain_env: dict[str, str] = {}
     if ask_model_chain:
         cold_chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(ask_model_chain)
@@ -2331,9 +2404,9 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
             raise RuntimeError(declare_err)
         return "", bound_sid, []
 
-    # ── Model fallback chain (reuse retry.fallbackChains from OMP config) ──
+    # ── M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导 ──
     agent_type = manifest.agent_type or _ORACLE_AGENT
-    model_chain = _resolve_oracle_model_chain(agent_type, manifest.model or "")
+    model_chain = _model_chain_from_manifest(agent_type, manifest)
     primary_model = model_chain[0] if model_chain else (manifest.model or "")
     chain_env: dict[str, str] = {}
     if model_chain:
@@ -2382,9 +2455,9 @@ def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
     if mode == "resume":
         mode = "bg"
     sid = _review_sid(review_key)
-    # ── Model fallback chain (reuse retry.fallbackChains from OMP config) ──
+    # ── M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导 ──
     agent_type = manifest.agent_type or _ORACLE_AGENT
-    model_chain = _resolve_oracle_model_chain(agent_type, manifest.model or "")
+    model_chain = _model_chain_from_manifest(agent_type, manifest)
     primary_model = model_chain[0] if model_chain else (manifest.model or "")
     chain_env: dict[str, str] = {}
     if model_chain:

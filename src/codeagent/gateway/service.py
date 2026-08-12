@@ -14,6 +14,7 @@ Fail-closed rules:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from codeagent.constants import ISO_TIMESTAMP_FORMAT
+from codeagent.gateway.control_store import ControlStore
 from codeagent.gateway.events import EventStore, control_socket_path
 from codeagent.gateway.model import (
     ERR_GENERATION_STALE,
@@ -45,6 +47,78 @@ from codeagent.mailbox.store import MailboxStore
 from codeagent.swarm.kernel import SwarmKernel
 
 log = logging.getLogger(__name__)
+
+# ── 三维状态（设计 §1）───────────────────────────────────────────────
+# presence：进程层存活（heartbeat / 进程退出驱动）
+PRESENCE_ALIVE = "alive"
+PRESENCE_STALE = "stale"
+PRESENCE_DEAD = "dead"
+# binding：backend session 注册 / 解绑驱动
+BINDING_PENDING = "pending"
+BINDING_BOUND = "bound"
+BINDING_LOST = "lost"
+# agent_state：OMP lifecycle/registry 事件驱动
+AGENT_RUNNING = "agent_running"
+AGENT_IDLE = "idle"
+AGENT_ENDED = "ended"
+
+# 权威 lifecycle 事件（runtime.lifecycle / 归约入口）
+LIFECYCLE_EVENTS = frozenset({
+    "session_ready", "agent_start", "turn_start", "turn_end", "agent_end",
+    "session_shutdown", "registry_parked", "registry_removed", "process_exit",
+    "heartbeat",
+})
+
+# ── runtime.send 持久命令状态机（设计 §3）────────────────────────────
+CMD_QUEUED = "QUEUED"
+CMD_CLAIMED = "CLAIMED"
+CMD_REVIVING = "REVIVING"
+CMD_TRIGGERING = "TRIGGERING"
+CMD_TURN_TRIGGERED = "TURN_TRIGGERED"
+CMD_FAILED_SAFE = "FAILED_SAFE"
+CMD_AMBIGUOUS = "AMBIGUOUS"
+CMD_TRIGGER_UNKNOWN = "TRIGGER_UNKNOWN"
+
+CMD_STATES = frozenset({
+    CMD_QUEUED, CMD_CLAIMED, CMD_REVIVING, CMD_TRIGGERING, CMD_TURN_TRIGGERED,
+    CMD_FAILED_SAFE, CMD_AMBIGUOUS, CMD_TRIGGER_UNKNOWN,
+})
+
+# 合法迁移表：terminal 状态（TURN_TRIGGERED/FAILED_SAFE/AMBIGUOUS/
+# TRIGGER_UNKNOWN）不可再迁移。
+CMD_TRANSITIONS = {
+    CMD_QUEUED: {CMD_CLAIMED, CMD_FAILED_SAFE, CMD_AMBIGUOUS},
+    CMD_CLAIMED: {CMD_REVIVING, CMD_TRIGGERING, CMD_FAILED_SAFE, CMD_AMBIGUOUS},
+    CMD_REVIVING: {CMD_TRIGGERING, CMD_FAILED_SAFE, CMD_AMBIGUOUS},
+    CMD_TRIGGERING: {CMD_TURN_TRIGGERED, CMD_AMBIGUOUS, CMD_TRIGGER_UNKNOWN},
+    CMD_TURN_TRIGGERED: set(),
+    CMD_FAILED_SAFE: set(),
+    CMD_AMBIGUOUS: set(),
+    CMD_TRIGGER_UNKNOWN: set(),
+}
+
+# 命令状态 → runtime.send 返回语义（设计 §3 返回语义表）。
+CMD_STATUS_BY_STATE = {
+    CMD_QUEUED: "mailbox_persisted",
+    CMD_CLAIMED: "claimed",
+    CMD_REVIVING: "session_live",
+    CMD_TRIGGERING: "ambiguous",       # 可能已触发，未确认 → 禁止自动重投
+    CMD_TURN_TRIGGERED: "turn_triggered",
+    CMD_FAILED_SAFE: "failed_safe",
+    CMD_AMBIGUOUS: "ambiguous",
+    CMD_TRIGGER_UNKNOWN: "ambiguous",
+}
+
+ERR_IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
+
+
+def _sha256(text: str) -> str:
+    """payload_hash 幂等键：body 的 sha256。"""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT)
 
 
 @dataclass
@@ -67,6 +141,13 @@ class RuntimeRecord:
     started_at: float = 0.0  # A12: epoch of process start (real elapsed baseline)
     spec: dict = field(default_factory=dict)
     initial_task: str = ""
+    # ── 三维状态（设计 §1，取代单一 status 作为路由权威）──────────────
+    # status 字段保留仅用于旧 API 兼容；hot 路由以三维为准。
+    presence: str = PRESENCE_ALIVE     # alive | stale | dead
+    binding: str = BINDING_PENDING     # pending | bound | lost
+    agent_state: str = AGENT_IDLE      # agent_running | idle | ended
+    binding_epoch: int = 0             # backend session 绑定代数（防陈旧 binding）
+    capabilities: list = field(default_factory=list)  # 插件握手上报能力
 
 
 @dataclass
@@ -122,6 +203,11 @@ class AgentGateway:
         self._sweep_stop = threading.Event()
         self._runtimes_lock = threading.RLock()
         self._sweep_thread: Optional[threading.Thread] = None
+        # 三维 presence 衰变：stale 持续超过该阈值 → dead（设计 §1）。
+        self._dead_timeout: float = 600.0
+        # 控制面存储（reviews/runtime_generations/commands，关键事务 FULL）。
+        # db 与 events 同目录（control.sqlite3）—— 测试传 events 路径即自动隔离。
+        self._control = ControlStore(db_path=Path(self._events._db_path).with_name("control.sqlite3"))
         # A6: hourly retention sweep (EventStore.sweep + outbox TTL).
         self._retention_sweep_interval: float = 3600.0
         self._last_retention_sweep: float = 0.0
@@ -238,7 +324,14 @@ class AgentGateway:
                     created_at=m.created_at and datetime.fromtimestamp(m.created_at, tz=timezone.utc).strftime(ISO_TIMESTAMP_FORMAT) or "",
                     last_activity=0.0,  # A2: no heartbeat signal until re-register
                     started_at=m.created_at,  # A12: manifest created_at as start marker
+                    # 三维（设计 §1）：HOT_PARKED 占位 —— presence 非 alive
+                    # （不得伪装 hot），binding 有 backend session 事实，
+                    # agent_state=ended（parked → ended）。
+                    presence=PRESENCE_STALE,
+                    binding=BINDING_BOUND if m.backend_session_id else BINDING_PENDING,
+                    agent_state=AGENT_ENDED,
                 )
+                self._persist_control_state(self._runtimes[runtime_id])
                 restored += 1
         if restored:
             log.info("gateway: restored %d runtime(s) from park registry", restored)
@@ -322,6 +415,7 @@ class AgentGateway:
                 if (now - record.last_activity) <= timeout:
                     continue
                 record.status = "offline"
+                record.presence = PRESENCE_STALE  # 三维：alive → stale
                 offline.append(rid)
                 try:
                     self._events.append_local(RuntimeEventDraft(
@@ -333,10 +427,22 @@ class AgentGateway:
                             "old_status": "active", "new_status": "offline",
                             "reason": "heartbeat_timeout",
                             "last_activity": record.last_activity,
+                            "presence": record.presence,
+                            "binding": record.binding,
+                            "agent_state": record.agent_state,
                         },
                     ))
                 except Exception as exc:
                     log.warning("gateway: offline event append failed: %s", exc)
+                # 离线是三维状态变化 → 镜像到控制面。
+                self._persist_control_state(record)
+            # 三维 presence 衰变：stale 持续超过 _dead_timeout → dead。
+            for rid, rec in list(self._runtimes.items()):
+                if (rec.status == "offline" and rec.presence == PRESENCE_STALE
+                        and rec.last_activity > 0
+                        and (now - rec.last_activity) > self._dead_timeout):
+                    rec.presence = PRESENCE_DEAD
+                    self._persist_control_state(rec)
             # A3: dropped stopped records — runtime_stop keeps the record
             # briefly (so the stopping caller can read back the state), the
             # sweep removes it so stopped runtimes never linger/aggregate.
@@ -442,6 +548,8 @@ class AgentGateway:
         runtime = params.get("runtime", "omp")
         owner_pid = int(params.get("owner_pid", 0) or 0)
         nonce = params.get("nonce", "")
+        # 设计 §2：插件握手上报能力（park_revive / correlated_turn_ack）。
+        capabilities = [str(c) for c in (params.get("capabilities") or [])]
 
         if not session_id or not agent_id or not runtime_id:
             raise GatewayError(ERR_NOT_AUTHORIZED, "runtime.register requires session_id/agent_id/runtime_id")
@@ -479,6 +587,16 @@ class AgentGateway:
             if agent_id not in roster:
                 raise GatewayError(ERR_NOT_AUTHORIZED, f"agent {agent_id!r} not in session roster")
 
+            # binding 代数：backend session (重)绑定计数 —— session 更换时 +1，
+            # 用于 ack/投递时校验 binding 未被陈旧引用覆盖。
+            binding_epoch = 0
+            if existing is not None:
+                binding_epoch = existing.binding_epoch
+                if backend_session_id and backend_session_id != existing.backend_session_id:
+                    binding_epoch += 1
+            elif backend_session_id:
+                binding_epoch = 1
+
             record = RuntimeRecord(
                 runtime_id=runtime_id,
                 session_id=session_id,
@@ -493,12 +611,29 @@ class AgentGateway:
                 created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
                 last_activity=time.time(),
                 started_at=time.time(),  # A12: real elapsed baseline
+                # 三维（设计 §1）：register = session_ready → idle + alive；
+                # binding 依 backend_session_id 是否在场。
+                presence=PRESENCE_ALIVE,
+                binding=BINDING_BOUND if backend_session_id else BINDING_PENDING,
+                agent_state=AGENT_IDLE,
+                binding_epoch=binding_epoch,
+                capabilities=capabilities,
             )
             # Preserve spec/initial_task from a prior spawn of the same runtime.
             if existing is not None:
                 record.spec = existing.spec
                 record.initial_task = existing.initial_task
             self._runtimes[runtime_id] = record
+            self._persist_control_state(record)
+            if review_key:
+                try:
+                    self._control.upsert_review(
+                        review_key=review_key, swarm_session_id=session_id,
+                        runtime_id=runtime_id, profile_id=agent_id,
+                        mailbox_agent_id=agent_id,
+                    )
+                except Exception as exc:
+                    log.warning("gateway: review mirror failed for %s: %s", review_key, exc)
 
         # Sync the real backend session id into the park manifest so warm
         # resume survives a gateway restart (in-memory record lost).
@@ -606,6 +741,9 @@ class AgentGateway:
                 # Idempotent re-declare: refresh activity.
                 existing.status = "active"
                 existing.last_activity = time.time()
+                existing.presence = PRESENCE_ALIVE
+                existing.binding = BINDING_BOUND
+                existing.agent_state = AGENT_IDLE
                 record = existing
             else:
                 if not runtime_id:
@@ -626,8 +764,23 @@ class AgentGateway:
                     status="active",
                     created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
                     last_activity=time.time(),
+                    # 三维：declare = session_ready → idle + alive + bound
+                    presence=PRESENCE_ALIVE,
+                    binding=BINDING_BOUND,
+                    agent_state=AGENT_IDLE,
+                    binding_epoch=1,
                 )
                 self._runtimes[runtime_id] = record
+            self._persist_control_state(record)
+            if review_key:
+                try:
+                    self._control.upsert_review(
+                        review_key=review_key, swarm_session_id=session_id,
+                        runtime_id=runtime_id, profile_id=agent_id,
+                        mailbox_agent_id=agent_id,
+                    )
+                except Exception as exc:
+                    log.warning("gateway: review mirror failed for %s: %s", review_key, exc)
 
         return {
             "runtime_id": runtime_id,
@@ -680,10 +833,25 @@ class AgentGateway:
             started_at=time.time(),  # A12: real elapsed baseline
             spec=params,
             initial_task=task,
+            # 三维：spawn 后进程已起但 backend session 尚未经插件握手注册
+            # → presence alive + binding pending + idle。
+            presence=PRESENCE_ALIVE,
+            binding=BINDING_PENDING,
+            agent_state=AGENT_IDLE,
         )
         # P2-2: lock runtimes dict write.
         with self._runtimes_lock:
             self._runtimes[handle.runtime_id] = record
+            self._persist_control_state(record)
+            if review_key:
+                try:
+                    self._control.upsert_review(
+                        review_key=review_key, swarm_session_id=session_id,
+                        runtime_id=handle.runtime_id, profile_id=agent_id,
+                        mailbox_agent_id=agent_id,
+                    )
+                except Exception as exc:
+                    log.warning("gateway: review mirror failed for %s: %s", review_key, exc)
         return {
             "runtime_id": handle.runtime_id,
             "generation": handle.generation,
@@ -707,9 +875,12 @@ class AgentGateway:
                 raise GatewayError(ERR_NOT_FOUND, f"runtime disappeared during heartbeat: {runtime_id}")
             was_offline = record.status == "offline"
             record.last_activity = time.time()
+            # 三维：heartbeat → 只更新 presence（设计 §1 归约表）。
+            record.presence = PRESENCE_ALIVE
             # P8.3: heartbeat restores an offline runtime.
             if was_offline:
                 record.status = "active"
+                self._persist_control_state(record)  # stale→alive 是状态变化
                 try:
                     self._events.append_local(RuntimeEventDraft(
                         runtime_id=runtime_id, generation=record.generation,
@@ -747,6 +918,11 @@ class AgentGateway:
             "host_alias": record.host_alias,
             "session_id": record.session_id,
             "agent_id": record.agent_id,
+            # 三维（设计 §1）—— 新增字段向后兼容。
+            "presence": record.presence,
+            "binding": record.binding,
+            "agent_state": record.agent_state,
+            "binding_epoch": record.binding_epoch,
         }
 
     def runtimes_list(self, params: dict) -> dict:
@@ -768,6 +944,10 @@ class AgentGateway:
                 "host_alias": rec.host_alias,
                 "review_key": rec.review_key,
                 "backend_session_id": rec.backend_session_id,
+                "presence": rec.presence,
+                "binding": rec.binding,
+                "agent_state": rec.agent_state,
+                "binding_epoch": rec.binding_epoch,
             })
         return {"runtimes": results}
 
@@ -792,31 +972,280 @@ class AgentGateway:
             # Any event is activity: keep the runtime's liveness window fresh
             # (hot detection + park renew cadence).
             record.last_activity = time.time()
+            # 三维归约（设计 §1）：TURN_STARTED → agent_running；
+            # payload 可显式携带 agent_state/binding 跳转（插件经事件上报）。
+            before = (record.presence, record.binding, record.agent_state)
+            if draft.kind == "TURN_STARTED":
+                record.agent_state = AGENT_RUNNING
+            if isinstance(draft.payload, dict):
+                st = draft.payload.get("agent_state")
+                if st in (AGENT_RUNNING, AGENT_IDLE, AGENT_ENDED):
+                    record.agent_state = st
+                bind = draft.payload.get("binding")
+                if bind in (BINDING_BOUND, BINDING_PENDING, BINDING_LOST):
+                    record.binding = bind
+            if (record.presence, record.binding, record.agent_state) != before:
+                self._persist_control_state(record)
         return {"event_id": ev.event_id, "source_sequence": ev.source_sequence}
 
     def runtime_send(self, params: dict) -> dict:
-        """Deliver a message to a runtime's agent inbox (in-loop steering).
+        """设计 §3：持久命令状态机投递。
 
-        Goes through MailboxService so require_ack / receipts behave like
-        any other mailbox message.
+        状态：QUEUED → CLAIMED → REVIVING → TRIGGERING → TURN_TRIGGERED
+        失败旁路：FAILED_SAFE / AMBIGUOUS / TRIGGER_UNKNOWN。
+
+        幂等：request_id+payload_hash 为幂等键 —— 同一对键返回原
+        command/turn，不重复注入；同 request_id 不同 payload →
+        IDEMPOTENCY_CONFLICT。
+
+        返回语义（status 字段，设计 §3 表）：
+          mailbox_persisted  仅写入持久队列（QUEUED）
+          claimed            插件已领取（CLAIMED）
+          session_live       revive/binding 完成（REVIVING）
+          turn_triggered     OMP 已建立关联 turn（成功，需 TURN_TRIGGERED ack）
+          binding_pending    未注入（binding 未建立），允许稍后重试
+          failed_safe        明确未触发，可安全重试
+          ambiguous          可能已触发，禁止自动重投
+
+        不承诺虚假 exactly-once：TRIGGERING 崩溃后重查 → AMBIGUOUS。
+        TURN_TRIGGERED ack 链（插件相关 ack 握手）为 TODO —— 本方法只
+        返回已确认阶段，绝不把未确认投递报成 turn_triggered。
         """
         runtime_id = params.get("runtime_id", "")
+        request_id = params.get("request_id", "")
+        body = params.get("body", "")
+        if not runtime_id or not request_id:
+            raise GatewayError(ERR_PROTOCOL, "runtime.send requires runtime_id + request_id")
         record = self._require_runtime(runtime_id)
-        receipt = self._svc.send(
-            session_id=record.session_id,
-            from_id=params.get("from", "manager"),
-            to_id=record.agent_id,
-            subject=params.get("subject", "steer"),
-            body=params.get("body", ""),
-            kind=params.get("kind", "TASK"),
-            reply_to=params.get("reply_to", ""),
-            run_id=params.get("run_id", ""),
-            request_id=params.get("request_id", ""),
-            require_ack=bool(params.get("require_ack", False)),
+        payload_hash = params.get("payload_hash", "") or _sha256(body)
+        if not payload_hash:
+            raise GatewayError(ERR_PROTOCOL, "runtime.send requires a non-empty body or payload_hash")
+
+        # ── 幂等重放：同一 request_id+payload_hash 返回原 command/turn ──
+        existing = self._control.get_command(request_id)
+        if existing is not None:
+            if existing["payload_hash"] != payload_hash:
+                raise GatewayError(
+                    ERR_IDEMPOTENCY_CONFLICT,
+                    f"request_id {request_id!r} already used with a different payload",
+                    {"request_id": request_id, "state": existing["state"]},
+                )
+            return self._command_result(existing)
+
+        # ── 1) 入队（关键事务 synchronous=FULL）─────────────────────────
+        command_id = f"cmd-{uuid4().hex}"
+        created = self._control.enqueue_command(
+            request_id=request_id,
+            command_id=command_id,
+            msg_id="",  # mailbox 写入后回填
+            runtime_id=runtime_id,
+            generation=record.generation,
+            payload_hash=payload_hash,
+            state=CMD_QUEUED,
+            binding_epoch=record.binding_epoch,
+            backend_session_id=record.backend_session_id,
         )
-        if receipt.status == "failed":
-            raise GatewayError(ERR_NOT_FOUND, receipt.error or "runtime_send failed")
-        return {"msg_id": receipt.msg_id, "status": receipt.status}
+        if not created:
+            # 并发入队：另一线程先到 → 走幂等重放。
+            return self._command_result(self._control.get_command(request_id))
+
+        # ── 2) 持久队列：mailbox 写入（真实投递载体）────────────────────
+        try:
+            receipt = self._svc.send(
+                session_id=record.session_id,
+                from_id=params.get("from", "manager"),
+                to_id=record.agent_id,
+                subject=params.get("subject", "steer"),
+                body=body,
+                kind=params.get("kind", "TASK"),
+                reply_to=params.get("reply_to", ""),
+                run_id=params.get("run_id", ""),
+                request_id=request_id,
+                require_ack=bool(params.get("require_ack", False)),
+            )
+            if receipt.status == "failed":
+                raise GatewayError(ERR_NOT_FOUND, receipt.error or "runtime_send mailbox failed")
+        except Exception as exc:
+            # 明确未触发（mailbox 未写入即未投递）→ FAILED_SAFE，可安全重试。
+            self._control.update_command(
+                request_id, state=CMD_FAILED_SAFE, detail={"reason": str(exc)},
+            )
+            return self._command_result(self._control.get_command(request_id))
+        self._control.update_command(
+            request_id, msg_id=receipt.msg_id, state=CMD_QUEUED,
+            detail={"mailbox": "persisted", "msg_id": receipt.msg_id},
+        )
+
+        # ── 3) hot 门控（三维，设计 §1）────────────────────────────────
+        with self._runtimes_lock:
+            cur = self._runtimes.get(runtime_id)
+            if cur is not None:
+                record = cur
+        if not self._is_hot(record):
+            gate_detail = {
+                "presence": record.presence, "binding": record.binding,
+                "agent_state": record.agent_state,
+            }
+            if record.binding != BINDING_BOUND:
+                # 未注入：binding 未建立 → binding_pending，允许稍后重试。
+                self._control.update_command(
+                    request_id, state=CMD_QUEUED,
+                    detail={"gate": "binding_pending", **gate_detail},
+                )
+                return self._command_result(self._control.get_command(request_id))
+            # presence 非 alive → 仅持久队列（mailbox_persisted）。
+            self._control.update_command(
+                request_id, state=CMD_QUEUED,
+                detail={"gate": "not_hot", **gate_detail},
+            )
+            return self._command_result(self._control.get_command(request_id))
+
+        # ── 4) ended/parked → REVIVING：发起 park-revive ────────────────
+        if record.agent_state == AGENT_ENDED:
+            self._control.update_command(
+                request_id, state=CMD_REVIVING,
+                binding_epoch=record.binding_epoch,
+                backend_session_id=record.backend_session_id,
+                detail={"revive": "starting", "agent_state": record.agent_state},
+            )
+            try:
+                from codeagent.park.router import park_revive
+
+                rv = park_revive(record.review_key, body)
+                if rv.success and rv.method in ("hot", "warm"):
+                    # revive/binding 完成（hot/warm 保活原 backend session）
+                    # → session_live；最终 turn 关联依赖 ack 链（TODO）。
+                    self._control.update_command(
+                        request_id, state=CMD_REVIVING,
+                        detail={"revive": rv.method},
+                    )
+                    return self._command_result(self._control.get_command(request_id))
+                if rv.success and rv.method == "cold":
+                    # cold 复活 = 需新 spawn + 重新绑定后才能注入 → 回到
+                    # QUEUED（binding_pending，允许稍后重试）。
+                    self._control.update_command(
+                        request_id, state=CMD_QUEUED,
+                        detail={"gate": "binding_pending", "revive": "cold"},
+                    )
+                    return self._command_result(self._control.get_command(request_id))
+                self._control.update_command(
+                    request_id, state=CMD_FAILED_SAFE,
+                    detail={"revive_failed": rv.method},
+                )
+                return self._command_result(self._control.get_command(request_id))
+            except Exception as exc:
+                self._control.update_command(
+                    request_id, state=CMD_FAILED_SAFE,
+                    detail={"revive_error": str(exc)},
+                )
+                return self._command_result(self._control.get_command(request_id))
+
+        # ── 5) hot（agent_running/idle）：mailbox 持久队列已写入 ────────
+        # OMP turn 关联需插件精确 claim + TURN_TRIGGERED ack（ack 链 TODO）；
+        # 不承诺虚假 exactly-once → 保持 QUEUED，返回 mailbox_persisted，
+        # 后续经 runtime.command_ack 推进状态。
+        return self._command_result(self._control.get_command(request_id))
+
+    def runtime_lifecycle(self, params: dict) -> dict:
+        """三维状态归约入口（设计 §1 权威事件）。
+
+        Params: {runtime_id, event, payload?}
+        event ∈ {session_ready, agent_start, turn_start, turn_end, agent_end,
+                 session_shutdown, registry_parked, registry_removed,
+                 process_exit, heartbeat}
+        """
+        runtime_id = params.get("runtime_id", "")
+        event = params.get("event", "")
+        if not runtime_id or event not in LIFECYCLE_EVENTS:
+            raise GatewayError(
+                ERR_PROTOCOL,
+                "runtime.lifecycle requires runtime_id + known event; "
+                f"got event={event!r}",
+            )
+        with self._runtimes_lock:
+            record = self._runtimes.get(runtime_id)
+            if record is None:
+                raise GatewayError(ERR_NOT_FOUND, f"unknown runtime: {runtime_id}")
+            if event == "heartbeat":
+                record.last_activity = time.time()
+            self._reduce_lifecycle(record, event, params.get("payload"))
+            self._persist_control_state(record)
+            result = self._record_state_dict(record)
+        try:
+            self._events.append_local(RuntimeEventDraft(
+                runtime_id=runtime_id, generation=record.generation,
+                session_id=record.session_id, agent_id=record.agent_id,
+                request_id="", run_id="", kind="AGENT_STATUS",
+                created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
+                payload={
+                    "lifecycle": event, "agent_state": record.agent_state,
+                    "presence": record.presence, "binding": record.binding,
+                },
+            ))
+        except Exception as exc:
+            log.warning("gateway: lifecycle event append failed: %s", exc)
+        return result
+
+    def runtime_command_ack(self, params: dict) -> dict:
+        """插件 ack 链的 gateway 半边（设计 §2/§3）。
+
+        插件领取 command 后按序上报 CLAIMED → REVIVING → TRIGGERING →
+        TURN_TRIGGERED；gateway 校验迁移合法性并持久化（关键事务 FULL）。
+        TURN_TRIGGERED 的 turn_id 与 OMP turn_start 的关联校验（correlated
+        ack 握手）为 TODO —— 插件侧未实现前仅做机械状态推进。
+        """
+        request_id = params.get("request_id", "")
+        state = params.get("state", "")
+        runtime_id = params.get("runtime_id", "")
+        turn_id = params.get("turn_id", "")
+        generation = params.get("generation")
+        if not request_id or state not in CMD_STATES:
+            raise GatewayError(
+                ERR_PROTOCOL,
+                f"runtime.command_ack requires request_id + valid state; got state={state!r}",
+            )
+        row = self._control.get_command(request_id)
+        if row is None:
+            raise GatewayError(ERR_NOT_FOUND, f"unknown command: {request_id}")
+        if runtime_id and runtime_id != row["runtime_id"]:
+            raise GatewayError(
+                ERR_NOT_AUTHORIZED,
+                f"command {request_id} belongs to runtime {row['runtime_id']}, not {runtime_id}",
+            )
+        if generation is not None:
+            try:
+                generation = int(generation)
+            except (TypeError, ValueError):
+                raise GatewayError(
+                    ERR_PROTOCOL, "runtime.command_ack generation must be an int",
+                ) from None
+            if generation < int(row["generation"]):
+                raise GatewayError(
+                    ERR_GENERATION_STALE,
+                    f"ack generation {generation} < command generation {row['generation']}",
+                )
+        allowed = CMD_TRANSITIONS.get(row["state"], set())
+        if state not in allowed:
+            raise GatewayError(
+                ERR_PROTOCOL_CONFLICT,
+                f"invalid command transition {row['state']} → {state} for {request_id}",
+            )
+        updated = self._control.update_command(
+            request_id, state=state,
+            turn_id=turn_id or row.get("turn_id", ""),
+            detail={"ack": state, "ack_at": _now_iso()},
+        )
+        return self._command_result(updated)
+
+    def runtime_command_status(self, params: dict) -> dict:
+        """查询命令当前状态（幂等重放 / 轮询用）。"""
+        request_id = params.get("request_id", "")
+        if not request_id:
+            raise GatewayError(ERR_PROTOCOL, "runtime.command_status requires request_id")
+        row = self._control.get_command(request_id)
+        if row is None:
+            raise GatewayError(ERR_NOT_FOUND, f"unknown command: {request_id}")
+        return self._command_result(row)
 
     def runtime_probe(self, params: dict) -> dict:
         runtime_id = params.get("runtime_id", "")
@@ -844,6 +1273,9 @@ class AgentGateway:
         return {
             "runtime_id": runtime_id,
             "generation": record.generation,
+            "presence": record.presence,
+            "binding": record.binding,
+            "agent_state": record.agent_state,
             "health": health,
         }
 
@@ -860,6 +1292,10 @@ class AgentGateway:
         # P2-2: lock status mutation.
         with self._runtimes_lock:
             record.status = "stopped"
+            # 三维：stop = 进程退出 → ended + dead。
+            record.agent_state = AGENT_ENDED
+            record.presence = PRESENCE_DEAD
+            self._persist_control_state(record)
         # A3: the record stays in-memory (stopped) so the stopping caller can
         # read back the state; the sweep removes it shortly after so stopped
         # runtimes never linger or get aggregated by runtime_info.
@@ -928,6 +1364,11 @@ class AgentGateway:
             "review_key": record.review_key,
             "backend_session_id": record.backend_session_id,
             "status": record.status,
+            # 三维（设计 §1）—— 新增字段向后兼容。
+            "presence": record.presence,
+            "binding": record.binding,
+            "agent_state": record.agent_state,
+            "binding_epoch": record.binding_epoch,
             # A12: elapsed is now the real runtime age (since started_at);
             # idle seconds move to their own field. elapsed stays for
             # compatibility with callers of the old (mislabeled) field.
@@ -1428,6 +1869,114 @@ class AgentGateway:
             raise GatewayError(ERR_NOT_FOUND, f"unknown runtime: {runtime_id}")
         return record
 
+    # ── 三维状态（设计 §1）─────────────────────────────────────────────
+
+    @staticmethod
+    def _reduce_lifecycle(record: RuntimeRecord, event: str,
+                          payload: Optional[dict] = None) -> None:
+        """三维状态归约 —— 权威事件驱动（设计 §1 归约表）。
+
+          session_ready                       → idle（+ alive）
+          agent_start / turn_start            → agent_running
+          turn_end                            → idle
+          agent_end                           → idle（正常结束；park 须另报
+                                                registry_parked/session_shutdown）
+          session_shutdown / registry_parked /
+          registry_removed / process_exit     → ended
+          heartbeat                           → 只更新 presence
+        """
+        if event == "heartbeat":
+            record.presence = PRESENCE_ALIVE
+            return
+        if event == "session_ready":
+            record.presence = PRESENCE_ALIVE
+            record.agent_state = AGENT_IDLE
+            return
+        if event in ("agent_start", "turn_start"):
+            record.agent_state = AGENT_RUNNING
+            return
+        if event in ("turn_end", "agent_end"):
+            # 正常结束 → idle；不能仅凭 agent_end 推断 parked/ended（设计 §1 注）。
+            record.agent_state = AGENT_IDLE
+            return
+        if event in ("session_shutdown", "registry_parked",
+                     "registry_removed", "process_exit"):
+            record.agent_state = AGENT_ENDED
+            return
+        # 未知事件：保持状态不变（fail-closed，不猜测）。
+        log.warning("gateway: unknown lifecycle event %r for %s", event, record.runtime_id)
+
+    def _is_hot(self, record: RuntimeRecord) -> bool:
+        """hot 投递门控（设计 §1）：三维状态正交判定。
+
+        presence=alive AND binding=bound AND
+        agent_state ∈ {agent_running, idle, ended}。
+        （设计同时要求插件 capability 含 park_revive + correlated_turn_ack；
+        P0 以三维为主，capability 收紧留给插件握手后收紧。）
+        """
+        return (
+            record.presence == PRESENCE_ALIVE
+            and record.binding == BINDING_BOUND
+            and record.agent_state in (AGENT_RUNNING, AGENT_IDLE, AGENT_ENDED)
+        )
+
+    def _persist_control_state(self, record: RuntimeRecord) -> None:
+        """镜像三维状态到 ControlStore.runtime_generations（关键事务 FULL）。
+
+        尽力而为：落盘失败仅告警，不阻断主流程（内存记录仍是操作权威）。
+        """
+        try:
+            self._control.upsert_generation(
+                runtime_id=record.runtime_id,
+                current_generation=record.generation,
+                owner_nonce=record.nonce,
+                presence=record.presence,
+                binding=record.binding,
+                backend_session_id=record.backend_session_id,
+                binding_epoch=record.binding_epoch,
+                agent_state=record.agent_state,
+            )
+        except Exception as exc:
+            log.warning("gateway: control state persist failed for %s: %s",
+                        record.runtime_id, exc)
+
+    @staticmethod
+    def _record_state_dict(record: RuntimeRecord) -> dict:
+        return {
+            "runtime_id": record.runtime_id,
+            "presence": record.presence,
+            "binding": record.binding,
+            "agent_state": record.agent_state,
+            "binding_epoch": record.binding_epoch,
+            "status": record.status,  # 旧字段保持兼容
+        }
+
+    # ── runtime.send 命令结果（设计 §3 返回语义）───────────────────────
+
+    def _command_result(self, row: dict) -> dict:
+        """命令行 → runtime.send 返回体：state 为机器状态，status 为语义。
+
+        QUEUED 的分支语义（设计 §3 表）：
+          - 因 binding 未建立而未注入 → binding_pending（允许稍后重试）
+          - 其余（presence 非 alive / 已持久队列）→ mailbox_persisted
+        """
+        state = row["state"]
+        status = CMD_STATUS_BY_STATE.get(state, "mailbox_persisted")
+        detail = row.get("detail") or {}
+        if state == CMD_QUEUED and detail.get("gate") == "binding_pending":
+            status = "binding_pending"
+        return {
+            "request_id": row["request_id"],
+            "command_id": row["command_id"],
+            "msg_id": row.get("msg_id", ""),
+            "turn_id": row.get("turn_id", ""),
+            "runtime_id": row["runtime_id"],
+            "generation": row.get("generation", 0),
+            "state": state,
+            "status": status,
+            "detail": detail,
+        }
+
     # ── dispatch ───────────────────────────────────────────────────────
 
     def dispatch(self, method: str, params: dict) -> dict:
@@ -1441,6 +1990,9 @@ class AgentGateway:
             "runtime.heartbeat": self.runtime_heartbeat,
             "runtime.event": self.runtime_event,
             "runtime.send": self.runtime_send,
+            "runtime.lifecycle": self.runtime_lifecycle,  # 三维归约入口（设计§1）
+            "runtime.command_ack": self.runtime_command_ack,  # 命令状态机 ack（§3）
+            "runtime.command_status": self.runtime_command_status,  # 命令状态查询
             "runtime.probe": self.runtime_probe,
             "runtime.stop": self.runtime_stop,
             "runtime.info": self.runtime_info,

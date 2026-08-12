@@ -49,6 +49,7 @@ class ParkManifest:
     swarm_session_id: str = ""
     agent_type: str = ""
     model: str = ""
+    primary_model: str = ""          # M-model: start 时解析的 chain[0]（agent profile 权威结果落盘；revive/ask 直接读，不再重推导）
     host: str = ""
     workdir: str = ""
     lifecycle: Lifecycle = Lifecycle.HOT_PARKED

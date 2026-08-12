@@ -367,6 +367,7 @@ class ParkRegistry:
             "swarm_session_id": m.swarm_session_id,
             "agent_type": m.agent_type,
             "model": m.model,
+            "primary_model": m.primary_model,  # M-model: start 落盘的 chain[0]
             "host": m.host,
             "workdir": m.workdir,
             "lifecycle": m.lifecycle.value,
