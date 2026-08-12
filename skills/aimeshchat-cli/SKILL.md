@@ -1,5 +1,5 @@
 ---
-name: aimeshchat
+name: aimeshchat-cli
 description: 使用 aimeshchat CLI 在本机或 repo-map 注册的远程仓执行代码 Agent。触发条件：目标源码不在当前机器、跨机器/多仓调研、需要持久 session、SSH/relay-login 路由。
 requires:
   online: true
