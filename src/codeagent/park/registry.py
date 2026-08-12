@@ -388,6 +388,9 @@ class ParkRegistry:
             "schema_version": m.schema_version,
             "release_mode": m.release_mode,
             "omp_session_path": m.omp_session_path,
+            "provider": m.provider,             # Q5: 模型供应商
+            "variant": m.variant,               # Q5: 模型变体
+            "system_prompt": m.system_prompt,    # Q5: 系统提示词
         }
         return d
 

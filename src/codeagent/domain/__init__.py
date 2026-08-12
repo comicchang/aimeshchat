@@ -13,6 +13,7 @@ from codeagent.domain.runtime import RunContext
 LOCAL_HOST_MARKER = "__local__"
 
 __all__ = [
+    "ExecutionSpec",
     "HostSpec",
     "RepoEntry",
     "TopicSpec",
@@ -25,6 +26,67 @@ __all__ = [
     "current_hostname",
     "resolve_is_local",
 ]
+
+
+@dataclass(frozen=True)
+class ExecutionSpec:
+    """Q5: 不可变执行规格——去 role 化的核心数据结构。
+
+    模型/提示词策略归 skill，aimeshchat 只保留执行/路由/会话/mailbox。
+    ExecutionSpec 封装一次 oracle 启动所需的全部执行参数，构造后不可变。
+
+    ``from_args(args)`` 从 CLI argparse.Namespace 构造，优先级：
+    显式 --model/--variant/--system > agent profile model。
+    """
+    provider: str          # 模型供应商（从 model 前缀提取，如 openai/claude/ollama）
+    model: str             # 完整模型标识（不含 variant）
+    variant: str           # 模型变体（如 reasoning/thinking；空串=默认）
+    system_prompt: str     # 系统提示词（空串=不设置）
+    full_prompt: str       # 组合后的完整提示词（system_prompt + prompt）
+
+    @classmethod
+    def from_args(cls, args, *, resolve_agent_model=None) -> "ExecutionSpec":
+        """从 CLI args 构造 ExecutionSpec。
+
+        优先级：
+        1. 显式 --model → 直接使用，不走 agent profile。
+        2. 否则调用 resolve_agent_model(agent) 获取 profile model。
+        3. --variant / --system 为空时使用默认值（空串）。
+        """
+        model = getattr(args, "model", "") or ""
+        variant = getattr(args, "variant", "") or ""
+        system_prompt = getattr(args, "system", "") or ""
+        prompt = getattr(args, "prompt", "") or ""
+
+        # 显式 --model 优先；否则走 agent profile
+        if not model and resolve_agent_model is not None:
+            agent = getattr(args, "agent", "") or ""
+            model = resolve_agent_model(agent) or ""
+
+        provider = cls._extract_provider(model)
+
+        # 组合 full_prompt：system_prompt 非空时前置
+        if system_prompt and prompt:
+            full_prompt = f"{system_prompt}\n\n{prompt}"
+        elif system_prompt:
+            full_prompt = system_prompt
+        else:
+            full_prompt = prompt
+
+        return cls(
+            provider=provider,
+            model=model,
+            variant=variant,
+            system_prompt=system_prompt,
+            full_prompt=full_prompt,
+        )
+
+    @staticmethod
+    def _extract_provider(model: str) -> str:
+        """从模型标识提取供应商前缀（openai/gpt-4 → openai）。"""
+        if "/" in model:
+            return model.split("/", 1)[0]
+        return ""
 
 
 @dataclass(frozen=True)

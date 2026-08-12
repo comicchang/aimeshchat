@@ -136,3 +136,99 @@ aimeshchat oracle release "$KEY" --purge   # 硬销毁：删 OMP session + swarm
   不硬编码 OMP runner。
 - OMP 提供 full hot/in-loop；OMP 不可用时 OpenCode 明确降级为 turn 间 follow-up；
   generic 因无 warm 仅显式指定时允许。
+
+## ExecutionSpec 承载（去 role 化，模型/提示词策略归 skill）
+
+### 设计原则
+
+aimeshchat CLI 去 role 化后，**模型与工作负载提示词策略由 skill 决定**，aimeshchat 只保留
+执行/路由/会话/mailbox 能力。oracle 顾问会话启动时，skill 生成 `ExecutionSpec`（含
+provider/model/variant/system/full_prompt），通过 CLI 参数透传给 aimeshchat。
+
+这确保：
+- 模型选择由 skill 按顾问档位/场景自主决策，不在 aimeshchat 硬编码。
+- 提示词策略（系统提示词、完整提示词模板）由 skill 维护，aimeshchat 不干预。
+- 调用方只需选择档位（`--agent oracle | oracle-lite | oracle-opus`）或显式覆盖模型。
+
+### ExecutionSpec 结构
+
+```yaml
+ExecutionSpec:
+  provider: <provider>       # 模型提供方（如 ppio/pa、anthropic、deepseek）
+  model: <model>             # 模型标识（如 gpt-5.6-sol、claude-opus-4-8、v4-pro）
+  variant: <variant>         # 变种标识（如 reasoning、fast、balanced）
+  system: <system_prompt>    # 系统提示词（skill 定义的顾问角色/约束/格式）
+  full_prompt: <prompt>      # 完整提示词（首轮任务 + 上下文拼装）
+```
+
+### 各档位 ExecutionSpec 推荐
+
+| 档位 | provider/model | variant | system 建议 | 适用场景 |
+|------|----------------|---------|-------------|----------|
+| `oracle`（慢思考） | `ppio/pa/gpt-5.6-sol` | `reasoning` | 深度分析 + 风险评估 + 多角度论证 | 架构评审、根因分析、复杂决策 |
+| `oracle-lite`（快思考） | `deepseek/v4-pro` | `fast` | 轻量审查 + 快速反馈 + 关键问题聚焦 | 代码质量、文档覆盖、日常 review |
+| `oracle-opus`（最强推理） | `anthropic/claude-opus-4-8` | `balanced` | 严格形式化 + 证据链 + 可执行建议 | 安全审计、合规检查、高风险变更 |
+
+> **skill 实现者**：以上为推荐默认值，可按项目/团队偏好覆盖。`variant` 和 `system` 字段
+> 为 skill 内部约定，aimeshchat 不解析语义，仅透传给 backend。
+
+### CLI 用法
+
+```bash
+# skill 生成 ExecutionSpec 后，通过 CLI 参数透传
+aimeshchat oracle start "$KEY" \
+  --model gpt-5.6-sol \
+  --variant reasoning \
+  --system "你是一位资深架构顾问，专注于..." \
+  --prompt "请评审以下架构方案..."
+
+# oracle-lite 档位
+aimeshchat oracle start "$KEY" \
+  --model v4-pro \
+  --variant fast \
+  --system "你是代码审查专家，快速识别关键问题..." \
+  --prompt "请审查 PR #123 的变更..."
+
+# oracle-opus 档位
+aimeshchat oracle start "$KEY" \
+  --model claude-opus-4-8 \
+  --variant balanced \
+  --system "你是安全审计专家，需提供证据链..." \
+  --prompt "请审计以下安全相关变更..."
+```
+
+### 默认继承规则
+
+**未显式指定时，default 继承主 agent 当前模型（runtime context）**，不在 skill 硬编码 mimo。
+
+```bash
+# 场景 1：skill 未指定 model → 继承主 agent 当前模型
+aimeshchat oracle start "$KEY" --prompt '...'
+# 实际使用主 agent 的 model（如主 agent 正在用 claude-sonnet → oracle 也用 claude-sonnet）
+
+# 场景 2：skill 显式指定 model → 使用 skill 指定的模型
+aimeshchat oracle start "$KEY" --model gpt-5.6-sol --prompt '...'
+# 实际使用 gpt-5.6-sol
+
+# 场景 3：用户 CLI 显式指定 model → 优先级最高
+aimeshchat oracle start "$KEY" --model v4-pro --prompt '...'
+# 实际使用 v4-pro，覆盖 skill 默认值
+```
+
+优先级链：**用户 CLI 显式指定 > skill ExecutionSpec > 主 agent runtime context > 报错**
+
+### 迁移提示
+
+- `--agent oracle | oracle-lite | oracle-opus` **保留为 profile 名**——它读取
+  `agents/oracle*.md` 的默认模型配置（`model:` 字段），用于未显式指定 `--model` 时的
+  兜底继承。
+- 显式 `--model` / `--variant` **优先级高于** `--agent` profile 读取的默认值。
+- 迁移后，**三处模型配置仍需同步**（见"模型一致性"段），但 skill 的
+  ExecutionSpec 成为运行时唯一决定源，profile 仅作兜底。
+
+```bash
+# 迁移前后对比：
+# 旧：--agent oracle → 读 agents/oracle.md → 使用 ppio/pa/gpt-5.6-sol
+# 新：--agent oracle → 读 agents/oracle.md → 使用 ppio/pa/gpt-5.6-sol（兜底）
+#     但 skill 可通过 ExecutionSpec 覆盖 → --model claude-opus-4-8 优先
+```

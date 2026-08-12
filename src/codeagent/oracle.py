@@ -41,6 +41,7 @@ from codeagent.gateway.model import GatewayError
 from codeagent.mailbox.store import MailboxStore, RequestLedger, resolve_root
 from codeagent.park.registry import ParkRegistry
 from codeagent.park.inject import build_cold_context
+from codeagent.domain import ExecutionSpec
 from codeagent.domain.park import Lifecycle, ParkManifest
 from codeagent.runtime.base import CAP_WARM_RESUME
 from codeagent.runtime.registry import RuntimeRegistry
@@ -675,6 +676,14 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         )
     memory_env = {"OMP_MEMORY_CONFIG_PATH": memory_report["config_path"]} if memory_report["config_path"] else {}
 
+    # ── Q5: ExecutionSpec — 不可变执行规格（去 role 化核心） ───────────
+    # 显式 --model/--variant/--system 优先，否则 agent profile model。
+    spec = ExecutionSpec.from_args(
+        args, resolve_agent_model=lambda a: (_resolve_oracle_model_chain(a, "") or [""])[0],
+    )
+    log.debug("oracle start: ExecutionSpec(provider=%s, model=%s, variant=%s, system=%r)",
+              spec.provider, spec.model, spec.variant, spec.system_prompt[:40] if spec.system_prompt else "")
+
     # ── M-model: agent profile model: 为唯一权威源（显式 --model 仍覆盖）──
     model_chain = _resolve_oracle_model_chain(agent, args.model or "")
     primary_model = model_chain[0] if model_chain else (args.model or "")
@@ -727,7 +736,8 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     #     mailbox 保留 prompt+B3；spawn task 置空。
     #   - opencode/generic：spawn task 经 argv 位置参数到达 runtime；
     #     mailbox TASK 仅携带 B3 协议块（不含 prompt），避免潜在二次执行。
-    prompt = args.prompt or ""
+    # Q5: 使用 spec.full_prompt（已含 system_prompt 前置组合）
+    prompt = spec.full_prompt
     if backend == "omp":
         init_task_body = prompt + _oracle_init_protocol(sid) if prompt else ""
     else:
@@ -794,6 +804,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     # M-model: manifest.model 仅存显式覆盖（args.model）；primary_model 存
     # start 时解析出的 chain[0]（agent profile 权威结果）。revive/ask 直接
     # 读 primary_model，不再重推导；显式覆盖优先于 primary_model。
+    # Q5: ExecutionSpec 字段持久化到 manifest（provider/variant/system_prompt）
     if existing is not None:
         # D3: restart path — preserve every untouched field via replace()
         # instead of copying 15+ fields manually. created_at is kept from
@@ -811,6 +822,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             last_activity_at=time.time(),
             release_mode="",
             omp_session_path="",
+            provider=spec.provider,
+            variant=spec.variant,
+            system_prompt=spec.system_prompt,
         )
         registry.update(review_key, manifest)
     else:
@@ -826,6 +840,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             backend_session_id=bound_session_id,
             created_at=time.time(),
             last_activity_at=time.time(),
+            provider=spec.provider,
+            variant=spec.variant,
+            system_prompt=spec.system_prompt,
         )
         registry.acquire(review_key, manifest)
 
@@ -856,6 +873,12 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "capabilities": sorted(handle.capabilities),
         "model_chain": model_chain,
         "primary_model": primary_model,  # M-model: manifest 落盘的 chain[0]
+        "spec": {                        # Q5: ExecutionSpec 完整快照
+            "provider": spec.provider,
+            "model": spec.model,
+            "variant": spec.variant,
+            "system_prompt": spec.system_prompt[:80] + "…" if len(spec.system_prompt) > 80 else spec.system_prompt,
+        },
     }, indent=2))
     return 0
 

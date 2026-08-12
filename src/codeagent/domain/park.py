@@ -67,6 +67,9 @@ class ParkManifest:
     transcript_uri: str = ""
     artifact_refs: list[str] = field(default_factory=list)
     config_fingerprint: str = ""
-    schema_version: int = 1
+    schema_version: int = 2          # Q5: v2 新增 provider/variant/system_prompt
     release_mode: str = ""           # P1-1: soft / hard / 空（未 release）
     omp_session_path: str = ""       # P1-1: OMP session 文件路径（revive warm 用）
+    provider: str = ""               # Q5: 模型供应商（从 model 前缀提取；向后兼容默认空串）
+    variant: str = ""                # Q5: 模型变体（reasoning/thinking；空串=默认）
+    system_prompt: str = ""          # Q5: 系统提示词（空串=不设置）

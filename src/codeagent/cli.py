@@ -268,7 +268,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_start.add_argument("--agent", default=_DEFAULT_ORACLE_AGENT, help="Oracle agent profile")
     ora_start.add_argument("--backend", default="omp", help="Runtime backend (omp|opencode)")
     ora_start.add_argument("--workdir", default="", help="Working directory")
-    ora_start.add_argument("--model", default="", help="Model override")
+    ora_start.add_argument("--model", default="", help="Model override (explicit model; overrides agent profile)")
+    ora_start.add_argument("--variant", default="", help="Q5: model variant (e.g. reasoning/thinking; default empty)")
+    ora_start.add_argument("--system", default="", help="Q5: system prompt (prepended to prompt; default empty)")
     ora_start.add_argument("--prompt", default="", help="Initial prompt (default empty — first TASK comes via ask)（初始 prompt；oracle 慢启动时 backend session 绑定需 ≤60s，绑定超时返回 binding=pending 不杀 runtime）")
     ora_start.add_argument("--apply-memory-config", action="store_true", dest="apply_memory_config",
                            help="D4: auto-merge missing OMP memory config keys (default: detect + warn only)")
