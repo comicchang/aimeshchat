@@ -111,6 +111,11 @@ CMD_STATUS_BY_STATE = {
 
 ERR_IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
 
+# ── 插件能力（设计 §2 握手上报）──────────────────────────────────────
+# hot 注入要求插件 capability 同时含 park_revive + correlated_turn_ack；
+# P2：_is_hot 检查已上报能力，缺失即降级（未上报按兼容放行仅告警）。
+HOT_REQUIRED_CAPABILITIES = frozenset({"park_revive", "correlated_turn_ack"})
+
 
 def _sha256(text: str) -> str:
     """payload_hash 幂等键：body 的 sha256。"""
@@ -1185,13 +1190,28 @@ class AgentGateway:
             cur = self._runtimes.get(runtime_id)
             if cur is not None:
                 record = cur
+        # params.wait_binding（与 oracle ask --wait-binding 拦截一致）：
+        # binding 未建立时轮询等待（默认 ≤60s，wait_binding_timeout 可覆盖），
+        # 窗口内绑定完成则继续 hot 路径；超时仍未绑定 → binding_pending。
+        if (params.get("wait_binding")
+                and record.binding == BINDING_PENDING
+                and record.presence == PRESENCE_ALIVE):
+            wait_secs = float(params.get("wait_binding_timeout") or 60.0)
+            deadline = time.monotonic() + wait_secs
+            while time.monotonic() < deadline and record.binding != BINDING_BOUND:
+                time.sleep(0.5)
+                with self._runtimes_lock:
+                    cur = self._runtimes.get(runtime_id)
+                    if cur is not None:
+                        record = cur
         if not self._is_hot(record):
             gate_detail = {
                 "presence": record.presence, "binding": record.binding,
                 "agent_state": record.agent_state,
             }
             if record.binding != BINDING_BOUND:
-                # 未注入：binding 未建立 → binding_pending，允许稍后重试。
+                # 未注入：binding 未建立（含 wait_binding 超时）→
+                # binding_pending，允许稍后重试。
                 self._control.update_command(
                     request_id, state=CMD_QUEUED,
                     detail={"gate": "binding_pending", **gate_detail},
@@ -2053,18 +2073,37 @@ class AgentGateway:
         log.warning("gateway: unknown lifecycle event %r for %s", event, record.runtime_id)
 
     def _is_hot(self, record: RuntimeRecord) -> bool:
-        """hot 投递门控（设计 §1）：三维状态正交判定。
+        """hot 投递门控（设计 §1 三维 + §2 插件能力）。
 
         presence=alive AND binding=bound AND
-        agent_state ∈ {agent_running, idle, ended}。
-        （设计同时要求插件 capability 含 park_revive + correlated_turn_ack；
-        P0 以三维为主，capability 收紧留给插件握手后收紧。）
+        agent_state ∈ {agent_running, idle, ended}；
+        且已上报 capability 须含 park_revive + correlated_turn_ack：
+          - 已上报但缺失必需能力 → 降级 not-hot（退回持久队列）；
+          - 未上报（老插件/未握手）→ 仅告警不降级（向后兼容）。
         """
-        return (
+        if not (
             record.presence == PRESENCE_ALIVE
             and record.binding == BINDING_BOUND
             and record.agent_state in (AGENT_RUNNING, AGENT_IDLE, AGENT_ENDED)
-        )
+        ):
+            return False
+        caps = {str(c) for c in (record.capabilities or [])}
+        if not caps:
+            # 未上报能力：无法校验 → 告警放行，保持向后兼容。
+            log.warning(
+                "gateway: runtime %s hot 但未上报插件能力（park_revive/"
+                "correlated_turn_ack），按兼容放行", record.runtime_id,
+            )
+            return True
+        missing = HOT_REQUIRED_CAPABILITIES - caps
+        if missing:
+            # 已上报能力但缺必需项 → 降级 not-hot（mailbox_persisted）。
+            log.warning(
+                "gateway: runtime %s 缺 hot 必需能力 %s → 降级 not-hot",
+                record.runtime_id, sorted(missing),
+            )
+            return False
+        return True
 
     def _persist_control_state(self, record: RuntimeRecord) -> None:
         """镜像三维状态 + model_context 到 ControlStore.runtime_generations（关键事务 FULL）。

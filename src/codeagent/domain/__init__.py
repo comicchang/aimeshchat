@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,8 @@ from codeagent.constants import DEFAULT_EXEC_TIMEOUT
 from codeagent.domain.runtime import RunContext
 
 LOCAL_HOST_MARKER = "__local__"
+# P2: execution-context model schema——model 必须匹配 ^[A-Za-z0-9_./-]{1,128}$
+_EXECUTION_CONTEXT_MODEL_RE = re.compile(r"^[A-Za-z0-9_./-]{1,128}$")
 _log = logging.getLogger(__name__)
 
 __all__ = [
@@ -36,8 +39,12 @@ class ModelContextUnavailable(RuntimeError):
     """Q5b: gateway 内调用但主 agent 无 runtime.context 时的明确失败。
 
     与 do_not_use（config.yml modelRoles.default）不同：default 模型必须
-    来自当前调用者的真实运行上下文（runtime.context 机制），缺失时显式
-    失败（MODEL_CONTEXT_UNAVAILABLE），不静默回落任何配置默认（mimo）。
+    来自当前调用者的真实运行上下文（runtime.context 机制）。
+    P0: 仅 strict 模式（oracle start --model-strict，经 ExecutionSpec
+    runtime_context_strict=True 触发）原样上抛 → 调用方报
+    MODEL_CONTEXT_UNAVAILABLE；默认（非 strict）由 ExecutionSpec.from_args
+    捕获后回退 execution-context 文件 / agent profile，不 fatal、不静默
+    使用 mimo。
     """
 
 
@@ -52,23 +59,28 @@ class ExecutionSpec:
     （Q5b default 继承主 agent 模型）：
     1. 显式 --model/--variant/--system → 直接使用，不走任何解析。
     2. 否则 resolve_runtime_context(agent) → (model, variant[, provider])：
-       继承当前调用者的 runtime.context（gateway 机制）；解析器抛
-       ModelContextUnavailable 时原样上抛（明确报错，不静默回落）；
-       返回 None 表示不适用（非 gateway 调用）。
+       继承当前调用者的 runtime.context（gateway 机制）；抛
+       ModelContextUnavailable 时按 runtime_context_strict 分流：
+       strict（--model-strict）→ 原样上抛；否则视为无上下文，继续
+       来源 3/4（不 fatal）；返回 None 表示不适用（非 gateway 调用）。
     3. 仍无 → 读 OMP 0600 execution-context 文件
        （~/.omp/agent/execution-context.json 或 $AIMESHCHAT_EXECUTION_CONTEXT）。
     4. 仍无 → resolve_agent_model(agent) 回退 agent profile（向后兼容）。
     provider 优先取 runtime.context 显式上报值，否则从 model 前缀提取。
+    model_source 记录最终命中的模型来源：explicit | runtime_context |
+    execution_context | agent_profile（空串 = 未解析出模型）。
     """
     provider: str          # 模型供应商（从 model 前缀提取，如 openai/claude/ollama）
     model: str             # 完整模型标识（不含 variant）
     variant: str           # 模型变体（如 reasoning/thinking；空串=默认）
     system_prompt: str     # 系统提示词（空串=不设置）
     full_prompt: str       # 组合后的完整提示词（system_prompt + prompt）
+    model_source: str      # 模型来源：explicit|runtime_context|execution_context|agent_profile
 
     @classmethod
     def from_args(cls, args, *, resolve_agent_model=None,
-                  resolve_runtime_context=None) -> "ExecutionSpec":
+                  resolve_runtime_context=None,
+                  runtime_context_strict: bool = False) -> "ExecutionSpec":
         """从 CLI args 构造 ExecutionSpec。
 
         模型优先级（Q5b default 继承主 agent 模型）：
@@ -76,8 +88,9 @@ class ExecutionSpec:
         2. 否则调用 resolve_runtime_context(agent) 继承调用者当前模型：
            - 返回 (model, variant[, provider]) → 使用（--variant 未显式时
              继承 variant；provider 未显式上报时从 model 前缀提取）；
-           - 抛 ModelContextUnavailable → 原样上抛（无上下文明确报错，
-             不静默回落 mimo）；
+           - 抛 ModelContextUnavailable → runtime_context_strict=True
+             （--model-strict）时原样上抛；否则记警告并视作无上下文，
+             继续来源 3/4（不 fatal，向后兼容）；
            - 返回 None → 不适用，继续下一步。
         3. 仍无 model → 读 OMP 0600 execution-context 文件
            （~/.omp/agent/execution-context.json 或 $AIMESHCHAT_EXECUTION_CONTEXT）。
@@ -90,15 +103,29 @@ class ExecutionSpec:
         system_prompt = getattr(args, "system", "") or ""
         prompt = getattr(args, "prompt", "") or ""
         agent = getattr(args, "agent", "") or ""
+        # P0: 模型来源追踪——最终命中哪个来源（start JSON 输出 model_source）。
+        model_source = "explicit" if model else ""
 
         # 1) 显式 --model 优先。
         # 2) Q5b: 未显式 --model 时继承调用者 runtime.context
         #    （resolve_runtime_context 由 CLI 层注入，负责 gateway 查询）。
+        #    P0: 查询失败（gateway socket 不可达等）默认不 fatal——记警告后
+        #    视作无上下文，继续来源 3/4；仅 runtime_context_strict
+        #    （--model-strict）才原样上抛 MODEL_CONTEXT_UNAVAILABLE。
         ctx_provider = ""
         if not model and resolve_runtime_context is not None:
-            ctx = resolve_runtime_context(agent)
+            try:
+                ctx = resolve_runtime_context(agent)
+            except ModelContextUnavailable as exc:
+                if runtime_context_strict:
+                    raise
+                _log.warning(
+                    "runtime.context 查询失败，回退 execution-context/agent profile: %s", exc,
+                )
+                ctx = None
             if ctx:
                 model = ctx[0] or ""
+                model_source = "runtime_context"
                 ctx_variant = ctx[1] if len(ctx) > 1 else ""
                 if len(ctx) > 2:
                     ctx_provider = ctx[2] or ""
@@ -112,6 +139,7 @@ class ExecutionSpec:
             ctx_model = cls._read_omp_execution_context()
             if ctx_model:
                 model = ctx_model[0] or ""
+                model_source = "execution_context"
                 if not variant:
                     variant = ctx_model[1] or ""
                 if not ctx_provider:
@@ -120,6 +148,8 @@ class ExecutionSpec:
         # 4) 仍无 model → agent profile（非 gateway 调用向后兼容路径）。
         if not model and resolve_agent_model is not None:
             model = resolve_agent_model(agent) or ""
+            if model:
+                model_source = "agent_profile"
 
         # provider：runtime.context 显式上报的优先；否则从 model 前缀提取。
         provider = ctx_provider or cls._extract_provider(model)
@@ -138,6 +168,7 @@ class ExecutionSpec:
             variant=variant,
             system_prompt=system_prompt,
             full_prompt=full_prompt,
+            model_source=model_source,
         )
 
     @staticmethod
@@ -171,6 +202,14 @@ class ExecutionSpec:
             return None
         model = (data.get("model") or "").strip()
         if not model:
+            return None
+        # P2: execution-context schema 校验——model 必须匹配
+        # ^[A-Za-z0-9_./-]{1,128}$，不合法视为缺失（回退后续来源）。
+        if not _EXECUTION_CONTEXT_MODEL_RE.match(model):
+            _log.warning(
+                "execution-context model %r 不合法（须匹配 ^[A-Za-z0-9_./-]{1,128}$），"
+                "按缺失处理", model,
+            )
             return None
         variant = (data.get("variant") or "").strip()
         provider = (data.get("provider") or "").strip()

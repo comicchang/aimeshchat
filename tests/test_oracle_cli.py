@@ -133,7 +133,7 @@ class TestOracleAsk:
 
         assert code == 0
         out = json.loads(capsys.readouterr().out)
-        assert out["method"] == "hot"
+        assert out["method"] == "hot_pending_ack"
         assert out["msg_id"] == "m-123"
         # send went to the live runtime with require_ack
         send_params = gw.call.call_args_list[1][0][1]

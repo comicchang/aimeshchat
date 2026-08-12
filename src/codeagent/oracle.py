@@ -312,6 +312,33 @@ def _model_chain_from_manifest(agent_type: str, manifest, explicit_override: str
     return _resolve_oracle_model_chain(agent_type, "")
 
 
+def _ask_model_chain_realtime(agent_type: str, manifest, explicit_override: str = "") -> list[str]:
+    """P1: ask 时实时修正 model_chain——runtime.context 优先，manifest 仅 fallback。
+
+    manifest 落盘的 primary_model 是 start 时刻的解析结果，主 agent 换模型后
+    会过期。ask（warm/cold spawn）先用 runtime.context_get 继承当前主 agent
+    模型作为实时修正源；查询失败（gateway 不可达）或非 gateway 调用 →
+    回退 manifest（旧行为，向后兼容）。
+
+    优先级：
+    1. 显式 --model（manifest.model / explicit_override）→ 永远优先。
+    2. AIMESHCHAT_RUNTIME_ID 下 runtime.context_get 命中 → [实时模型]。
+    3. manifest 落盘模型（start 时解析的 primary_model / model）。
+    4. 旧 manifest 无 primary_model → 现场解析 agent profile。
+    """
+    explicit = (manifest.model if manifest else "") or explicit_override
+    if explicit:
+        return [explicit]
+    try:
+        ctx = _runtime_context_model(agent_type)
+    except ModelContextUnavailable:
+        # 网关查询失败 → manifest 仅作 fallback（不 fatal）。
+        ctx = None
+    if ctx and ctx[0]:
+        return [ctx[0]]
+    return _model_chain_from_manifest(agent_type, manifest, "")
+
+
 def _looks_like_quota(text: str) -> bool:
     """True when *text* carries a provider quota/rate-limit marker.
 
@@ -717,16 +744,19 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
 
     # ── Q5: ExecutionSpec — 不可变执行规格（去 role 化核心） ───────────
     # Q5b: 显式 --model/--variant 优先；无显式时若在 gateway runtime 内
-    # （AIMESHCHAT_RUNTIME_ID）继承主 agent 当前模型（runtime.context）；
-    # 无上下文 → 明确报错 MODEL_CONTEXT_UNAVAILABLE（不静默回落 mimo）；
-    # 非 gateway 调用回退 agent profile model（向后兼容）。
+    # （AIMESHCHAT_RUNTIME_ID）继承主 agent 当前模型（runtime.context）。
+    # P0: runtime.context 查询失败（gateway socket 不可达等）默认回退
+    # execution-context 文件 → agent profile，不 fatal；仅显式
+    # --model-strict 才报 MODEL_CONTEXT_UNAVAILABLE。
     try:
         spec = ExecutionSpec.from_args(
             args,
             resolve_agent_model=lambda a: (_resolve_oracle_model_chain(a, "") or [""])[0],
             resolve_runtime_context=_runtime_context_model,
+            runtime_context_strict=bool(getattr(args, "model_strict", False)),
         )
     except ModelContextUnavailable as exc:
+        # 仅 --model-strict 可达：显式要求 runtime.context 缺失即失败。
         print(f"MODEL_CONTEXT_UNAVAILABLE: {exc}", file=sys.stderr)
         return 1
     log.debug("oracle start: ExecutionSpec(provider=%s, model=%s, variant=%s, system=%r)",
@@ -929,6 +959,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             "provider": spec.provider,
             "model": spec.model,
             "variant": spec.variant,
+            "model_source": spec.model_source,  # P0: runtime_context|execution_context|agent_profile|explicit
             "system_prompt": spec.system_prompt[:80] + "…" if len(spec.system_prompt) > 80 else spec.system_prompt,
         },
     }, indent=2))
@@ -1010,12 +1041,17 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "request_id": f"ask-{uuid4().hex[:10]}",
                 "run_id": f"run-{uuid4().hex[:10]}",
             })
+            # P1: method 语义修正 —— 底层为持久命令状态机（QUEUED 等 ack），
+            # 不承诺已注入 turn；status 取 runtime_send 返回的已确认阶段
+            # （mailbox_persisted|claimed|session_live|turn_triggered|...）。
+            hot_status = result.get("status", "mailbox_persisted")
             print(json.dumps({
-                "method": "hot",
+                "method": "hot_pending_ack",
                 "review_key": review_key,
                 "runtime_id": info["runtime_id"],
                 "backend_session_id": info.get("backend_session_id", ""),
                 "msg_id": result.get("msg_id", ""),
+                "status": hot_status,
                 "note": "in-loop send to live runtime (plugin steer)",
                 "hint": _ask_retrieve_hint(review_key),  # E1
             }, indent=2))
@@ -1074,9 +1110,11 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             except Exception as exc:
                 print(f"warning: warm task enqueue failed: {exc}", file=sys.stderr)
             # M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导；
+            # P1: manifest 可能过期——先经 runtime.context_get 实时修正，
+            # 查询失败/非 gateway 调用时 manifest 仅作 fallback。
             # 显式 --model / manifest.model 覆盖仍优先。
             ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
-            ask_model_chain = _model_chain_from_manifest(
+            ask_model_chain = _ask_model_chain_realtime(
                 ask_agent_type, manifest, explicit_override=getattr(args, "model", "") or "")
             ask_primary = ask_model_chain[0] if ask_model_chain else (manifest.model or "")
             ask_chain_env: dict[str, str] = {}
@@ -1179,9 +1217,11 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     # 实例（回归）。这里直接生成 snapshot 上下文，忽略决策层的 context。
     cold_context = build_cold_context(review_key)
     # M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导；
+    # P1: manifest 可能过期——先经 runtime.context_get 实时修正，
+    # 查询失败/非 gateway 调用时 manifest 仅作 fallback。
     # 显式 --model / manifest.model 覆盖仍优先。
     ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
-    ask_model_chain = _model_chain_from_manifest(
+    ask_model_chain = _ask_model_chain_realtime(
         ask_agent_type, manifest, explicit_override=getattr(args, "model", "") or "")
     cold_primary = ask_model_chain[0] if ask_model_chain else (
         (manifest.model if manifest else "") or (getattr(args, "model", "") or ""))

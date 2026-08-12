@@ -222,39 +222,36 @@ class ControlStore:
         variant/epoch）。传空字符串时保留已有值（不覆盖）。
         """
         now = _utcnow_iso()
+        # P1: 事务边界统一由 _connect(critical) 上下文管理器承担（正常退出
+        # commit / 异常 rollback）；不再函数内显式 BEGIN IMMEDIATE/COMMIT，
+        # 避免与外层 _connect 事务套事务冲突。
         with self._connect(critical=True) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = conn.execute(
-                    "SELECT last_state_seq, model_context FROM runtime_generations"
-                    " WHERE runtime_id = ?",
-                    (runtime_id,),
-                ).fetchone()
-                seq = int(row[0]) + 1 if row else 1
-                # model_context 为空时保留已有值（避免无上下文的归约覆盖已持久化的上下文）
-                effective_ctx = model_context if model_context else (row[1] if row else '{}')
-                conn.execute(
-                    "INSERT INTO runtime_generations (runtime_id, current_generation,"
-                    " owner_nonce, presence, binding, backend_session_id, binding_epoch,"
-                    " agent_state, last_state_seq, updated_at, model_context)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                    " ON CONFLICT(runtime_id) DO UPDATE SET"
-                    " current_generation=excluded.current_generation,"
-                    " owner_nonce=excluded.owner_nonce, presence=excluded.presence,"
-                    " binding=excluded.binding,"
-                    " backend_session_id=excluded.backend_session_id,"
-                    " binding_epoch=excluded.binding_epoch,"
-                    " agent_state=excluded.agent_state,"
-                    " last_state_seq=excluded.last_state_seq, updated_at=excluded.updated_at,"
-                    " model_context=excluded.model_context",
-                    (runtime_id, int(current_generation), owner_nonce, presence,
-                     binding, backend_session_id, int(binding_epoch), agent_state,
-                     seq, now, effective_ctx),
-                )
-                conn.execute("COMMIT")
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
+            row = conn.execute(
+                "SELECT last_state_seq, model_context FROM runtime_generations"
+                " WHERE runtime_id = ?",
+                (runtime_id,),
+            ).fetchone()
+            seq = int(row[0]) + 1 if row else 1
+            # model_context 为空时保留已有值（避免无上下文的归约覆盖已持久化的上下文）
+            effective_ctx = model_context if model_context else (row[1] if row else '{}')
+            conn.execute(
+                "INSERT INTO runtime_generations (runtime_id, current_generation,"
+                " owner_nonce, presence, binding, backend_session_id, binding_epoch,"
+                " agent_state, last_state_seq, updated_at, model_context)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(runtime_id) DO UPDATE SET"
+                " current_generation=excluded.current_generation,"
+                " owner_nonce=excluded.owner_nonce, presence=excluded.presence,"
+                " binding=excluded.binding,"
+                " backend_session_id=excluded.backend_session_id,"
+                " binding_epoch=excluded.binding_epoch,"
+                " agent_state=excluded.agent_state,"
+                " last_state_seq=excluded.last_state_seq, updated_at=excluded.updated_at,"
+                " model_context=excluded.model_context",
+                (runtime_id, int(current_generation), owner_nonce, presence,
+                 binding, backend_session_id, int(binding_epoch), agent_state,
+                 seq, now, effective_ctx),
+            )
 
     def delete_generation(self, runtime_id: str) -> bool:
         """删除 runtime_generations 行（清理旧 stopped 记录）。"""
@@ -303,23 +300,18 @@ class ControlStore:
         不重复注入）。
         """
         now = created_at or _utcnow_iso()
+        # P1: 事务边界统一由 _connect(critical) 上下文管理器承担，不显式 BEGIN/COMMIT。
         with self._connect(critical=True) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO commands (request_id, command_id, msg_id, turn_id,"
-                    " runtime_id, generation, payload_hash, state, binding_epoch,"
-                    " backend_session_id, created_at, updated_at, detail)"
-                    " VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (request_id, command_id, msg_id, runtime_id, int(generation),
-                     payload_hash, state, int(binding_epoch), backend_session_id,
-                     now, now, json.dumps(detail or {}, ensure_ascii=False)),
-                )
-                created = int(cur.rowcount or 0) > 0
-                conn.execute("COMMIT")
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO commands (request_id, command_id, msg_id, turn_id,"
+                " runtime_id, generation, payload_hash, state, binding_epoch,"
+                " backend_session_id, created_at, updated_at, detail)"
+                " VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (request_id, command_id, msg_id, runtime_id, int(generation),
+                 payload_hash, state, int(binding_epoch), backend_session_id,
+                 now, now, json.dumps(detail or {}, ensure_ascii=False)),
+            )
+            created = int(cur.rowcount or 0) > 0
         return created
 
     def get_command(self, request_id: str) -> Optional[dict]:
@@ -364,16 +356,11 @@ class ControlStore:
         sets.append("updated_at = ?")
         args.append(now)
         args.append(request_id)
+        # P1: 事务边界统一由 _connect(critical) 上下文管理器承担，不显式 BEGIN/COMMIT。
         with self._connect(critical=True) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    f"UPDATE commands SET {', '.join(sets)} WHERE request_id = ?", args,
-                )
-                conn.execute("COMMIT")
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
+            conn.execute(
+                f"UPDATE commands SET {', '.join(sets)} WHERE request_id = ?", args,
+            )
         return self.get_command(request_id)
 
     def list_commands(self, runtime_id: str = "", state: Optional[str] = None,
