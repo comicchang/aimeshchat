@@ -1,8 +1,8 @@
 """Gateway + events CLI handlers — start/ensure/status/stop/serve/rpc and events watch.
 
-- ``gateway start``  — spawn the gateway inside a private tmux pane (idempotent:
-  an already-handshaking UDS returns success; a stale socket is only removed
-  when same-UID, connect fails AND the tmux session is not alive).
+- ``gateway start``  — spawn the gateway inside a private tmux pane (idempotent):
+  stale socket detected via UDS connect (not tmux session liveness); PID lock
+  prevents concurrent gateways; old brand tmux servers are cleaned up on start.
 - ``gateway ensure`` — (P3) verify a remote host's aimeshchat/wire/tmux, then
   start its gateway over SSH.
 - ``gateway serve``  — foreground gateway process (the tmux pane's command).
@@ -26,8 +26,9 @@ log = logging.getLogger(__name__)
 
 from codeagent.constants import STREAM_HEARTBEAT_INTERVAL
 from codeagent.gateway.client import GatewayClient, rpc_stdio
-from codeagent.gateway.events import control_socket_path
+from codeagent.gateway.events import control_socket_path, gateway_state_dir
 from codeagent.gateway.model import GatewayError
+from codeagent.gateway.server import _socket_is_alive
 from codeagent.launchers.tmux import (
     TMUX_SESSION_NAME,
     ensure_tmux_server,
@@ -46,32 +47,60 @@ def _gateway_running() -> bool:
 
 
 def cmd_gateway_start(args) -> int:
-    """Start the local gateway inside the private tmux session (idempotent)."""
+    """Start the local gateway inside the private tmux session (idempotent).
+
+    P1: stale socket detected via UDS connect test (not tmux session liveness).
+    P2: old brand tmux servers (postmesh-tmux, codeagent-tmux) are cleaned up.
+    P3: PID lock file prevents concurrent gateways.
+    """
     if _gateway_running():
         print("gateway: already running")
         return 0
 
     sock = control_socket_path()
-    # Stale socket policy: only remove when same-UID, connect fails, and the
-    # tmux session is not alive.
+    # P1: Stale socket policy — use UDS connect test, not tmux session.
     if sock.exists():
         same_uid = _socket_owner_is_self(sock)
-        tmux_alive = _tmux_session_alive()
-        if same_uid and not tmux_alive:
-            print(f"gateway: removing stale socket {sock}")
-            try:
-                sock.unlink()
-            except OSError:
-                pass
-        elif not same_uid:
+        if not same_uid:
             print(
                 f"gateway: refusing to remove socket {sock} (same_uid={same_uid})",
                 file=sys.stderr,
             )
             return 1
+        # UDS connect test: socket exists → try to connect.
+        if _socket_is_alive(sock):
+            # connect OK → someone is listening.  Re-check gateway handshake
+            # (may have passed above, but the socket could have appeared
+            # between the _gateway_running() check and now).
+            if _gateway_running():
+                print("gateway: already running")
+                return 0
+            # connect OK but handshake fails → stale process holding socket.
+            print(f"gateway: socket alive but handshake failed, removing {sock}")
+            try:
+                sock.unlink()
+            except OSError:
+                pass
+        else:
+            # connect failed → nobody listening → stale socket.
+            print(f"gateway: removing stale socket {sock}")
+            try:
+                sock.unlink()
+            except OSError:
+                pass
+
+    # P2: Clean up old brand tmux server remnants before starting.
+    _cleanup_legacy_tmux_servers()
 
     if not ensure_tmux_server():
         print("gateway: cannot start private tmux server", file=sys.stderr)
+        return 1
+
+    # P3: PID lock — another gateway process may hold the lock.
+    pid_path = _gateway_pid_path()
+    pid_ok, pid_val = _check_pid_lock(pid_path)
+    if not pid_ok:
+        print(f"gateway: another gateway running (pid={pid_val})", file=sys.stderr)
         return 1
 
     # A "gateway"-named window that is NOT responding is stale — remove it
@@ -111,6 +140,99 @@ def _tmux_session_alive() -> bool:
     return rc == 0
 
 
+# ── P2: legacy tmux brand cleanup ──────────────────────────────────────
+
+_LEGACY_TMUX_BRANDS = ("postmesh-tmux", "codeagent-tmux")
+
+
+def _cleanup_legacy_tmux_servers() -> None:
+    """P2: kill old brand tmux servers left over from prior branding.
+
+    Looks for ``${TMPDIR:-/tmp}/<brand>/codeagent.sock`` (the private tmux
+    socket) and runs ``tmux -S <sock> kill-server`` before removing the
+    directory.  Best-effort: failures are logged but never abort the start.
+    """
+    tmpdir = Path(os.environ.get("TMPDIR", "/tmp"))
+    for brand in _LEGACY_TMUX_BRANDS:
+        brand_dir = tmpdir / brand
+        sock = brand_dir / "codeagent.sock"
+        if not brand_dir.exists():
+            continue
+        # Attempt tmux kill-server on the brand's private socket.
+        if sock.exists():
+            try:
+                subprocess.run(
+                    ["tmux", "-S", str(sock), "kill-server"],
+                    capture_output=True, timeout=5,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                log.debug("legacy tmux kill-server failed for %s: %s", brand, exc)
+        # Remove the brand directory (best-effort).
+        import shutil
+
+        try:
+            shutil.rmtree(brand_dir, ignore_errors=True)
+            log.info("cleaned up legacy tmux dir: %s", brand_dir)
+        except OSError:
+            pass
+
+
+# ── P3: PID lock file ──────────────────────────────────────────────────
+
+
+def _gateway_pid_path() -> Path:
+    """Return ``gateway_state_dir()/gateway.pid``."""
+    return gateway_state_dir() / "gateway.pid"
+
+
+def _check_pid_lock(pid_path: Path) -> tuple[bool, Optional[int]]:
+    """Check the PID lock file.
+
+    Returns ``(True, None)`` when no lock or lock is stale (process gone).
+    Returns ``(False, pid)`` when another live gateway holds the lock.
+    """
+    if not pid_path.exists():
+        return True, None
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        # Corrupt lock file — treat as stale.
+        try:
+            pid_path.unlink()
+        except OSError:
+            pass
+        return True, None
+    # Check if process is alive.
+    try:
+        os.kill(pid, 0)
+        return False, pid
+    except (ProcessLookupError, OSError):
+        # Stale lock — remove it.
+        try:
+            pid_path.unlink()
+        except OSError:
+            pass
+        return True, None
+
+
+def _write_pid_file(pid_path: Path) -> None:
+    """Write current PID to the lock file (called by serve_forever)."""
+    try:
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError as exc:
+        log.warning("failed to write PID file %s: %s", pid_path, exc)
+
+
+def _remove_pid_file(pid_path: Path) -> None:
+    """Remove the PID lock file (best-effort, called on shutdown)."""
+    try:
+        if pid_path.exists():
+            pid_path.unlink()
+    except OSError:
+        pass
+
+
 def _tmux(*args: str) -> tuple[int, str, str]:
     try:
         r = subprocess.run(
@@ -147,6 +269,67 @@ def _tmux_new_gateway_pane() -> tuple[int, str, str]:
     if not pane:
         return 1, "", "tmux returned no pane id"
     return _tmux("send-keys", "-t", pane, serve_cmd, "Enter")
+
+
+# ── P5: gateway health monitoring ───────────────────────────────────────
+
+
+def cmd_gateway_health(args) -> int:
+    """Check gateway health; --watch for continuous monitoring.
+
+    P5: reports UDS liveness, PID lock status, and capability details.
+    In --watch mode, polls every ``--interval`` seconds and prints status
+    lines.  Exit 0 when gateway is healthy; exit 1 when unhealthy.
+    """
+    watch = bool(getattr(args, "watch", False))
+    interval = float(getattr(args, "interval", 5) or 5)
+
+    while True:
+        alive = _gateway_running()
+        pid_path = _gateway_pid_path()
+        pid_info = ""
+        if pid_path.exists():
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8").strip())
+                try:
+                    os.kill(pid, 0)
+                    pid_info = f"pid={pid} alive"
+                except (ProcessLookupError, OSError):
+                    pid_info = f"pid={pid} stale"
+            except (ValueError, OSError):
+                pid_info = "pid=unknown(corrupt)"
+        else:
+            pid_info = "pid=none"
+
+        sock = control_socket_path()
+        sock_exists = sock.exists()
+
+        if alive:
+            try:
+                caps = GatewayClient(timeout=3).call("capabilities.get")
+                version = caps.get("version")
+                runtimes = caps.get("runtimes", [])
+                status_line = (
+                    f"healthy  socket={sock}  {pid_info}  "
+                    f"version={version}  runtimes={len(runtimes)}"
+                )
+            except (GatewayError, Exception) as exc:
+                status_line = f"degraded  socket={sock}  {pid_info}  error={exc}"
+        else:
+            status_line = (
+                f"unhealthy  socket_exists={sock_exists}  {pid_info}"
+            )
+
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] {status_line}")
+
+        if not watch:
+            return 0 if alive else 1
+
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            return 0
 
 
 def cmd_gateway_ensure(args) -> int:
@@ -275,6 +458,8 @@ def cmd_gateway_stop(args) -> int:
             sock.unlink()
         except OSError:
             pass
+    # P3: clean up PID lock file on stop.
+    _remove_pid_file(_gateway_pid_path())
     print("gateway: stopped")
     return 0
 
@@ -493,6 +678,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub.add_parser("status", help="Show local gateway status")
     sub.add_parser("stop", help="Stop the local gateway")
     sub.add_parser("serve", help="Foreground gateway process (tmux pane command)")
+    health_p = sub.add_parser("health", help="P5: gateway health check / watch")
+    health_p.add_argument("--watch", action="store_true", help="Continuous monitoring mode")
+    health_p.add_argument("--interval", type=float, default=5, help="Poll interval seconds (default 5)")
     rpc_p = sub.add_parser("rpc", help="Bounded RPC")
     rpc_p.add_argument("--stdio", action="store_true")
     rpc_p.add_argument("method", nargs="?", default="")
@@ -507,12 +695,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         gw_cmd=args.cmd, host=None, stdio=getattr(args, "stdio", False),
         method=getattr(args, "method", ""), params=getattr(args, "params", ""),
         timeout=getattr(args, "timeout", 15.0),
+        watch=getattr(args, "watch", False),
+        interval=getattr(args, "interval", 5),
     )
     handlers = {
         "start": cmd_gateway_start,
         "status": cmd_gateway_status,
         "stop": cmd_gateway_stop,
         "serve": cmd_gateway_serve,
+        "health": cmd_gateway_health,
         "rpc": cmd_gateway_rpc,
     }
     return handlers[args.cmd](ns)

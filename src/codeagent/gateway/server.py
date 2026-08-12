@@ -86,6 +86,8 @@ class GatewayServer:
         self._sock = sock
         # P3-b: track that THIS process owns the socket we just bound.
         self._owned_socket = True
+        # P3: write PID lock file after successful bind.
+        self._write_pid_file()
         log.info("gateway listening on %s", self._socket_path)
 
         while not self._shutdown.is_set():
@@ -130,6 +132,8 @@ class GatewayServer:
                 self._socket_path.unlink()
             except OSError:
                 pass
+        # P3: remove PID lock file on shutdown.
+        self._remove_pid_file()
         # P3-c: join all connection handler threads so stop() is a clean
         # shutdown barrier (no orphaned threads leaking past teardown).
         with self._threads_lock:
@@ -144,6 +148,29 @@ class GatewayServer:
         """P3-c: remove finished threads from the deque (caller holds lock)."""
         while self._threads and not self._threads[0].is_alive():
             self._threads.popleft()
+
+    # ── P3: PID lock file ──────────────────────────────────────────────
+
+    def _pid_file_path(self) -> Path:
+        """Return ``<socket_dir>/gateway.pid``."""
+        return self._socket_path.parent / "gateway.pid"
+
+    def _write_pid_file(self) -> None:
+        """Write current PID to the lock file."""
+        pid_path = self._pid_file_path()
+        try:
+            pid_path.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError as exc:
+            log.warning("failed to write PID file %s: %s", pid_path, exc)
+
+    def _remove_pid_file(self) -> None:
+        """Remove the PID lock file (best-effort)."""
+        pid_path = self._pid_file_path()
+        try:
+            if pid_path.exists():
+                pid_path.unlink()
+        except OSError:
+            pass
 
     # ── connection handling ────────────────────────────────────────────
 

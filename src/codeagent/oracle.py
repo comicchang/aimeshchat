@@ -58,6 +58,54 @@ def _gateway() -> GatewayClient:
     return GatewayClient(timeout=10)
 
 
+def _ensure_gateway_or_hint() -> bool:
+    """P4: ensure a gateway is reachable; auto-start if not.
+
+    Returns True when the gateway is (or just became) running.
+    When auto-start fails, prints a hint to stderr and returns False.
+    """
+    # Fast path: already running.
+    try:
+        GatewayClient(timeout=2).call("capabilities.get")
+        return True
+    except Exception:
+        pass
+
+    # Attempt auto-start via subprocess (same entry-point as `aimeshchat gateway start`).
+    log.info("oracle: gateway not running — attempting auto-start")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "codeagent.gateway.cli", "start"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if proc.returncode == 0:
+            # Brief pause for socket readiness after a successful start.
+            time.sleep(1.5)
+            try:
+                GatewayClient(timeout=2).call("capabilities.get")
+                log.info("oracle: gateway auto-start succeeded")
+                return True
+            except Exception:
+                pass
+        # start command failed or socket still not ready.
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        hint_detail = detail[-1] if detail else "unknown error"
+        log.warning("oracle: gateway auto-start failed (%s)", hint_detail)
+    except subprocess.TimeoutExpired:
+        log.warning("oracle: gateway auto-start timed out (20s)")
+    except FileNotFoundError:
+        log.warning("oracle: python executable not found for gateway auto-start")
+    except Exception as exc:
+        log.warning("oracle: gateway auto-start error: %s", exc)
+
+    print(
+        "error: gateway not running — auto-start failed.\n"
+        "hint: run 'aimeshchat gateway start' manually, then retry.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _review_sid(review_key: str) -> str:
     """Swarm session id for a review key (hash-derived ora-* scheme).
 
@@ -588,6 +636,10 @@ def _resolve_bound_session_id(review_key: str, manifest) -> str:
 
 def cmd_oracle_start(args: argparse.Namespace) -> int:
     """Create review/session/runtime and return the runtime id."""
+    # P4: refuse to start when gateway is unreachable (auto-start attempted).
+    if not _ensure_gateway_or_hint():
+        return 1
+
     # A4: heartbeat defense — refuse to start when the mailbox plugin cannot
     # report runtime events (presence/heartbeat would silently degrade).
     plugin_err = _check_mailbox_plugin()
@@ -1981,6 +2033,10 @@ def cmd_oracle_revive(args: argparse.Namespace) -> int:
     mode: bg（默认）/pane 走 RuntimeRegistry.spawn（监督式 runtime）；
     resume 走 ``omp --resume`` 前台附着（绕过 aimeshchat）。
     """
+    # P4: refuse to revive when gateway is unreachable (auto-start attempted).
+    if not _ensure_gateway_or_hint():
+        return 1
+
     from codeagent.park.router import revive_or_spawn
 
     review_key = args.review_key

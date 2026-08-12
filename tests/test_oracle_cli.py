@@ -71,7 +71,8 @@ class TestOracleStart:
                  workdir=str(tmp_path), model="", prompt="hi")
         from codeagent.park.registry import ParkRegistry
 
-        with patch("codeagent.oracle.RuntimeRegistry.spawn", return_value=_handle()) as spawn, \
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn", return_value=_handle()) as spawn, \
              patch("codeagent.cli._get_swarm_kernel") as mock_kernel:
             kernel = MagicMock()
             store = MagicMock()
@@ -92,7 +93,8 @@ class TestOracleStart:
         registry.acquire("k1", _manifest("k1"))
         ns = _NS(review_key="k1", agent="oracle", backend="omp",
                  workdir=str(tmp_path), model="", prompt="")
-        with patch("codeagent.oracle.RuntimeRegistry.spawn", return_value=_handle()), \
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn", return_value=_handle()), \
              patch("codeagent.cli._get_swarm_kernel") as mock_kernel:
             kernel = MagicMock()
             store = MagicMock()
@@ -349,7 +351,8 @@ def test_attach_routes_to_revive_when_released(tmp_path):
         backend_session_id="sid-a", lifecycle=Lifecycle.HOT_PARKED))
     registry.release("k-attach")  # → RELEASED_SOFT
     ns = Namespace(review_key="k-attach", mode="bg", prompt="")
-    rc = cmd_oracle_attach(ns)
+    with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True):
+        rc = cmd_oracle_attach(ns)
     assert rc == 0
     got = registry.lookup("k-attach")
     assert got is not None and got.lifecycle == Lifecycle.HOT_PARKED, "attach 应 revive 回 HOT_PARKED"

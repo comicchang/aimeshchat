@@ -220,6 +220,9 @@ def _build_parser() -> argparse.ArgumentParser:
     gw_rpc.add_argument("method", nargs="?", default="", help="Gateway method (when not --stdio)")
     gw_rpc.add_argument("--params", default="", help="JSON params dict (when not --stdio)")
     gw_rpc.add_argument("--timeout", type=float, default=15.0)
+    gw_health = gw_sub.add_parser("health", help="P5: gateway health check / watch")
+    gw_health.add_argument("--watch", action="store_true", help="Continuous monitoring mode")
+    gw_health.add_argument("--interval", type=float, default=5.0, help="Poll interval in seconds (--watch)")
 
     # ── events ──────────────────────────────────────────────────────────
     ev_p = sub.add_parser("events", help="Runtime event observability")
@@ -2033,7 +2036,7 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
 
     cmd = args.gw_cmd
     if cmd is None:
-        print("gateway: missing subcommand. Try: aimeshchat gateway start|ensure|status|stop|serve|rpc", file=sys.stderr)
+        print("gateway: missing subcommand. Try: aimeshchat gateway start|ensure|status|stop|serve|rpc|health", file=sys.stderr)
         return 1
     handlers = {
         "start": gw_cli.cmd_gateway_start,
@@ -2042,6 +2045,7 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
         "stop": gw_cli.cmd_gateway_stop,
         "serve": gw_cli.cmd_gateway_serve,
         "rpc": gw_cli.cmd_gateway_rpc,
+        "health": gw_cli.cmd_gateway_health,
     }
     return handlers[cmd](args)
 
