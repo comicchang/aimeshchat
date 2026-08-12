@@ -25,6 +25,7 @@ def gw(tmp_path: Path) -> AgentGateway:
         store=store, events=events, restore_from_park=False,
         peers_file=base / "peers.json",
     )
+    gateway._offline_timeout = 120.0  # explicit (A4: default relaxed to 300s)
     yield gateway
 
 

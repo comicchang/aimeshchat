@@ -20,16 +20,19 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
 log = logging.getLogger(__name__)
 
+from codeagent.constants import ISO_TIMESTAMP_FORMAT
 from codeagent.gateway.client import GatewayClient
 from codeagent.gateway.events import control_socket_path
 from codeagent.gateway.model import GatewayError
@@ -379,8 +382,194 @@ def ensure_omp_memory_config() -> dict:
 # ── start ──────────────────────────────────────────────────────────────
 
 
+def _check_mailbox_plugin() -> Optional[str]:
+    """A4: verify the installed omp-mailbox-plugin can report runtime events.
+
+    Returns an error message when the plugin is missing or predates
+    RuntimeEventReporter — otherwise None. Without the reporter, gateway
+    heartbeat presence silently degrades (no runtime events), so oracle start
+    must fail loudly instead of proceeding blind.
+    """
+    plugin_src = (
+        Path.home() / ".omp" / "plugins" / "node_modules"
+        / "omp-mailbox-plugin" / "src" / "index.ts"
+    )
+    try:
+        text = plugin_src.read_text(encoding="utf-8")
+    except OSError as exc:
+        return (
+            f"omp-mailbox-plugin not found at {plugin_src} ({exc}); oracle "
+            "heartbeat presence requires it. Update: run `omp plugin update "
+            "omp-mailbox-plugin` (or reinstall), then retry oracle start."
+        )
+    if "RuntimeEventReporter" not in text:
+        return (
+            f"installed omp-mailbox-plugin ({plugin_src}) predates "
+            "RuntimeEventReporter — heartbeat presence is unavailable. Update "
+            "the plugin (`omp plugin update omp-mailbox-plugin`), then retry "
+            "oracle start."
+        )
+    return None
+
+
+def _oracle_init_protocol(sid: str) -> str:
+    """B3: self-describing protocol block embedded in the oracle-init TASK body.
+
+    The plugin handshake picks the TASK body up as the initial user message
+    (pi.sendUserMessage); embedding reply_format / required_fields / example
+    makes the handshake self-describing without a separate doc fetch.
+    """
+    return (
+        "\n\n--- ORACLE MAILBOX PROTOCOL (B3) ---\n"
+        "reply_format: REPORT envelope via `mailbox send --kind REPORT` "
+        "(JSON payload in --body)\n"
+        "required_fields: reply_to=<original msg_id>, run_id, request_id\n"
+        f"example: mailbox send --session {sid} --from oracle --to manager "
+        "--kind REPORT --reply-to <msg_id> --run-id <run_id> "
+        "--request-id <request_id> --subject result --body '<json>'\n"
+    )
+
+
+# ── A1: session_id 同步绑定 + meta.json ───────────────────────────────
+
+
+def _oracle_meta_path(review_key: str) -> Path:
+    """A1: meta.json path for a review key (~/.omp/oracle/<safe-key>/meta.json).
+
+    review_key may carry ':' / '/' — sanitize into a safe directory name
+    (same substitution ``_review_sid`` applies to ':').
+    """
+    safe = review_key.replace(":", "-").replace("/", "-").replace("\\", "-")
+    return Path.home() / ".omp" / "oracle" / safe / "meta.json"
+
+
+def _read_oracle_meta(review_key: str) -> dict:
+    """A1: read the bound-session meta for a review key ({} when absent)."""
+    try:
+        path = _oracle_meta_path(review_key)
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_oracle_meta(review_key: str, backend_session_id: str, status: str,
+                       swarm_session_id: str = "") -> dict:
+    """A1: persist bound-session meta (backend_session_id/bound_at/status).
+
+    ``status`` is "bound" after a successful bind; the file is the warm
+    resume point for revive/ask when the park manifest is missing or stale.
+    """
+    meta = {
+        "review_key": review_key,
+        "swarm_session_id": swarm_session_id,
+        "backend_session_id": backend_session_id,
+        "bound_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
+        "status": status,
+    }
+    try:
+        path = _oracle_meta_path(review_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".tmp-{uuid4().hex[:8]}.json"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(path))
+    except OSError as exc:
+        print(f"warning: oracle meta write failed: {exc}", file=sys.stderr)
+    return meta
+
+
+def _runtime_log_path(handle) -> Optional[Path]:
+    """A1: runtime log file for a spawned handle.
+
+    OMP interactive handles carry the supervisor spec path — the log lives
+    beside it (<runtime_dir>/<runtime_id>.log). Falls back to the
+    supervisor's canonical runtime dir (``_runtime_dir``).
+    """
+    spec_path = getattr(handle, "extra", {}).get("spec_path") if hasattr(handle, "extra") else None
+    if spec_path:
+        p = Path(spec_path)
+        if p.parent.is_dir():
+            return p.parent / f"{handle.runtime_id}.log"
+    try:
+        from codeagent.runtime.supervisor import _runtime_dir
+
+        return _runtime_dir(handle.runtime_id) / f"{handle.runtime_id}.log"
+    except Exception:
+        return None
+
+
+def _scan_runtime_log_for_session_id(log_path: Optional[Path]) -> str:
+    """A1: extract the native backend session id from a runtime log.
+
+    Scans for ``session_id=`` / ``backend_session=`` markers (the OMP plugin
+    / opencode runner print the native backend session id as it binds).
+    ``backend_session*`` matches win over generic ``session_id`` (which can
+    also carry the ora-* swarm sid); the LAST match wins (the bound id is
+    printed once the session actually starts).
+    """
+    if log_path is None or not log_path.exists():
+        return ""
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    backend_matches = re.findall(r"backend_session(?:_id)?\s*=\s*([^\s,;\"']+)", text)
+    if backend_matches:
+        return backend_matches[-1].strip()
+    for g in reversed(re.findall(r"session_id\s*=\s*([^\s,;\"']+)", text)):
+        g = g.strip().strip('"').strip("'")
+        if g and not g.startswith("ora-"):
+            return g
+    return ""
+
+
+def _poll_backend_session_id(handle, timeout: float = 60.0, interval: float = 0.5) -> str:
+    """A1: synchronously bind the backend session id after spawn (≤60s).
+
+    Fast path: the handle already carries a ``backend_session_id`` (adapters
+    that resolve it synchronously). Otherwise poll the runtime log for up to
+    *timeout* seconds, scanning for ``session_id=`` / ``backend_session=``.
+    Returns "" when binding times out (caller must NOT report success).
+    """
+    direct = getattr(handle, "backend_session_id", "") or ""
+    if direct:
+        return direct
+    log_path = _runtime_log_path(handle)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sid = _scan_runtime_log_for_session_id(log_path)
+        if sid:
+            return sid
+        time.sleep(interval)
+    return ""
+
+
+def _resolve_bound_session_id(review_key: str, manifest) -> str:
+    """A1: backend session id for a review key — manifest → meta.json.
+
+    The park manifest is authoritative (updated on start/ask/revive);
+    meta.json is the A1 persistence that survives manifest loss and warms
+    revive/ask before spawning.
+    """
+    if manifest is not None and getattr(manifest, "backend_session_id", ""):
+        return manifest.backend_session_id
+    meta = _read_oracle_meta(review_key)
+    return (meta or {}).get("backend_session_id", "") or ""
+
+
 def cmd_oracle_start(args: argparse.Namespace) -> int:
     """Create review/session/runtime and return the runtime id."""
+    # A4: heartbeat defense — refuse to start when the mailbox plugin cannot
+    # report runtime events (presence/heartbeat would silently degrade).
+    plugin_err = _check_mailbox_plugin()
+    if plugin_err is not None:
+        print(f"error: {plugin_err}", file=sys.stderr)
+        return 1
     review_key = args.review_key
     backend = _resolve_backend(args.agent, args.backend)
     workdir = args.workdir or os.getcwd()
@@ -448,7 +637,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
                 from_id="manager",
                 to_id=_ORACLE_AGENT,
                 subject="oracle-init",
-                body=prompt,
+                body=prompt + _oracle_init_protocol(sid),  # B3: self-describing handshake
                 kind="TASK",
                 run_id=f"run-{uuid4().hex[:10]}",
                 request_id=f"req-{uuid4().hex[:10]}",
@@ -474,6 +663,23 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "env": spawn_env,
     })
 
+    # ── A1: session_id 同步绑定 ──────────────────────────────────────
+    # Poll the runtime log (≤60s) for the native backend session id so the
+    # review's warm resume point is known BEFORE start returns, then persist
+    # it to ~/.omp/oracle/<review_key>/meta.json for revive/ask reuse.
+    bound_session_id = _poll_backend_session_id(handle)
+    if not bound_session_id:
+        # A1: binding failure must NOT report success — stop the runtime to
+        # avoid a leak and return non-zero.
+        try:
+            reg.stop(handle.runtime_id, "session-id-binding-timeout")
+        except Exception as stop_exc:
+            log.debug("oracle start: runtime stop after binding timeout failed (%s)", stop_exc)
+        print("error: session_id binding timeout "
+              f"(no 'session_id='/backend_session=' marker in the runtime log for "
+              f"{handle.runtime_id} within 60s)", file=sys.stderr)
+        return 1
+
     # Persist backend session into the park manifest (authoritative).
     # NOTE: manifest.model stores the EXPLICIT override only (args.model).
     # The resolved primary (chain[0]) is used for spawn, but persisting it
@@ -487,7 +693,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         host="__local__",
         workdir=workdir,
         lifecycle=Lifecycle.HOT_PARKED,
-        backend_session_id=handle.backend_session_id,
+        backend_session_id=bound_session_id,
         created_at=(existing.created_at if existing else time.time()),
         last_activity_at=time.time(),
     )
@@ -495,6 +701,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         registry.update(review_key, manifest)
     else:
         registry.acquire(review_key, manifest)
+
+    # A1: persist the bound-session meta (backend_session_id/bound_at/status).
+    _write_oracle_meta(review_key, bound_session_id, "bound", swarm_session_id=sid)
 
     # Adopt the runtime into the LOCAL gateway so presence/status work even
     # for runtimes without a plugin handshake (opencode/generic).
@@ -505,7 +714,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "session_id": sid,
         "runtime_id": handle.runtime_id,
         "backend": backend,
-        "backend_session_id": handle.backend_session_id,
+        "backend_session_id": bound_session_id,
+        "bound": True,
+        "meta_path": str(_oracle_meta_path(review_key)),
         "generation": handle.generation,
         "mode": handle.mode,
         "capabilities": sorted(handle.capabilities),
@@ -570,7 +781,9 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     # ── Warm: native backend session resume ───────────────────────────
     registry = ParkRegistry()
     manifest = registry.lookup(review_key)
-    if manifest and manifest.backend_session_id:
+    # A1: warm 前置 — meta.json 绑定的 backend session 复用（manifest 优先）。
+    bound_sid = _resolve_bound_session_id(review_key, manifest)
+    if manifest and bound_sid:
         # P2-12: registry is created up front so a failed warm spawn can be
         # stopped from the except handler before degrading to cold.
         reg = RuntimeRegistry()
@@ -608,7 +821,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "workdir": manifest.workdir or os.getcwd(),
                 "task": prompt,
                 "model": ask_primary,
-                "backend_session_id": manifest.backend_session_id,
+                "backend_session_id": bound_sid,
                 "gateway_socket": str(control_socket_path()),
                 "owner_pid": os.getpid(),
                 "nonce": uuid4().hex[:12],
@@ -619,11 +832,11 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             # with an empty one — the opencode extraction window may close
             # before the session id is known, and clobbering it would destroy
             # the resume point (next warm attempt degrades to cold).
-            new_backend_session_id = warm_handle.backend_session_id or manifest.backend_session_id
+            new_backend_session_id = warm_handle.backend_session_id or bound_sid
             if not warm_handle.backend_session_id:
                 print(
                     f"warning: warm: backend session id extraction window failed — "
-                    f"preserving previous id {manifest.backend_session_id!r}",
+                    f"preserving previous id {bound_sid!r}",
                     file=sys.stderr,
                 )
             # Update manifest backend id + lifecycle (in-place, no UNIQUE clash).
@@ -645,7 +858,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "method": "warm",
                 "review_key": review_key,
                 "runtime_id": warm_handle.runtime_id,
-                "old_backend_session_id": manifest.backend_session_id,
+                "old_backend_session_id": bound_sid,
                 "new_backend_session_id": new_backend_session_id,
                 "model_chain": ask_model_chain,
                 "note": (
@@ -733,9 +946,6 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
         "note": "snapshot reconstruction (no live/hot session)",
     }, indent=2))
     return 0
-
-
-# ── status ─────────────────────────────────────────────────────────────
 
 
 def cmd_oracle_status(args: argparse.Namespace) -> int:
@@ -831,6 +1041,46 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
         except Exception:
             out["receipts"] = []
 
+    # B2: mailbox unread aggregation — unread count + latest REPORT preview +
+    # recommendation.  Inbox files == delivered-but-not-read (two-phase
+    # consumption: inbox → processing → archive).
+    if manifest and manifest.swarm_session_id:
+        try:
+            inbox_dir = store.agent_subdir(manifest.swarm_session_id, _ORACLE_AGENT, "inbox")
+            unread = 0
+            latest_report: Optional[dict] = None
+            for f in store.list_messages(inbox_dir):
+                try:
+                    msg = json.loads(f.read_bytes())
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    continue
+                unread += 1
+                if msg.get("kind") == "REPORT":
+                    created = msg.get("created_at", "")
+                    if latest_report is None or created >= latest_report.get("created_at", ""):
+                        latest_report = {
+                            "msg_id": msg.get("msg_id"),
+                            "from": msg.get("from"),
+                            "created_at": created,
+                            "subject": (msg.get("subject") or "")[:120],
+                            "body_preview": (msg.get("body") or "")[:300],
+                        }
+            if unread == 0:
+                recommendation = "none"
+            elif latest_report is not None:
+                recommendation = "read or ack REPORT before release"
+            else:
+                recommendation = "read inbox before release"
+            out["mailbox"] = {
+                "unread": unread,
+                "latest_report": latest_report,
+                "recommendation": recommendation,
+            }
+        except Exception:
+            out["mailbox"] = None
+    else:
+        out["mailbox"] = None
+
     print(json.dumps(out, indent=2))
     return 0
 
@@ -899,33 +1149,47 @@ def _extract_assistant_messages(path: Path, max_messages: int = 1) -> list[str]:
     return msgs[-max_messages:]
 
 
-def _fallback_find_session_for_key(review_key: str) -> Optional[Path]:
-    """Best-effort scan of recent OMP session files when backend_session_id is missing.
+def _fallback_find_session_for_key(review_key: str, since: Optional[float] = None) -> Optional[Path]:
+    """A2-③ filesystem source: recursive scan, EXACT review_key match, start-time window.
 
-    Recursively scans ~/.omp/agent/sessions/ for .jsonl files (newest first,
-    max 5) and scores candidates instead of first-hit matching — a short
-    tail segment (e.g. ``blur`` from ``proj:oracle:gfx:blur``) previously
-    matched unrelated sessions mentioning that word.  Scoring:
-      +100  full *review_key* appears in the transcript (most specific)
+    Recursively walks ~/.omp/agent/sessions/ (``os.walk``) for .jsonl files
+    and scores candidates instead of first-hit matching — a short tail
+    segment (e.g. ``blur`` from ``proj:oracle:gfx:blur``) previously matched
+    unrelated sessions mentioning that word.  Scoring:
+      +100  full *review_key* appears EXACTLY (word-boundary, not substring)
       +10   file lives under an oracle session dir (``ora-*`` / ``__advisor``)
       +1    specific tail segment (>= 5 chars) appears
+    ``since`` (epoch mtime) filters out sessions written before the review
+    started. A key-derived signal (full-key exact OR specific tail) is
+    REQUIRED — the ``ora-*`` dir bonus alone never matches an unrelated key.
     Returns the best-scoring file (or ``None`` when nothing scores).
     """
     sessions_root = Path.home() / ".omp" / "agent" / "sessions"
     if not sessions_root.is_dir():
         return None
 
-    # Recursively collect all .jsonl session files across every subdirectory
+    # A2: recursive walk — every session file anywhere under the root.
     all_files: list[Path] = []
-    for d in sessions_root.iterdir():
-        if d.is_dir():
-            all_files.extend(d.rglob("*.jsonl"))
+    for dirpath, _dirnames, filenames in os.walk(sessions_root):
+        for name in filenames:
+            if name.endswith(".jsonl"):
+                all_files.append(Path(dirpath) / name)
     if not all_files:
         return None
 
-    # Sort by mtime descending, keep the 5 most recent
-    all_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    recent = all_files[:5]
+    # Sort by mtime descending; drop files older than *since* (the review
+    # start), keep the 5 most recent within the window.
+    recent: list[Path] = []
+    for f in all_files:
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        if since is not None and mtime < since:
+            continue
+        recent.append((mtime, f))
+    recent.sort(key=lambda t: t[0], reverse=True)
+    recent = [f for _m, f in recent[:5]]
 
     # Derive tokens: full review_key first (most specific), then the tail
     # segment ONLY when it is specific enough (>= 5 chars) — short generic
@@ -934,81 +1198,227 @@ def _fallback_find_session_for_key(review_key: str) -> Optional[Path]:
     full_key = review_key if len(review_key) >= 6 else ""
     tail_ok = tail and tail != review_key and len(tail) >= 5
 
+    def _exact(lower: str, needle: str) -> bool:
+        """A2: word-boundary containment — 'proj:oracle:gfx:blur' must NOT
+        match 'proj:oracle:gfx:blur2' (substring false positive). Empty
+        before/after (string start/end) counts as a boundary."""
+        _alpha = "abcdefghijklmnopqrstuvwxyz_"
+        idx = 0
+        while True:
+            idx = lower.find(needle, idx)
+            if idx < 0:
+                return False
+            before = lower[idx - 1] if idx > 0 else ""
+            after = lower[idx + len(needle)] if idx + len(needle) < len(lower) else ""
+            if (not before or before not in _alpha) and (not after or after not in _alpha):
+                return True
+            idx += len(needle)
+        return False
+
     best: Optional[Path] = None
     best_score = 0
+    best_key_score = 0  # A2: key-derived signal (full-key exact / tail) —
+                        # the ora-* dir bonus alone must NOT match an
+                        # unrelated key (精确 review_key 匹配要求).
     for f in recent:
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         lower = text.lower()
-        score = 0
-        if full_key and full_key.lower() in lower:
-            score += 100
+        key_score = 0
+        if full_key and _exact(lower, full_key.lower()):
+            key_score += 100
+        if tail_ok and _exact(lower, tail.lower()):
+            key_score += 1
+        if key_score == 0:
+            continue  # no key signal — skip regardless of dir bonus
+        score = key_score
         if "ora-" in f.name.lower() or "ora-" in str(f.parent).lower() or "__advisor" in f.name.lower():
             score += 10
-        if tail_ok and tail.lower() in lower:
-            score += 1
         if score > best_score:
-            best, best_score = f, score
-    return best if best_score > 0 else None
+            best, best_score, best_key_score = f, score, key_score
+    return best if best_key_score > 0 else None
+
+
+def _review_start_ts(review_key: str, manifest) -> Optional[float]:
+    """A2: review start timestamp (epoch) — meta bound_at → manifest created_at.
+
+    Used as the lower bound of the filesystem source's time window (only
+    session files modified AFTER the review started are considered).
+    """
+    meta = _read_oracle_meta(review_key)
+    bound_at = meta.get("bound_at", "")
+    if bound_at:
+        try:
+            return datetime.fromisoformat(bound_at.replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError):
+            pass
+    if manifest is not None and getattr(manifest, "created_at", 0):
+        try:
+            return float(manifest.created_at)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _review_reply_to_candidates(review_key: str) -> set[str]:
+    """A2: plausible ``reply_to`` encodings for a review key.
+
+    Mailbox ``reply_to`` is validated as a safe path component — a raw
+    review key with ':' (proj:oracle:gfx:blur) can never appear verbatim.
+    Senders sanitize: full substitution (proj-oracle-gfx-blur) or the short
+    slug used by ``_review_sid``/tmux (``replace(':', '-')[-12:]``).
+    """
+    safe = review_key.replace(":", "-").replace("/", "-").replace("\\", "-")
+    slug = review_key.replace(":", "-")[-12:]
+    return {review_key, safe, slug}
+
+
+def _scan_mailbox_report(review_key: str, manifest) -> Optional[str]:
+    """A2-② mailbox source: latest REPORT envelope answering the review key.
+
+    Matches REPORT messages whose ``reply_to`` encodes the review key
+    (raw / sanitized / slug — see _review_reply_to_candidates). Scans the
+    swarm session history (manifest → meta), then falls back to a recursive
+    scan of the whole mailbox root (a plugin may report under a different
+    session). Returns the REPORT body when found, else None.
+    """
+    store = MailboxStore()
+    swarm_ids: list[str] = []
+    if manifest is not None and getattr(manifest, "swarm_session_id", ""):
+        swarm_ids.append(manifest.swarm_session_id)
+    meta = _read_oracle_meta(review_key)
+    if meta.get("swarm_session_id"):
+        swarm_ids.append(meta["swarm_session_id"])
+    reply_keys = _review_reply_to_candidates(review_key)
+
+    def _match(msg: dict) -> bool:
+        return (msg.get("kind") == "REPORT"
+                and (msg.get("reply_to") or "") in reply_keys)
+
+    # Known sessions first — canonical history, newest first.
+    for swarm_id in dict.fromkeys(swarm_ids):
+        try:
+            for msg in store.read_history(swarm_id, kind="REPORT"):
+                if _match(msg):
+                    return msg.get("body", "") or ""
+        except Exception:
+            continue
+    # Fallback: bounded recursive scan of every session history directory.
+    try:
+        candidates: list[tuple[float, dict]] = []
+        for dirpath, _dirs, files in os.walk(resolve_root()):
+            if Path(dirpath).name != "history":
+                continue
+            for name in files:
+                if not name.endswith(".json"):
+                    continue
+                p = Path(dirpath) / name
+                try:
+                    msg = json.loads(p.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if _match(msg):
+                    try:
+                        candidates.append((p.stat().st_mtime, msg))
+                    except OSError:
+                        continue
+        if candidates:
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            return candidates[0][1].get("body", "") or ""
+    except Exception:
+        pass
+    return None
 
 
 def cmd_oracle_result(args: argparse.Namespace) -> int:
-    """Print the persist-oracle's latest response for a review key.
+    """A2: unified result extraction — session transcript → mailbox REPORT → FS scan.
 
-    Reads the OMP session transcript directly — no manual file extraction.
-    ``--all`` prints every assistant message since the last checkpoint;
-    default prints the latest one.
+    Source priority (first hit wins):
+      ① session_transcript — meta.json/manifest backend_session_id → the
+         standard session-file API (_find_session_file + extract)
+      ② mailbox_report    — swarm history REPORT envelope with
+         reply_to == review_key (the task's terminal outcome)
+      ③ filesystem        — recursive scan matching review_key EXACTLY with
+         an mtime window after the review started (fallback scan)
 
-    When ``backend_session_id`` is missing (legacy plugin era), the function
-    degrades gracefully by scanning recent session files for a match.
+    Output is JSON carrying source/confidence so callers can weigh the
+    answer. ``--all`` returns every assistant message, default the latest.
     """
     review_key = args.review_key
-    manifest = ParkRegistry().lookup(review_key)
-    backend_id = (manifest.backend_session_id if manifest else "") or ""
-
-    recovered = False
-    path: Optional[Path] = None
-
-    if backend_id:
-        path = _find_session_file(backend_id)
-
-    # 改进项5: --strict refuses the best-effort scan degradation.
     strict = bool(getattr(args, "strict", False))
-    if path is None and not strict:
+    want_all = bool(getattr(args, "all", False))
+    manifest = ParkRegistry().lookup(review_key)
+    start_since = _review_start_ts(review_key, manifest)
+    max_msgs = 10**6 if want_all else 1
+
+    out: dict = {
+        "review_key": review_key,
+        "source": "",
+        "confidence": 0.0,
+        "messages": [],
+        "meta": {"strict": strict, "all": want_all},
+    }
+
+    # ── ① session transcript（meta.json session_id → 标准 API）────────
+    bound_sid = _resolve_bound_session_id(review_key, manifest)
+    if bound_sid:
+        out["meta"]["session_id"] = bound_sid
+        path = _find_session_file(bound_sid)
+        if path is not None:
+            msgs = _extract_assistant_messages(path, max_messages=max_msgs)
+            if msgs:
+                out.update({
+                    "source": "session_transcript",
+                    "confidence": 0.95,
+                    "messages": msgs,
+                })
+                out["meta"]["path"] = str(path)
+                print(json.dumps(out, indent=2))
+                return 0
+
+    # ── ② mailbox REPORT（reply_to == review_key 的终端信封）─────────
+    report = _scan_mailbox_report(review_key, manifest)
+    if report:
+        out.update({
+            "source": "mailbox_report",
+            "confidence": 0.9,
+            "messages": [report],
+        })
+        print(json.dumps(out, indent=2))
+        return 0
+
+    # ── ③ filesystem（递归 + 精确 key + start 后时间窗）──────────────
+    if not strict:
         try:
-            path = _fallback_find_session_for_key(review_key)
+            path = _fallback_find_session_for_key(review_key, since=start_since)
         except Exception:  # pragma: no cover — defensive
             path = None
         if path is not None:
-            recovered = True
+            msgs = _extract_assistant_messages(path, max_messages=max_msgs)
+            if msgs:
+                out.update({
+                    "source": "filesystem",
+                    "confidence": 0.7,
+                    "messages": msgs,
+                })
+                out["meta"]["path"] = str(path)
+                out["meta"]["since"] = start_since
+                print(json.dumps(out, indent=2))
+                return 0
 
-    if path is None:
-        # Neither primary nor fallback found anything
-        if strict:
-            print(f"no session transcript found for review key {review_key!r} "
-                  "(strict mode — best-effort scan refused; "
-                  "backend_session_id={backend_id!r})", file=sys.stderr)
-        elif not backend_id:
-            print(f"no backend session for review key {review_key!r} "
-                  "(oracle start 后才有)", file=sys.stderr)
-        else:
-            print(f"session transcript not found for {backend_id} "
-                  f"(under ~/.omp/agent/sessions/)", file=sys.stderr)
-        return 1
-
-    max_msgs = 0 if getattr(args, "all", False) else 1
-    msgs = _extract_assistant_messages(path, max_messages=max_msgs or 10**6)
-    if not msgs:
-        print(f"(no assistant messages in {path.name})", file=sys.stderr)
-        return 1
-    for m in msgs:
-        print(m)
-        print("\n" + "─" * 60 + "\n")
-    if recovered:
-        print("(recovered-from-session-log)", file=sys.stderr)
-    return 0
+    # ── Nothing found ─────────────────────────────────────────────────
+    if strict:
+        print(f"no result found for review key {review_key!r} (strict mode — "
+              f"filesystem fallback refused; backend_session_id={bound_sid!r})",
+              file=sys.stderr)
+    elif not bound_sid:
+        print(f"no result for review key {review_key!r} (oracle start 后才有)", file=sys.stderr)
+    else:
+        print(f"no result for review key {review_key!r} (session {bound_sid!r} not "
+              f"found; no mailbox REPORT; no matching session file)", file=sys.stderr)
+    return 1
 
 
 def cmd_oracle_watch(args: argparse.Namespace) -> int:
@@ -1044,6 +1454,90 @@ def cmd_oracle_watch(args: argparse.Namespace) -> int:
     return cmd_events_watch(ns)
 
 
+# ── wait（B1：阻塞到 agent_end 事件，然后内联最终文本）────────────────
+
+
+def _wait_final_text(review_key: str) -> Optional[str]:
+    """B1: extract the latest assistant text for inline printing on agent_end.
+
+    Same sources as ``oracle result`` (primary backend session transcript,
+    then best-effort scan) but returns the text instead of printing.
+    """
+    manifest = ParkRegistry().lookup(review_key)
+    backend_id = (manifest.backend_session_id if manifest else "") or ""
+    path = _find_session_file(backend_id) if backend_id else None
+    if path is None:
+        try:
+            path = _fallback_find_session_for_key(review_key)
+        except Exception:  # pragma: no cover — defensive
+            path = None
+    if path is None:
+        return None
+    msgs = _extract_assistant_messages(path, max_messages=1)
+    return msgs[-1] if msgs else None
+
+
+def cmd_oracle_wait(args: argparse.Namespace) -> int:
+    """B1: block until the review's runtime emits a TASK_STATE.agent_end event.
+
+    Polls the gateway event stream every ``--interval`` (default 5s) up to
+    ``--timeout`` (default 300s).  On agent_end, prints the final assistant
+    text inline (same transcript sources as ``oracle result``) and exits 0.
+    On timeout, emits ``{status: timeout, suggestion: "use oracle result"}``
+    and returns 1 so callers can fall back to ``oracle result``.
+    """
+    review_key = args.review_key
+    interval = max(0.1, float(getattr(args, "interval", 5.0) or 5.0))
+    timeout = max(0.0, float(getattr(args, "timeout", 300.0) or 300.0))
+
+    try:
+        info = _gateway().call("runtime.info", {"review_key": review_key})
+        runtime_id = info.get("runtime_id", "")
+        session_id = info.get("session_id", "")
+    except GatewayError as exc:
+        print(json.dumps({"status": "error", "error": exc.code,
+                          "message": exc.message}, indent=2))
+        return 1
+    if not runtime_id:
+        print(json.dumps({"status": "error", "error": "NO_RUNTIME",
+                          "message": f"no active runtime for review key {review_key!r} "
+                                     "(use 'oracle start' first)"}, indent=2))
+        return 1
+
+    # B1: replay from cursor 0 — the agent_end may already be in the store
+    # (terminal events are retained 90 days), so a missed poll never wedges.
+    cursor = 0
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            result = _gateway().call("events.list", {
+                "cursor": cursor,
+                "filters": ["TASK_STATE"],
+                "limit": 200,
+                "session_id": session_id,
+                "runtime_id": runtime_id,
+            })
+        except GatewayError as exc:
+            print(json.dumps({"status": "error", "error": exc.code,
+                              "message": exc.message}, indent=2))
+            return 1
+        for ev in result.get("events", []):
+            if ev.get("kind") == "TASK_STATE" and (ev.get("payload") or {}).get("state") == "agent_end":
+                final = _wait_final_text(review_key)
+                if final is not None:
+                    print(final)  # B1: inline final text, like `oracle result`
+                return 0
+        cursor = int(result.get("cursor") or cursor or 0)
+        if time.monotonic() >= deadline:
+            print(json.dumps({"status": "timeout",
+                              "suggestion": "use oracle result"}, indent=2))
+            return 1
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            return 130
+
+
 # ── release ────────────────────────────────────────────────────────────
 
 
@@ -1057,6 +1551,34 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
     review_key = args.review_key
     registry = ParkRegistry()
     manifest = registry.lookup(review_key)
+
+    # B2: release guard — refuse to silently drop unread REPORTs in the
+    # oracle inbox.  Advisory + interactive confirmation; --force skips.
+    if manifest:
+        try:
+            store = MailboxStore()
+            inbox_dir = store.agent_subdir(manifest.swarm_session_id, _ORACLE_AGENT, "inbox")
+            unread_reports = 0
+            for f in store.list_messages(inbox_dir):
+                try:
+                    msg = json.loads(f.read_bytes())
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    continue
+                if msg.get("kind") == "REPORT":
+                    unread_reports += 1
+            if unread_reports > 0 and not getattr(args, "force", False):
+                answer = input(f"有 {unread_reports} 条未读 REPORT，确认释放？(y/N) ").strip().lower()
+                if answer not in ("y", "yes"):
+                    print(json.dumps({
+                        "review_key": review_key,
+                        "release_aborted": True,
+                        "unread_reports": unread_reports,
+                    }, indent=2))
+                    return 1
+        except Exception:
+            # B2: mailbox unreachable/unreadable — the guard is advisory,
+            # never a hard gate on release.
+            pass
 
     # Stop the runtime (gateway) — the only way to terminate it.
     stopped = False
@@ -1173,7 +1695,10 @@ def cmd_oracle_revive(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
 
-    method = "warm" if manifest.backend_session_id else "cold"
+    # A1: warm 前置 — meta.json 绑定的 backend session 复用（manifest 优先）。
+    # 缺少 manifest 字段但 meta 有绑定时仍走 warm，避免冷重建丢失上下文。
+    bound_sid = _resolve_bound_session_id(review_key, manifest)
+    method = "warm" if bound_sid else "cold"
     try:
         if method == "warm":
             runtime_id, backend_session_id, model_chain = _revive_warm(review_key, manifest, mode)
@@ -1186,6 +1711,12 @@ def cmd_oracle_revive(args: argparse.Namespace) -> int:
             "message": str(exc),
         }, indent=2), file=sys.stderr)
         return 1
+
+    # A1: refresh the bound-session meta after a successful revive so the
+    # next warm attempt reuses the (possibly new) backend session id.
+    if backend_session_id:
+        _write_oracle_meta(review_key, backend_session_id, "bound",
+                           swarm_session_id=manifest.swarm_session_id or "")
 
     print(json.dumps({
         "review_key": review_key,
@@ -1243,10 +1774,12 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
     pane），与 cmd_oracle_ask 的 warm 路径同构。
     """
     sid = manifest.swarm_session_id or _review_sid(review_key)
+    # A1: 复用 meta.json 绑定的 backend session（manifest 缺失/被清时仍 warm）。
+    bound_sid = _resolve_bound_session_id(review_key, manifest)
 
     if mode == "resume":
-        _attach_omp_session(manifest.backend_session_id, review_key, manifest.workdir)
-        return "", manifest.backend_session_id, []
+        _attach_omp_session(bound_sid, review_key, manifest.workdir)
+        return "", bound_sid, []
 
     # ── Model fallback chain (reuse retry.fallbackChains from OMP config) ──
     agent_type = manifest.agent_type or _ORACLE_AGENT
@@ -1265,7 +1798,7 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
         "workdir": manifest.workdir or os.getcwd(),
         "task": "",
         "model": primary_model,
-        "backend_session_id": manifest.backend_session_id,
+        "backend_session_id": bound_sid,
         "gateway_socket": str(control_socket_path()),
         "owner_pid": os.getpid(),
         "nonce": uuid4().hex[:12],
@@ -1274,10 +1807,10 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
     })
     try:
         # P2-11 同款保护：session id 提取窗口失败时保留原值，避免破坏续接点。
-        new_backend_session_id = handle.backend_session_id or manifest.backend_session_id
+        new_backend_session_id = handle.backend_session_id or bound_sid
         if not handle.backend_session_id:
             print(f"warning: revive warm: backend session id extraction window failed — "
-                  f"preserving previous id {manifest.backend_session_id!r}", file=sys.stderr)
+                  f"preserving previous id {bound_sid!r}", file=sys.stderr)
         _flip_to_hot(review_key, manifest, sid=sid, backend_session_id=new_backend_session_id)
         _adopt_runtime(review_key, sid, handle, backend)
     except Exception:

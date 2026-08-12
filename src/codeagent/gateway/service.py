@@ -111,7 +111,9 @@ class AgentGateway:
         self._svc = MailboxService(store=self._store, kernel=self._kernel)
         self._runtimes: dict[str, RuntimeRecord] = {}
         # P8.3 presence: heartbeat timeout → offline sweep.
-        self._offline_timeout: float = 120.0
+        # A4: 120s → 300s to cover slow networks; cold-start grace below
+        # (timeout * 2) is unchanged.
+        self._offline_timeout: float = 300.0
         self._sweep_interval: float = 30.0
         self._sweep_stop = threading.Event()
         self._runtimes_lock = threading.RLock()

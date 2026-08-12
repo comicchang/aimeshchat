@@ -30,6 +30,40 @@ def _parse_attachment_args(raw: list[str]) -> list[AttachmentRef]:
     return refs
 
 
+# ── B3: send self-description — complete examples + --template ─────────
+#
+# Per-kind required fields (protocol.KIND_CONDITIONAL_REQUIRED):
+#   TASK    -> run_id, request_id
+#   REPORT  -> run_id, request_id, reply_to
+#   RECEIPT -> reply_to, run_id, request_id, receipt_type
+# When a send fails on a missing required field, the error appends a full
+# usable example; `send --template <kind>` prints one without sending.
+
+_SEND_TEMPLATES: dict[str, str] = {
+    "report": (
+        "mailbox send --session <session_id> --from <agent_id> --to <agent_id> "
+        "--kind REPORT --reply-to <msg_id> --run-id <run_id> "
+        "--request-id <request_id> --subject \"<subject>\" --body \"<body>\""
+    ),
+    "task": (
+        "mailbox send --session <session_id> --from <agent_id> --to <agent_id> "
+        "--kind TASK --run-id <run_id> --request-id <request_id> "
+        "--subject \"<subject>\" --body \"<body>\""
+    ),
+    "receipt": (
+        "mailbox send --session <session_id> --from <agent_id> --to <agent_id> "
+        "--kind RECEIPT --reply-to <msg_id> --run-id <run_id> "
+        "--request-id <request_id> --receipt-type READ "
+        "--subject \"READ <msg_id>\" --body \"<ack>\""
+    ),
+}
+
+_SEND_EXAMPLE_HINT = (
+    "\nsend failed — required field missing. Complete example:\n"
+    f"  {_SEND_TEMPLATES['report']}"
+)
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="mailbox — session-based direct-inbox CLI")
     sub = p.add_subparsers(dest="cmd")
@@ -43,11 +77,18 @@ def main(argv: list[str] | None = None) -> None:
 
     # send
     s = sub.add_parser("send")
-    s.add_argument("--session", required=True)
-    s.add_argument("--from", required=True, dest="from_worker")
-    s.add_argument("--to", required=True, help="recipient agent ID, or '*' to broadcast to all except the sender")
-    s.add_argument("--subject", required=True)
-    s.add_argument("--body", required=True)
+    # B3: core fields are required=False so `--template` can print an
+    # example without them; the send branch validates them manually and the
+    # resulting error carries a complete example (self-describing).
+    s.add_argument("--session", default="")
+    s.add_argument("--from", default="", dest="from_worker")
+    s.add_argument("--to", default="", help="recipient agent ID, or '*' to broadcast to all except the sender")
+    s.add_argument("--subject", default="")
+    s.add_argument("--body", default="")
+    s.add_argument(
+        "--template", default=None, choices=["report", "task", "receipt"],
+        help="B3: print a complete example send command for this kind and exit (no send)",
+    )
     s.add_argument("--kind", default="TASK", choices=sorted(VALID_KINDS))
     s.add_argument("--reply-to", default="")
     s.add_argument("--run-id", default="")
@@ -158,7 +199,16 @@ def main(argv: list[str] | None = None) -> None:
     # Global options
     p.add_argument("--mailbox-root", help="Override MAILBOX_ROOT")
 
-    args = p.parse_args(argv)
+    # B3: first non-option token identifies the subcommand (argparse errors
+    # exit before args.cmd is populated; the hint needs to know it was send).
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    subcmd = next((t for t in tokens if not t.startswith("-")), "")
+    try:
+        args = p.parse_args(argv)
+    except SystemExit as exc:
+        if subcmd == "send" and exc.code == 2:
+            print(_SEND_EXAMPLE_HINT, file=sys.stderr)
+        raise
     root = Path(args.mailbox_root) if args.mailbox_root else None
     store = MailboxStore(root=root)
 
@@ -167,6 +217,17 @@ def main(argv: list[str] | None = None) -> None:
             acl = json.loads(args.acl) if args.acl else None
             print(store.session_init(args.session, args.manager, args.agents.split(","), acl=acl))
         elif args.cmd == "send":
+            # B3: --template prints a complete example command (no send).
+            if args.template:
+                print(_SEND_TEMPLATES[args.template])
+                return
+            missing = [flag for flag, val in (
+                ("--session", args.session), ("--from", args.from_worker),
+                ("--to", args.to), ("--subject", args.subject),
+                ("--body", args.body),
+            ) if not val]
+            if missing:
+                raise ValueError("send requires: " + ", ".join(missing))
             attachments = _parse_attachment_args(args.attachment)
             # v2: send through MailboxService so require_ack / receipt_type
             # are honored and the JSON field is exactly `require_ack`.
@@ -268,7 +329,12 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as e:
         # P2 (oracle-lite): terminal 错误用 exit 2（校验/roster/幂等冲突——
         # 重试无意义），delivery 侧据此分类，不再只靠关键字匹配。
-        print(str(e), file=sys.stderr)
+        # B3: send validation failures (missing reply_to/run_id/request_id
+        # per kind) append a complete usable example.
+        detail = str(e)
+        if args.cmd == "send":
+            detail += _SEND_EXAMPLE_HINT
+        print(detail, file=sys.stderr)
         sys.exit(2)  # terminal
     except Exception as e:
         # exit 1 = retryable（未知/环境错误，重试可能成功）
