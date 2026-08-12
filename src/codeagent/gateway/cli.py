@@ -3,7 +3,7 @@
 - ``gateway start``  — spawn the gateway inside a private tmux pane (idempotent:
   an already-handshaking UDS returns success; a stale socket is only removed
   when same-UID, connect fails AND the tmux session is not alive).
-- ``gateway ensure`` — (P3) verify a remote host's postmesh/wire/tmux, then
+- ``gateway ensure`` — (P3) verify a remote host's aimeshchat/wire/tmux, then
   start its gateway over SSH.
 - ``gateway serve``  — foreground gateway process (the tmux pane's command).
 - ``gateway rpc --stdio`` — SSH-bounded control: one request in, one response out.
@@ -150,7 +150,7 @@ def _tmux_new_gateway_pane() -> tuple[int, str, str]:
 
 
 def cmd_gateway_ensure(args) -> int:
-    """Verify a remote host (postmesh/wire/tmux), then start its gateway over SSH.
+    """Verify a remote host (aimeshchat/wire/tmux), then start its gateway over SSH.
 
     Remote wire < 2 → REMOTE_UPGRADE_REQUIRED (no legacy fallback).
     Missing OMP/OpenCode only disables that runtime capability.
@@ -181,7 +181,7 @@ def cmd_gateway_ensure(args) -> int:
         cm = ControlMaster(host, ssh_bin="ssh")
         if not cm.is_alive():
             cm.create()
-        ssh_cmd = cm.ssh_cmd("export PATH=$HOME/.local/bin:$PATH; postmesh-remote-exec")
+        ssh_cmd = cm.ssh_cmd("export PATH=$HOME/.local/bin:$PATH; aimeshchat-remote-exec")
         proc = subprocess.Popen(ssh_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out_b, err_b = proc.communicate(input=encode_line(make_ping()), timeout=30)
         remote_ver = 0
@@ -214,7 +214,7 @@ def cmd_gateway_ensure(args) -> int:
         cm = ControlMaster(host, ssh_bin="ssh")
         if not cm.is_alive():
             cm.create()
-        start_cmd = "export PATH=$HOME/.local/bin:$PATH; postmesh gateway start"
+        start_cmd = "export PATH=$HOME/.local/bin:$PATH; aimeshchat gateway start"
         proc = subprocess.Popen(cm.ssh_cmd(start_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out_b, err_b = proc.communicate(timeout=60)
         out_text = out_b.decode("utf-8", errors="replace") if isinstance(out_b, bytes) else (out_b or "")
@@ -309,8 +309,8 @@ def cmd_gateway_rpc(args) -> int:
 def _watch_cursor_file(session_id: str, runtime_id: str, filters: Optional[list[str]] = None) -> Optional[Path]:
     """A4: persisted watch-cursor path.
 
-    ``$XDG_STATE_HOME/postmesh/watch-cursor-<key>.json`` (default
-    ``~/.local/state/postmesh/...``) where the key is the session_id when
+    ``$XDG_STATE_HOME/aimeshchat/watch-cursor-<key>.json`` (default
+    ``~/.local/state/aimeshchat/...``) where the key is the session_id when
     filtering by session, else runtime_id, else None — an unfiltered
     global stream is not persisted.
 
@@ -327,7 +327,7 @@ def _watch_cursor_file(session_id: str, runtime_id: str, filters: Optional[list[
         fhash = hashlib.sha256(",".join(sorted(filters)).encode("utf-8")).hexdigest()[:12]
         key = f"{key}-f{fhash}"
     base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
-    return base / "postmesh" / f"watch-cursor-{key}.json"
+    return base / "aimeshchat" / f"watch-cursor-{key}.json"
 
 
 def _load_watch_cursor(session_id: str, runtime_id: str, filters: Optional[list[str]] = None) -> int:
@@ -405,7 +405,7 @@ def cmd_events_watch(args) -> int:
 
     A4: ``--exit-on KIND.STATE,...`` terminates with exit 0 on the first
     terminal event. The cursor is persisted under
-    ``~/.local/state/postmesh/`` so a reconnect resumes automatically;
+    ``~/.local/state/aimeshchat/`` so a reconnect resumes automatically;
     an explicit ``--cursor`` overrides the persisted value.
     """
     client = GatewayClient(timeout=args.timeout)
@@ -487,7 +487,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     """
     import argparse as _ap
 
-    p = _ap.ArgumentParser(prog="postmesh gateway", description="Local gateway control")
+    p = _ap.ArgumentParser(prog="aimeshchat gateway", description="Local gateway control")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("start", help="Start the local gateway (idempotent)")
     sub.add_parser("status", help="Show local gateway status")

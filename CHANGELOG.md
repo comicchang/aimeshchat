@@ -4,6 +4,17 @@ All notable changes to **codeagent** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] — 2026-08-12
+
+### Changed
+
+- **feat: 品牌再次改名 aimeshchat (AI Mesh Chat)** — CLI binaries renamed
+  `aichatmesh` → `aimeshchat` and `aichatmesh-remote-exec` →
+  `aimeshchat-remote-exec`.  Python package `codeagent` is unchanged.
+  `mailbox` / `mailbox-hook` / `mailbox-health` are kept as brand-neutral
+  primitives. Data paths migrate from `~/.local/share/aichatmesh` →
+  `~/.local/share/aimeshchat`, env vars from `AICHATMESH_*` → `AIMESHCHAT_*`.
+
 ## [0.2.7] — 2026-08-11
 
 ### Changed

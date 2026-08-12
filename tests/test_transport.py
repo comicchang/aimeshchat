@@ -421,7 +421,7 @@ class TestControlMaster:
 
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
         d = cm_mod._socket_dir()
-        assert d == tmp_path / "postmesh" / "ssh"
+        assert d == tmp_path / "aimeshchat" / "ssh"
         assert d.exists()
 
     def test_socket_dir_chmod_failure_ok(self, tmp_path: Path, monkeypatch):
@@ -1022,7 +1022,7 @@ class TestSSHTransport:
         mock_cm.is_alive.return_value = True
         mock_cm.ssh_cmd.return_value = [
             "ssh", "-S", "/tmp/s.sock", "host",
-            "source ~/.zshrc &&; postmesh-remote-exec",
+            "source ~/.zshrc &&; aimeshchat-remote-exec",
         ]
         mock_cm_cls.return_value = mock_cm
 
@@ -1045,9 +1045,9 @@ class TestSSHTransport:
         mock_cm.ssh_cmd.assert_called_once()
         args = mock_cm.ssh_cmd.call_args[0]
         assert len(args) == 1
-        assert args[0] == "source ~/.zshrc &&; postmesh-remote-exec"
+        assert args[0] == "source ~/.zshrc &&; aimeshchat-remote-exec"
         assert "source ~/.zshrc &&" in args[0]
-        assert "postmesh-remote-exec" in args[0]
+        assert "aimeshchat-remote-exec" in args[0]
 
     @patch("codeagent.transport.ssh.ControlMaster")
     @patch("subprocess.Popen")
@@ -1580,4 +1580,4 @@ class TestRelayTransport:
         assert "relay-login" in cmd
         assert "dev.example.com" in cmd
         assert "base64 -d" in cmd
-        assert "postmesh-remote-exec" in cmd
+        assert "aimeshchat-remote-exec" in cmd

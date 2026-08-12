@@ -1,4 +1,4 @@
-"""Tests for the ``postmesh swarm`` CLI subcommands.
+"""Tests for the ``aimeshchat swarm`` CLI subcommands.
 
 Covers: all 10 subcommands + watch, help, error paths, JSON output shape,
 and swarm hook functions (register/unregister).
@@ -983,7 +983,7 @@ class TestTmuxWatchScript:
     def test_script_has_usage(self):
         script = Path(__file__).resolve().parent.parent / "scripts" / "tmux" / "swarm-watch.sh"
         content = script.read_text()
-        assert "postmesh swarm watch" in content
+        assert "aimeshchat swarm watch" in content
         assert "SESSION_ID" in content
         assert "AGENT_ID" in content
 
@@ -1009,12 +1009,12 @@ class TestSkillReferences:
     def test_manager_skill_mentions_swarm(self):
         skill = Path(__file__).resolve().parent.parent / "skills" / "agent-swarm" / "SKILL.md"
         content = skill.read_text()
-        assert "postmesh swarm" in content
+        assert "aimeshchat swarm" in content
 
     def test_worker_skill_mentions_swarm(self):
         skill = Path(__file__).resolve().parent.parent / "skills" / "agent-swarm" / "protocol" / "mailbox.md"
         content = skill.read_text()
-        assert "postmesh swarm" in content
+        assert "aimeshchat swarm" in content
 
 
 # ── OMP runner hook wiring ──────────────────────────────────────────────

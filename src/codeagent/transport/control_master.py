@@ -1,8 +1,8 @@
 """SSH ControlMaster socket management.
 
 Each remote host gets an independent SSH ControlMaster socket.
-Socket path: ``$XDG_RUNTIME_DIR/postmesh/ssh/<host-hash>.sock``
-Fallback:    ``$TMPDIR/postmesh-<UID>/ssh/<host-hash>.sock``
+Socket path: ``$XDG_RUNTIME_DIR/aimeshchat/ssh/<host-hash>.sock``
+Fallback:    ``$TMPDIR/aimeshchat-<UID>/ssh/<host-hash>.sock``
 
 The *host-hash* is a stable 12-char hex digest of the SSH alias,
 so different aliases never share a socket.
@@ -24,14 +24,14 @@ from codeagent.transport.base import TransportError
 log = logging.getLogger(__name__)
 
 def _known_hosts_file() -> str:
-    """Explicit known_hosts path for postmesh SSH connections.
+    """Explicit known_hosts path for aimeshchat SSH connections.
 
     P2-16: pointing UserKnownHostsFile explicitly (instead of leaving it
     to ~/.ssh/config) guarantees a config file cannot silently redirect
-    host-key state to /dev/null or a per-host file that postmesh does not
-    expect. ``POSTMESH_KNOWN_HOSTS`` overrides for testing/containers.
+    host-key state to /dev/null or a per-host file that aimeshchat does not
+    expect. ``AIMESHCHAT_KNOWN_HOSTS`` overrides for testing/containers.
     """
-    return os.environ.get("POSTMESH_KNOWN_HOSTS") or os.path.expanduser("~/.ssh/known_hosts")
+    return os.environ.get("AIMESHCHAT_KNOWN_HOSTS") or os.path.expanduser("~/.ssh/known_hosts")
 
 
 # P2-16: explicit host-key verification policy. The SSH default inherits
@@ -69,10 +69,10 @@ def _socket_dir() -> Path:
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
-        d = Path(xdg) / "postmesh" / "ssh"
+        d = Path(xdg) / "aimeshchat" / "ssh"
     else:
         uid = os.getuid()
-        d = Path(os.environ.get("TMPDIR", "/tmp")) / f"postmesh-{uid}" / "ssh"
+        d = Path(os.environ.get("TMPDIR", "/tmp")) / f"aimeshchat-{uid}" / "ssh"
     d.mkdir(parents=True, exist_ok=True)
     # Ensure restrictive permissions (0700) even if directory existed before.
     try:

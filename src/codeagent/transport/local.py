@@ -79,7 +79,7 @@ class LocalTransport(Transport):
             capabilities=request.capabilities,
         )
         return _run_wire(
-            ["postmesh-remote-exec"],
+            ["aimeshchat-remote-exec"],
             req,
             workdir=workdir,
             host_name=LOCAL_HOST_MARKER,

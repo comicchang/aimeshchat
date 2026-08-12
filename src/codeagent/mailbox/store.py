@@ -48,7 +48,7 @@ def resolve_root(root: Optional[Path] = None) -> Path:
     if env:
         return Path(env)
     xdg = os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
-    return Path(xdg) / "postmesh" / "mailbox"
+    return Path(xdg) / "aimeshchat" / "mailbox"
 
 
 def gen_msg_id(sender: str) -> str:

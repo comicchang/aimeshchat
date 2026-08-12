@@ -1,4 +1,4 @@
-"""CLI facade — unified entry point for all postmesh commands."""
+"""CLI facade — unified entry point for all aimeshchat commands."""
 from __future__ import annotations
 
 from codeagent.artifact import ArtifactDescriptor, pull_artifact, verify_artifact, validate_descriptor
@@ -49,7 +49,7 @@ def _get_transport(host: HostSpec, repo_map=None):
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("postmesh", description="Multi-host code agent orchestration")
+    p = argparse.ArgumentParser("aimeshchat", description="Multi-host code agent orchestration")
     p.add_argument("--version", "-v", action="version", version=f"%(prog)s {__version__}")
 
     sub = p.add_subparsers(dest="command")
@@ -131,7 +131,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pull_p = art_sub.add_parser("pull", help="Pull an artifact from a remote host")
     pull_p.add_argument("--host", required=True, help="SSH alias for remote host")
     pull_p.add_argument("--artifact-id", required=True, help="Artifact identifier")
-    pull_p.add_argument("--remote-root", default="/tmp/postmesh-artifacts", help="Remote artifact root directory")
+    pull_p.add_argument("--remote-root", default="/tmp/aimeshchat-artifacts", help="Remote artifact root directory")
     pull_p.add_argument("--relative-path", required=True, help="Relative path within remote root")
     pull_p.add_argument("--size", type=int, required=True, help="Expected file size in bytes")
     pull_p.add_argument("--sha256", required=True, help="Expected SHA-256 hex digest")
@@ -922,7 +922,7 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
 
             # session-init on remote host
             cmd = [
-                "postmesh", "mailbox", "session-init",
+                "aimeshchat", "mailbox", "session-init",
                 "--host", host,
                 "--session", args.session_id,
                 "--manager", manager,
@@ -946,7 +946,7 @@ def _swarm_launch(kernel: SwarmKernel, args: argparse.Namespace) -> int:
             init_run_id = f"run-{_uuid.uuid4().hex[:12]}"
             init_req_id = f"req-{_uuid.uuid4().hex[:12]}"
             cmd = [
-                "postmesh", "mailbox", "send",
+                "aimeshchat", "mailbox", "send",
                 "--host", host,
                 "--session", args.session_id,
                 "--to", agent,
@@ -1147,7 +1147,7 @@ def _execute(request: RunRequest, target: Target, registry: SessionRegistry, rep
                 try:
                     subprocess.run(
                         [
-                            "postmesh", "park", "acquire",
+                            "aimeshchat", "park", "acquire",
                             ns_key, "--agent-type", request.agent,
                             "--backend-id", result.session_id,
                             "--peer-id", result.session_id,
@@ -1647,7 +1647,7 @@ def _cmd_park(args: argparse.Namespace) -> int:
     cmd = args.park_cmd
 
     if cmd is None:
-        print("park: missing subcommand. Try: postmesh park list|info|revive|release|sweep")
+        print("park: missing subcommand. Try: aimeshchat park list|info|revive|release|sweep")
         return 1
 
     if cmd == "list":
@@ -1808,7 +1808,7 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
 
     cmd = args.gw_cmd
     if cmd is None:
-        print("gateway: missing subcommand. Try: postmesh gateway start|ensure|status|stop|serve|rpc", file=sys.stderr)
+        print("gateway: missing subcommand. Try: aimeshchat gateway start|ensure|status|stop|serve|rpc", file=sys.stderr)
         return 1
     handlers = {
         "start": gw_cli.cmd_gateway_start,
@@ -1827,7 +1827,7 @@ def _cmd_events(args: argparse.Namespace) -> int:
 
     if args.ev_cmd == "watch":
         return gw_cli.cmd_events_watch(args)
-    print("events: missing subcommand. Try: postmesh events watch", file=sys.stderr)
+    print("events: missing subcommand. Try: aimeshchat events watch", file=sys.stderr)
     return 1
 
 
@@ -1850,7 +1850,7 @@ def _cmd_runtime(args: argparse.Namespace) -> int:
     except GatewayError as exc:
         print(f"error: {exc.message}", file=sys.stderr)
         return 1
-    print("runtime: missing subcommand. Try: postmesh runtime status|stop", file=sys.stderr)
+    print("runtime: missing subcommand. Try: aimeshchat runtime status|stop", file=sys.stderr)
     return 1
 
 
@@ -1867,7 +1867,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
 
     cmd = args.ora_cmd
     if cmd is None:
-        print("oracle: missing subcommand. Try: postmesh oracle start|ask|status|watch|release|result", file=sys.stderr)
+        print("oracle: missing subcommand. Try: aimeshchat oracle start|ask|status|watch|release|result", file=sys.stderr)
         return 1
     handlers = {
         "start": cmd_oracle_start,
@@ -1889,7 +1889,7 @@ def _cmd_session(args: argparse.Namespace) -> int:
     """
     cmd = getattr(args, "session_cmd", None)
     if cmd is None:
-        print("error: specify a session subcommand. Try: postmesh session clean --older-than 30",
+        print("error: specify a session subcommand. Try: aimeshchat session clean --older-than 30",
               file=sys.stderr)
         return 1
     if cmd == "clean":

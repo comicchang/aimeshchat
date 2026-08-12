@@ -586,7 +586,7 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
         if exc.code in ("GATEWAY_DOWN", "GATEWAY_CONNECT_FAILED"):
             out["runtime"] = {
                 "status": "gateway_down",
-                "hint": "run 'postmesh gateway start'",
+                "hint": "run 'aimeshchat gateway start'",
             }
         else:
             out["runtime"] = {"status": "unavailable", "error": exc.message}

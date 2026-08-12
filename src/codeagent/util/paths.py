@@ -46,30 +46,30 @@ def _xdg_dir(env_var: str, default_suffix: str) -> Path:
 
 
 def config_dir() -> Path:
-    """Return the postmesh configuration directory.
+    """Return the aimeshchat configuration directory.
 
-    ``$XDG_CONFIG_HOME/postmesh`` or ``~/.config/postmesh``.
+    ``$XDG_CONFIG_HOME/aimeshchat`` or ``~/.config/aimeshchat``.
     """
-    return _xdg_dir("XDG_CONFIG_HOME", ".config") / "postmesh"
+    return _xdg_dir("XDG_CONFIG_HOME", ".config") / "aimeshchat"
 
 
 def state_dir() -> Path:
-    """Return the postmesh state directory.
+    """Return the aimeshchat state directory.
 
-    ``$XDG_STATE_HOME/postmesh`` or ``~/.local/state/postmesh``.
+    ``$XDG_STATE_HOME/aimeshchat`` or ``~/.local/state/aimeshchat``.
     """
-    return _xdg_dir("XDG_STATE_HOME", ".local/state") / "postmesh"
+    return _xdg_dir("XDG_STATE_HOME", ".local/state") / "aimeshchat"
 
 
 def runtime_dir() -> Path:
-    """Return the postmesh runtime directory for ephemeral files.
+    """Return the aimeshchat runtime directory for ephemeral files.
 
-    ``$XDG_RUNTIME_DIR/postmesh`` if set, otherwise
-    ``$TMPDIR/postmesh-$UID`` (or ``/tmp/postmesh-$UID`` as a last resort).
+    ``$XDG_RUNTIME_DIR/aimeshchat`` if set, otherwise
+    ``$TMPDIR/aimeshchat-$UID`` (or ``/tmp/aimeshchat-$UID`` as a last resort).
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
-        return Path(xdg) / "postmesh"
+        return Path(xdg) / "aimeshchat"
     tmpdir = os.environ.get("TMPDIR", "/tmp")
     uid = os.getuid()
-    return Path(tmpdir) / f"postmesh-{uid}"
+    return Path(tmpdir) / f"aimeshchat-{uid}"

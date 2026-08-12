@@ -50,7 +50,7 @@ class GatewayClient:
         if not self._socket_path.exists():
             raise GatewayError(
                 "GATEWAY_DOWN",
-                f"gateway socket not found: {self._socket_path} (run 'postmesh gateway start')",
+                f"gateway socket not found: {self._socket_path} (run 'aimeshchat gateway start')",
             )
         payload = (req.to_json() + "\n").encode("utf-8")
         if len(payload) > MAX_FRAME_LENGTH + 1:
@@ -85,7 +85,7 @@ class GatewayClient:
 def rpc_stdio(socket_path: Optional[Path] = None) -> int:
     """SSH-bounded RPC: read one GatewayRequest from stdin, emit one response.
 
-    Used by ``postmesh gateway rpc --stdio`` over an SSH ControlMaster —
+    Used by ``aimeshchat gateway rpc --stdio`` over an SSH ControlMaster —
     a bounded control call, never a long-lived stream.
     """
     line = sys.stdin.readline()

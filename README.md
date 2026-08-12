@@ -1,4 +1,4 @@
-# postmesh
+# aimeshchat
 
 Multi-host code agent orchestration with SSH, session persistence, and routing.
 
@@ -10,7 +10,7 @@ Unified CLI for executing AI code agents across local and remote machines, with 
 - **SSH transport**: Independent ControlMaster per host, no global ControlPersist changes
 - **Session persistence**: SQLite-backed registry, auto-resume by namespace key
 - **Topic routing**: repo-map.json maps topics to host/path, with local detection
-- **Remote helper**: `postmesh-remote-exec` console entrypoint, installed per host via `uv tool install`
+- **Remote helper**: `aimeshchat-remote-exec` console entrypoint, installed per host via `uv tool install`
 - **Mailbox IPC**: session-based direct-inbox for agent-to-agent communication (local + cross-host via SSH)
 - **Wire protocol**: JSONL over SSH stdin/stdout, no shell quoting issues
 - **Swarm IPC**: IRC-style kernel with session/roster/ACL/routing, delivery engine with durable outbox, real-time receiver (watch + stream modes), artifact transport
@@ -27,7 +27,7 @@ uv tool install "git+https://github.com/comicchang/postmesh-py"
 ```
 
 Installs 5 entrypoints to `~/.local/bin` (ensure it's on your `PATH`).
-Only **two** matter: `postmesh` (the CLI) and `postmesh-remote-exec`
+Only **two** matter: `aimeshchat` (the CLI) and `aimeshchat-remote-exec`
 (the remote helper, auto-discovered over SSH on each host).
 `mailbox` / `mailbox-hook` / `mailbox-health` are authoritative mailbox
 management entrypoints (not shims).
@@ -48,48 +48,48 @@ No config files needed — a swarm session is pure CLI:
 
 ```bash
 # 1. Start a session with 2 agents (manager + worker)
-postmesh swarm create-session s1 --manager mgr --members w1
-postmesh swarm register s1 --agent w1 --host __local__
+aimeshchat swarm create-session s1 --manager mgr --members w1
+aimeshchat swarm register s1 --agent w1 --host __local__
 
 # 2. Talk
-postmesh swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body "hello w1"
-postmesh swarm poll s1 --agent w1            # w1 reads its inbox
+aimeshchat swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body "hello w1"
+aimeshchat swarm poll s1 --agent w1            # w1 reads its inbox
 
 # 3. Broadcast / channel / notice / poll
-postmesh swarm broadcast s1 --from mgr --kind NOTICE --subject sync --body "everyone"
-postmesh swarm watch s1 --agent w1 --interval 2   # polling loop
+aimeshchat swarm broadcast s1 --from mgr --kind NOTICE --subject sync --body "everyone"
+aimeshchat swarm watch s1 --agent w1 --interval 2   # polling loop
 ```
 
 Cross-host: register the worker with its SSH host instead of `__local__`
 (`--host dev-server`) — delivery goes over SSH automatically, same commands.
 
 Optional: topic routing (`repo-map.json`) and model config (`models.json`)
-are only needed for `postmesh run`/`route` — see `examples/`.
+are only needed for `aimeshchat run`/`route` — see `examples/`.
 
 ## Usage
 
 ```bash
 # Local execution
-postmesh run "analyze the rendering pipeline"
+aimeshchat run "analyze the rendering pipeline"
 
 # SSH to remote host
-postmesh run "list all source files" ~/src/project --host dev-server
+aimeshchat run "list all source files" ~/src/project --host dev-server
 
 # Route via repo-map (topic → host → path)
-postmesh route MyTopic "analyze module X" --repo 0
-postmesh route list
-postmesh route where "MyTopic"
+aimeshchat route MyTopic "analyze module X" --repo 0
+aimeshchat route list
+aimeshchat route where "MyTopic"
 
 # Session management
-postmesh sessions list
-postmesh sessions show <key>
-postmesh sessions reset <key>
-postmesh sessions bind --key <k> --id <session-id>
+aimeshchat sessions list
+aimeshchat sessions show <key>
+aimeshchat sessions reset <key>
+aimeshchat sessions bind --key <k> --id <session-id>
 
 # SSH connection management
-postmesh ssh warm dev-server build-box
-postmesh ssh status
-postmesh ssh stop dev-server
+aimeshchat ssh warm dev-server build-box
+aimeshchat ssh status
+aimeshchat ssh stop dev-server
 ```
 
 ## Configuration
@@ -200,17 +200,17 @@ Sessions are auto-resumed by default. Key = `host:workdir:backend:agent`.
 
 ```bash
 # View all sessions
-postmesh sessions list
+aimeshchat sessions list
 
 # Filter by host or topic
-postmesh sessions list --host dev-server
-postmesh sessions list --topic MyTopic
+aimeshchat sessions list --host dev-server
+aimeshchat sessions list --topic MyTopic
 
 # Force new session (don't resume)
-postmesh run "start fresh analysis" --new-session
+aimeshchat run "start fresh analysis" --new-session
 
 # Manual session binding
-postmesh sessions bind --key "dev-server:/src:opencode:explore" --id abc123
+aimeshchat sessions bind --key "dev-server:/src:opencode:explore" --id abc123
 ```
 
 ## SSH Connection Management
@@ -219,18 +219,18 @@ ControlMaster sockets are managed independently per host:
 
 ```bash
 # Pre-establish connections (e.g., at session start)
-postmesh ssh warm dev-server build-box
+aimeshchat ssh warm dev-server build-box
 
 # Check status
-postmesh ssh status
-#   dev-server: alive (/run/user/1000/postmesh/ssh/abc123.sock)
+aimeshchat ssh status
+#   dev-server: alive (/run/user/1000/aimeshchat/ssh/abc123.sock)
 #   build-box: dead
 
 # Close connections
-postmesh ssh stop dev-server
+aimeshchat ssh stop dev-server
 ```
 
-Socket path: `$XDG_RUNTIME_DIR/postmesh/ssh/<host-hash>.sock`
+Socket path: `$XDG_RUNTIME_DIR/aimeshchat/ssh/<host-hash>.sock`
 
 ## Architecture
 
@@ -268,7 +268,7 @@ Socket path: `$XDG_RUNTIME_DIR/postmesh/ssh/<host-hash>.sock`
 
 ## Remote Deployment
 
-Remote hosts only need `postmesh-remote-exec` on PATH.  Install it on each
+Remote hosts only need `aimeshchat-remote-exec` on PATH.  Install it on each
 machine the same way as locally (no agent-side daemon, no shared filesystem):
 
 ```bash
@@ -276,8 +276,8 @@ machine the same way as locally (no agent-side daemon, no shared filesystem):
 git clone https://github.com/comicchang/postmesh-py
 cd postmesh-py
 uv tool install . --force
-postmesh --version        # verify the CLI
-postmesh-remote-exec --help   # verify the remote helper
+aimeshchat --version        # verify the CLI
+aimeshchat-remote-exec --help   # verify the remote helper
 ```
 
 That is the whole deployment: five console entrypoints via `uv tool install`,
@@ -308,63 +308,63 @@ push over SSH (long-lived connection, no polling).
 
 ```bash
 # 1. Create a swarm session with manager + two workers
-postmesh swarm create-session s1 --manager mgr --members w1,w2
+aimeshchat swarm create-session s1 --manager mgr --members w1,w2
 
 # 2. Register agents (location = __local__ for co-located)
-postmesh swarm register s1 --agent mgr --host __local__
-postmesh swarm register s1 --agent w1  --host __local__
+aimeshchat swarm register s1 --agent mgr --host __local__
+aimeshchat swarm register s1 --agent w1  --host __local__
 
 # 3. Send a direct message
-postmesh swarm direct s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "check src/"
+aimeshchat swarm direct s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "check src/"
 
 # 4. Poll + ack lifecycle
-out=$(postmesh swarm poll s1 --agent w1)
+out=$(aimeshchat swarm poll s1 --agent w1)
 msg_id=$(echo "$out" | jq -r '.messages[0].msg_id')
-postmesh swarm ack s1 --agent w1 --msg-id "$msg_id" --phase consumed
+aimeshchat swarm ack s1 --agent w1 --msg-id "$msg_id" --phase consumed
 # --phase released returns the message to inbox for re-processing
 
 # 5. Watch for new messages (continuous, polling loop)
-postmesh swarm watch s1 --agent mgr --interval 2
+aimeshchat swarm watch s1 --agent mgr --interval 2
 
 # 6. Durable outbox (cross-host delivery with retry)
-postmesh swarm outbox pending              # list undelivered envelopes
-postmesh swarm outbox flush                 # retry all pending envelopes
-postmesh swarm outbox status                # show outbox summary counts
+aimeshchat swarm outbox pending              # list undelivered envelopes
+aimeshchat swarm outbox flush                 # retry all pending envelopes
+aimeshchat swarm outbox status                # show outbox summary counts
 ```
 
 ### Mailbox CLI
 
-`postmesh mailbox` provides the lower-level store operations used by the kernel:
+`aimeshchat mailbox` provides the lower-level store operations used by the kernel:
 
 ```bash
 # Session management
-postmesh mailbox session-init --session s1 --manager mgr --agents w1,w2
+aimeshchat mailbox session-init --session s1 --manager mgr --agents w1,w2
 
 # Send message
-postmesh mailbox send --session s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "..."
+aimeshchat mailbox send --session s1 --from mgr --to w1 --kind TASK --subject "analyze" --body "..."
 
 # Send with attachments (repeat --attachment for multiple)
-postmesh mailbox send --session s1 --from mgr --to w1 --kind TASK \
+aimeshchat mailbox send --session s1 --from mgr --to w1 --kind TASK \
   --subject "results ready" --body "see attached" \
   --attachment '{"artifact_id":"art-1","source_host":"worker-1","remote_root":"/tmp/artifacts","relative_path":"out/result.json","size":1024,"sha256":"'$(printf 'a%.0s' {1..64})'"}'
 
 # Broadcast to every roster member except the sender
-postmesh mailbox send --session s1 --from mgr --to '*' --kind NOTICE --subject "standby" --body "..."
+aimeshchat mailbox send --session s1 --from mgr --to '*' --kind NOTICE --subject "standby" --body "..."
 
 # Peek inbox
-postmesh mailbox peek --session s1 --agent w1
+aimeshchat mailbox peek --session s1 --agent w1
 
 # Read (inbox→processing)
-postmesh mailbox read --session s1 --agent w1 --owner w1
+aimeshchat mailbox read --session s1 --agent w1 --owner w1
 
 # Finalize (processing→archive)
-postmesh mailbox finalize --session s1 --agent w1 --msg-id <id> --owner w1
+aimeshchat mailbox finalize --session s1 --agent w1 --msg-id <id> --owner w1
 
 # Status update
-postmesh mailbox status --session s1 --agent w1 --state BUSY --current-task "working"
+aimeshchat mailbox status --session s1 --agent w1 --state BUSY --current-task "working"
 
 # Canonical history (newest first; filters: --since/--before/--limit/--from/--kind)
-postmesh mailbox history --session s1 --json --kind TASK --limit 10
+aimeshchat mailbox history --session s1 --json --kind TASK --limit 10
 ```
 
 Sends land in the recipient's per-agent archive on finalize; the canonical
@@ -378,7 +378,7 @@ Attachments are specified via repeatable `--attachment` flags, each taking
 a JSON object:
 
 ```bash
-postmesh mailbox send --session s1 --from mgr --to w1 --kind EVIDENCE \
+aimeshchat mailbox send --session s1 --from mgr --to w1 --kind EVIDENCE \
   --subject "output" --body "attached" \
   --attachment '{"artifact_id":"art-1","source_host":"worker-1","remote_root":"/tmp/art","relative_path":"out/res.json","size":1024,"sha256":"'$(printf 'a%.0s' {1..64})'"}' \
   --attachment '{"artifact_id":"art-2","source_host":"worker-1","remote_root":"/tmp/art","relative_path":"out/log.txt","size":512,"sha256":"'$(printf 'b%.0s' {1..64})'","media_type":"text/plain"}'
@@ -405,8 +405,8 @@ existing SSH ControlMaster.
 Add `--host <host>` to execute on a remote host via SSH:
 
 ```bash
-postmesh mailbox send --session s1 --from mgr --to w1 --kind TASK ... --host dev-server
-postmesh mailbox peek --session s1 --agent w1 --host dev-server
+aimeshchat mailbox send --session s1 --from mgr --to w1 --kind TASK ... --host dev-server
+aimeshchat mailbox peek --session s1 --agent w1 --host dev-server
 ```
 
 ### Standalone CLI
@@ -421,7 +421,7 @@ mailbox-health --session s1 --agent w1
 
 ### OMP Plugin Environment Variables
 
-When launching agents via `postmesh run` or the OMP runner, these env vars
+When launching agents via `aimeshchat run` or the OMP runner, these env vars
 are injected so the mailbox plugin activates automatically:
 
 | Variable                    | Purpose                                                  |
@@ -438,19 +438,19 @@ launcher, not to the agent's reasoning.
 
 ## Relationship to code-route
 
-`postmesh` replaces `code_route.py` as the routing/execution layer. The Go `codeagent-wrapper` binary is preserved as-is for codex/claude/gemini/opencode backends.
+`aimeshchat` replaces `code_route.py` as the routing/execution layer. The Go `codeagent-wrapper` binary is preserved as-is for codex/claude/gemini/opencode backends.
 
 | Old command | New command |
 |-------------|-------------|
-| `python3 code_route.py list` | `postmesh route list` |
-| `python3 code_route.py where <topic>` | `postmesh route where <topic>` |
-| `echo task \| python3 code_route.py route <topic>` | `postmesh route <topic> <task>` |
+| `python3 code_route.py list` | `aimeshchat route list` |
+| `python3 code_route.py where <topic>` | `aimeshchat route where <topic>` |
+| `echo task \| python3 code_route.py route <topic>` | `aimeshchat route <topic> <task>` |
 
 ## Development
 
 ```bash
 uv run pytest tests/ -v    # Run all tests
-uv run postmesh --version # Verify CLI
+uv run aimeshchat --version # Verify CLI
 ```
 
 ## ACKNOWLEDGEMENTS

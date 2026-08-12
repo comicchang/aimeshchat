@@ -1,7 +1,7 @@
 """Smoke tests — real subprocess execution, no mocks.
 
-These tests exercise the actual postmesh-remote-exec helper and wire
-protocol end-to-end. They require `postmesh-remote-exec` to be installed
+These tests exercise the actual aimeshchat-remote-exec helper and wire
+protocol end-to-end. They require `aimeshchat-remote-exec` to be installed
 (uv tool install) or available on PATH.
 """
 from __future__ import annotations
@@ -23,10 +23,10 @@ from codeagent.wire.protocol import (
 
 
 def _has_remote_exec() -> bool:
-    """Check if postmesh-remote-exec is available."""
+    """Check if aimeshchat-remote-exec is available."""
     try:
         r = subprocess.run(
-            ["postmesh-remote-exec", "--help"],
+            ["aimeshchat-remote-exec", "--help"],
             capture_output=True, timeout=5,
         )
         return r.returncode == 0
@@ -35,12 +35,12 @@ def _has_remote_exec() -> bool:
 
 
 def _run_remote_exec(request_dict: dict, timeout: float = 10) -> dict:
-    """Run postmesh-remote-exec with a single request, return parsed response.
+    """Run aimeshchat-remote-exec with a single request, return parsed response.
 
     Skips the initial 'ready' handshake message and returns the actual response.
     """
     proc = subprocess.Popen(
-        ["postmesh-remote-exec"],
+        ["aimeshchat-remote-exec"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -62,12 +62,12 @@ def _run_remote_exec(request_dict: dict, timeout: float = 10) -> dict:
 
 pytestmark = pytest.mark.skipif(
     not _has_remote_exec(),
-    reason="postmesh-remote-exec not installed (run: uv tool install .)",
+    reason="aimeshchat-remote-exec not installed (run: uv tool install .)",
 )
 
 
 class TestRemoteExecPing:
-    """Smoke: real postmesh-remote-exec ping/pong cycle."""
+    """Smoke: real aimeshchat-remote-exec ping/pong cycle."""
 
     def test_ping_returns_pong(self):
         resp = _run_remote_exec(make_ping())
@@ -85,11 +85,11 @@ class TestRemoteExecPing:
 
 
 class TestRemoteExecValidation:
-    """Smoke: real validation errors from postmesh-remote-exec."""
+    """Smoke: real validation errors from aimeshchat-remote-exec."""
 
     def test_invalid_json_returns_error(self):
         proc = subprocess.Popen(
-            ["postmesh-remote-exec"],
+            ["aimeshchat-remote-exec"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

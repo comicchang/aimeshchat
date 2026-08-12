@@ -160,7 +160,7 @@ class OMPRuntimeAdapter(RuntimeAdapter):
             th = TmuxRuntimeHandle(
                 runtime_id=handle.runtime_id,
                 socket_path=tmux_socket_path(),
-                session="postmesh-gateway",
+                session="aimeshchat-gateway",
                 window="",
                 pane_id="",
                 host_alias=handle.host_alias,
@@ -230,7 +230,7 @@ class OMPRuntimeAdapter(RuntimeAdapter):
             th = TmuxRuntimeHandle(
                 runtime_id=handle.runtime_id,
                 socket_path=tmux_socket_path(),
-                session="postmesh-gateway",
+                session="aimeshchat-gateway",
                 window="", pane_id="",
                 host_alias=handle.host_alias,
                 runtime=RUNTIME_OMP, pid=None, started_at="",

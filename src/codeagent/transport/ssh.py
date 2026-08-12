@@ -233,7 +233,7 @@ class SSHTransport(Transport):
         if not cm.is_alive():
             cm.create()
         req = make_mailbox_request(args=args, mailbox_root=mailbox_root)
-        remote_exec = "postmesh-remote-exec"
+        remote_exec = "aimeshchat-remote-exec"
         if host.shell_prefix:
             # Non-interactive SSH omits ~/.local/bin etc. — same gap
             # dotai setup's shell_prefix fills for ``run``; mailbox must
@@ -288,7 +288,7 @@ class SSHTransport(Transport):
     ) -> RunResult:
         """Build remote command and execute on *cm*."""
         # shell_prefix must be expanded on the REMOTE host, not locally.
-        remote_exec = "postmesh-remote-exec"
+        remote_exec = "aimeshchat-remote-exec"
         if host.shell_prefix:
             # shell_prefix is trusted config (repo-map.json, same trust domain
             # as SSH aliases), but quote the fixed segment so a compromised
@@ -301,7 +301,7 @@ class SSHTransport(Transport):
             # A single string is executed as-is remotely (same as mailbox()).
             remote_cmd = [remote_cmd_str]
         else:
-            remote_cmd = ["postmesh-remote-exec"]
+            remote_cmd = ["aimeshchat-remote-exec"]
 
         req = make_request(
             command="run",
@@ -605,9 +605,9 @@ def _is_ssh_error(stderr: str) -> bool:
 
 
 class SSHStream:
-    """Bidirectional JSONL stream to a remote ``postmesh remote-exec serve``.
+    """Bidirectional JSONL stream to a remote ``aimeshchat remote-exec serve``.
 
-    Spawns ``ssh <host> postmesh-remote-exec`` (which enters serve mode
+    Spawns ``ssh <host> aimeshchat-remote-exec`` (which enters serve mode
     automatically when ``stream`` is requested), keeps stdin/stdout open,
     and provides ``poll()`` to wait for stream events with cursor-based
     resumable delivery.
@@ -824,7 +824,7 @@ class SSHStream:
         # shell_prefix.  Single-string remote command (OpenSSH joins
         # argv[4:] with spaces, so multi-arg would lose quoting).
         remote_cmd = [
-            "export PATH=$HOME/.local/bin:$PATH; postmesh-remote-exec",
+            "export PATH=$HOME/.local/bin:$PATH; aimeshchat-remote-exec",
         ]
         # P2-16: SSHStream spawns a raw `ssh` process — splice in the same
         # explicit host-key policy ControlMaster uses, so a direct stream

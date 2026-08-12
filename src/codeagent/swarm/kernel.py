@@ -1088,7 +1088,7 @@ class SwarmKernel:
 
         # P3-13: every pull_agent read targets the SAME manager inbox on
         # from_host, differing only by mailbox_root.  Group by root so N
-        # agents on one host cost one ``postmesh mailbox read`` subprocess
+        # agents on one host cost one ``aimeshchat mailbox read`` subprocess
         # instead of N.
         by_root: dict[str, list[str]] = {}
         for agent_id in pull_agents:
@@ -1098,7 +1098,7 @@ class SwarmKernel:
 
         for agent_mailbox_root, root_agents in by_root.items():
             cmd = [
-                "postmesh", "mailbox", "read",
+                "aimeshchat", "mailbox", "read",
                 "--session", session_id,
                 "--agent", manager_id,
                 "--owner", manager_id,
@@ -1145,7 +1145,7 @@ class SwarmKernel:
         if not msg_id:
             return
         finalize_cmd = [
-            "postmesh", "mailbox", "finalize",
+            "aimeshchat", "mailbox", "finalize",
             "--host", from_host,
             "--session", session_id,
             "--agent", manager_id,
@@ -1172,7 +1172,7 @@ class SwarmKernel:
     def release_remote(self, session_id: str, msg_id: str, from_host: str,
                        manager_id: str, mailbox_root: str = "") -> bool:
         """Release message back to remote inbox (on ingest/ACL failure)."""
-        cmd = ["postmesh", "mailbox", "release",
+        cmd = ["aimeshchat", "mailbox", "release",
                "--host", from_host, "--session", session_id,
                "--agent", manager_id, "--owner", manager_id,
                "--msg-id", msg_id]
@@ -1194,11 +1194,11 @@ class SwarmKernel:
         Reuses the host's ControlMaster socket (same connection the
         transport layer multiplexes) so the whole batch costs a single
         subprocess + SSH session instead of one per msg_id.  The remote
-        side runs plain local mailbox ops (no ``--host`` — postmesh's
+        side runs plain local mailbox ops (no ``--host`` — aimeshchat's
         ``--host`` would re-dispatch through the router and double-hop).
 
         Returns True if every command in the chain exited 0 (aggregate —
-        the remote ``postmesh`` per-msg exit codes are not individually
+        the remote ``aimeshchat`` per-msg exit codes are not individually
         surfaced).
         """
         if not msg_ids:
@@ -1211,7 +1211,7 @@ class SwarmKernel:
         if mailbox_root:
             parts.append(f"export MAILBOX_ROOT={shlex.quote(mailbox_root)}")
         for mid in msg_ids:
-            cmd_parts = ["postmesh", "mailbox", subcmd,
+            cmd_parts = ["aimeshchat", "mailbox", subcmd,
                          "--session", session_id,
                          "--agent", manager_id,
                          "--owner", manager_id,
@@ -1246,7 +1246,7 @@ class SwarmKernel:
                               mailbox_root: str = "") -> None:
         """P3-13: Finalize multiple messages in a single SSH call.
 
-        Replaces N ``postmesh mailbox finalize`` subprocesses (one per
+        Replaces N ``aimeshchat mailbox finalize`` subprocesses (one per
         msg_id) with a single ControlMaster-reusing SSH invocation.
         """
         self._batch_remote_mailbox(

@@ -5,8 +5,8 @@ with a 0600 RuntimeSpec JSON path) — no shell redirection is ever composed
 into a tmux command. The supervisor owns the agent process lifecycle and
 reports PID/exit to the gateway.
 
-Private socket: ${TMPDIR:-/tmp}/postmesh-tmux/codeagent.sock, session
-``postmesh-gateway`` — keeps gateway-managed runtimes out of the user's
+Private socket: ${TMPDIR:-/tmp}/aimeshchat-tmux/codeagent.sock, session
+``aimeshchat-gateway`` — keeps gateway-managed runtimes out of the user's
 interactive tmux sessions.
 """
 from __future__ import annotations
@@ -28,14 +28,14 @@ from codeagent.constants import ISO_TIMESTAMP_FORMAT
 
 log = logging.getLogger(__name__)
 
-TMUX_SOCKET_DIR_ENV = "POSTMESH_TMUX_SOCKET_DIR"
-TMUX_SESSION_NAME = "postmesh-gateway"
+TMUX_SOCKET_DIR_ENV = "AIMESHCHAT_TMUX_SOCKET_DIR"
+TMUX_SESSION_NAME = "aimeshchat-gateway"
 
 
 def tmux_socket_dir() -> Path:
-    """${TMPDIR:-/tmp}/postmesh-tmux — private socket directory."""
+    """${TMPDIR:-/tmp}/aimeshchat-tmux — private socket directory."""
     override = os.environ.get(TMUX_SOCKET_DIR_ENV)
-    base = Path(override) if override else Path(os.environ.get("TMPDIR", "/tmp")) / "postmesh-tmux"
+    base = Path(override) if override else Path(os.environ.get("TMPDIR", "/tmp")) / "aimeshchat-tmux"
     base.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(base, 0o700)

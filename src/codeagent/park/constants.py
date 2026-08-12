@@ -18,11 +18,11 @@ def park_state_dir() -> Path:
     """SQLite 状态数据库目录。"""
     xdg = os.environ.get("XDG_STATE_HOME")
     base = Path(xdg) if xdg else Path.home() / ".local" / "state"
-    return base / "postmesh" / "park"
+    return base / "aimeshchat" / "park"
 
 
 def park_data_dir() -> Path:
     """Snapshot/metrcis 数据目录。"""
     xdg = os.environ.get("XDG_DATA_HOME")
     base = Path(xdg) if xdg else Path.home() / ".local" / "share"
-    return base / "postmesh" / "park"
+    return base / "aimeshchat" / "park"

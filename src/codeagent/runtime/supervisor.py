@@ -153,7 +153,7 @@ def write_spec(spec: RuntimeSpec, dir: Optional[Path] = None) -> Path:
 def _runtime_dir(runtime_id: str) -> Path:
     xdg = os.environ.get("XDG_STATE_HOME")
     base = Path(xdg) if xdg else Path.home() / ".local" / "state"
-    d = base / "postmesh" / "runtime" / runtime_id
+    d = base / "aimeshchat" / "runtime" / runtime_id
     d.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(d, 0o700)
@@ -329,8 +329,8 @@ def main(argv: list[str] | None = None) -> int:
     # Spec-provided env (e.g. OMP_MEMORY_CONFIG_PATH from oracle start).
     for k, v in spec.env.items():
         env[k] = v
-    env.setdefault("POSTMESH_RUNTIME_ID", spec.runtime_id)
-    env.setdefault("POSTMESH_GATEWAY_SOCKET", spec.gateway_socket)
+    env.setdefault("AIMESHCHAT_RUNTIME_ID", spec.runtime_id)
+    env.setdefault("AIMESHCHAT_GATEWAY_SOCKET", spec.gateway_socket)
     if spec.review_key:
         env.setdefault("REVIEW_KEY", spec.review_key)
     if spec.session_id:
@@ -373,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
             env["OMP_MAILBOX_NONCE"] = spec.nonce
         # Runtime adapter mode for the plugin.
         env["CODEAGENT_ROLE"] = "oracle" if spec.agent_id.startswith("oracle") else "worker"
-        env["POSTMESH_GATEWAY_SOCKET"] = spec.gateway_socket
+        env["AIMESHCHAT_GATEWAY_SOCKET"] = spec.gateway_socket
 
     log_path = d / f"{spec.runtime_id}.log"
     try:
