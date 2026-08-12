@@ -114,7 +114,53 @@ ERR_IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
 # ── 插件能力（设计 §2 握手上报）──────────────────────────────────────
 # hot 注入要求插件 capability 同时含 park_revive + correlated_turn_ack；
 # P2：_is_hot 检查已上报能力，缺失即降级（未上报按兼容放行仅告警）。
+# P1-1：插件上报带版本后缀（park_revive_v1 / correlated_turn_ack_v1），
+# _is_hot 匹配前经 _normalize_capability 归一化（基础名同样兼容）。
 HOT_REQUIRED_CAPABILITIES = frozenset({"park_revive", "correlated_turn_ack"})
+
+
+def _normalize_capability(name: str) -> str:
+    """能力名归一化：剥掉 _vN 版本后缀（park_revive_v1 → park_revive）。
+
+    插件侧上报带版本后缀的能力名，gateway 以基础名匹配；旧插件上报
+    基础名时原样返回（向后兼容）。只剥尾部 _v<digits>，其余不动。
+    """
+    base, sep, ver = name.rpartition("_")
+    if sep and ver[:1] == "v" and ver[1:].isdigit():
+        return base
+    return name
+
+
+# ── 插件 ack 规范推进链（P1-2 统一 ack 协议）─────────────────────────
+# 插件可跳级上报（turn_start 直接 TURN_TRIGGERED，无 CLAIMED/REVIVING/
+# TRIGGERING）→ gateway 沿此链原子补齐中间态，而非 PROTOCOL_CONFLICT
+# 拒绝；terminal 状态（FAILED_SAFE/AMBIGUOUS/TRIGGER_UNKNOWN）不在链上。
+CMD_ACK_CHAIN = (
+    CMD_QUEUED, CMD_CLAIMED, CMD_REVIVING, CMD_TRIGGERING, CMD_TURN_TRIGGERED,
+)
+
+
+def _advance_ack_chain(current: str, target: str) -> Optional[tuple[str, list[str]]]:
+    """沿规范链把 current 原子推进到 target（跳级补齐中间态）。
+
+    current/target 都必须在 CMD_ACK_CHAIN 上且 target 严格在 current
+    之后；每一步都校验 CMD_TRANSITIONS，保证推进合法。非法返回 None，
+    由调用方按 PROTOCOL_CONFLICT 处理。返回 (终态, 跳过的中间态列表)。
+    """
+    if current not in CMD_ACK_CHAIN or target not in CMD_ACK_CHAIN:
+        return None
+    i, j = CMD_ACK_CHAIN.index(current), CMD_ACK_CHAIN.index(target)
+    if j <= i:
+        return None
+    intermediates: list[str] = []
+    src = current
+    for hop in CMD_ACK_CHAIN[i + 1 : j + 1]:
+        if hop not in CMD_TRANSITIONS.get(src, set()):
+            return None
+        if hop != target:
+            intermediates.append(hop)
+        src = hop
+    return target, intermediates
 
 
 def _sha256(text: str) -> str:
@@ -1217,6 +1263,24 @@ class AgentGateway:
                     detail={"gate": "binding_pending", **gate_detail},
                 )
                 return self._command_result(self._control.get_command(request_id))
+            if record.runtime not in ("", "omp"):
+                # P1-3：非 omp backend 无插件 consumer —— mailbox 已写入但
+                # 永无人消费（TASK 滞留）。标记 FAILED_SAFE（未触发、可安全
+                # 重试）并快速失败，让调用方（oracle ask）降级走 warm native
+                # --session 路径。
+                self._control.update_command(
+                    request_id, state=CMD_FAILED_SAFE,
+                    detail={
+                        "gate": "no_plugin_consumer", "backend": record.runtime,
+                        **gate_detail,
+                    },
+                )
+                raise GatewayError(
+                    ERR_UNSUPPORTED_RUNTIME,
+                    f"runtime {runtime_id} backend={record.runtime} 无插件"
+                    " consumer，hot/mailbox 投递不可用 — 请走 warm native"
+                    " 路径（oracle ask 自动降级）",
+                )
             # presence 非 alive → 仅持久队列（mailbox_persisted）。
             self._control.update_command(
                 request_id, state=CMD_QUEUED,
@@ -1315,6 +1379,11 @@ class AgentGateway:
 
         插件领取 command 后按序上报 CLAIMED → REVIVING → TRIGGERING →
         TURN_TRIGGERED；gateway 校验迁移合法性并持久化（关键事务 FULL）。
+        P1-2：插件跳级上报（turn_start 直接 TURN_TRIGGERED，无 CLAIMED/
+        REVIVING/TRIGGERING）时沿规范链原子补齐中间态（如 REVIVING →
+        TRIGGERING → TURN_TRIGGERED），而非 PROTOCOL_CONFLICT 拒绝
+        （统一 ack 协议：插件可跳级，gateway 在 claim/revive/dispatch
+        边界补齐）。
         TURN_TRIGGERED 的 turn_id 与 OMP turn_start 的关联校验（correlated
         ack 握手）为 TODO —— 插件侧未实现前仅做机械状态推进。
         """
@@ -1350,10 +1419,26 @@ class AgentGateway:
                 )
         allowed = CMD_TRANSITIONS.get(row["state"], set())
         if state not in allowed:
-            raise GatewayError(
-                ERR_PROTOCOL_CONFLICT,
-                f"invalid command transition {row['state']} → {state} for {request_id}",
+            # P1-2：插件 turn_start 直接上报 TURN_TRIGGERED（无 CLAIMED/
+            # REVIVING/TRIGGERING）时，沿规范链原子补齐中间态，而非拒绝
+            # （统一 ack 协议：插件可跳级，gateway 补齐）。
+            advanced = _advance_ack_chain(row["state"], state)
+            if advanced is None:
+                raise GatewayError(
+                    ERR_PROTOCOL_CONFLICT,
+                    f"invalid command transition {row['state']} → {state} for {request_id}",
+                )
+            final_state, intermediates = advanced
+            updated = self._control.update_command(
+                request_id, state=final_state,
+                turn_id=turn_id or row.get("turn_id", ""),
+                detail={
+                    "ack": state, "ack_at": _now_iso(),
+                    "advanced_from": row["state"],
+                    "advanced_through": intermediates,
+                },
             )
+            return self._command_result(updated)
         updated = self._control.update_command(
             request_id, state=state,
             turn_id=turn_id or row.get("turn_id", ""),
@@ -2087,11 +2172,15 @@ class AgentGateway:
         log.warning("gateway: unknown lifecycle event %r for %s", event, record.runtime_id)
 
     def _is_hot(self, record: RuntimeRecord) -> bool:
-        """hot 投递门控（设计 §1 三维 + §2 插件能力）。
+        """hot 投递门控（设计 §1 三维 + §2 插件能力 + P1-3 backend 约束）。
 
         presence=alive AND binding=bound AND
         agent_state ∈ {agent_running, idle, ended}；
-        且已上报 capability 须含 park_revive + correlated_turn_ack：
+        P1-3：backend 必须是 omp（或空，向后兼容）——opencode/generic/
+        native（adopt/declare 的 OpenCode 等）无插件 consumer，hot/mailbox
+        投递是死胡同，一律不判 hot（走 warm native --session 路径）；
+        且已上报 capability（归一化 _vN 后缀后）须含 park_revive +
+        correlated_turn_ack：
           - 已上报但缺失必需能力 → 降级 not-hot（退回持久队列）；
           - 未上报（老插件/未握手）→ 仅告警不降级（向后兼容）。
         """
@@ -2101,7 +2190,17 @@ class AgentGateway:
             and record.agent_state in (AGENT_RUNNING, AGENT_IDLE, AGENT_ENDED)
         ):
             return False
-        caps = {str(c) for c in (record.capabilities or [])}
+        if record.runtime not in ("", "omp"):
+            # P1-3：非 omp backend 无插件 consumer（OpenCode 空 capabilities
+            # 曾被兼容放行误判 hot → ask 走 mailbox 滞留 TASK）；这里直接
+            # 拒绝，调用方降级走 warm native 路径。
+            log.warning(
+                "gateway: runtime %s backend=%r 无插件 consumer → 不判 hot"
+                "（走 warm native 路径）", record.runtime_id, record.runtime,
+            )
+            return False
+        # P1-1：能力名归一化（park_revive_v1 → park_revive）后比对。
+        caps = {_normalize_capability(str(c)) for c in (record.capabilities or [])}
         if not caps:
             # 未上报能力：无法校验 → 告警放行，保持向后兼容。
             log.warning(

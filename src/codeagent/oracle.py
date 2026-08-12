@@ -136,15 +136,28 @@ def _review_sid(review_key: str) -> str:
     return f"ora-{digest}-{uuid4().hex[:10]}"
 
 
-def _adopt_runtime(review_key: str, sid: str, handle, backend: str) -> bool:
+def _adopt_runtime(review_key: str, sid: str, handle, backend: str) -> bool | str:
     """Adopt a spawned runtime into the local gateway (presence/status).
 
     Needed for runtimes WITHOUT a plugin handshake (opencode/generic); OMP
     runtimes are adopted by the plugin's runtime.register instead.
 
+    P1-4 OWNER_MISMATCH 修复：OMP backend 禁止在此 adopt。CLI 进程用
+    os.getpid()/随机 nonce 抢先注册时，会把 gateway 的 owner 身份占成
+    "CLI PID + 随机 nonce"；随后插件 handshake 以 supervisor PID + spec
+    nonce 同 generation 重注册，被 gateway 判为 OWNER_MISMATCH 而拒绝，
+    真实插件的注册因此丢失。OMP 的 presence 由插件 runtime.register 正常
+    接管，这里直接跳过。
+
     I2: returns True on success / False on failure so callers can surface
     ``adopted: false`` in their success JSON instead of silently degrading.
+    OMP backend 返回 "skipped"（注册归插件 handshake，CLI 不 adopt）。
     """
+    if backend == "omp":
+        # OMP：插件 handshake（supervisor PID + spec nonce）负责
+        # runtime.register；CLI 侧任何 adopt 都会以错误 owner 身份同
+        # generation 抢先注册，触发 gateway OWNER_MISMATCH——必须跳过。
+        return "skipped"
     try:
         from codeagent.gateway.client import GatewayClient
 
