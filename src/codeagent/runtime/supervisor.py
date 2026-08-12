@@ -118,6 +118,7 @@ class RuntimeHealth:
     pid: Optional[int] = None
     markers: dict[str, str] = field(default_factory=dict)
     reason: str = ""
+    quota_error: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -127,6 +128,7 @@ class RuntimeHealth:
             "pid": self.pid,
             "markers": self.markers,
             "reason": self.reason,
+            "quota_error": self.quota_error,
         }
 
 
@@ -289,6 +291,40 @@ def _mark(spec: RuntimeSpec, name: str, content: str = "") -> None:
     (d / f"{spec.runtime_id}.{name}").write_text(content)
 
 
+def _scan_quota_error(log_path: Path, model: str) -> str:
+    """Scan the tail of a runtime log for provider quota/rate-limit markers.
+
+    Returns the first matching line (trimmed) or "" when absent.  Providers
+    surface quota exhaustion with varied wording (insufficient_quota, quota
+    exceeded, rate limit, payment required, billing) — matching any of them
+    turns an opaque exit into an actionable QUOTA error.
+    """
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            # Tail only: quota failures happen at first API call, and the
+            # whole log is small — 16 KiB covers it without loading a huge
+            # transcript in pathological cases.
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 16 * 1024))
+            tail = f.read()
+    except OSError:
+        return ""
+
+    import re
+
+    markers = re.compile(
+        r"insufficient[_ -]?quota|quota[ _-]?exceeded|quota exceeded|"
+        r"rate[ _-]?limit|payment required|\b402\b|billing|quota",
+        re.IGNORECASE,
+    )
+    for line in tail.splitlines():
+        line = line.strip()
+        if line and markers.search(line):
+            return line[:400]
+    return ""
+
+
 def main(argv: list[str] | None = None) -> int:
     """Supervisor entry: ``python -m codeagent.runtime.supervisor <spec_path>``."""
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -405,8 +441,25 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         pass
     _mark(spec, MARKER_AGENT_EXITED, str(rc))
+
+    # Quota/rate-limit detection: a fast-exiting runtime whose log carries
+    # provider billing markers must be reported EXPLICITLY (insufficient_quota
+    # etc.) — never disguised as a generic transport/spawn timeout.  Writes a
+    # probe-visible marker + an ERROR event the oracle CLI can surface with a
+    # degradation hint.
+    quota_hit = _scan_quota_error(log_path, spec.model)
+    if quota_hit:
+        _mark(spec, "QUOTA_ERROR", quota_hit)
+        _report(spec.gateway_socket, spec, "ERROR", {
+            "error_type": "insufficient_quota",
+            "model": spec.model,
+            "detail": quota_hit[:400],
+            "degrade_hint": "model quota exhausted — retry with a cheaper model "
+                            "(oracle-lite / default chain) or wait for quota reset",
+        })
     _report(spec.gateway_socket, spec, "RUNTIME_STATE", {
         "state": "agent_exited", "exit_code": rc,
+        "quota_error": bool(quota_hit),
     })
     return rc
 

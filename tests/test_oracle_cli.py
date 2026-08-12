@@ -353,3 +353,181 @@ def test_attach_routes_to_revive_when_released(tmp_path):
     assert rc == 0
     got = registry.lookup("k-attach")
     assert got is not None and got.lifecycle == Lifecycle.HOT_PARKED, "attach 应 revive 回 HOT_PARKED"
+
+
+# ── model fallback chain ───────────────────────────────────────────────
+
+
+def test_parse_retry_fallback_chains(tmp_path):
+    """retry.fallbackChains 2 级嵌套解析（default/slow/smol 链）。"""
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "retry: \n"
+        "  enabled: true\n"
+        "  fallbackChains: \n"
+        "    default: \n"
+        "      - opencode-go/deepseek-v4-flash\n"
+        "      - Mify/deepseek/deepseek-v4-pro\n"
+        "    smol: \n"
+        "      - opencode-go/deepseek-v4-flash\n"
+        "    slow: \n"
+        "      - Mify-ppio/ppio/pa/gpt-5.6-sol\n"
+        "      - Mify/deepseek/deepseek-v4-pro\n"
+        "compaction: \n"
+        "  enabled: true\n"
+        "memory: \n"
+        "  backend: memsearch\n"
+    , encoding="utf-8")
+    from codeagent.oracle import _parse_retry_fallback_chains
+
+    chains = _parse_retry_fallback_chains(cfg)
+    assert chains["default"] == ["opencode-go/deepseek-v4-flash", "Mify/deepseek/deepseek-v4-pro"]
+    assert chains["slow"] == ["Mify-ppio/ppio/pa/gpt-5.6-sol", "Mify/deepseek/deepseek-v4-pro"]
+    assert chains["smol"] == ["opencode-go/deepseek-v4-flash"]
+    # 不存在的 section 不得串入
+    assert "compaction" not in chains and "memory" not in chains
+
+
+def test_resolve_oracle_model_chain_mapping(tmp_path, monkeypatch):
+    """oracle → slow（无 slow 时 default）；oracle-lite → default；显式 model 优先。"""
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "retry: \n"
+        "  fallbackChains: \n"
+        "    default: \n"
+        "      - model-default-a\n"
+        "      - model-default-b\n"
+        "    slow: \n"
+        "      - model-slow-a\n"
+        "      - model-slow-b\n"
+    , encoding="utf-8")
+    from codeagent.oracle import _resolve_oracle_model_chain
+
+    with patch("codeagent.oracle._omp_config_paths", return_value=[cfg]):
+        assert _resolve_oracle_model_chain("oracle", "") == ["model-slow-a", "model-slow-b"]
+        assert _resolve_oracle_model_chain("oracle-opus", "") == ["model-slow-a", "model-slow-b"]
+        assert _resolve_oracle_model_chain("oracle-lite", "") == ["model-default-a", "model-default-b"]
+        # 显式指定不覆盖
+        assert _resolve_oracle_model_chain("oracle", "explicit/model-x") == ["explicit/model-x"]
+
+
+def test_resolve_oracle_model_chain_no_config(tmp_path, monkeypatch):
+    """无配置/无 chain → 空列表（保持现状）。"""
+    from codeagent.oracle import _resolve_oracle_model_chain
+
+    with patch("codeagent.oracle._omp_config_paths", return_value=[]):
+        assert _resolve_oracle_model_chain("oracle", "") == []
+
+    cfg = tmp_path / "config.yml"
+    cfg.write_text("memory: \n  backend: memsearch\n", encoding="utf-8")
+    with patch("codeagent.oracle._omp_config_paths", return_value=[cfg]):
+        assert _resolve_oracle_model_chain("oracle-lite", "") == []
+
+
+def test_ask_cold_uses_model_chain(tmp_path, capsys, monkeypatch):
+    """ask cold 分支补模型链：spawn model=primary，env 注入链，输出含 model_chain。"""
+    from codeagent.park.registry import ParkRegistry
+    from codeagent.oracle import _parse_flat_yaml
+
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        "retry: \n"
+        "  fallbackChains: \n"
+        "    default: \n"
+        "      - ask-default-a\n"
+        "      - ask-default-b\n"
+    , encoding="utf-8")
+    monkeypatch.setattr("codeagent.oracle._omp_config_paths", lambda: [cfg])
+
+    ns = _NS(review_key="k1", prompt="cold ask", agent="oracle-lite", backend="omp")
+    gw = MagicMock()
+    gw.call.side_effect = _raise(Exception("GATEWAY_DOWN: socket not found"))
+    with patch("codeagent.oracle._gateway", return_value=gw), \
+         patch("codeagent.oracle.RuntimeRegistry.spawn",
+               return_value=_handle("rt-c", backend_session_id="bc")) as spawn, \
+         patch("codeagent.oracle.build_cold_context", return_value="snapshot"):
+        code = cmd_oracle_ask(ns)
+
+    assert code == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["method"] == "cold"
+    assert out["model_chain"] == ["ask-default-a", "ask-default-b"]
+    req = spawn.call_args[0][1]
+    assert req["model"] == "ask-default-a"
+    assert req["env"]["OMP_MODEL_FALLBACK_CHAIN"] == "ask-default-a,ask-default-b"
+
+
+def test_ask_hot_surfaces_quota_warning(tmp_path, capsys):
+    """运行时死于 quota → ask 显式告警（insufficient_quota + degrade_hint），
+    而非静默降级成 transport 超时。"""
+    from codeagent.park.registry import ParkRegistry
+
+    ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="native-1"))
+    ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp")
+    info = {
+        "runtime_id": "rt-1", "status": "offline",
+        "runtime_health": {"alive": False, "quota_error": "insufficient_quota for model X"},
+    }
+    gw = MagicMock()
+    gw.call.side_effect = lambda m, p=None: info if m == "runtime.info" else {}
+    with patch("codeagent.oracle._gateway", return_value=gw), \
+         patch("codeagent.oracle.RuntimeRegistry.spawn",
+               return_value=_handle("rt-4", backend_session_id="b4")):
+        code = cmd_oracle_ask(ns)
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "insufficient_quota" in err
+    assert "oracle-lite" in err
+
+
+def test_looks_like_quota():
+    from codeagent.oracle import _looks_like_quota
+
+    assert _looks_like_quota("insufficient_quota on model X")
+    assert _looks_like_quota("quota exceeded (402)")
+    assert _looks_like_quota("rate limit reached")
+    assert not _looks_like_quota("transport timed out after 30s")
+    assert not _looks_like_quota("connection refused")
+
+
+def test_fallback_session_scoring_avoids_short_tail_mismatch(tmp_path, monkeypatch):
+    """短 tail（< 5 字符）不再误匹配旧会话；full key 命中优先。"""
+    from codeagent.oracle import _fallback_find_session_for_key
+
+    sessions = tmp_path / "sessions"
+    (sessions / "old-proj").mkdir(parents=True)
+    (sessions / "ora-new").mkdir()
+
+    unrelated = sessions / "old-proj" / "old.jsonl"
+    unrelated.write_text(
+        '{"type":"message","message":{"role":"assistant","content":'
+        '[{"type":"text","text":"blur is a gaussian filter"}]}}\n',
+        encoding="utf-8",
+    )
+    correct = sessions / "ora-new" / "session.jsonl"
+    correct.write_text(
+        '{"type":"message","message":{"role":"assistant","content":'
+        '[{"type":"text","text":"proj:oracle:gfx:blur discussion here"}]}}\n',
+        encoding="utf-8",
+    )
+    # unrelated is newest — naive first-hit would pick it
+    import os as _os
+    _os.utime(unrelated, (1, 1))
+    _os.utime(correct, (2, 2))
+
+    monkeypatch.setattr("codeagent.oracle.Path.home",
+                        lambda: tmp_path)
+    monkeypatch.setenv("OMP_CONFIG", "")
+    # 旧实现用 sessions_root = ~/.omp/agent/sessions，这里 monkeypatch home
+    # 后路径不对——直接测核心逻辑：通过 _find_session_file 不可行，改用
+    # 对 sessions_root 的间接依赖：把 sessions 目录放到 home 下
+    (tmp_path / ".omp" / "agent").mkdir(parents=True, exist_ok=True)
+    import shutil as _sh
+    if (tmp_path / ".omp" / "agent" / "sessions").exists():
+        _sh.rmtree(tmp_path / ".omp" / "agent" / "sessions")
+    _sh.copytree(sessions, tmp_path / ".omp" / "agent" / "sessions")
+
+    found = _fallback_find_session_for_key("proj:oracle:gfx:blur")
+    expected = tmp_path / ".omp" / "agent" / "sessions" / "ora-new" / "session.jsonl"
+    assert found is not None
+    assert found == expected, "full-key match（ora-* 目录）必须胜过短 tail 误匹配"

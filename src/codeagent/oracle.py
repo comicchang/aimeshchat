@@ -134,6 +134,136 @@ def _parse_flat_yaml(path: Path) -> dict:
     return out
 
 
+def _parse_retry_fallback_chains(path: Path) -> dict[str, list[str]]:
+    """Parse ``retry.fallbackChains`` from an omp config file.
+
+    The existing ``_parse_flat_yaml`` only handles 1-level nesting
+    (section → key: value).  Fallback chains are 2-level nested:
+
+        retry:
+          fallbackChains:
+            default:
+              - model-a
+              - model-b
+
+    This targeted parser reads only the ``retry`` section, extracts
+    ``fallbackChains.*`` sub-keys as list[str].  Returns e.g.
+    ``{"default": ["model-a", "model-b"], "slow": ["model-c"]}``.
+    """
+    chains: dict[str, list[str]] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return chains
+
+    # Phase 1: locate the retry: section boundaries.
+    in_retry = False
+    in_chains = False
+    current_chain = ""
+    retry_indent = -1
+    chains_indent = -1
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        # Detect section header: "retry:" at indent 0
+        if not in_retry and stripped == "retry:" and not line[0].isspace():
+            in_retry = True
+            retry_indent = 0
+            continue
+
+        if not in_retry:
+            continue
+
+        # Compute indentation
+        indent = len(line) - len(line.lstrip())
+
+        # If we're back to top-level, retry section ended
+        if indent <= retry_indent and stripped and not stripped.startswith("#"):
+            # A new top-level key → exit retry section
+            if not line[0].isspace():
+                break
+            continue
+
+        # Inside retry: look for "fallbackChains:"
+        if not in_chains and stripped == "fallbackChains:":
+            in_chains = True
+            chains_indent = indent
+            continue
+
+        if not in_chains:
+            continue
+
+        # Inside fallbackChains: chain names are 2-space indented under it
+        if indent == chains_indent + 2 and stripped.endswith(":") and not stripped.startswith("-"):
+            current_chain = stripped[:-1].strip()
+            chains[current_chain] = []
+            continue
+
+        # List items: "- model-name" under current chain
+        if current_chain and stripped.startswith("- "):
+            model = stripped[2:].strip()
+            if model:
+                chains[current_chain].append(model)
+            continue
+
+        # Anything else at retry level or above → exit chains
+        if indent <= chains_indent:
+            break
+
+    return chains
+
+
+def _resolve_oracle_model_chain(agent_type: str, explicit_model: str) -> list[str]:
+    """Resolve the fallback model chain for an oracle agent.
+
+    - ``explicit_model`` non-empty → single-element ``[explicit_model]``
+      (user override, never replaced).
+    - Otherwise read ``retry.fallbackChains`` from the OMP config and
+      select by *agent_type*:
+        - oracle / oracle-opus → ``slow`` (or ``default``)
+        - oracle-lite → ``default``
+    - No config / no matching chain → return ``[]`` (keep existing behaviour).
+    """
+    if explicit_model:
+        return [explicit_model]
+
+    for cfg_path in _omp_config_paths():
+        chains = _parse_retry_fallback_chains(cfg_path)
+        if not chains:
+            continue
+
+        # Map agent_type → preferred chain name
+        if agent_type in ("oracle", "oracle-opus"):
+            chain = chains.get("slow") or chains.get("default")
+        else:  # oracle-lite or anything else
+            chain = chains.get("default")
+
+        if chain:
+            return list(chain)
+
+    return []
+
+
+def _looks_like_quota(text: str) -> bool:
+    """True when *text* carries a provider quota/rate-limit marker.
+
+    Mirrors the supervisor's ``_scan_quota_error`` markers so CLI-side
+    failures (spawn errors, warm/cold degrade messages) can be reported
+    explicitly as insufficient_quota instead of generic timeouts.
+    """
+    import re
+
+    return bool(re.search(
+        r"insufficient[_ -]?quota|quota[ _-]?exceeded|quota exceeded|"
+        r"rate[ _-]?limit|payment required|\b402\b|billing|quota",
+        text,
+        re.IGNORECASE,
+    ))
+
+
 def _merge_flat_yaml(path: Path, ensure: dict[str, dict[str, str]]) -> bool:
     """Insert missing keys under their correct YAML sections (with backup).
 
@@ -263,6 +393,14 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         print(f"warning: {memory_report['missing'][0]}", file=sys.stderr)
     memory_env = {"OMP_MEMORY_CONFIG_PATH": memory_report["config_path"]} if memory_report["config_path"] else {}
 
+    # ── Model fallback chain (reuse retry.fallbackChains from OMP config) ──
+    model_chain = _resolve_oracle_model_chain(args.agent, args.model or "")
+    primary_model = model_chain[0] if model_chain else (args.model or "")
+    chain_env: dict[str, str] = {}
+    if model_chain:
+        chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(model_chain)
+        log.debug("oracle start: model chain resolved: %s (primary=%s)", model_chain, primary_model)
+
     # ── Swarm session + agent registration ────────────────────────────
     kernel, store = _kernel_and_store()
     sid = _review_sid(review_key)
@@ -321,21 +459,26 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
 
     # ── Spawn runtime (native path) ───────────────────────────────────
     reg = RuntimeRegistry()
+    spawn_env = {**memory_env, **chain_env}
     handle = reg.spawn(backend, {
         "session_id": sid,
         "agent_id": _ORACLE_AGENT,
         "review_key": review_key,
         "workdir": workdir,
         "task": prompt,
-        "model": args.model or "",
+        "model": primary_model,
         "gateway_socket": str(control_socket_path()),
         "owner_pid": os.getpid(),
         "nonce": uuid4().hex[:12],
         "short_task": False,
-        "env": memory_env,
+        "env": spawn_env,
     })
 
     # Persist backend session into the park manifest (authoritative).
+    # NOTE: manifest.model stores the EXPLICIT override only (args.model).
+    # The resolved primary (chain[0]) is used for spawn, but persisting it
+    # here would make revive treat it as an explicit override and collapse
+    # the fallback chain to one element.
     manifest = ParkManifest(
         review_key=review_key,
         swarm_session_id=sid,
@@ -366,6 +509,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "generation": handle.generation,
         "mode": handle.mode,
         "capabilities": sorted(handle.capabilities),
+        "model_chain": model_chain,
     }, indent=2))
     return 0
 
@@ -405,6 +549,16 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "note": "in-loop send to live runtime (plugin steer)",
             }, indent=2))
             return 0
+        # Runtime not alive: if it died of quota exhaustion, say so
+        # EXPLICITLY before silently degrading to warm/cold.
+        quota = health.get("quota_error", "")
+        if quota:
+            print(json.dumps({
+                "warning": "insufficient_quota",
+                "review_key": review_key,
+                "detail": quota[:300],
+                "degrade_hint": "primary model quota exhausted — retry with oracle-lite or a cheaper model",
+            }, indent=2), file=sys.stderr)
     except GatewayError as exc:
         # 改进项3: the hot path always degrades to warm/cold — log WHY the
         # in-loop send was skipped (gateway down, runtime gone, etc.).
@@ -441,18 +595,25 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:
                 print(f"warning: warm task enqueue failed: {exc}", file=sys.stderr)
+            # Model fallback chain (same resolution as start/revive).
+            ask_model_chain = _resolve_oracle_model_chain(args.agent, manifest.model or "")
+            ask_primary = ask_model_chain[0] if ask_model_chain else (manifest.model or "")
+            ask_chain_env: dict[str, str] = {}
+            if ask_model_chain:
+                ask_chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(ask_model_chain)
             warm_handle = reg.spawn(_resolve_backend(args.agent, args.backend), {
                 "session_id": sid,
                 "agent_id": _ORACLE_AGENT,
                 "review_key": review_key,
                 "workdir": manifest.workdir or os.getcwd(),
                 "task": prompt,
-                "model": manifest.model or "",
+                "model": ask_primary,
                 "backend_session_id": manifest.backend_session_id,
                 "gateway_socket": str(control_socket_path()),
                 "owner_pid": os.getpid(),
                 "nonce": uuid4().hex[:12],
                 "short_task": False,
+                "env": ask_chain_env,
             })
             # P2-11: never overwrite the manifest's known backend session id
             # with an empty one — the opencode extraction window may close
@@ -486,6 +647,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "runtime_id": warm_handle.runtime_id,
                 "old_backend_session_id": manifest.backend_session_id,
                 "new_backend_session_id": new_backend_session_id,
+                "model_chain": ask_model_chain,
                 "note": (
                     "native backend session resumed (OMP --resume / opencode --session)"
                     if new_backend_session_id else
@@ -503,12 +665,19 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 except Exception as stop_exc:
                     log.debug("oracle ask: warm runtime stop failed (%s): %s",
                               warm_handle.runtime_id, stop_exc)
-            print(json.dumps({
+            error_text = str(exc)
+            warm_fail: dict = {
                 "method": "warm_failed",
                 "review_key": review_key,
-                "error": str(exc),
+                "error": error_text,
                 "note": "backend resume failed — degrading to cold",
-            }, indent=2), file=sys.stderr)
+            }
+            if _looks_like_quota(error_text):
+                warm_fail["error_type"] = "insufficient_quota"
+                warm_fail["degrade_hint"] = (
+                    "model quota exhausted — retry with oracle-lite or a cheaper model"
+                )
+            print(json.dumps(warm_fail, indent=2), file=sys.stderr)
 
     # ── Cold: snapshot reconstruction ─────────────────────────────────
     # P1-7: cold 分支必须注入 snapshot 上下文（build_cold_context），不能
@@ -517,6 +686,14 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     # peer_agent_id=..."），round3 起该提示被当成首轮 prompt 注入重建
     # 实例（回归）。这里直接生成 snapshot 上下文，忽略决策层的 context。
     cold_context = build_cold_context(review_key)
+    # Model fallback chain (same resolution as start/revive; explicit
+    # --model / manifest override wins).
+    cold_explicit = (manifest.model if manifest else "") or (getattr(args, "model", "") or "")
+    ask_model_chain = _resolve_oracle_model_chain(args.agent, cold_explicit)
+    cold_primary = ask_model_chain[0] if ask_model_chain else cold_explicit
+    cold_chain_env: dict[str, str] = {}
+    if ask_model_chain:
+        cold_chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(ask_model_chain)
     try:
         reg = RuntimeRegistry()
         handle = reg.spawn(_resolve_backend(args.agent, args.backend), {
@@ -525,18 +702,26 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             "review_key": review_key,
             "workdir": manifest.workdir if manifest else os.getcwd(),
             "task": cold_context + "\n\n" + prompt,
-            "model": (manifest.model if manifest else "") or (getattr(args, "model", "") or ""),
+            "model": cold_primary,
             "gateway_socket": str(control_socket_path()),
             "owner_pid": os.getpid(),
             "nonce": uuid4().hex[:12],
             "short_task": False,
+            "env": cold_chain_env,
         })
     except Exception as exc:
-        print(json.dumps({
+        error_text = str(exc)
+        cold_fail: dict = {
             "method": "cold_failed",
             "review_key": review_key,
-            "error": str(exc),
-        }, indent=2), file=sys.stderr)
+            "error": error_text,
+        }
+        if _looks_like_quota(error_text):
+            cold_fail["error_type"] = "insufficient_quota"
+            cold_fail["degrade_hint"] = (
+                "model quota exhausted — retry with oracle-lite or a cheaper model"
+            )
+        print(json.dumps(cold_fail, indent=2), file=sys.stderr)
         return 1
     _adopt_runtime(review_key, _review_sid(review_key), handle, _resolve_backend(args.agent, args.backend))
     print(json.dumps({
@@ -544,6 +729,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
         "review_key": review_key,
         "runtime_id": handle.runtime_id,
         "backend_session_id": handle.backend_session_id,
+        "model_chain": ask_model_chain,
         "note": "snapshot reconstruction (no live/hot session)",
     }, indent=2))
     return 0
@@ -583,6 +769,15 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
             "tool_stats": info.get("tool_stats", {}),
             "runtime_health": info.get("runtime_health", {}),
         }
+        # Quota exhaustion must be surfaced EXPLICITLY (not as a generic
+        # timeout/dead-runtime) — with a concrete degradation hint.
+        quota = (info.get("runtime_health") or {}).get("quota_error", "")
+        if quota:
+            out["runtime"]["quota_error"] = quota
+            out["runtime"]["degrade_hint"] = (
+                "model quota exhausted — retry with oracle-lite or a cheaper model, "
+                "or wait for quota reset"
+            )
     except GatewayError as exc:
         # 改进项2: gateway 不在时给结构化降级 + 修复提示，而不是裸 error 字符串。
         if exc.code in ("GATEWAY_DOWN", "GATEWAY_CONNECT_FAILED"):
@@ -708,11 +903,13 @@ def _fallback_find_session_for_key(review_key: str) -> Optional[Path]:
     """Best-effort scan of recent OMP session files when backend_session_id is missing.
 
     Recursively scans ~/.omp/agent/sessions/ for .jsonl files (newest first,
-    max 5), returning the first file whose content mentions a fragment of
-    *review_key* (the last ``:``-separated segment) — oracle sessions live in
-    per-session subdirectories (e.g. ``<session>/__advisor.jsonl``), so a
-    shallow top-level scan misses them.  Returns ``None`` when nothing
-    matches — caller should fall back to the original error.
+    max 5) and scores candidates instead of first-hit matching — a short
+    tail segment (e.g. ``blur`` from ``proj:oracle:gfx:blur``) previously
+    matched unrelated sessions mentioning that word.  Scoring:
+      +100  full *review_key* appears in the transcript (most specific)
+      +10   file lives under an oracle session dir (``ora-*`` / ``__advisor``)
+      +1    specific tail segment (>= 5 chars) appears
+    Returns the best-scoring file (or ``None`` when nothing scores).
     """
     sessions_root = Path.home() / ".omp" / "agent" / "sessions"
     if not sessions_root.is_dir():
@@ -730,21 +927,31 @@ def _fallback_find_session_for_key(review_key: str) -> Optional[Path]:
     all_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
     recent = all_files[:5]
 
-    # Derive search tokens: prefer exact tail (review_key fragment), fall back
-    # to generic "oracle" only if no tail exists (avoids matching unrelated
-    # historical oracle sessions).
+    # Derive tokens: full review_key first (most specific), then the tail
+    # segment ONLY when it is specific enough (>= 5 chars) — short generic
+    # segments ("blur", "v1") cause false positives against old sessions.
     tail = review_key.rsplit(":", 1)[-1].strip()
-    search_tokens = [tail] if tail and tail != review_key else ["oracle"]
+    full_key = review_key if len(review_key) >= 6 else ""
+    tail_ok = tail and tail != review_key and len(tail) >= 5
 
+    best: Optional[Path] = None
+    best_score = 0
     for f in recent:
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         lower = text.lower()
-        if any(tok.lower() in lower for tok in search_tokens):
-            return f
-    return None
+        score = 0
+        if full_key and full_key.lower() in lower:
+            score += 100
+        if "ora-" in f.name.lower() or "ora-" in str(f.parent).lower() or "__advisor" in f.name.lower():
+            score += 10
+        if tail_ok and tail.lower() in lower:
+            score += 1
+        if score > best_score:
+            best, best_score = f, score
+    return best if best_score > 0 else None
 
 
 def cmd_oracle_result(args: argparse.Namespace) -> int:
@@ -969,9 +1176,9 @@ def cmd_oracle_revive(args: argparse.Namespace) -> int:
     method = "warm" if manifest.backend_session_id else "cold"
     try:
         if method == "warm":
-            runtime_id, backend_session_id = _revive_warm(review_key, manifest, mode)
+            runtime_id, backend_session_id, model_chain = _revive_warm(review_key, manifest, mode)
         else:
-            runtime_id, backend_session_id = _revive_cold(review_key, manifest, mode)
+            runtime_id, backend_session_id, model_chain = _revive_cold(review_key, manifest, mode)
     except Exception as exc:
         print(json.dumps({
             "error": f"{method}_failed",
@@ -987,6 +1194,7 @@ def cmd_oracle_revive(args: argparse.Namespace) -> int:
         "lifecycle": Lifecycle.HOT_PARKED.value,
         "runtime_id": runtime_id,
         "backend_session_id": backend_session_id,
+        "model_chain": model_chain,
     }, indent=2))
     return 0
 
@@ -1027,7 +1235,7 @@ def cmd_oracle_attach(args: argparse.Namespace) -> int:
     return cmd_oracle_revive(args)
 
 
-def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[str, str]:
+def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[str, str, list[str]]:
     """P1-2: warm 复活——复用 backend_session_id 的原生会话。
 
     resume → _attach_omp_session 前台附着（无 runtime_id）。
@@ -1038,9 +1246,17 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
 
     if mode == "resume":
         _attach_omp_session(manifest.backend_session_id, review_key, manifest.workdir)
-        return "", manifest.backend_session_id
+        return "", manifest.backend_session_id, []
 
-    backend = _resolve_backend(manifest.agent_type or _ORACLE_AGENT, "omp")
+    # ── Model fallback chain (reuse retry.fallbackChains from OMP config) ──
+    agent_type = manifest.agent_type or _ORACLE_AGENT
+    model_chain = _resolve_oracle_model_chain(agent_type, manifest.model or "")
+    primary_model = model_chain[0] if model_chain else (manifest.model or "")
+    chain_env: dict[str, str] = {}
+    if model_chain:
+        chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(model_chain)
+
+    backend = _resolve_backend(agent_type, "omp")
     reg = RuntimeRegistry()
     handle = reg.spawn(backend, {
         "session_id": sid,
@@ -1048,12 +1264,13 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
         "review_key": review_key,
         "workdir": manifest.workdir or os.getcwd(),
         "task": "",
-        "model": manifest.model or "",
+        "model": primary_model,
         "backend_session_id": manifest.backend_session_id,
         "gateway_socket": str(control_socket_path()),
         "owner_pid": os.getpid(),
         "nonce": uuid4().hex[:12],
         "short_task": False,
+        "env": chain_env,
     })
     try:
         # P2-11 同款保护：session id 提取窗口失败时保留原值，避免破坏续接点。
@@ -1070,10 +1287,10 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
         except Exception:
             pass
         raise
-    return handle.runtime_id, new_backend_session_id
+    return handle.runtime_id, new_backend_session_id, model_chain
 
 
-def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[str, str]:
+def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[str, str, list[str]]:
     """P1-2: cold 复活——快照重建新会话（无 backend session 可复用时）。
 
     resume 模式没有可附着的会话，退化为 bg（监督式 spawn）。
@@ -1082,7 +1299,14 @@ def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
     if mode == "resume":
         mode = "bg"
     sid = _review_sid(review_key)
-    backend = _resolve_backend(manifest.agent_type or _ORACLE_AGENT, "omp")
+    # ── Model fallback chain (reuse retry.fallbackChains from OMP config) ──
+    agent_type = manifest.agent_type or _ORACLE_AGENT
+    model_chain = _resolve_oracle_model_chain(agent_type, manifest.model or "")
+    primary_model = model_chain[0] if model_chain else (manifest.model or "")
+    chain_env: dict[str, str] = {}
+    if model_chain:
+        chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(model_chain)
+    backend = _resolve_backend(agent_type, "omp")
     reg = RuntimeRegistry()
     handle = reg.spawn(backend, {
         "session_id": sid,
@@ -1090,11 +1314,12 @@ def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
         "review_key": review_key,
         "workdir": manifest.workdir or os.getcwd(),
         "task": build_cold_context(review_key),
-        "model": manifest.model or "",
+        "model": primary_model,
         "gateway_socket": str(control_socket_path()),
         "owner_pid": os.getpid(),
         "nonce": uuid4().hex[:12],
         "short_task": False,
+        "env": chain_env,
     })
     try:
         _flip_to_hot(review_key, manifest, sid=sid,
@@ -1106,7 +1331,7 @@ def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
         except Exception:
             pass
         raise
-    return handle.runtime_id, handle.backend_session_id or ""
+    return handle.runtime_id, handle.backend_session_id or "", model_chain
 
 
 def _flip_to_hot(review_key: str, manifest: ParkManifest, sid: str,

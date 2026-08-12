@@ -355,6 +355,9 @@ def probe_runtime(handle: TmuxRuntimeHandle) -> dict:
         p = marker_dir / f"{handle.runtime_id}.{marker}"
         if p.exists():
             health["markers"][marker] = p.read_text(errors="replace").strip()[:200]
+    quota_file = marker_dir / f"{handle.runtime_id}.QUOTA_ERROR"
+    if quota_file.exists():
+        health["quota_error"] = quota_file.read_text(errors="replace").strip()[:400]
     health["alive"] = health["pane_alive"] and health["pid_alive"]
     return health
 

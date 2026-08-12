@@ -128,6 +128,37 @@ class TestSupervisorMain:
         assert marker.exists()
 
 
+# ── quota / rate-limit detection ───────────────────────────────────────
+
+
+def test_scan_quota_error_detects_provider_markers(tmp_path):
+    """insufficient_quota / quota exceeded / rate limit in the log tail are
+    detected — never disguised as a generic transport timeout."""
+    from codeagent.runtime.supervisor import _scan_quota_error
+
+    log = tmp_path / "runtime.log"
+    log.write_text(
+        "2026-08-12T10:00:01 [info] omp started\n"
+        "2026-08-12T10:00:02 [error] provider error: insufficient_quota for "
+        "model Mify-ppio/ppio/pa/gpt-5.6-sol\n",
+        encoding="utf-8",
+    )
+    hit = _scan_quota_error(log, "some-model")
+    assert "insufficient_quota" in hit
+
+    log.write_text("rate limit exceeded (429) on request", encoding="utf-8")
+    assert "rate limit" in _scan_quota_error(log, "m")
+
+    log.write_text("all good, nothing to see", encoding="utf-8")
+    assert _scan_quota_error(log, "m") == ""
+
+
+def test_scan_quota_error_missing_log(tmp_path):
+    from codeagent.runtime.supervisor import _scan_quota_error
+
+    assert _scan_quota_error(tmp_path / "nope.log", "m") == ""
+
+
 # ── capture-pane is never used for state ───────────────────────────────
 
 
