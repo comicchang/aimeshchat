@@ -41,7 +41,7 @@ from codeagent.gateway.model import GatewayError
 from codeagent.mailbox.store import MailboxStore, RequestLedger, resolve_root
 from codeagent.park.registry import ParkRegistry
 from codeagent.park.inject import build_cold_context
-from codeagent.domain import ExecutionSpec
+from codeagent.domain import ExecutionSpec, ModelContextUnavailable
 from codeagent.domain.park import Lifecycle, ParkManifest
 from codeagent.runtime.base import CAP_WARM_RESUME
 from codeagent.runtime.registry import RuntimeRegistry
@@ -228,6 +228,39 @@ def _normalize_oracle_agent(agent_type: str) -> str:
                     "(agent profile model: is the single authority)", _ORACLE_AGENT)
         return _ORACLE_AGENT
     return agent_type
+
+
+# ── Q5b: default 继承主 agent 模型（runtime.context 机制）─────────────
+
+
+def _runtime_context_model(agent: str) -> Optional[tuple[str, str, str]]:
+    """Q5b: 从 gateway runtime.context 继承主 agent 当前模型。
+
+    仅当调用方在 gateway runtime 内（AIMESHCHAT_RUNTIME_ID 已设置）时
+    启用：``runtime.context_get`` 命中返回 (model, variant, provider)；
+    无上下文或查询失败 → 抛 ``ModelContextUnavailable``（明确报错，不
+    静默回落 mimo）；非 gateway 调用（无环境变量）→ 返回 None，由调用
+    方回退 agent profile 模型（向后兼容）。
+
+    ``agent`` 仅作签名对齐（from_args 调用约定）；继承与 agent 无关。
+    """
+    runtime_id = os.environ.get("AIMESHCHAT_RUNTIME_ID", "")
+    if not runtime_id:
+        return None
+    try:
+        resp = _gateway().call("runtime.context_get", {"runtime_id": runtime_id})
+    except Exception as exc:
+        raise ModelContextUnavailable(
+            f"gateway runtime.context_get failed for {runtime_id}: {exc}"
+        ) from exc
+    ctx = (resp or {}).get("model_context") or {}
+    model = ctx.get("model", "") or ""
+    if not model:
+        raise ModelContextUnavailable(
+            f"runtime {runtime_id} has no model context "
+            "(plugin model_change 未上报)；请显式 --model 或等待主 agent 上报"
+        )
+    return model, ctx.get("variant", "") or "", ctx.get("provider", "") or ""
 
 
 def _resolve_oracle_model_chain(agent_type: str, explicit_model: str) -> list[str]:
@@ -677,16 +710,28 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     memory_env = {"OMP_MEMORY_CONFIG_PATH": memory_report["config_path"]} if memory_report["config_path"] else {}
 
     # ── Q5: ExecutionSpec — 不可变执行规格（去 role 化核心） ───────────
-    # 显式 --model/--variant/--system 优先，否则 agent profile model。
-    spec = ExecutionSpec.from_args(
-        args, resolve_agent_model=lambda a: (_resolve_oracle_model_chain(a, "") or [""])[0],
-    )
+    # Q5b: 显式 --model/--variant 优先；无显式时若在 gateway runtime 内
+    # （AIMESHCHAT_RUNTIME_ID）继承主 agent 当前模型（runtime.context）；
+    # 无上下文 → 明确报错 MODEL_CONTEXT_UNAVAILABLE（不静默回落 mimo）；
+    # 非 gateway 调用回退 agent profile model（向后兼容）。
+    try:
+        spec = ExecutionSpec.from_args(
+            args,
+            resolve_agent_model=lambda a: (_resolve_oracle_model_chain(a, "") or [""])[0],
+            resolve_runtime_context=_runtime_context_model,
+        )
+    except ModelContextUnavailable as exc:
+        print(f"MODEL_CONTEXT_UNAVAILABLE: {exc}", file=sys.stderr)
+        return 1
     log.debug("oracle start: ExecutionSpec(provider=%s, model=%s, variant=%s, system=%r)",
               spec.provider, spec.model, spec.variant, spec.system_prompt[:40] if spec.system_prompt else "")
 
     # ── M-model: agent profile model: 为唯一权威源（显式 --model 仍覆盖）──
-    model_chain = _resolve_oracle_model_chain(agent, args.model or "")
-    primary_model = model_chain[0] if model_chain else (args.model or "")
+    # Q5b: 以 ExecutionSpec 最终解析结果（spec.model，可能是显式、继承的
+    # runtime.context 或 profile）作为 primary；revive/ask 从 manifest 的
+    # primary_model 直接读，不再重推导。
+    model_chain = _resolve_oracle_model_chain(agent, spec.model)
+    primary_model = model_chain[0] if model_chain else spec.model
     chain_env: dict[str, str] = {}
     if model_chain:
         chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(model_chain)

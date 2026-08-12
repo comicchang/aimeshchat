@@ -148,6 +148,11 @@ class RuntimeRecord:
     agent_state: str = AGENT_IDLE      # agent_running | idle | ended
     binding_epoch: int = 0             # backend session 绑定代数（防陈旧 binding）
     capabilities: list = field(default_factory=list)  # 插件握手上报能力
+    # ── Q5b: 主 agent 当前模型上下文（runtime.context 机制）───────────
+    # 插件在 model_change/thinking_level 时经 runtime.context_set 原子更新
+    # provider/model/variant/epoch；内存态（同 capabilities，不落盘），
+    # 供 oracle CLI default 继承（AIMESHCHAT_RUNTIME_ID → context_get）。
+    model_context: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -928,6 +933,90 @@ class AgentGateway:
             "binding": record.binding,
             "agent_state": record.agent_state,
             "binding_epoch": record.binding_epoch,
+        }
+
+    # ── Q5b: runtime.context（default 继承主 agent 模型）───────────────
+
+    def runtime_context_set(self, params: dict) -> dict:
+        """Q5b: 原子更新一个 runtime 的 model_context（插件 model_change 上报）。
+
+        参数：runtime_id（必填）、provider/model/variant/epoch（epoch 为
+        模型切换代数，便于调用方判断上下文新鲜度）。
+
+        语义：记录主 agent 当前已解析模型，供 oracle CLI default 继承
+        （AIMESHCHAT_RUNTIME_ID → runtime.context_get）。与 heartbeat 不同，
+        不更新 last_activity —— 模型切换不是活性信号，避免掩盖失联 runtime。
+        """
+        runtime_id = params.get("runtime_id", "")
+        if not runtime_id:
+            raise GatewayError(ERR_PROTOCOL, "runtime.context_set requires runtime_id")
+        provider = params.get("provider", "") or ""
+        model = params.get("model", "") or ""
+        variant = params.get("variant", "") or ""
+        epoch_raw = params.get("epoch", 0)
+        try:
+            epoch = int(epoch_raw or 0)
+        except (TypeError, ValueError):
+            raise GatewayError(ERR_PROTOCOL, "runtime.context_set epoch must be an int")
+        with self._runtimes_lock:
+            record = self._runtimes.get(runtime_id)
+            if record is None:
+                raise GatewayError(ERR_NOT_FOUND, f"unknown runtime: {runtime_id}")
+            # 与 runtime_event 同款 generation 校验：提供则必须匹配，
+            # 防止陈旧代际的插件把新 runtime 的上下文覆盖掉。
+            generation = params.get("generation")
+            if generation is not None:
+                try:
+                    generation = int(generation)
+                except (TypeError, ValueError):
+                    raise GatewayError(ERR_PROTOCOL, "runtime.context_set generation must be an int")
+                if generation != record.generation:
+                    raise GatewayError(
+                        ERR_GENERATION_STALE,
+                        f"generation {generation} != registered {record.generation} "
+                        f"for {runtime_id}",
+                    )
+            record.model_context = {
+                "provider": provider,
+                "model": model,
+                "variant": variant,
+                "epoch": epoch,
+            }
+            snapshot = dict(record.model_context)
+        return {"runtime_id": runtime_id, "model_context": snapshot}
+
+    def runtime_context_get(self, params: dict) -> dict:
+        """Q5b: 查询一个 runtime 的 model_context（runtime_id 或 review_key）。
+
+        与 runtime_info 相同 A3 语义：优先 live 记录，过滤 stopped。
+        记录存在但尚未上报（无 model_context）→ 返回空 dict，由调用方
+        决定（oracle CLI → MODEL_CONTEXT_UNAVAILABLE）。
+        """
+        runtime_id = params.get("runtime_id", "")
+        review_key = params.get("review_key", "")
+        with self._runtimes_lock:
+            record = None
+            if runtime_id:
+                record = self._runtimes.get(runtime_id)
+                # A3: stopped 记录视为不存在（sweep 前不报旧答案）。
+                if record is not None and record.status == "stopped":
+                    record = None
+            elif review_key:
+                candidates = [r for r in self._runtimes.values() if r.review_key == review_key]
+                live = [r for r in candidates if r.status != "stopped"]
+                record = max(live, key=lambda r: r.last_activity) if live else None
+            if record is None:
+                raise GatewayError(
+                    ERR_NOT_FOUND,
+                    f"no runtime for runtime_id={runtime_id!r} review_key={review_key!r}",
+                )
+            snapshot = dict(record.model_context or {})
+            record_id = record.runtime_id
+            record_key = record.review_key
+        return {
+            "runtime_id": record_id,
+            "review_key": record_key,
+            "model_context": snapshot,
         }
 
     def runtimes_list(self, params: dict) -> dict:
@@ -2036,6 +2125,9 @@ class AgentGateway:
             "runtime.spawn": self.runtime_spawn,
             "runtime.heartbeat": self.runtime_heartbeat,
             "runtime.event": self.runtime_event,
+            # Q5b: runtime.context —— 插件 model_change 上报 + oracle CLI 继承查询。
+            "runtime.context_set": self.runtime_context_set,
+            "runtime.context_get": self.runtime_context_get,
             "runtime.send": self.runtime_send,
             "runtime.lifecycle": self.runtime_lifecycle,  # 三维归约入口（设计§1）
             "runtime.command_ack": self.runtime_command_ack,  # 命令状态机 ack（§3）
