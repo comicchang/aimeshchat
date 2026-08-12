@@ -197,94 +197,6 @@ def _parse_flat_yaml(path: Path) -> dict:
     return out
 
 
-def _parse_retry_fallback_chains(path: Path) -> dict[str, list[str]]:
-    """Parse ``retry.fallbackChains`` from an omp config file.
-
-    The existing ``_parse_flat_yaml`` only handles 1-level nesting
-    (section → key: value).  Fallback chains are 2-level nested:
-
-        retry:
-          fallbackChains:
-            default:
-              - model-a
-              - model-b
-
-    This targeted parser reads only the ``retry`` section, extracts
-    ``fallbackChains.*`` sub-keys as list[str].  Returns e.g.
-    ``{"default": ["model-a", "model-b"], "slow": ["model-c"]}``.
-
-    P2: format-sensitive — relies on the exact YAML indentation layout
-    (``retry:`` at col 0, ``fallbackChains:`` indented, list items 2-space
-    further).  Non-standard formatting or comments inside the ``retry``
-    block may cause early exit; safe because OMP's config writer uses
-    canonical indentation.
-    """
-    chains: dict[str, list[str]] = {}
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return chains
-
-    # Phase 1: locate the retry: section boundaries.
-    in_retry = False
-    in_chains = False
-    current_chain = ""
-    retry_indent = -1
-    chains_indent = -1
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        # Detect section header: "retry:" at indent 0
-        if not in_retry and stripped == "retry:" and not line[0].isspace():
-            in_retry = True
-            retry_indent = 0
-            continue
-
-        if not in_retry:
-            continue
-
-        # Compute indentation
-        indent = len(line) - len(line.lstrip())
-
-        # If we're back to top-level, retry section ended
-        if indent <= retry_indent and stripped and not stripped.startswith("#"):
-            # A new top-level key → exit retry section
-            if not line[0].isspace():
-                break
-            continue
-
-        # Inside retry: look for "fallbackChains:"
-        if not in_chains and stripped == "fallbackChains:":
-            in_chains = True
-            chains_indent = indent
-            continue
-
-        if not in_chains:
-            continue
-
-        # Inside fallbackChains: chain names are 2-space indented under it
-        if indent == chains_indent + 2 and stripped.endswith(":") and not stripped.startswith("-"):
-            current_chain = stripped[:-1].strip()
-            chains[current_chain] = []
-            continue
-
-        # List items: "- model-name" under current chain
-        if current_chain and stripped.startswith("- "):
-            model = stripped[2:].strip()
-            if model:
-                chains[current_chain].append(model)
-            continue
-
-        # Anything else at retry level or above → exit chains
-        if indent <= chains_indent:
-            break
-
-    return chains
-
-
 def _read_agent_model(agent_type: str) -> str:
     """Read an OMP agent profile's ``model:`` field (agents/<agent_type>.md).
 
@@ -307,8 +219,8 @@ def _read_agent_model(agent_type: str) -> str:
 def _normalize_oracle_agent(agent_type: str) -> str:
     """未显式指定 agent 时给明确默认（oracle），不再静默回落 default/mimo。
 
-    空值 / ``default``（旧 fallbackChains 的默认链名）归一为 ``oracle``
-    （与 CLI ``--agent`` 默认值一致），并打 warning 提示；其余类型原样透传。
+    空值 / ``default`` 归一为 ``oracle``（与 CLI ``--agent`` 默认值一致），
+    并打 warning 提示；其余类型原样透传。
     """
     if not agent_type or agent_type == "default":
         log.warning("oracle: no explicit agent specified — defaulting to %r "
@@ -320,18 +232,13 @@ def _normalize_oracle_agent(agent_type: str) -> str:
 def _resolve_oracle_model_chain(agent_type: str, explicit_model: str) -> list[str]:
     """Resolve the primary model chain for an oracle agent（M-model）。
 
-    Agent profile（agents/<agent_type>.md 的 ``model:``）是模型唯一权威源，
-    不再依赖 config.yml 的 retry.fallbackChains YAML 子集解析：
+    模型解析两条路径，不再依赖 config.yml 的 retry.fallbackChains：
 
     - ``explicit_model`` 非空 → 单元素 ``[explicit_model]``（用户显式
       --model，永远优先，不被 profile 覆盖）。
     - 否则读 agent profile 的 model:（oracle → gpt-5.6-sol、oracle-lite →
-      v4-pro、oracle-opus → claude-opus；以 profile 实际值为准，如
-      ``Mify-ppio/ppio/pa/gpt-5.6-sol``）。
-    - 空/未知 agent → ``_normalize_oracle_agent`` 归一为明确默认 oracle，
-      不再静默取 config 的 default 链（mimo）。
-    - profile model 缺失时弱化回退 ``retry.fallbackChains``（保持旧依赖
-      兼容），仅作兜底、不再是优先来源。
+      v4-pro、oracle-opus → claude-opus；以 profile 实际值为准）。
+    - 空/未知 agent → ``_normalize_oracle_agent`` 归一为明确默认 oracle。
     - 全部缺失 → ``[]``（调用方显式处理，不静默降级）。
     """
     if explicit_model:
@@ -341,21 +248,6 @@ def _resolve_oracle_model_chain(agent_type: str, explicit_model: str) -> list[st
     m = _read_agent_model(agent_type)
     if m:
         return [m]
-
-    # 弱化回退：仅当 profile model 缺失时读取 retry.fallbackChains（兼容旧调用）。
-    for cfg_path in _omp_config_paths():
-        chains = _parse_retry_fallback_chains(cfg_path)
-        if not chains:
-            continue
-
-        # 映射 agent_type → 优先 chain 名（旧兼容逻辑）。
-        if agent_type in ("oracle", "oracle-opus"):
-            chain = chains.get("slow") or chains.get("default")
-        else:
-            chain = chains.get("default")
-
-        if chain:
-            return list(chain)
 
     return []
 

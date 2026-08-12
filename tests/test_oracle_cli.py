@@ -352,92 +352,44 @@ def test_attach_routes_to_revive_when_released(tmp_path):
     assert got is not None and got.lifecycle == Lifecycle.HOT_PARKED, "attach 应 revive 回 HOT_PARKED"
 
 
-# ── model fallback chain ───────────────────────────────────────────────
+# ── model resolve ──────────────────────────────────────────────────────
 
 
-def test_parse_retry_fallback_chains(tmp_path):
-    """retry.fallbackChains 2 级嵌套解析（default/slow/smol 链）。"""
-    cfg = tmp_path / "config.yml"
-    cfg.write_text(
-        "retry: \n"
-        "  enabled: true\n"
-        "  fallbackChains: \n"
-        "    default: \n"
-        "      - opencode-go/deepseek-v4-flash\n"
-        "      - Mify/deepseek/deepseek-v4-pro\n"
-        "    smol: \n"
-        "      - opencode-go/deepseek-v4-flash\n"
-        "    slow: \n"
-        "      - Mify-ppio/ppio/pa/gpt-5.6-sol\n"
-        "      - Mify/deepseek/deepseek-v4-pro\n"
-        "compaction: \n"
-        "  enabled: true\n"
-        "memory: \n"
-        "  backend: memsearch\n"
-    , encoding="utf-8")
-    from codeagent.oracle import _parse_retry_fallback_chains
-
-    chains = _parse_retry_fallback_chains(cfg)
-    assert chains["default"] == ["opencode-go/deepseek-v4-flash", "Mify/deepseek/deepseek-v4-pro"]
-    assert chains["slow"] == ["Mify-ppio/ppio/pa/gpt-5.6-sol", "Mify/deepseek/deepseek-v4-pro"]
-    assert chains["smol"] == ["opencode-go/deepseek-v4-flash"]
-    # 不存在的 section 不得串入
-    assert "compaction" not in chains and "memory" not in chains
-
-
-def test_resolve_oracle_model_chain_mapping(tmp_path, monkeypatch):
-    """M-model: agent profile model: 为唯一权威源；显式 model 优先；profile
-    缺失时弱化回退 retry.fallbackChains；空 agent 归一为 oracle。"""
-    cfg = tmp_path / "config.yml"
-    cfg.write_text(
-        "retry: \n"
-        "  fallbackChains: \n"
-        "    default: \n"
-        "      - model-default-a\n"
-        "      - model-default-b\n"
-        "    slow: \n"
-        "      - model-slow-a\n"
-        "      - model-slow-b\n"
-    , encoding="utf-8")
+def test_resolve_oracle_model_chain_mapping(monkeypatch):
+    """M-model: agent profile model: 为唯一权威源；显式 model 优先；
+    profile 缺失 → 空列表；空 agent 归一为 oracle。"""
     from codeagent.oracle import _resolve_oracle_model_chain
 
     profiles = {"oracle": "prof/gpt-5.6-sol",
                 "oracle-opus": "prof/claude-opus",
                 "oracle-lite": "prof/v4-pro"}
 
-    with patch("codeagent.oracle._omp_config_paths", return_value=[cfg]):
-        # 1) profile 存在 → profile model 优先于 config chain（单一权威）
-        with patch("codeagent.oracle._read_agent_model", side_effect=lambda t: profiles.get(t, "")):
-            assert _resolve_oracle_model_chain("oracle", "") == ["prof/gpt-5.6-sol"]
-            assert _resolve_oracle_model_chain("oracle-opus", "") == ["prof/claude-opus"]
-            assert _resolve_oracle_model_chain("oracle-lite", "") == ["prof/v4-pro"]
-        # 2) 显式 model 永远优先（不被 profile 覆盖）
-        with patch("codeagent.oracle._read_agent_model", return_value="prof/gpt-5.6-sol"):
-            assert _resolve_oracle_model_chain("oracle", "explicit/model-x") == ["explicit/model-x"]
-        # 3) profile 缺失 → 弱化回退 config chain（旧兼容，不再是优先来源）
-        with patch("codeagent.oracle._read_agent_model", return_value=""):
-            assert _resolve_oracle_model_chain("oracle", "") == ["model-slow-a", "model-slow-b"]
-            assert _resolve_oracle_model_chain("oracle-opus", "") == ["model-slow-a", "model-slow-b"]
-            assert _resolve_oracle_model_chain("oracle-lite", "") == ["model-default-a", "model-default-b"]
-        # 4) 空/未显式 agent → 明确默认 oracle（不静默回落 default 链/mimo）
-        with patch("codeagent.oracle._read_agent_model", return_value="prof/gpt-5.6-sol"):
-            assert _resolve_oracle_model_chain("", "") == ["prof/gpt-5.6-sol"]
-            assert _resolve_oracle_model_chain("default", "") == ["prof/gpt-5.6-sol"]
+    # 1) profile 存在 → profile model 为单一权威源
+    with patch("codeagent.oracle._read_agent_model", side_effect=lambda t: profiles.get(t, "")):
+        assert _resolve_oracle_model_chain("oracle", "") == ["prof/gpt-5.6-sol"]
+        assert _resolve_oracle_model_chain("oracle-opus", "") == ["prof/claude-opus"]
+        assert _resolve_oracle_model_chain("oracle-lite", "") == ["prof/v4-pro"]
+    # 2) 显式 model 永远优先（不被 profile 覆盖）
+    with patch("codeagent.oracle._read_agent_model", return_value="prof/gpt-5.6-sol"):
+        assert _resolve_oracle_model_chain("oracle", "explicit/model-x") == ["explicit/model-x"]
+    # 3) profile 缺失 → 空列表（不再回退 config chain）
+    with patch("codeagent.oracle._read_agent_model", return_value=""):
+        assert _resolve_oracle_model_chain("oracle", "") == []
+        assert _resolve_oracle_model_chain("oracle-opus", "") == []
+        assert _resolve_oracle_model_chain("oracle-lite", "") == []
+    # 4) 空/未显式 agent → 明确默认 oracle（不静默回落 default 链）
+    with patch("codeagent.oracle._read_agent_model", return_value="prof/gpt-5.6-sol"):
+        assert _resolve_oracle_model_chain("", "") == ["prof/gpt-5.6-sol"]
+        assert _resolve_oracle_model_chain("default", "") == ["prof/gpt-5.6-sol"]
 
 
-def test_resolve_oracle_model_chain_no_config(tmp_path, monkeypatch):
-    """profile 缺失 + 无配置/无 chain → 空列表（不静默降级）。"""
+def test_resolve_oracle_model_chain_no_config(monkeypatch):
+    """profile 缺失 + 无配置 → 空列表（不静默降级）。"""
     from codeagent.oracle import _resolve_oracle_model_chain
 
-    with patch("codeagent.oracle._omp_config_paths", return_value=[]), \
-         patch("codeagent.oracle._read_agent_model", return_value=""):
+    with patch("codeagent.oracle._read_agent_model", return_value=""):
         assert _resolve_oracle_model_chain("oracle", "") == []
         assert _resolve_oracle_model_chain("", "") == []
-
-    cfg = tmp_path / "config.yml"
-    cfg.write_text("memory: \n  backend: memsearch\n", encoding="utf-8")
-    with patch("codeagent.oracle._omp_config_paths", return_value=[cfg]), \
-         patch("codeagent.oracle._read_agent_model", return_value=""):
         assert _resolve_oracle_model_chain("oracle-lite", "") == []
 
 
@@ -472,22 +424,13 @@ def test_model_chain_from_manifest_prefers_persisted():
 def test_ask_cold_uses_model_chain(tmp_path, capsys, monkeypatch):
     """ask cold 分支补模型链：spawn model=primary，env 注入链，输出含 model_chain。
 
-    M-model: 无 manifest 且 profile model 缺失时，弱化回退 retry.fallbackChains
-    （兼容旧依赖）；profile 存在时以其为准（见 test_model_chain_from_manifest_*）。
+    M-model: agent profile model: 为唯一权威源（见 test_model_chain_from_manifest_*）。
     """
     from codeagent.park.registry import ParkRegistry
-    from codeagent.oracle import _parse_flat_yaml
 
-    cfg = tmp_path / "config.yml"
-    cfg.write_text(
-        "retry: \n"
-        "  fallbackChains: \n"
-        "    default: \n"
-        "      - ask-default-a\n"
-        "      - ask-default-b\n"
-    , encoding="utf-8")
-    monkeypatch.setattr("codeagent.oracle._omp_config_paths", lambda: [cfg])
-    monkeypatch.setattr("codeagent.oracle._read_agent_model", lambda t: "")
+    # profile 存在 → agent profile model 为单一权威源
+    monkeypatch.setattr("codeagent.oracle._read_agent_model",
+                        lambda t: "ask-prof/v4-pro" if t == "oracle-lite" else "")
 
     ns = _NS(review_key="k1", prompt="cold ask", agent="oracle-lite", backend="omp")
     gw = MagicMock()
@@ -501,10 +444,10 @@ def test_ask_cold_uses_model_chain(tmp_path, capsys, monkeypatch):
     assert code == 0
     out = json.loads(capsys.readouterr().out)
     assert out["method"] == "cold"
-    assert out["model_chain"] == ["ask-default-a", "ask-default-b"]
+    assert out["model_chain"] == ["ask-prof/v4-pro"]
     req = spawn.call_args[0][1]
-    assert req["model"] == "ask-default-a"
-    assert req["env"]["OMP_MODEL_FALLBACK_CHAIN"] == "ask-default-a,ask-default-b"
+    assert req["model"] == "ask-prof/v4-pro"
+    assert req["env"]["OMP_MODEL_FALLBACK_CHAIN"] == "ask-prof/v4-pro"
 
 
 def test_ask_hot_surfaces_quota_warning(tmp_path, capsys):

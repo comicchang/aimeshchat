@@ -45,6 +45,27 @@ grep -rE 'ppio/pa/gpt-5.6-sol|claude-opus-4-8|deepseek-v4-pro' \
 异步回写 park manifest，warm resume 仍收敛。status 显示 `binding: pending` 属正常，
 不等同失败。
 
+## 顾问双模式（CLI 主会话 或 worker mailbox，2026-08-12 澄清）
+
+Oracle 顾问**可以与 agent-swarm worker/mailbox 共存**——两种交付模式都合法，按使用场景选择：
+
+- **模式 A：CLI 主会话**（`aimeshchat oracle start/ask/result/wait`）——顾问问答流走主会话文本，
+  `oracle result` 取回复。适用：独立多轮咨询，无 swarm 编排。
+- **模式 B：agent-swarm worker**（`OMP_WORKER_ID=oracle` + mailbox）——oracle 以 worker 身份参与
+  swarm，答案经 mailbox `REPORT` 交付给 manager。适用：swarm 编排下由 manager 派发/回收顾问结果。
+  这是合法模式，**不是错配**。
+
+两者不冲突，取决于会话是否在 swarm 编排内。**不要强行隔离** worker 身份——顾问在 swarm 内就该是
+worker 角色。若用 CLI 主会话（模式 A）且不希望继承 worker 身份，则启动前 `unset OMP_WORKER_ID`；
+若用 swarm 编排（模式 B），保留 `OMP_WORKER_ID` 并走 mailbox REPORT。
+
+```bash
+# 模式 A（CLI 主会话，不参与 swarm）：
+unset OMP_WORKER_ID
+aimeshchat oracle start "$KEY" --agent oracle --prompt '...'
+# 模式 B（swarm worker，走 mailbox REPORT）：保留 OMP_WORKER_ID，由 manager 派发
+```
+
 ## CLI 契约（唯一工作流）
 
 ```
