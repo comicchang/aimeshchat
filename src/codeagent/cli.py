@@ -68,6 +68,31 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--no-auto-resume", action="store_true")
     run_p.add_argument("--skip-permissions", action="store_true", default=False)
     run_p.add_argument("--output", help="Write structured JSON to file")
+    # Execution mode flags (mutually exclusive, default = synchronous foreground)
+    run_mode = run_p.add_mutually_exclusive_group()
+    run_mode.add_argument(
+        "--tmux", action="store_true", default=False,
+        help="Spawn in the current tmux session (new window/pane, visible & interactive)",
+    )
+    run_mode.add_argument(
+        "--split", action="store_true", default=False,
+        help="Like --tmux but splits the current pane instead of a new window",
+    )
+    run_mode.add_argument(
+        "--background", action="store_true", default=False,
+        help="Run in a background thread (non-blocking; poll with 'job status <id>')",
+    )
+    # Hidden flag: child process writes result to this job dir.
+    run_p.add_argument("--_bg-job-id", dest="_bg_job_id", default=None, help=argparse.SUPPRESS)
+    # job subcommand
+    job_p = sub.add_parser("job", help="Manage background jobs")
+    job_sub = job_p.add_subparsers(dest="job_cmd")
+    job_sub.add_parser("list", help="List recent jobs")
+    status_p = job_sub.add_parser("status", help="Show job status")
+    status_p.add_argument("job_id", help="Job ID to query")
+    wait_p = job_sub.add_parser("wait", help="Wait for job completion")
+    wait_p.add_argument("job_id", help="Job ID to wait on")
+    wait_p.add_argument("--timeout", type=float, default=0, help="Seconds to wait (0 = forever)")
 
     # route
     route_p = sub.add_parser("route", help="Route task via repo-map")
@@ -1281,6 +1306,47 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print("error: no task provided", file=sys.stderr)
         return 1
 
+    # ── background child mode (--_bg-job-id) ───────────────────────────
+    # Hidden flag: this is a detached child process — run synchronously
+    # and persist the result to the job directory on exit.
+    bg_job_id = getattr(args, "_bg_job_id", None)
+    if bg_job_id:
+        return _run_bg_child(args, task, bg_job_id)
+
+    # ── tmux foreground mode (--tmux / --split) ────────────────────────
+    if getattr(args, "tmux", False) or getattr(args, "split", False):
+        return _run_in_tmux(args, task)
+
+    # ── background thread mode (--background) ──────────────────────────
+    if getattr(args, "background", False):
+        return _run_in_background(args, task)
+
+    # ── synchronous foreground (default — unchanged) ───────────────────
+    return _run_sync(args, task)
+
+
+def _run_bg_child(args: argparse.Namespace, task: str, job_id: str) -> int:
+    """Background child process entry — run sync, persist result to job dir.
+
+    This function is reached only via ``--_bg-job-id`` (hidden flag set by
+    ``_run_in_background``).  It executes the task synchronously and writes
+    the ``RunResult`` to the job directory via ``JobManager.mark_done``.
+    """
+    result = _run_sync(args, task)
+    try:
+        from codeagent.job import get_manager
+        mgr = get_manager()
+        # Reconstruct a RunResult from the exit code (stdout/stderr already
+        # printed to /dev/null by the parent Popen; the wire result is in
+        # the session registry, not here).  We persist the returncode.
+        mgr.mark_done(job_id, RunResult(returncode=result))
+    except Exception as exc:
+        log.warning("bg child: failed to persist job %s: %s", job_id, exc)
+    return result
+
+
+def _run_sync(args: argparse.Namespace, task: str) -> int:
+    """Original synchronous foreground execution — no behavior change."""
     # Runtime resolution via the registry — oracle agents are NOT hardcoded
     # to OMP (they prefer it, but degrade to OpenCode when unavailable).
     backend = _resolve_agent_backend(args.agent, args.backend)
@@ -1373,6 +1439,128 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "exit_code": result.returncode,
         }, indent=2))
     return result.returncode
+
+
+def _run_in_tmux(args: argparse.Namespace, task: str) -> int:
+    """Spawn the agent in the user's current tmux session (visible, interactive).
+
+    Reconstructs the ``aimeshchat run`` command *without* --tmux/--split
+    flags so the child runs in synchronous foreground mode inside the pane.
+    """
+    from codeagent.launchers.tmux import detect_current_tmux, spawn_in_current_tmux
+
+    if detect_current_tmux() is None:
+        print(
+            "error: --tmux/--split requires running inside a tmux session.\n"
+            "Start tmux or byobu first, then retry.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Reconstruct the equivalent aimeshchat CLI command (no tmux flags).
+    argv: list[str] = ["aimeshchat", "run"]
+    if args.workdir:
+        argv.append(args.workdir)
+    argv.append(task)
+    if args.host:
+        argv.extend(["--host", args.host])
+    if args.backend:
+        argv.extend(["--backend", args.backend])
+    if args.agent:
+        argv.extend(["--agent", args.agent])
+    if args.model:
+        argv.extend(["--model", args.model])
+    if getattr(args, "skills", None):
+        argv.extend(["--skills", args.skills])
+    if args.session_key:
+        argv.extend(["--session-key", args.session_key])
+    if args.new_session:
+        argv.append("--new-session")
+    if args.no_auto_resume:
+        argv.append("--no-auto-resume")
+    if args.skip_permissions:
+        argv.append("--skip-permissions")
+    if args.output:
+        argv.extend(["--output", args.output])
+
+    try:
+        pane_id = spawn_in_current_tmux(
+            argv,
+            label="aimeshchat",
+            split=getattr(args, "split", False),
+            cwd=args.workdir or "",
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[tmux] agent spawned in pane {pane_id}", file=sys.stderr)
+    return 0
+
+
+def _run_in_background(args: argparse.Namespace, task: str) -> int:
+    """Submit the execution as a detached subprocess and return immediately.
+
+    The child process writes its result to a job directory on disk so the
+    caller can poll via ``aimeshchat job status/wait/list`` even after the
+    parent CLI exits.
+
+    Uses ``start_new_session=True`` so the child is not killed when the
+    parent's terminal closes (SIGHUP).
+    """
+    from codeagent.job import get_manager
+
+    mgr = get_manager()
+    job_id = mgr.create_placeholder(
+        task=task[:120],
+        host=args.host or "__local__",
+        workdir=args.workdir,
+    )
+
+    # Reconstruct the equivalent aimeshchat run command (no --background),
+    # adding --_bg-job-id so the child knows where to write its result.
+    argv: list[str] = [sys.executable, "-m", "codeagent.cli", "run"]
+    if args.workdir:
+        argv.append(args.workdir)
+    argv.append(task)
+    if args.host:
+        argv.extend(["--host", args.host])
+    if args.backend:
+        argv.extend(["--backend", args.backend])
+    if args.agent:
+        argv.extend(["--agent", args.agent])
+    if args.model:
+        argv.extend(["--model", args.model])
+    if getattr(args, "skills", None):
+        argv.extend(["--skills", args.skills])
+    if args.session_key:
+        argv.extend(["--session-key", args.session_key])
+    if args.new_session:
+        argv.append("--new-session")
+    if args.no_auto_resume:
+        argv.append("--no-auto-resume")
+    if args.skip_permissions:
+        argv.append("--skip-permissions")
+    if args.output:
+        argv.extend(["--output", args.output])
+    # Hidden flag: child writes result to job dir.
+    argv.extend(["--_bg-job-id", job_id])
+
+    # Detach: start_new_session so SIGHUP from terminal doesn't kill the child.
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    # Write the child PID so the job dir can track liveness.
+    mgr.mark_running(job_id, pid=proc.pid)
+
+    print(f"[background] job submitted: {job_id}  (pid={proc.pid})", file=sys.stderr)
+    print(f"  poll:  aimeshchat job status {job_id}", file=sys.stderr)
+    print(f"  wait:  aimeshchat job wait {job_id}", file=sys.stderr)
+    return 0
 
 
 def _build_route_prompt(topic: str, task: str) -> str:
@@ -1880,6 +2068,48 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
     return handlers[cmd](args)
 
 
+def _cmd_job(args: argparse.Namespace) -> int:
+    """Dispatch ``job`` subcommands (list / status / wait)."""
+    from codeagent.job import get_manager
+
+    cmd = args.job_cmd
+    if cmd is None:
+        print("error: specify a job subcommand: list | status <id> | wait <id>", file=sys.stderr)
+        return 1
+
+    mgr = get_manager()
+
+    if cmd == "list":
+        jobs = mgr.list_jobs()
+        if not jobs:
+            print("no jobs found")
+            return 0
+        for j in jobs:
+            print(f"{j.job_id}  {j.status:8s}  {j.created_at}  {j.task[:60]}")
+        return 0
+
+    if cmd == "status":
+        try:
+            info = mgr.status(args.job_id)
+        except FileNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(info.to_dict(), indent=2, ensure_ascii=False))
+        return 0
+
+    if cmd == "wait":
+        try:
+            info = mgr.wait(args.job_id, timeout=args.timeout)
+        except FileNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(info.to_dict(), indent=2, ensure_ascii=False))
+        return info.returncode if info.returncode is not None else 0
+
+    print(f"job: unknown subcommand {cmd!r}", file=sys.stderr)
+    return 1
+
+
 def _cmd_session(args: argparse.Namespace) -> int:
     """A6: session storage lifecycle — ``session clean --older-than N``.
 
@@ -1930,6 +2160,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "events": _cmd_events,
         "runtime": _cmd_runtime,
         "oracle": _cmd_oracle,
+        "job": _cmd_job,
     }
     # args.command is guaranteed to be one of the registered subcommands:
     # argparse rejects unknown names, and ``None`` was handled above.

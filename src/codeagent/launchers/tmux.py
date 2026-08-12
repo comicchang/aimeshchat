@@ -114,6 +114,120 @@ def _tmux_ok() -> bool:
     return which("tmux") is not None
 
 
+# ── Current-session tmux (user's interactive session) ──────────────────
+
+
+def detect_current_tmux() -> tuple[str, str] | None:
+    """Detect whether we are inside a user tmux session.
+
+    Returns ``(session_name, socket_path)`` or ``None`` when the process
+    is NOT running inside tmux (checked via ``$TMUX`` env var).
+    """
+    tmux_env = os.environ.get("TMUX")
+    if not tmux_env:
+        return None
+    if not _tmux_ok():
+        return None
+    # $TMUX is ``<socket_path>,<pid>,<session_number>`` — extract the socket.
+    parts = tmux_env.split(",", 2)
+    socket_path = parts[0] if parts else ""
+    # Get the human-readable session name from tmux itself.
+    proc = subprocess.run(
+        ["tmux", "display-message", "-p", "#{session_name}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if proc.returncode != 0:
+        return None
+    session_name = proc.stdout.strip()
+    if not session_name:
+        return None
+    return session_name, socket_path
+
+
+def spawn_in_current_tmux(
+    cmd: list[str],
+    *,
+    label: str = "aimeshchat",
+    split: bool = False,
+    cwd: str = "",
+) -> str:
+    """Launch *cmd* in the user's current tmux session.
+
+    Parameters
+    ----------
+    cmd:
+        Full argv to execute in the new pane/window.
+    label:
+        Window/pane title (tmux ``-n`` or ``-T``).
+    split:
+        If ``True``, split the current pane (``split-window``).
+        Otherwise create a new window (``new-window``).
+    cwd:
+        Working directory for the new pane (defaults to current dir).
+
+    Returns
+    -------
+    str
+        The tmux pane target string (e.g. ``%42``).
+
+    Raises
+    ------
+    RuntimeError
+        If not inside tmux or the spawn command fails.
+    """
+    info = detect_current_tmux()
+    if info is None:
+        raise RuntimeError(
+            "not inside a tmux session — cannot spawn in current tmux. "
+            "Run this command inside tmux/byobu, or omit --tmux."
+        )
+    session_name, _socket = info
+
+    if not cwd:
+        cwd = os.getcwd()
+
+    quoted = " ".join(shlex.quote(a) for a in cmd)
+
+    if split:
+        # Split the CURRENT pane (where the user ran the command).
+        argv = [
+            "tmux", "split-window",
+            "-t", session_name,
+            "-c", cwd,
+            "-P", "-F", "#{pane_id}",
+            "-T", label,
+        ]
+    else:
+        argv = [
+            "tmux", "new-window",
+            "-t", f"{session_name}:",
+            "-n", label,
+            "-c", cwd,
+            "-P", "-F", "#{pane_id}",
+        ]
+
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    if proc.returncode != 0:
+        raise RuntimeError(f"tmux {'split-window' if split else 'new-window'} failed: {proc.stderr.strip()}")
+
+    pane_id = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+    if not pane_id:
+        raise RuntimeError("tmux returned no pane id")
+
+    # Send the command into the pane.
+    rc = subprocess.run(
+        ["tmux", "send-keys", "-t", pane_id, quoted, "Enter"],
+        capture_output=True, timeout=10,
+    ).returncode
+    if rc != 0:
+        # Clean up the pane on failure.
+        subprocess.run(["tmux", "kill-pane", "-t", pane_id], capture_output=True)
+        raise RuntimeError("tmux send-keys failed")
+
+    log.info("spawned agent in current tmux pane %s (session=%s)", pane_id, session_name)
+    return pane_id
+
+
 def _tmux(*args: str, timeout: int = 10) -> tuple[int, str, str]:
     try:
         r = subprocess.run(
