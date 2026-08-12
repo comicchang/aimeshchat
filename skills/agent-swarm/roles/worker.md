@@ -12,6 +12,23 @@ You are a worker agent. This file is your sole **protocol** source — not domai
 4. **File isolation** — only your assigned artifact path. Conflict → BLOCKED.
 5. **Evidence honesty** — insufficient evidence → `[EVIDENCE PENDING]` or `[INFERENCE: reason]`. Never fabricate.
 
+## Channel Decision（最先执行，防双收件箱错配）
+
+收到任何 "check inbox"/wake 提示后，**先判定你是哪种 worker**，再决定通道。把
+mailbox（mailbox CLI）与 OMP hub inbox（进程内 agent 消息）混用 = 领不到任务、空转。
+
+```text
+$OMP_MAILBOX_IDENTITY_FILE 存在 → 你是 mailbox worker：唯一通道 = mailbox CLI
+                                  （mailbox read → process → finalize）
+不存在                          → 你是 OMP task worker：唯一通道 = hub inbox
+```
+
+- 收到 "📬 MAILBOX: N pending..." 通知 → **一律走 `mailbox read`**（mailbox CLI），
+  与 hub inbox 无关。不要用 `hub inbox` 领 mailbox 投递的任务（会返回空）。
+- OMP `hub inbox` 是进程内 agent 消息箱，不是 mailbox——两者不可互替。
+- 永远用 mailbox CLI 读/领任务；**手动 read inbox JSON 文件不产生 consumption ACK**，
+  TASK 会持续悬挂（oracle-init 一直挂着），必须 `mailbox read → finalize` 才算消费。
+
 ## Launch and Identity
 
 Manager is responsible for shell, cwd, and agent launch. INIT must provide actual `session_id`, `worker_id`, role profile, and artifact root. All subsequent `<session-id>` and `<worker-id>` placeholders must be replaced with INIT-provided values — never copy placeholders verbatim or infer from other profiles.
@@ -27,7 +44,14 @@ Restored sessions may carry stale IPC/conversation context from before session-b
 1. After receiving Manager's reset/wake prompt, your first action is to discard ALL prior mailbox paths, command names, protocol assumptions, and IPC mechanisms.
 2. Re-read `skill://agent-swarm` for the CURRENT protocol.
 3. The ONLY valid commands are standalone `mailbox` CLI.
-4. The ONLY valid paths are `.mailbox/<session>/<agent>/inbox|processing|archive/`.
+4. The ONLY valid paths are under the mailbox root. **MAILBOX_ROOT 澄清**：root 由
+   `store.resolve_root()` 决定（源码）——`$MAILBOX_ROOT` 环境变量优先；未设则
+   `$XDG_DATA_HOME/aimeshchat/mailbox`（`XDG_DATA_HOME` 默认 `~/.local/share`，
+   即 `~/.local/share/aimeshchat/mailbox`）。**不要假设 root 在 cwd 的 `.mailbox/`**；
+   `.mailbox/` 不存在不代表 mailbox 不可用，先查 `~/.local/share/aimeshchat/mailbox`
+   与 `$MAILBOX_ROOT`。本文件其余 `.mailbox/<session>/<agent>/` 硬编码路径均为
+   **同机 Mode A 特例**（Manager 显式以 `.mailbox` 为 root 时）；root 不同则路径前缀
+   相应替换。
 5. Do NOT reference `scripts/tmux_worker.py`, `workers.toml`, `mailbox-v2-*`, outbox, relay, cursor, or flat `.mailbox/<worker>/` paths.
 6. Verify with `ls .mailbox/<session-id>/<worker-id>/inbox/` before proceeding.
 7. Do not report "Inbox empty" from old flat paths.
@@ -251,6 +275,9 @@ SourceAnalysis and ClosedSourceReverse Workers must verify symbols, call chains,
 ## Prevention Rules
 
 - Always use CLI; never hand-write mailbox/status JSON.
+- **手动 read inbox JSON = 违规**：直接读/`cat` inbox 文件不产生 consumption ACK，
+  通知持续悬挂（oracle-init 一直挂着）。必须 `mailbox read`（inbox→processing）
+  + `mailbox finalize`（→archive）才算消费。调试排障除外，但不得替代消费流程。
 - Always validate `--to`; only write to recipient's inbox, never to another's status/archive.
 - Two-phase consumption always: `read` (inbox→processing) → process → `finalize` (processing→archive).
 - Remote SSH Worker formal communication is fully mailbox-based; INIT check prompt is via available runner channel, not send-keys.
