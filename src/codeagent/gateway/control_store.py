@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS runtime_generations (
     binding_epoch      INTEGER NOT NULL DEFAULT 0,
     agent_state        TEXT NOT NULL DEFAULT 'idle',
     last_state_seq     INTEGER NOT NULL DEFAULT 0,
-    updated_at         TEXT NOT NULL
+    updated_at         TEXT NOT NULL,
+    model_context      TEXT NOT NULL DEFAULT '{}'
 )
 """,
     """\
@@ -144,6 +145,15 @@ class ControlStore:
                 conn.execute(ddl)
             for idx in _INDEXES:
                 conn.execute(idx)
+            # 向后兼容迁移：为已有 runtime_generations 表补 model_context 列
+            # （旧库 CREATE TABLE IF NOT EXISTS 不会加新列）。
+            try:
+                conn.execute(
+                    "ALTER TABLE runtime_generations"
+                    " ADD COLUMN model_context TEXT NOT NULL DEFAULT '{}'"
+                )
+            except sqlite3.OperationalError:
+                pass  # 列已存在（新库 CREATE TABLE 已包含）
 
     # ── reviews ───────────────────────────────────────────────────────
 
@@ -204,22 +214,30 @@ class ControlStore:
     def upsert_generation(self, runtime_id: str, current_generation: int,
                           owner_nonce: str = "", presence: str = "alive",
                           binding: str = "pending", backend_session_id: str = "",
-                          binding_epoch: int = 0, agent_state: str = "idle") -> None:
-        """三维状态归约落盘（关键事务；last_state_seq 单调递增）。"""
+                          binding_epoch: int = 0, agent_state: str = "idle",
+                          model_context: str = "") -> None:
+        """三维状态归约落盘（关键事务；last_state_seq 单调递增）。
+
+        model_context：JSON 字符串，持久化 runtime.context（provider/model/
+        variant/epoch）。传空字符串时保留已有值（不覆盖）。
+        """
         now = _utcnow_iso()
         with self._connect(critical=True) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT last_state_seq FROM runtime_generations WHERE runtime_id = ?",
+                    "SELECT last_state_seq, model_context FROM runtime_generations"
+                    " WHERE runtime_id = ?",
                     (runtime_id,),
                 ).fetchone()
                 seq = int(row[0]) + 1 if row else 1
+                # model_context 为空时保留已有值（避免无上下文的归约覆盖已持久化的上下文）
+                effective_ctx = model_context if model_context else (row[1] if row else '{}')
                 conn.execute(
                     "INSERT INTO runtime_generations (runtime_id, current_generation,"
                     " owner_nonce, presence, binding, backend_session_id, binding_epoch,"
-                    " agent_state, last_state_seq, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " agent_state, last_state_seq, updated_at, model_context)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(runtime_id) DO UPDATE SET"
                     " current_generation=excluded.current_generation,"
                     " owner_nonce=excluded.owner_nonce, presence=excluded.presence,"
@@ -227,10 +245,11 @@ class ControlStore:
                     " backend_session_id=excluded.backend_session_id,"
                     " binding_epoch=excluded.binding_epoch,"
                     " agent_state=excluded.agent_state,"
-                    " last_state_seq=excluded.last_state_seq, updated_at=excluded.updated_at",
+                    " last_state_seq=excluded.last_state_seq, updated_at=excluded.updated_at,"
+                    " model_context=excluded.model_context",
                     (runtime_id, int(current_generation), owner_nonce, presence,
                      binding, backend_session_id, int(binding_epoch), agent_state,
-                     seq, now),
+                     seq, now, effective_ctx),
                 )
                 conn.execute("COMMIT")
             except BaseException:
@@ -250,17 +269,25 @@ class ControlStore:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT runtime_id, current_generation, owner_nonce, presence, binding,"
-                " backend_session_id, binding_epoch, agent_state, last_state_seq, updated_at"
+                " backend_session_id, binding_epoch, agent_state, last_state_seq,"
+                " updated_at, model_context"
                 " FROM runtime_generations WHERE runtime_id = ?",
                 (runtime_id,),
             ).fetchone()
         if row is None:
             return None
+        # model_context 向后兼容：旧库无此列时 row[10] 为默认 '{}'
+        ctx_raw = row[10] if row[10] else '{}'
+        try:
+            model_context = json.loads(ctx_raw)
+        except (json.JSONDecodeError, TypeError):
+            model_context = {}
         return {
             "runtime_id": row[0], "current_generation": int(row[1]),
             "owner_nonce": row[2], "presence": row[3], "binding": row[4],
             "backend_session_id": row[5], "binding_epoch": int(row[6]),
-            "agent_state": row[7], "last_state_seq": int(row[8]), "updated_at": row[9],
+            "agent_state": row[7], "last_state_seq": int(row[8]),
+            "updated_at": row[9], "model_context": model_context,
         }
 
     # ── commands（runtime.send 持久命令状态机）─────────────────────────

@@ -1,6 +1,8 @@
 """Domain contracts — data models shared across all layers."""
 from __future__ import annotations
 
+import json
+import logging
 import os
 import socket
 from dataclasses import dataclass, field
@@ -11,6 +13,7 @@ from codeagent.constants import DEFAULT_EXEC_TIMEOUT
 from codeagent.domain.runtime import RunContext
 
 LOCAL_HOST_MARKER = "__local__"
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "ExecutionSpec",
@@ -52,7 +55,9 @@ class ExecutionSpec:
        继承当前调用者的 runtime.context（gateway 机制）；解析器抛
        ModelContextUnavailable 时原样上抛（明确报错，不静默回落）；
        返回 None 表示不适用（非 gateway 调用）。
-    3. 仍无 → resolve_agent_model(agent) 回退 agent profile（向后兼容）。
+    3. 仍无 → 读 OMP 0600 execution-context 文件
+       （~/.omp/agent/execution-context.json 或 $AIMESHCHAT_EXECUTION_CONTEXT）。
+    4. 仍无 → resolve_agent_model(agent) 回退 agent profile（向后兼容）。
     provider 优先取 runtime.context 显式上报值，否则从 model 前缀提取。
     """
     provider: str          # 模型供应商（从 model 前缀提取，如 openai/claude/ollama）
@@ -74,9 +79,11 @@ class ExecutionSpec:
            - 抛 ModelContextUnavailable → 原样上抛（无上下文明确报错，
              不静默回落 mimo）；
            - 返回 None → 不适用，继续下一步。
-        3. 仍无 model → 调用 resolve_agent_model(agent) 获取 profile
+        3. 仍无 model → 读 OMP 0600 execution-context 文件
+           （~/.omp/agent/execution-context.json 或 $AIMESHCHAT_EXECUTION_CONTEXT）。
+        4. 仍无 model → 调用 resolve_agent_model(agent) 获取 profile
            model（向后兼容：非 gateway 内调用回退当前行为）。
-        4. --system 为空时使用默认值（空串）。
+        5. --system 为空时使用默认值（空串）。
         """
         model = getattr(args, "model", "") or ""
         variant = getattr(args, "variant", "") or ""
@@ -98,7 +105,19 @@ class ExecutionSpec:
                 if not variant:
                     variant = ctx_variant or ""
 
-        # 3) 仍无 model → agent profile（非 gateway 调用向后兼容路径）。
+        # 3) Q5 §9 来源 3: OMP 0600 execution-context 文件
+        #    （~/.omp/agent/execution-context.json 或 $AIMESHCHAT_EXECUTION_CONTEXT）。
+        #    不扫描"最新 session"——只读明确指针（固定路径或 env）。
+        if not model:
+            ctx_model = cls._read_omp_execution_context()
+            if ctx_model:
+                model = ctx_model[0] or ""
+                if not variant:
+                    variant = ctx_model[1] or ""
+                if not ctx_provider:
+                    ctx_provider = ctx_model[2] or ""
+
+        # 4) 仍无 model → agent profile（非 gateway 调用向后兼容路径）。
         if not model and resolve_agent_model is not None:
             model = resolve_agent_model(agent) or ""
 
@@ -127,6 +146,35 @@ class ExecutionSpec:
         if "/" in model:
             return model.split("/", 1)[0]
         return ""
+
+    @staticmethod
+    def _read_omp_execution_context() -> Optional[tuple[str, str, str]]:
+        """Q5 §9 来源 3: 读取 OMP 0600 execution-context 文件。
+
+        文件路径：``$AIMESHCHAT_EXECUTION_CONTEXT`` 环境变量 →
+        ``~/.omp/agent/execution-context.json``（默认）。
+        文件含 JSON ``{"provider": ..., "model": ..., "variant": ..., "epoch": ...}``。
+        由 OMP/plugin 通过 model_change 原子更新；CLI 只读明确指针，不扫描。
+
+        返回 ``(model, variant, provider)`` 或 ``None``（文件不存在/无 model）。
+        """
+        ctx_path = os.environ.get("AIMESHCHAT_EXECUTION_CONTEXT", "")
+        if not ctx_path:
+            ctx_path = str(Path.home() / ".omp" / "agent" / "execution-context.json")
+        p = Path(ctx_path)
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _log.debug("execution-context 文件读取失败 %s: %s", p, exc)
+            return None
+        model = (data.get("model") or "").strip()
+        if not model:
+            return None
+        variant = (data.get("variant") or "").strip()
+        provider = (data.get("provider") or "").strip()
+        return model, variant, provider
 
 
 @dataclass(frozen=True)

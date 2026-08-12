@@ -234,13 +234,19 @@ def _normalize_oracle_agent(agent_type: str) -> str:
 
 
 def _runtime_context_model(agent: str) -> Optional[tuple[str, str, str]]:
-    """Q5b: 从 gateway runtime.context 继承主 agent 当前模型。
+    """Q5b: 从 gateway runtime.context 继承主 agent 当前模型（来源 2）。
 
     仅当调用方在 gateway runtime 内（AIMESHCHAT_RUNTIME_ID 已设置）时
     启用：``runtime.context_get`` 命中返回 (model, variant, provider)；
     无上下文或查询失败 → 抛 ``ModelContextUnavailable``（明确报错，不
     静默回落 mimo）；非 gateway 调用（无环境变量）→ 返回 None，由调用
-    方回退 agent profile 模型（向后兼容）。
+    方继续尝试来源 3（OMP execution-context 文件）或回退 agent profile。
+
+    完整优先级（Q5 §9）：
+    1. 显式 --model/--variant；
+    2. AIMESHCHAT_RUNTIME_ID → gateway runtime.context（本函数）；
+    3. OMP 0600 execution-context 文件（ExecutionSpec.from_args 内部）；
+    4. agent profile（向后兼容）。
 
     ``agent`` 仅作签名对齐（from_args 调用约定）；继承与 agent 无关。
     """

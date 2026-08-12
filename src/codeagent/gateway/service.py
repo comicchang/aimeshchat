@@ -336,6 +336,14 @@ class AgentGateway:
                     binding=BINDING_BOUND if m.backend_session_id else BINDING_PENDING,
                     agent_state=AGENT_ENDED,
                 )
+                # 恢复持久化的 model_context（gateway 重启不丢失 runtime.context）
+                try:
+                    stored = self._control.get_generation(runtime_id)
+                    if stored and stored.get("model_context"):
+                        self._runtimes[runtime_id].model_context = stored["model_context"]
+                except Exception as exc:
+                    log.debug("gateway: model_context restore skipped for %s: %s",
+                              runtime_id, exc)
                 self._persist_control_state(self._runtimes[runtime_id])
                 restored += 1
         if restored:
@@ -983,6 +991,8 @@ class AgentGateway:
                 "epoch": epoch,
             }
             snapshot = dict(record.model_context)
+        # 持久化到 ControlStore（原子：内存已更新，持久化尽力而为）
+        self._persist_control_state(record)
         return {"runtime_id": runtime_id, "model_context": snapshot}
 
     def runtime_context_get(self, params: dict) -> dict:
@@ -2057,11 +2067,13 @@ class AgentGateway:
         )
 
     def _persist_control_state(self, record: RuntimeRecord) -> None:
-        """镜像三维状态到 ControlStore.runtime_generations（关键事务 FULL）。
+        """镜像三维状态 + model_context 到 ControlStore.runtime_generations（关键事务 FULL）。
 
         尽力而为：落盘失败仅告警，不阻断主流程（内存记录仍是操作权威）。
+        model_context 非空时同步持久化；空时不覆盖已有值（upsert_generation 保留逻辑）。
         """
         try:
+            ctx_json = json.dumps(record.model_context, ensure_ascii=False) if record.model_context else ""
             self._control.upsert_generation(
                 runtime_id=record.runtime_id,
                 current_generation=record.generation,
@@ -2071,6 +2083,7 @@ class AgentGateway:
                 backend_session_id=record.backend_session_id,
                 binding_epoch=record.binding_epoch,
                 agent_state=record.agent_state,
+                model_context=ctx_json,
             )
         except Exception as exc:
             log.warning("gateway: control state persist failed for %s: %s",
