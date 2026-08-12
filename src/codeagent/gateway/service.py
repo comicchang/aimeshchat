@@ -448,6 +448,11 @@ class AgentGateway:
             # sweep removes it so stopped runtimes never linger/aggregate.
             for rid in [rid for rid, rec in list(self._runtimes.items()) if rec.status == "stopped"]:
                 self._runtimes.pop(rid, None)
+                # 同步清理 ControlStore.runtime_generations 记录
+                try:
+                    self._control.delete_generation(rid)
+                except Exception as exc:
+                    log.warning("gateway: control generation delete failed for %s: %s", rid, exc)
             # A9: prune expired session claims — _claims grows unboundedly
             # otherwise (TTL 3600s default, takeover already handles expiry).
             if self._claims:
@@ -1279,6 +1284,32 @@ class AgentGateway:
             "health": health,
         }
 
+    def _purge_stopped_for_key(self, review_key: str, keep_runtime_id: str = "") -> list[str]:
+        """清理某 review_key 下所有 stopped 旧 runtime 记录（内存 + ControlStore）。
+
+        保留 keep_runtime_id（刚停止的，供调用方短暂读回状态），清理其余
+        更早的 stopped 记录，防止多次 release/revive 累积。
+        """
+        purged: list[str] = []
+        with self._runtimes_lock:
+            for rid, rec in list(self._runtimes.items()):
+                if rec.review_key != review_key:
+                    continue
+                if rec.status != "stopped":
+                    continue
+                if rid == keep_runtime_id:
+                    continue
+                self._runtimes.pop(rid, None)
+                # 同步清理 ControlStore.runtime_generations 记录
+                try:
+                    self._control.delete_generation(rid)
+                except Exception as exc:
+                    log.warning("gateway: control generation delete failed for %s: %s", rid, exc)
+                purged.append(rid)
+        if purged:
+            log.info("gateway: purged %d stopped runtime(s) for review_key=%s", len(purged), review_key)
+        return purged
+
     def runtime_stop(self, params: dict) -> dict:
         runtime_id = params.get("runtime_id", "")
         record = self._require_runtime(runtime_id)
@@ -1306,7 +1337,23 @@ class AgentGateway:
             created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
             payload={"state": "stopped", "reason": reason},
         ))
+        # 立即清理同 review_key 下其他 stopped 旧记录（防多次 release/revive 累积）。
+        if record.review_key:
+            self._purge_stopped_for_key(record.review_key, keep_runtime_id=runtime_id)
         return {"runtime_id": runtime_id, "status": "stopped"}
+
+    def runtime_purge_stopped(self, params: dict) -> dict:
+        """清理指定 review_key 的所有 stopped 记录（内存 + ControlStore）。
+
+        release 流程在 runtime.stop 之后调用——调用方已从 runtime.stop 的
+        返回值读回停止状态，此处把该 key 剩余 stopped 记录全部清除（含刚
+        停止的），使 release 后不残留任何记录，不等 sweep。
+        """
+        review_key = params.get("review_key", "")
+        if not review_key:
+            raise GatewayError(ERR_PROTOCOL, "runtime.purge_stopped requires review_key")
+        purged = self._purge_stopped_for_key(review_key)
+        return {"review_key": review_key, "purged": purged}
 
     def runtime_info(self, params: dict) -> dict:
         """Aggregate runtime observability for park info (by review_key or id)."""
@@ -1995,6 +2042,7 @@ class AgentGateway:
             "runtime.command_status": self.runtime_command_status,  # 命令状态查询
             "runtime.probe": self.runtime_probe,
             "runtime.stop": self.runtime_stop,
+            "runtime.purge_stopped": self.runtime_purge_stopped,  # 释放时清理旧 stopped 记录
             "runtime.info": self.runtime_info,
             "runtime.status": self.runtime_status,
             "runtime.list": self.runtimes_list,

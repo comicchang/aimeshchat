@@ -2123,6 +2123,9 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
             rid = info.get("runtime_id")
             if rid:
                 _gateway().call("runtime.stop", {"runtime_id": rid, "reason": "oracle release"})
+                # 立即清理该 review_key 的所有 stopped 旧记录（内存 + ControlStore），
+                # 避免多次 release/revive 累积多个 runtime 记录。
+                _gateway().call("runtime.purge_stopped", {"review_key": review_key})
                 stopped = True
         except GatewayError as exc:
             # NOT_FOUND = gateway 正常但 runtime 本就不存在（无泄漏）；

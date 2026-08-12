@@ -237,6 +237,15 @@ class ControlStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    def delete_generation(self, runtime_id: str) -> bool:
+        """删除 runtime_generations 行（清理旧 stopped 记录）。"""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM runtime_generations WHERE runtime_id = ?",
+                (runtime_id,),
+            )
+        return cur.rowcount > 0
+
     def get_generation(self, runtime_id: str) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
