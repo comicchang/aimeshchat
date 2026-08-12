@@ -429,3 +429,4 @@ class _LineReader:
             self._done = True
             return self._line
         return ""
+

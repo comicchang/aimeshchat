@@ -20,6 +20,8 @@ import argparse
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -839,7 +841,12 @@ def cmd_oracle_watch(args: argparse.Namespace) -> int:
 
 
 def cmd_oracle_release(args: argparse.Namespace) -> int:
-    """Write terminal state, stop the runtime, release the park lease."""
+    """Write terminal state, stop the runtime, release the park lease.
+
+    P1-1: 默认 soft release —— lifecycle=RELEASED_SOFT，保留 OMP session
+    文件，`oracle revive` 可 warm 复活；--purge 硬销毁 —— 删 OMP session
+    文件 + 删 park 行（registry.release(mode="hard") → registry.delete）。
+    """
     review_key = args.review_key
     registry = ParkRegistry()
     manifest = registry.lookup(review_key)
@@ -857,13 +864,296 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
             print(f"warning: runtime stop failed: {exc.code}: {exc.message}", file=sys.stderr)
 
     # Release the park lease.
+    purge = bool(getattr(args, "purge", False))
+    release_mode = "soft"
     if manifest:
-        registry.release(review_key)
+        if purge:
+            # P1-1: 硬销毁——删 OMP session 文件 + 删 park 行。
+            _purge_omp_session(manifest)
+            registry.release(review_key, mode="hard")
+            release_mode = "hard"
+        else:
+            # P1-1: 软释放（默认）——RELEASED_SOFT，session 文件保留可 revive。
+            registry.release(review_key, mode="soft")
+            release_mode = "soft"
 
     print(json.dumps({
         "review_key": review_key,
         "runtime_stopped": stopped,
         "park_released": manifest is not None,
-        "note": "terminal written; runtime identity cleanup complete",
+        "release_mode": release_mode,
+        "session_purged": purge and manifest is not None,
     }, indent=2))
     return 0
+
+
+# ── revive（P1-2：RELEASED_SOFT / COLD_RESUMABLE → HOT_PARKED）──────────
+
+
+def _purge_omp_session(manifest: ParkManifest) -> list[str]:
+    """P1-1: 硬销毁——删除 OMP session 文件（--purge）。
+
+    删除对象（存在才删，返回实际删除路径列表）：
+    - manifest.omp_session_path（若已记录）
+    - _find_session_file(backend_session_id) 命中的 ``*_{sid}.jsonl``
+    - 同目录下 ``*_{sid}`` 命名的会话子目录（``<ts>_<sid>/``，含 __advisor
+      等附属文件）
+    """
+    removed: list[str] = []
+    targets: set[Path] = set()
+
+    raw_path = getattr(manifest, "omp_session_path", "") or ""
+    if raw_path:
+        p = Path(raw_path)
+        if p.exists():
+            targets.add(p)
+
+    sid = manifest.backend_session_id or ""
+    if sid:
+        found = _find_session_file(sid)
+        if found is not None:
+            targets.add(found)
+            parent = found.parent
+            if parent.is_dir():
+                for child in parent.glob(f"*_{sid}"):
+                    if child.is_dir() and child not in targets:
+                        targets.add(child)
+
+    for p in sorted(targets, key=str):
+        try:
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            removed.append(str(p))
+        except OSError as exc:
+            print(f"warning: purge session file failed: {p}: {exc}", file=sys.stderr)
+    return removed
+
+
+def cmd_oracle_revive(args: argparse.Namespace) -> int:
+    """P1-2: 从 RELEASED_SOFT / COLD_RESUMABLE 复活。
+
+    路由：
+    - absent        → error not_found（需 start）
+    - HOT_PARKED    → error already_active（用 ask）
+    - RELEASED_HARD → error purged（需 start）
+    - BROKEN        → error broken（purge 后 start）
+    - 有 backend_session_id → warm（复用原生会话）；无 → cold（快照重建）
+
+    mode: bg（默认）/pane 走 RuntimeRegistry.spawn（监督式 runtime）；
+    resume 走 ``omp --resume`` 前台附着（绕过 postmesh）。
+    """
+    review_key = args.review_key
+    mode = getattr(args, "mode", "bg") or "bg"
+    registry = ParkRegistry()
+    manifest = registry.lookup(review_key)
+
+    if manifest is None:
+        print(json.dumps({"error": "not_found", "hint": "use 'oracle start' first"}, indent=2),
+              file=sys.stderr)
+        return 1
+    if manifest.lifecycle == Lifecycle.HOT_PARKED:
+        print(json.dumps({"error": "already_active", "hint": "use 'oracle ask' to deliver a prompt"}, indent=2),
+              file=sys.stderr)
+        return 1
+    if manifest.lifecycle == Lifecycle.RELEASED_HARD:
+        print(json.dumps({"error": "purged", "hint": "use 'oracle start' to create a new instance"}, indent=2),
+              file=sys.stderr)
+        return 1
+    if manifest.lifecycle == Lifecycle.BROKEN:
+        print(json.dumps({"error": "broken", "hint": "use 'oracle release --purge' then 'oracle start'"}, indent=2),
+              file=sys.stderr)
+        return 1
+
+    method = "warm" if manifest.backend_session_id else "cold"
+    try:
+        if method == "warm":
+            runtime_id, backend_session_id = _revive_warm(review_key, manifest, mode)
+        else:
+            runtime_id, backend_session_id = _revive_cold(review_key, manifest, mode)
+    except Exception as exc:
+        print(json.dumps({
+            "error": f"{method}_failed",
+            "review_key": review_key,
+            "message": str(exc),
+        }, indent=2), file=sys.stderr)
+        return 1
+
+    print(json.dumps({
+        "review_key": review_key,
+        "method": method,
+        "mode": mode,
+        "lifecycle": Lifecycle.HOT_PARKED.value,
+        "runtime_id": runtime_id,
+        "backend_session_id": backend_session_id,
+    }, indent=2))
+    return 0
+
+
+# ── attach（P2：统一入口——hot send 或 revive）──────────────────────────
+
+
+def cmd_oracle_attach(args: argparse.Namespace) -> int:
+    """P2: Unified attach entry — connect (HOT_PARKED) or revive (released/cold).
+
+    Routes:
+    - absent         → error not_found (hint: use start)
+    - HOT_PARKED     → delegate to cmd_oracle_ask (hot send to live runtime)
+    - RELEASED_SOFT  → delegate to cmd_oracle_revive (warm revive)
+    - COLD_RESUMABLE → delegate to cmd_oracle_revive (cold revive)
+    - RELEASED_HARD  → cmd_oracle_revive reports purged
+    - BROKEN         → cmd_oracle_revive reports broken
+
+    mode: bg（默认）/pane/resume — forwarded to revive when applicable.
+    """
+    review_key = args.review_key
+    registry = ParkRegistry()
+    manifest = registry.lookup(review_key)
+
+    # P2: manifest absent → cannot attach
+    if manifest is None:
+        print(json.dumps({
+            "error": "not_found",
+            "hint": "use 'oracle start' first",
+        }, indent=2), file=sys.stderr)
+        return 1
+
+    # P2: already active → hot send via ask
+    if manifest.lifecycle == Lifecycle.HOT_PARKED:
+        return cmd_oracle_ask(args)
+
+    # P2: released/cold/broken → revive (lifecycle routing inside revive)
+    return cmd_oracle_revive(args)
+
+
+def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[str, str]:
+    """P1-2: warm 复活——复用 backend_session_id 的原生会话。
+
+    resume → _attach_omp_session 前台附着（无 runtime_id）。
+    bg/pane → RuntimeRegistry.spawn（``omp --resume <sid>`` 监督式 tmux
+    pane），与 cmd_oracle_ask 的 warm 路径同构。
+    """
+    sid = manifest.swarm_session_id or _review_sid(review_key)
+
+    if mode == "resume":
+        _attach_omp_session(manifest.backend_session_id, review_key, manifest.workdir)
+        return "", manifest.backend_session_id
+
+    backend = _resolve_backend(manifest.agent_type or _ORACLE_AGENT, "omp")
+    reg = RuntimeRegistry()
+    handle = reg.spawn(backend, {
+        "session_id": sid,
+        "agent_id": _ORACLE_AGENT,
+        "review_key": review_key,
+        "workdir": manifest.workdir or os.getcwd(),
+        "task": "",
+        "model": manifest.model or "",
+        "backend_session_id": manifest.backend_session_id,
+        "gateway_socket": str(control_socket_path()),
+        "owner_pid": os.getpid(),
+        "nonce": uuid4().hex[:12],
+        "short_task": False,
+    })
+    try:
+        # P2-11 同款保护：session id 提取窗口失败时保留原值，避免破坏续接点。
+        new_backend_session_id = handle.backend_session_id or manifest.backend_session_id
+        if not handle.backend_session_id:
+            print(f"warning: revive warm: backend session id extraction window failed — "
+                  f"preserving previous id {manifest.backend_session_id!r}", file=sys.stderr)
+        _flip_to_hot(review_key, manifest, sid=sid, backend_session_id=new_backend_session_id)
+        _adopt_runtime(review_key, sid, handle, backend)
+    except Exception:
+        # P2-12 同款：后续步骤失败时停掉已 spawn 的 runtime，避免泄漏。
+        try:
+            reg.stop(handle.runtime_id, "revive-warm-failed")
+        except Exception:
+            pass
+        raise
+    return handle.runtime_id, new_backend_session_id
+
+
+def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[str, str]:
+    """P1-2: cold 复活——快照重建新会话（无 backend session 可复用时）。
+
+    resume 模式没有可附着的会话，退化为 bg（监督式 spawn）。
+    首轮 task 注入 build_cold_context（与 cmd_oracle_ask cold 分支一致）。
+    """
+    if mode == "resume":
+        mode = "bg"
+    sid = _review_sid(review_key)
+    backend = _resolve_backend(manifest.agent_type or _ORACLE_AGENT, "omp")
+    reg = RuntimeRegistry()
+    handle = reg.spawn(backend, {
+        "session_id": sid,
+        "agent_id": _ORACLE_AGENT,
+        "review_key": review_key,
+        "workdir": manifest.workdir or os.getcwd(),
+        "task": build_cold_context(review_key),
+        "model": manifest.model or "",
+        "gateway_socket": str(control_socket_path()),
+        "owner_pid": os.getpid(),
+        "nonce": uuid4().hex[:12],
+        "short_task": False,
+    })
+    try:
+        _flip_to_hot(review_key, manifest, sid=sid,
+                     backend_session_id=handle.backend_session_id or "")
+        _adopt_runtime(review_key, sid, handle, backend)
+    except Exception:
+        try:
+            reg.stop(handle.runtime_id, "revive-cold-failed")
+        except Exception:
+            pass
+        raise
+    return handle.runtime_id, handle.backend_session_id or ""
+
+
+def _flip_to_hot(review_key: str, manifest: ParkManifest, sid: str,
+                 backend_session_id: str) -> None:
+    """P1-2: revive 成功后把 park manifest 原位翻回 HOT_PARKED。
+
+    用 update()（而非 acquire()）——COLD_RESUMABLE 不是终态，acquire
+    会拒绝回迁（仅 RELEASED_SOFT 允许重新 acquire）；update 与
+    cmd_oracle_ask 的 warm 路径一致。
+    """
+    ParkRegistry().update(review_key, ParkManifest(
+        review_key=review_key,
+        swarm_session_id=sid,
+        agent_type=manifest.agent_type,
+        model=manifest.model,
+        host=manifest.host,
+        workdir=manifest.workdir,
+        lifecycle=Lifecycle.HOT_PARKED,
+        backend_session_id=backend_session_id,
+        round=manifest.round + 1,
+        created_at=manifest.created_at,
+        last_activity_at=time.time(),
+        release_mode="",
+        omp_session_path=getattr(manifest, "omp_session_path", "") or "",
+    ))
+
+
+def _attach_omp_session(session_id: str, review_key: str, workdir: str = "") -> None:
+    """P1-3: resume 模式——前台 ``omp --resume`` 附着（绕过 postmesh）。
+
+    设计稿的 ``omp -s <sid>`` 在真实 omp CLI（v17）中不存在：交互式续接
+    旗标是 ``-r/--resume=<sid>``，这里用实际旗标。附带向 gateway 声明
+    presence（runtime.declare 是 Phase 3 可选 API，失败静默降级）。
+    """
+    try:
+        subprocess.Popen(
+            ["omp", "--resume", session_id],
+            cwd=workdir or None,
+        )
+    except OSError as exc:
+        print(f"warning: omp --resume attach failed: {exc}", file=sys.stderr)
+    try:
+        _gateway().call("runtime.declare", {  # P3: weak presence declaration
+            "review_key": review_key,
+            "backend_session_id": session_id,
+            "mode": "native_resume",
+            "agent_id": _ORACLE_AGENT,
+        })
+    except Exception as exc:
+        log.debug("oracle revive: gateway presence declare skipped (%s)", exc)

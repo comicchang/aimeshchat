@@ -331,3 +331,18 @@ class TestMergePersistence:
             })
         assert ei.value.code == "PROTOCOL_CONFLICT"
         gw2.stop()
+
+
+def test_runtime_declare_registers_native_presence(gw):
+    """runtime.declare 注册非 postmesh 管理的 native runtime（weak presence）。"""
+    from codeagent.domain.park import ParkManifest, Lifecycle
+    from codeagent.park.registry import ParkRegistry
+    ParkRegistry().acquire("k-declare", ParkManifest(
+        review_key="k-declare", swarm_session_id="s-declare", lifecycle=Lifecycle.HOT_PARKED))
+    result = gw.runtime_declare({
+        "review_key": "k-declare", "backend_session_id": "native-sid-1", "mode": "native_resume"})
+    assert result.get("runtime_id", "").startswith("native-")
+    assert result.get("status") == "active"
+    again = gw.runtime_declare({
+        "review_key": "k-declare", "backend_session_id": "native-sid-1", "mode": "native_resume"})
+    assert again["runtime_id"] == result["runtime_id"]

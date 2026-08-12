@@ -38,7 +38,8 @@ class ParkRegistry:
 
     acquire: 原子 insert-or-fail。同一个 key 只能有一个活跃实例。
     renew:   更新 last_activity + soft_expires。
-    release: 标记 lifecycle=RELEASED。
+    release: 标记 lifecycle=RELEASED_SOFT（soft 模式）或调用 delete（hard 模式）。
+    delete:  真销毁 park 行（硬释放）。
     lookup:  按 review_key 查询 ParkManifest。
     lookup_by_field: 按 peer_agent_id/mailbox_agent_id/backend_session_id 反查。
     sweep:   驱逐过期/TTL/超限实例，返回被驱逐的 key 列表。
@@ -55,6 +56,11 @@ class ParkRegistry:
         with sqlite3.connect(str(self._db_path)) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(_CREATE_TABLE)
+            # P1-1: 兼容迁移——旧 lifecycle='released' 统一改为 'released_soft'
+            conn.execute(
+                "UPDATE park_leases SET lifecycle = 'released_soft' "
+                "WHERE lifecycle = 'released'"
+            )
             conn.commit()
 
     @contextmanager
@@ -71,7 +77,8 @@ class ParkRegistry:
         """尝试 acquire 一个 park 实例。
 
         - 无既有记录 → 插入新实例
-        - 已有 RELEASED（终态）记录 → 重新 acquire（RELEASED→HOT_PARKED 的 oracle 重启路径）
+        - 已有 RELEASED_SOFT 记录 → 重新 acquire（RELEASED_SOFT→HOT_PARKED 的 oracle 重启路径）
+        - 已有 RELEASED_HARD 记录 → 拒绝（硬销毁后不可复用）
         - 已有 HOT_PARKED/COLD_RESUMABLE/BROKEN 等非终态记录 → 返回 False（阻止错误转换）
         """
         with self._lock(review_key):
@@ -82,12 +89,12 @@ class ParkRegistry:
                 ).fetchone()
                 if row is not None:
                     existing = Lifecycle(row[0])
-                    if existing != Lifecycle.RELEASED:
-                        # P0-2: 非终态已有实例（HOT_PARKED/COLD_RESUMABLE/BROKEN）→
-                        # 拒绝重复 acquire 或错误的状态转换。
-                        return False
-                    # P0-2: RELEASED 是终态，允许重新 acquire 回到热 park
+                    # P1-1: RELEASED_SOFT 是暖终态，允许重新 acquire 回到热 park
                     # （oracle 重启路径：release 后再次 park）。
+                    # RELEASED_HARD 是硬销毁，行不应存在（delete() 已删除），
+                    # 但防御性拒绝以防残留。
+                    if existing != Lifecycle.RELEASED_SOFT:
+                        return False
                     now = time.time()
                     conn.execute(
                         "UPDATE park_leases SET manifest_json = ?, lifecycle = ?, "
@@ -157,8 +164,15 @@ class ParkRegistry:
                 )
                 conn.commit()
 
-    def release(self, review_key: str) -> None:
-        """释放 park 实例（标记为 RELEASED）。"""
+    def release(self, review_key: str, mode: str = "soft") -> None:
+        """释放 park 实例。
+
+        P1-1: mode='soft' → RELEASED_SOFT（行保留，可 revive）。
+        mode='hard' → 调用 delete() 真销毁行。
+        """
+        if mode == "hard":
+            self.delete(review_key)
+            return
         with self._lock(review_key):
             with self._connect() as conn:
                 row = conn.execute(
@@ -168,13 +182,25 @@ class ParkRegistry:
                 if row is None:
                     return
                 d = json.loads(row[0])
-                d["lifecycle"] = "released"
+                d["lifecycle"] = "released_soft"
+                d["release_mode"] = "soft"
+                now = time.time()
                 # P3-16: release 时更新 last_activity=now —— released 行保留
                 # 窗口从 release 时刻起算（sweep 按 last_activity 清理旧行）。
                 conn.execute(
-                    "UPDATE park_leases SET lifecycle = 'released', "
+                    "UPDATE park_leases SET lifecycle = 'released_soft', "
                     "manifest_json = ?, last_activity = ? WHERE key = ?",
-                    (json.dumps(d), time.time(), review_key),
+                    (json.dumps(d), now, review_key),
+                )
+                conn.commit()
+
+    def delete(self, review_key: str) -> None:
+        """P1-1: 真销毁 park 行（硬释放）。"""
+        with self._lock(review_key):
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM park_leases WHERE key = ?",
+                    (review_key,),
                 )
                 conn.commit()
 
@@ -278,12 +304,12 @@ class ParkRegistry:
                         evicted.append(key)
 
             # 4. P3-16: RELEASED 终态行清理——超过保留窗口（hard_limit_seconds）
-            # 的 released 行直接删除，防止表无限增长。保留窗口内的 released
-            # 行仍保留（acquire 的 RELEASED→HOT_PARKED 重启路径需要读取）。
+            # 的 released_soft 行直接删除，防止表无限增长。保留窗口内的
+            # released_soft 行仍保留（acquire 的 RELEASED_SOFT→HOT_PARKED 重启路径需要读取）。
             released_ttl = PARK_DEFAULTS["hard_limit_seconds"]
             with self._connect() as conn:
                 cur = conn.execute(
-                    "DELETE FROM park_leases WHERE lifecycle = 'released' "
+                    "DELETE FROM park_leases WHERE lifecycle IN ('released', 'released_soft') "
                     "AND last_activity < ?",
                     (now - released_ttl,),
                 )
@@ -359,6 +385,8 @@ class ParkRegistry:
             "artifact_refs": m.artifact_refs,
             "config_fingerprint": m.config_fingerprint,
             "schema_version": m.schema_version,
+            "release_mode": m.release_mode,
+            "omp_session_path": m.omp_session_path,
         }
         return d
 

@@ -295,3 +295,61 @@ def test_fallback_find_session_recursive_scan(tmp_path, monkeypatch):
     found = _fallback_find_session_for_key("proj:oracle:review:r4-closure")
     assert found is not None
     assert "r4-closure" in found.read_text(errors="replace")
+
+
+def test_release_soft_preserves_session_and_manifest(tmp_path):
+    """release（默认 soft）保留 manifest 行 + backend_session_id，lifecycle=RELEASED_SOFT。"""
+    from codeagent.park.registry import ParkRegistry
+    from codeagent.domain.park import ParkManifest, Lifecycle
+    registry = ParkRegistry()
+    m = ParkManifest(review_key="k-soft", swarm_session_id="s-soft",
+                     backend_session_id="sid-1", lifecycle=Lifecycle.HOT_PARKED)
+    registry.acquire("k-soft", m)
+    registry.release("k-soft")  # 默认 soft
+    got = registry.lookup("k-soft")
+    assert got is not None, "soft release 应保留行"
+    assert got.lifecycle == Lifecycle.RELEASED_SOFT
+    assert got.backend_session_id == "sid-1"
+
+
+def test_release_purge_deletes_manifest(tmp_path):
+    """release --purge（hard）删 park 行。"""
+    from codeagent.park.registry import ParkRegistry
+    from codeagent.domain.park import ParkManifest, Lifecycle
+    registry = ParkRegistry()
+    registry.acquire("k-hard", ParkManifest(
+        review_key="k-hard", swarm_session_id="s-hard", lifecycle=Lifecycle.HOT_PARKED))
+    registry.release("k-hard", mode="hard")
+    assert registry.lookup("k-hard") is None, "hard release 应删行"
+
+
+def test_revive_warm_from_released_soft(tmp_path):
+    """RELEASED_SOFT + backend_session_id → revive 路由 warm。"""
+    from codeagent.park.registry import ParkRegistry
+    from codeagent.domain.park import ParkManifest, Lifecycle
+    from codeagent.park.router import revive_or_spawn
+    registry = ParkRegistry()
+    registry.acquire("k-revive", ParkManifest(
+        review_key="k-revive", swarm_session_id="s-revive",
+        backend_session_id="sid-2", lifecycle=Lifecycle.HOT_PARKED))
+    registry.release("k-revive")  # → RELEASED_SOFT，保留 sid-2
+    rv = revive_or_spawn("k-revive")
+    assert rv.method == "warm", f"RELEASED_SOFT+sid 应 warm，got {rv.method}"
+
+
+def test_attach_routes_to_revive_when_released(tmp_path):
+    """attach 对 RELEASED_SOFT 走 revive（而非 ask）。"""
+    from codeagent.park.registry import ParkRegistry
+    from codeagent.domain.park import ParkManifest, Lifecycle
+    from codeagent.oracle import cmd_oracle_attach
+    from argparse import Namespace
+    registry = ParkRegistry()
+    registry.acquire("k-attach", ParkManifest(
+        review_key="k-attach", swarm_session_id="s-attach",
+        backend_session_id="sid-a", lifecycle=Lifecycle.HOT_PARKED))
+    registry.release("k-attach")  # → RELEASED_SOFT
+    ns = Namespace(review_key="k-attach", mode="bg", prompt="")
+    rc = cmd_oracle_attach(ns)
+    assert rc == 0
+    got = registry.lookup("k-attach")
+    assert got is not None and got.lifecycle == Lifecycle.HOT_PARKED, "attach 应 revive 回 HOT_PARKED"

@@ -54,15 +54,20 @@ def revive_or_spawn(review_key: str, prompt: str = "") -> ReviveResult:
             prompt=prompt,
         )
 
-    # P0-4: 只有 COLD_RESUMABLE 可 warm-revivable；RELEASED 是终态，
-    # 不应再恢复 backend session（终态过滤），一律走 cold reconstruction。
-    if manifest and manifest.lifecycle == Lifecycle.COLD_RESUMABLE:
+    # P1-2: COLD_RESUMABLE 或 RELEASED_SOFT 且有 backend_session_id → warm。
+    #   - COLD_RESUMABLE: agent 因进程退出而失去 peer，但 backend session 仍在。
+    #   - RELEASED_SOFT:  agent 被显式 release，但 backend session 尚未被清理。
+    #     无 backend_session_id 则 fall-through 到 cold reconstruction。
+    if manifest and manifest.lifecycle in (
+        Lifecycle.COLD_RESUMABLE,
+        Lifecycle.RELEASED_SOFT,
+    ):
         if manifest.backend_session_id:
             return ReviveResult(
                 success=True,
                 method="warm",
                 context=(
-                    f"Warm resume available: "
+                    f"Warm resume available ({manifest.lifecycle.value}): "
                     f"backend_session_id={manifest.backend_session_id}"
                 ),
                 manifest=manifest,

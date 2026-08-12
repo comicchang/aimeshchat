@@ -551,6 +551,84 @@ class AgentGateway:
             "initial_task_msg_id": initial_task_msg_id,
         }
 
+    def runtime_declare(self, params: dict) -> dict:
+        """P3: Weak presence declaration for native_resume sessions.
+
+        Unlike runtime.register, this does NOT require owner_pid/nonce —
+        there is no plugin handshake.  It registers a placeholder record
+        for status/presence awareness so ``runtime.info`` / heartbeat sweep
+        can see the session.  ``review_key`` must exist in the park registry
+        to prevent arbitrary runtime forgery (A7 weak gate).
+
+        Params: review_key, backend_session_id, mode (default 'native_resume'),
+                runtime_id (optional; derived if absent), agent_id (default 'oracle').
+        """
+        review_key = params.get("review_key", "")
+        backend_session_id = params.get("backend_session_id", "")
+        mode = params.get("mode", "native_resume")
+        runtime_id = params.get("runtime_id", "")
+        agent_id = params.get("agent_id", "oracle")
+
+        if not review_key:
+            raise GatewayError(ERR_NOT_AUTHORIZED, "runtime.declare requires review_key")
+        if not backend_session_id:
+            raise GatewayError(ERR_NOT_AUTHORIZED, "runtime.declare requires backend_session_id")
+
+        # A7: review_key must exist in the park registry — this is the weak
+        # identity gate for declare (prevents arbitrary runtime forgery).
+        from codeagent.park.registry import ParkRegistry
+
+        manifest = ParkRegistry().lookup(review_key)
+        if manifest is None:
+            raise GatewayError(ERR_NOT_FOUND, f"review_key not found: {review_key}")
+
+        session_id = manifest.swarm_session_id or ""
+
+        with self._runtimes_lock:
+            existing = None
+            if runtime_id:
+                existing = self._runtimes.get(runtime_id)
+            if existing is None:
+                # Idempotent lookup by backend_session_id (oracle omits runtime_id).
+                for rec in self._runtimes.values():
+                    if rec.backend_session_id == backend_session_id:
+                        existing = rec
+                        runtime_id = rec.runtime_id
+                        break
+
+            if existing is not None:
+                # Idempotent re-declare: refresh activity.
+                existing.status = "active"
+                existing.last_activity = time.time()
+                record = existing
+            else:
+                if not runtime_id:
+                    import hashlib
+
+                    slug = hashlib.sha256(
+                        backend_session_id.encode()
+                    ).hexdigest()[:16]
+                    runtime_id = f"native-{slug}"
+                record = RuntimeRecord(
+                    runtime_id=runtime_id,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    generation=0,
+                    review_key=review_key,
+                    backend_session_id=backend_session_id,
+                    runtime="native",
+                    status="active",
+                    created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
+                    last_activity=time.time(),
+                )
+                self._runtimes[runtime_id] = record
+
+        return {
+            "runtime_id": runtime_id,
+            "status": record.status,
+            "mode": mode,
+        }
+
     def runtime_spawn(self, params: dict) -> dict:
         """Spawn a runtime via the launcher + supervisor.
 
@@ -1352,6 +1430,7 @@ class AgentGateway:
             "capabilities.get": self.capabilities,
             "session.ensure": self.session_ensure,
             "runtime.register": self.runtime_register,
+            "runtime.declare": self.runtime_declare,  # P3: weak presence declaration
             "runtime.spawn": self.runtime_spawn,
             "runtime.heartbeat": self.runtime_heartbeat,
             "runtime.event": self.runtime_event,

@@ -298,6 +298,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ora_release = ora_sub.add_parser("release", help="Terminal state + release park + stop runtime")
     ora_release.add_argument("review_key")
+    ora_release.add_argument("--purge", action="store_true",
+                             help="P1-1: hard destroy — delete OMP session files + park row "
+                                  "(default: soft release, revivable)")
+
+    ora_revive = ora_sub.add_parser("revive", help="Revive a released/cold park instance")
+    ora_revive.add_argument("review_key")
+    ora_revive.add_argument("--mode", default="bg", choices=["bg", "pane", "resume"],
+                            help="P1-2: revive mode — bg (default, supervised) | pane (tmux) "
+                                 "| resume (omp --resume attach)")
 
     ora_result = ora_sub.add_parser("result", help="Print the oracle's latest response (from session transcript)")
     ora_result.add_argument("review_key")
@@ -305,6 +314,14 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_result.add_argument("--strict", action="store_true",
                             help="改进项5: fail instead of degrading to the best-effort "
                                  "session-file scan when backend_session_id is missing/mismatched")
+
+    # P2: unified attach entry — hot send (HOT_PARKED) or revive (released/cold)
+    ora_attach = ora_sub.add_parser("attach", help="Attach to an existing oracle session (hot send or revive)")
+    ora_attach.add_argument("review_key")
+    ora_attach.add_argument("prompt", nargs="?", default="", help="Prompt text (required for HOT_PARKED hot send; or stdin)")
+    ora_attach.add_argument("--mode", default="bg", choices=["bg", "pane", "resume"],
+                            help="P2: attach mode — bg (default, supervised) | pane (tmux) "
+                                 "| resume (omp --resume attach); forwarded to revive when applicable")
 
     return p
 
@@ -2043,11 +2060,13 @@ def _cmd_runtime(args: argparse.Namespace) -> int:
 
 
 def _cmd_oracle(args: argparse.Namespace) -> int:
-    """Dispatch oracle subcommands (start/ask/status/watch/release)."""
+    """Dispatch oracle subcommands (start/ask/status/watch/release/revive/result)."""
     from codeagent.oracle import (
         cmd_oracle_ask,
+        cmd_oracle_attach,
         cmd_oracle_release,
         cmd_oracle_result,
+        cmd_oracle_revive,
         cmd_oracle_start,
         cmd_oracle_status,
         cmd_oracle_watch,
@@ -2055,7 +2074,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
 
     cmd = args.ora_cmd
     if cmd is None:
-        print("oracle: missing subcommand. Try: aimeshchat oracle start|ask|status|watch|release|result", file=sys.stderr)
+        print("oracle: missing subcommand. Try: aimeshchat oracle start|ask|status|watch|release|revive|result|attach", file=sys.stderr)
         return 1
     handlers = {
         "start": cmd_oracle_start,
@@ -2063,7 +2082,9 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
         "status": cmd_oracle_status,
         "watch": cmd_oracle_watch,
         "release": cmd_oracle_release,
+        "revive": cmd_oracle_revive,
         "result": cmd_oracle_result,
+        "attach": cmd_oracle_attach,
     }
     return handlers[cmd](args)
 
