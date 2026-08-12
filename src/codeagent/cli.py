@@ -298,8 +298,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_watch.add_argument("--interval", type=float, default=1.0)
     ora_watch.add_argument("--timeout", type=float, default=10.0)
     ora_watch.add_argument("--exit-on", default="",
-                          help="A4: comma-separated terminal specs KIND.STATE (e.g. "
-                               "TASK_STATE.agent_end,RUNTIME_STATE.stopped); exit 0 on the first match")
+                          help="A4: comma-separated terminal specs KIND.STATE or kind-only "
+                               "KIND (e.g. TASK_STATE.agent_end, ASSISTANT_PROGRESS exits on "
+                               "any new output); exit 0 on the first match")
     ora_watch.add_argument("--max-events", type=int, default=0,
                           help="A4: stop after this many events (0 = unlimited)")
     ora_watch.add_argument("--duration", type=float, default=0.0,
@@ -309,7 +310,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_watch.add_argument("--plain", action="store_true", dest="plain",
                            help="Human-readable lines (default)")
 
-    ora_wait = ora_sub.add_parser("wait", help="B1: block until the runtime's agent_end event, then print final text")
+    ora_wait = ora_sub.add_parser("wait", help="A3/B1: block until NEW assistant output (or agent_end), print final text")
     ora_wait.add_argument("review_key")
     ora_wait.add_argument("--timeout", type=float, default=300.0,
                           help="B1: max seconds to wait (default 300); on timeout emits "

@@ -627,11 +627,55 @@ def _resolve_bound_session_id(review_key: str, manifest) -> str:
     The park manifest is authoritative (updated on start/ask/revive);
     meta.json is the A1 persistence that survives manifest loss and warms
     revive/ask before spawning.
+
+    Root-cause fix (2026-08-12): plugin handshake runs BEFORE OMP binds its
+    native session id, so runtime_register persisted an EMPTY sid into the
+    manifest — manifest/meta stayed empty forever even though the gateway's
+    in-memory runtime record later got the real sid.  When both manifest and
+    meta are empty, lazily sync from the gateway (runtime.info) and backfill
+    both, so every consumer self-heals regardless of registration timing.
     """
     if manifest is not None and getattr(manifest, "backend_session_id", ""):
         return manifest.backend_session_id
     meta = _read_oracle_meta(review_key)
-    return (meta or {}).get("backend_session_id", "") or ""
+    sid = (meta or {}).get("backend_session_id", "") or ""
+    if sid:
+        return sid
+    # Lazy sync: query the gateway's authoritative binding, backfill both.
+    sid = _sync_backend_session_from_gateway(review_key, manifest)
+    return sid
+
+
+def _sync_backend_session_from_gateway(review_key: str, manifest):
+    """Lazy-backfill a bound backend_session_id from the live gateway.
+
+    The gateway's in-memory runtime record holds the real OMP session id
+    (bound after plugin handshake).  When park manifest and meta.json are
+    both stale/empty, pull it here and persist to both so warm resume and
+    transcript extraction work.  Idempotent; returns "" when not bound yet.
+    """
+    try:
+        info = _gateway().call("runtime.info", {"review_key": review_key})
+        sid = info.get("backend_session_id", "")
+        if not sid:
+            return ""
+    except (GatewayError, Exception):  # noqa: BLE001
+        return ""
+    # Backfill manifest + meta.json so downstream reads (warm revive,
+    # _wait_final_text transcript extraction) use the real session.
+    try:
+        from codeagent.park.registry import ParkRegistry
+        from dataclasses import replace
+
+        reg = ParkRegistry()
+        cur = reg.lookup(review_key) if manifest is None else manifest
+        if cur is not None and not getattr(cur, "backend_session_id", ""):
+            reg.update(review_key, replace(cur, backend_session_id=sid))
+        _write_oracle_meta(review_key, sid, "bound",
+                           swarm_session_id=(getattr(cur, "swarm_session_id", "") or "") if cur else "")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("oracle: lazy backend-session sync failed (%s)", exc)
+    return sid
 
 
 def cmd_oracle_start(args: argparse.Namespace) -> int:
@@ -1436,6 +1480,13 @@ def _fallback_find_session_for_key(review_key: str, since: Optional[float] = Non
                         # the ora-* dir bonus alone must NOT match an
                         # unrelated key (精确 review_key 匹配要求).
     for f in recent:
+        # Root-cause fix (2026-08-12): __advisor*.jsonl is a SEPARATE monitor
+        # session (advisor meta-comments), not the main agent's answer. It
+        # must never be selected — previously it got a +10 dir bonus AND its
+        # text often contains the review_key, so a stale advisor file could
+        # beat the real (recent) main session. Skip advisor files outright.
+        if "__advisor" in f.name.lower():
+            continue
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -1449,7 +1500,7 @@ def _fallback_find_session_for_key(review_key: str, since: Optional[float] = Non
         if key_score == 0:
             continue  # no key signal — skip regardless of dir bonus
         score = key_score
-        if "ora-" in f.name.lower() or "ora-" in str(f.parent).lower() or "__advisor" in f.name.lower():
+        if "ora-" in f.name.lower() or "ora-" in str(f.parent).lower():
             score += 10
         if score > best_score:
             best, best_score, best_key_score = f, score, key_score
@@ -1712,7 +1763,11 @@ def _wait_final_text(review_key: str) -> Optional[str]:
     then best-effort scan) but returns the text instead of printing.
     """
     manifest = ParkRegistry().lookup(review_key)
-    backend_id = (manifest.backend_session_id if manifest else "") or ""
+    # Root-cause fix (2026-08-12): resolve via lazy-sync so a bound backend
+    # sid (persisted only after plugin handshake) is backfilled — previously
+    # manifest/meta stayed empty and _find_session_file("") fell through to
+    # the score-based fallback, which could pick a stale __advisor session.
+    backend_id = _resolve_bound_session_id(review_key, manifest)
     path = _find_session_file(backend_id) if backend_id else None
     if path is None:
         try:
@@ -1772,6 +1827,10 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
     # replaying the full event history on every poll iteration.  Do one
     # initial full drain (cursor 0, large limit) to catch an agent_end
     # that already landed; subsequent iterations only see NEW events.
+    # Root-cause fix (2026-08-12): baseline = current main-session text; a
+    # wait started AFTER the oracle already answered must not return that
+    # old answer, and advisor meta-comments must not short-circuit it.
+    baseline_text = _wait_final_text(review_key) or ""
     cursor: int = 0
     deadline = time.monotonic() + timeout
     try:
@@ -1814,10 +1873,17 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
             # A3: new assistant output → return final text (parked oracle
             # stays active, so this is the primary completion signal).
             if kind == "ASSISTANT_PROGRESS":
+                # Root-cause fix (2026-08-12): __advisor (monitor session)
+                # ALSO emits ASSISTANT_PROGRESS into this event stream, but it
+                # writes a SEPARATE __advisor.jsonl — the main session text is
+                # unchanged. Compare against the baseline: only a genuinely new
+                # main-session output counts, so advisor meta-comments can't
+                # short-circuit wait with a stale/wrong answer.
                 final = _wait_final_text(review_key)
-                if final is not None:
+                if final is not None and final != baseline_text:
                     print(final)
-                return 0
+                    return 0
+                continue  # advisor noise or no new main output — keep waiting
             if kind == "TASK_STATE" and payload.get("state") == "agent_end":
                 final = _wait_final_text(review_key)
                 if final is not None:

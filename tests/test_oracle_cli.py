@@ -270,33 +270,27 @@ class TestOracleStatusRelease:
 
 
 def test_fallback_find_session_recursive_scan(tmp_path, monkeypatch):
-    """P2-11 fallback：递归扫描子目录 .jsonl（含 __advisor）+ 精确 tail 匹配。"""
+    """P2-11 fallback：递归扫描子目录 .jsonl（主会话）+ 精确 tail 匹配；__advisor 排除。"""
     from codeagent.oracle import _fallback_find_session_for_key
-    from pathlib import Path
 
-    # 模拟 sessions 根：一个顶层文件（含 oracle 但不含 tail）+ 一个深层 __advisor（含 tail）
-    root = tmp_path / "sessions"
-    top = root / "some-project"
-    top.mkdir(parents=True)
-    (top / "unrelated.jsonl").write_text('{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"oracle 历史"}]}}')
-    sdir = top / "2026-08-11T16-36-40-491Z_019ff1ae"
-    sdir.mkdir()
-    (sdir / "__advisor.jsonl").write_text('{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"2 r4-closure answer"}]}}')
-
-    monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
-    # 需要让 sessions_root 指向 tmp_path/sessions — 但 home 是 tmp_path，sessions_root=home/.omp/agent/sessions
-    # 直接构造到正确位置
     real_root = tmp_path / ".omp" / "agent" / "sessions"
     real_root.mkdir(parents=True)
     (real_root / "some-project").mkdir()
     (real_root / "some-project" / "unrelated.jsonl").write_text('oracle 历史')
     sd = real_root / "some-project" / "sdir"
     sd.mkdir()
-    (sd / "__advisor.jsonl").write_text('r4-closure 2 answer')
+    # 主会话文件（应被选中）
+    (sd / "main.jsonl").write_text('r4-closure 2 answer')
+    # __advisor 监控会话（含 tail 但必须被排除——根因2修复）
+    (sd / "__advisor.jsonl").write_text('r4-closure advisor meta-comment')
+
+    monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
 
     found = _fallback_find_session_for_key("proj:oracle:review:r4-closure")
     assert found is not None
     assert "r4-closure" in found.read_text(errors="replace")
+    # 根因2修复：__advisor（独立监控会话）不得被选为主回答来源
+    assert "__advisor" not in found.name, "__advisor 会话不应被选作主回答"
 
 
 def test_release_soft_preserves_session_and_manifest(tmp_path):
