@@ -1689,6 +1689,15 @@ class RequestLedger:
         """Return all events for *(request_id, run_id)*, newest last."""
         return self._read_entries(request_id, run_id)
 
+    def get_entries_all_runs(self, request_id: str) -> dict[str, list[dict]]:
+        """Return all entries for *request_id*, grouped by run_id.
+
+        Public API over ``_read_entries_all_runs`` so callers (e.g.
+        ``oracle status``) never reach into the private implementation
+        (I4).
+        """
+        return self._read_entries_all_runs(request_id)
+
     def record_artifact_verdict(
         self, request_id: str, run_id: str, verified: bool
     ) -> dict:

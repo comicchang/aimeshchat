@@ -267,16 +267,23 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_start.add_argument("--workdir", default="", help="Working directory")
     ora_start.add_argument("--model", default="", help="Model override")
     ora_start.add_argument("--prompt", default="", help="Initial prompt (default empty — first TASK comes via ask)")
+    ora_start.add_argument("--apply-memory-config", action="store_true", dest="apply_memory_config",
+                           help="D4: auto-merge missing OMP memory config keys (default: detect + warn only)")
 
     ora_ask = ora_sub.add_parser("ask", help="Hot/warm/cold deliver a prompt to the review")
     ora_ask.add_argument("review_key")
-    ora_ask.add_argument("prompt", nargs="?", default="", help="Prompt text (or stdin)")
+    # U1: prompt 必填（去掉 nargs='?'）——不再 fallback 读 stdin，避免
+    # 忘记 prompt 时终端挂起（非交互 stdin 会一直阻塞）。
+    ora_ask.add_argument("prompt", help="Prompt text (required — no stdin fallback)")
     ora_ask.add_argument("--agent", default=_DEFAULT_ORACLE_AGENT)
     ora_ask.add_argument("--backend", default="omp")
     ora_ask.add_argument("--model", default="")
 
     ora_status = ora_sub.add_parser("status", help="Aggregate receipt/progress/park")
     ora_status.add_argument("review_key")
+
+    # E2: list all parked oracle reviews (ParkRegistry.list_active + lifecycle)
+    ora_list = ora_sub.add_parser("list", help="List all parked oracle reviews (active + lifecycle)")
 
     ora_watch = ora_sub.add_parser("watch", help="Watch runtime events (cursor-resumable)")
     ora_watch.add_argument("review_key")
@@ -2073,10 +2080,11 @@ def _cmd_runtime(args: argparse.Namespace) -> int:
 
 
 def _cmd_oracle(args: argparse.Namespace) -> int:
-    """Dispatch oracle subcommands (start/ask/status/watch/wait/release/revive/result/attach)."""
+    """Dispatch oracle subcommands (start/ask/status/list/watch/wait/release/revive/result/attach)."""
     from codeagent.oracle import (
         cmd_oracle_ask,
         cmd_oracle_attach,
+        cmd_oracle_list,
         cmd_oracle_release,
         cmd_oracle_result,
         cmd_oracle_revive,
@@ -2088,12 +2096,13 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
 
     cmd = args.ora_cmd
     if cmd is None:
-        print("oracle: missing subcommand. Try: aimeshchat oracle start|ask|status|watch|wait|release|revive|result|attach", file=sys.stderr)
+        print("oracle: missing subcommand. Try: aimeshchat oracle start|ask|status|list|watch|wait|release|revive|result|attach", file=sys.stderr)
         return 1
     handlers = {
         "start": cmd_oracle_start,
         "ask": cmd_oracle_ask,
         "status": cmd_oracle_status,
+        "list": cmd_oracle_list,
         "watch": cmd_oracle_watch,
         "wait": cmd_oracle_wait,
         "release": cmd_oracle_release,

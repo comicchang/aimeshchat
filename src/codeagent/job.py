@@ -330,14 +330,12 @@ def _iso_now() -> str:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """Write *content* to *path* atomically (write-then-rename)."""
+    """Write *content* to *path* atomically (write-then-rename).
+
+    I6: no non-atomic fallback — a failed rename must propagate so a
+    caller never observes a partially-written file masquerading as a
+    completed atomic write.
+    """
     tmp = path.with_suffix(".tmp")
-    try:
-        tmp.write_text(content, encoding="utf-8")
-        os.replace(str(tmp), str(path))
-    except OSError:
-        # Best-effort fallback.
-        try:
-            path.write_text(content, encoding="utf-8")
-        except OSError:
-            log.warning("failed to write %s", path)
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(str(tmp), str(path))

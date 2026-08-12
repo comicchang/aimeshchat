@@ -17,6 +17,7 @@ method used — never claim a hot revive that did not happen.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -57,16 +59,24 @@ def _gateway() -> GatewayClient:
 
 
 def _review_sid(review_key: str) -> str:
-    """Swarm session id for a review key (existing ora-* scheme)."""
-    safe = review_key.replace(":", "-")[-12:]
-    return f"ora-{safe}-{uuid4().hex[:10]}"
+    """Swarm session id for a review key (hash-derived ora-* scheme).
+
+    I3: previously ``replace(':', '-')[-12:]`` truncated the review key —
+    two keys sharing the same 12-char suffix collided on the same swarm
+    session id. A sha256 prefix is collision-safe for the same entropy.
+    """
+    digest = hashlib.sha256(review_key.encode("utf-8")).hexdigest()[:12]
+    return f"ora-{digest}-{uuid4().hex[:10]}"
 
 
-def _adopt_runtime(review_key: str, sid: str, handle, backend: str) -> None:
+def _adopt_runtime(review_key: str, sid: str, handle, backend: str) -> bool:
     """Adopt a spawned runtime into the local gateway (presence/status).
 
     Needed for runtimes WITHOUT a plugin handshake (opencode/generic); OMP
     runtimes are adopted by the plugin's runtime.register instead.
+
+    I2: returns True on success / False on failure so callers can surface
+    ``adopted: false`` in their success JSON instead of silently degrading.
     """
     try:
         from codeagent.gateway.client import GatewayClient
@@ -82,8 +92,10 @@ def _adopt_runtime(review_key: str, sid: str, handle, backend: str) -> None:
             "owner_pid": os.getpid(),
             "nonce": uuid4().hex[:12],
         })
+        return True
     except Exception as exc:
         print(f"warning: gateway runtime adoption failed: {exc}", file=sys.stderr)
+        return False
 
 
 def _resolve_backend(agent: str, requested: str) -> str:
@@ -340,12 +352,17 @@ def _merge_flat_yaml(path: Path, ensure: dict[str, dict[str, str]]) -> bool:
     return True
 
 
-def ensure_omp_memory_config() -> dict:
+def ensure_omp_memory_config(apply: bool = False) -> dict:
     """Verify/merge OMP native memory config (memsearch/autoRecall/handoff).
+
+    D4: 默认只检测缺失项，不自动修改用户配置。传 ``apply=True`` 时才
+    写入缺失的配置项（带时间戳备份）；``apply=False`` 时 report 包含
+    ``missing`` 列表供调用方提示用户。
 
     Per the native-first directive: codeagent actively ensures the OMP
     native persistence knobs are on. Missing keys are merged (with a
-    timestamped backup); existing values are never overwritten.
+    timestamped backup) ONLY when apply=True; existing values are never
+    overwritten.
     """
     paths = _omp_config_paths()
     report: dict = {
@@ -370,7 +387,8 @@ def ensure_omp_memory_config() -> dict:
     if not report["backend"]:
         report["missing"].append("memory.backend=memsearch")
 
-    if report["missing"]:
+    # D4: 只有 apply=True 时才自动写入缺失配置。
+    if report["missing"] and apply:
         try:
             ensure = {}
             if not report["auto_recall"]:
@@ -574,18 +592,33 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     # report runtime events (presence/heartbeat would silently degrade).
     plugin_err = _check_mailbox_plugin()
     if plugin_err is not None:
-        print(f"error: {plugin_err}", file=sys.stderr)
+        # U3: error output is JSON to stderr (consistent with ask/revive).
+        print(json.dumps({
+            "error": "mailbox_plugin_unavailable",
+            "review_key": args.review_key,
+            "detail": plugin_err,
+        }, indent=2), file=sys.stderr)
         return 1
     review_key = args.review_key
     backend = _resolve_backend(args.agent, args.backend)
     workdir = args.workdir or os.getcwd()
 
     # ── OMP native memory config (B1): verify/merge autoRecall + handoff ──
-    memory_report = ensure_omp_memory_config()
+    # D4: 默认只检测不写入；--apply-memory-config 才自动修改用户配置。
+    apply_mem_cfg = getattr(args, "apply_memory_config", False)
+    memory_report = ensure_omp_memory_config(apply=apply_mem_cfg)
     if memory_report["merged"]:
         print(f"omp memory config merged: {memory_report['config_path']}", file=sys.stderr)
     elif memory_report["missing"] and not memory_report["config_path"]:
         print(f"warning: {memory_report['missing'][0]}", file=sys.stderr)
+    elif memory_report["missing"] and memory_report["config_path"] and not apply_mem_cfg:
+        # D4: 检测到缺失但未自动修改——提示用户加 --apply-memory-config。
+        print(
+            f"info: omp memory config has missing keys ({', '.join(memory_report['missing'])}). "
+            f"Use --apply-memory-config to auto-merge, or fix manually in "
+            f"{memory_report['config_path']}.",
+            file=sys.stderr,
+        )
     memory_env = {"OMP_MEMORY_CONFIG_PATH": memory_report["config_path"]} if memory_report["config_path"] else {}
 
     # ── Model fallback chain (reuse retry.fallbackChains from OMP config) ──
@@ -633,8 +666,19 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
 
     # ── Initial TASK into the oracle inbox (plugin handshake picks it up
     #    as the initial task via pi.sendUserMessage). ─────────────────
+    # U2: prompt 只走单一通道，消除双重传递：
+    #   - omp（默认 interactive_plugin）：mailbox TASK 是唯一到达 runtime
+    #     的通道（gateway runtime_register handshake → pi.sendUserMessage；
+    #     spawn 的 task 对 interactive 模式只写进 spec.json，不进 argv）。
+    #     mailbox 保留 prompt+B3；spawn task 置空。
+    #   - opencode/generic：spawn task 经 argv 位置参数到达 runtime；
+    #     mailbox TASK 仅携带 B3 协议块（不含 prompt），避免潜在二次执行。
     prompt = args.prompt or ""
-    if prompt:
+    if backend == "omp":
+        init_task_body = prompt + _oracle_init_protocol(sid) if prompt else ""
+    else:
+        init_task_body = _oracle_init_protocol(sid)
+    if init_task_body:
         try:
             from codeagent.mailbox.service import MailboxService
 
@@ -643,7 +687,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
                 from_id="manager",
                 to_id=_ORACLE_AGENT,
                 subject="oracle-init",
-                body=prompt + _oracle_init_protocol(sid),  # B3: self-describing handshake
+                body=init_task_body,  # B3: self-describing handshake
                 kind="TASK",
                 run_id=f"run-{uuid4().hex[:10]}",
                 request_id=f"req-{uuid4().hex[:10]}",
@@ -660,7 +704,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "agent_id": _ORACLE_AGENT,
         "review_key": review_key,
         "workdir": workdir,
-        "task": prompt,
+        # U2: omp 走 mailbox 单通道（interactive 模式 task 不进 argv）；
+        # 非 omp 后端（opencode argv 位置参数）经 task 传递 prompt。
+        "task": prompt if backend != "omp" else "",
         "model": primary_model,
         "gateway_socket": str(control_socket_path()),
         "owner_pid": os.getpid(),
@@ -681,9 +727,14 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             reg.stop(handle.runtime_id, "session-id-binding-timeout")
         except Exception as stop_exc:
             log.debug("oracle start: runtime stop after binding timeout failed (%s)", stop_exc)
-        print("error: session_id binding timeout "
-              f"(no 'session_id='/backend_session=' marker in the runtime log for "
-              f"{handle.runtime_id} within 60s)", file=sys.stderr)
+        # U3: error output is JSON to stderr (consistent with ask/revive).
+        print(json.dumps({
+            "error": "session_id_binding_timeout",
+            "review_key": review_key,
+            "runtime_id": handle.runtime_id,
+            "detail": "no 'session_id='/backend_session=' marker in the runtime "
+                      "log within 60s",
+        }, indent=2), file=sys.stderr)
         return 1
 
     # Persist backend session into the park manifest (authoritative).
@@ -691,21 +742,37 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     # The resolved primary (chain[0]) is used for spawn, but persisting it
     # here would make revive treat it as an explicit override and collapse
     # the fallback chain to one element.
-    manifest = ParkManifest(
-        review_key=review_key,
-        swarm_session_id=sid,
-        agent_type=args.agent,
-        model=args.model or "",
-        host="__local__",
-        workdir=workdir,
-        lifecycle=Lifecycle.HOT_PARKED,
-        backend_session_id=bound_session_id,
-        created_at=(existing.created_at if existing else time.time()),
-        last_activity_at=time.time(),
-    )
     if existing is not None:
+        # D3: restart path — preserve every untouched field via replace()
+        # instead of copying 15+ fields manually. created_at is kept from
+        # the original row; stale release/session state is reset.
+        manifest = replace(
+            existing,
+            swarm_session_id=sid,
+            agent_type=args.agent,
+            model=args.model or "",
+            host="__local__",
+            workdir=workdir,
+            lifecycle=Lifecycle.HOT_PARKED,
+            backend_session_id=bound_session_id,
+            last_activity_at=time.time(),
+            release_mode="",
+            omp_session_path="",
+        )
         registry.update(review_key, manifest)
     else:
+        manifest = ParkManifest(
+            review_key=review_key,
+            swarm_session_id=sid,
+            agent_type=args.agent,
+            model=args.model or "",
+            host="__local__",
+            workdir=workdir,
+            lifecycle=Lifecycle.HOT_PARKED,
+            backend_session_id=bound_session_id,
+            created_at=time.time(),
+            last_activity_at=time.time(),
+        )
         registry.acquire(review_key, manifest)
 
     # A1: persist the bound-session meta (backend_session_id/bound_at/status).
@@ -713,7 +780,9 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
 
     # Adopt the runtime into the LOCAL gateway so presence/status work even
     # for runtimes without a plugin handshake (opencode/generic).
-    _adopt_runtime(review_key, sid, handle, backend)
+    # I2: surface adoption failure — a silent presence gap would otherwise
+    # look like a healthy runtime.
+    adopted = _adopt_runtime(review_key, sid, handle, backend)
 
     print(json.dumps({
         "review_key": review_key,
@@ -722,6 +791,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "backend": backend,
         "backend_session_id": bound_session_id,
         "bound": True,
+        "adopted": adopted,
         "meta_path": str(_oracle_meta_path(review_key)),
         "generation": handle.generation,
         "mode": handle.mode,
@@ -734,13 +804,25 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
 # ── ask (hot → warm → cold) ────────────────────────────────────────────
 
 
+def _ask_retrieve_hint(review_key: str) -> str:
+    """E1: ask 成功后的取回答提示——引导用户用 wait/result 子命令。"""
+    return (
+        f"use 'oracle wait {review_key}' or 'oracle result {review_key}' "
+        "to retrieve the answer"
+    )
+
+
 def cmd_oracle_ask(args: argparse.Namespace) -> int:
     """Deliver a prompt to the review's runtime: hot in-loop, warm resume,
     or cold reconstruction. Reports the ACTUAL method used."""
     review_key = args.review_key
-    prompt = args.prompt or sys.stdin.read().strip()
+    # U1: prompt 必填（argparse 已移除 nargs='?'）——删除 sys.stdin.read()
+    # fallback，避免非交互终端/忘记 prompt 时挂起。程序化调用方仍防御空值。
+    prompt = (args.prompt or "").strip()
     if not prompt:
-        print("error: no prompt provided", file=sys.stderr)
+        # U3: error output is JSON to stderr.
+        print(json.dumps({"error": "no_prompt", "review_key": review_key},
+                         indent=2), file=sys.stderr)
         return 1
 
     # ── Hot: live runtime, in-loop send ───────────────────────────────
@@ -764,6 +846,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "backend_session_id": info.get("backend_session_id", ""),
                 "msg_id": result.get("msg_id", ""),
                 "note": "in-loop send to live runtime (plugin steer)",
+                "hint": _ask_retrieve_hint(review_key),  # E1
             }, indent=2))
             return 0
         # Runtime not alive: if it died of quota exhaustion, say so
@@ -846,32 +929,32 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             # Update manifest backend id + lifecycle (in-place, no UNIQUE clash).
-            registry.update(review_key, ParkManifest(
-                review_key=review_key,
-                swarm_session_id=manifest.swarm_session_id,
-                agent_type=manifest.agent_type,
-                model=manifest.model,
-                host=manifest.host,
-                workdir=manifest.workdir,
+            # D3: replace() preserves every untouched field instead of the
+            # 15-field manual copy.
+            registry.update(review_key, replace(
+                manifest,
                 lifecycle=Lifecycle.HOT_PARKED,
                 backend_session_id=new_backend_session_id,
                 round=manifest.round + 1,
-                created_at=manifest.created_at,
                 last_activity_at=time.time(),
             ))
-            _adopt_runtime(review_key, sid, warm_handle, _resolve_backend(args.agent, args.backend))
+            # I2: surface adoption failure in the success JSON.
+            adopted = _adopt_runtime(review_key, sid, warm_handle,
+                                     _resolve_backend(args.agent, args.backend))
             print(json.dumps({
                 "method": "warm",
                 "review_key": review_key,
                 "runtime_id": warm_handle.runtime_id,
                 "old_backend_session_id": bound_sid,
                 "new_backend_session_id": new_backend_session_id,
+                "adopted": adopted,
                 "model_chain": ask_model_chain,
                 "note": (
                     "native backend session resumed (OMP --resume / opencode --session)"
                     if new_backend_session_id else
                     "warm runtime spawned; session id pending — previous id preserved"
                 ),
+                "hint": _ask_retrieve_hint(review_key),  # E1
             }, indent=2))
             return 0
         except Exception as exc:
@@ -942,14 +1025,18 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             )
         print(json.dumps(cold_fail, indent=2), file=sys.stderr)
         return 1
-    _adopt_runtime(review_key, _review_sid(review_key), handle, _resolve_backend(args.agent, args.backend))
+    # I2: surface adoption failure in the success JSON.
+    adopted = _adopt_runtime(review_key, _review_sid(review_key), handle,
+                             _resolve_backend(args.agent, args.backend))
     print(json.dumps({
         "method": "cold",
         "review_key": review_key,
         "runtime_id": handle.runtime_id,
         "backend_session_id": handle.backend_session_id,
+        "adopted": adopted,
         "model_chain": ask_model_chain,
         "note": "snapshot reconstruction (no live/hot session)",
+        "hint": _ask_retrieve_hint(review_key),  # E1
     }, indent=2))
     return 0
 
@@ -1017,7 +1104,9 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
                     if not req_dir.is_dir():
                         continue
                     lg = RequestLedger(store.session_dir(manifest.swarm_session_id), _ORACLE_AGENT)
-                    for run_id, evs in lg._read_entries_all_runs(req_dir.name).items():
+                    # I4: use the public API — never reach into the private
+                    # _read_entries_all_runs implementation.
+                    for run_id, evs in lg.get_entries_all_runs(req_dir.name).items():
                         reqs.append({
                             "request_id": req_dir.name,
                             "run_id": run_id,
@@ -1088,6 +1177,34 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
         out["mailbox"] = None
 
     print(json.dumps(out, indent=2))
+    return 0
+
+
+# ── list（E2：列出所有 park review）───────────────────────────────────
+
+
+def cmd_oracle_list(args: argparse.Namespace) -> int:
+    """List every parked oracle review (ParkRegistry.list_active).
+
+    E2: ``ParkRegistry.list_active()`` already existed but had no CLI
+    entry — ``aimeshchat oracle list`` surfaces it. Each entry carries
+    the manifest's lifecycle (HOT_PARKED for active instances) plus the
+    fields needed to pick a next action (ask/status/result/release).
+    """
+    registry = ParkRegistry()
+    reviews: list[dict] = []
+    for m in registry.list_active():
+        reviews.append({
+            "review_key": m.review_key,
+            "lifecycle": m.lifecycle.value,
+            "agent_type": m.agent_type or "",
+            "backend_session_id": m.backend_session_id or "",
+            "swarm_session_id": m.swarm_session_id or "",
+            "round": m.round,
+            "model": m.model or "",
+            "last_activity_at": m.last_activity_at,
+        })
+    print(json.dumps({"reviews": reviews}, indent=2))
     return 0
 
 
@@ -1273,12 +1390,15 @@ def _review_reply_to_candidates(review_key: str) -> set[str]:
 
     Mailbox ``reply_to`` is validated as a safe path component — a raw
     review key with ':' (proj:oracle:gfx:blur) can never appear verbatim.
-    Senders sanitize: full substitution (proj-oracle-gfx-blur) or the short
-    slug used by ``_review_sid``/tmux (``replace(':', '-')[-12:]``).
+    Senders sanitize: full substitution (proj-oracle-gfx-blur), the short
+    slug used by tmux (``replace(':', '-')[-12:]``), or — since I3 — the
+    sha256 prefix used by ``_review_sid``. The old truncation slug is kept
+    for backward compatibility with pre-I3 sessions.
     """
     safe = review_key.replace(":", "-").replace("/", "-").replace("\\", "-")
     slug = review_key.replace(":", "-")[-12:]
-    return {review_key, safe, slug}
+    hash_slug = hashlib.sha256(review_key.encode("utf-8")).hexdigest()[:12]
+    return {review_key, safe, slug, hash_slug}
 
 
 def _scan_mailbox_report(review_key: str, manifest) -> Optional[str]:
@@ -1434,15 +1554,21 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
                 return 0
 
     # ── Nothing found ─────────────────────────────────────────────────
+    # U3: error output is JSON to stderr (consistent with ask/revive).
     if strict:
-        print(f"no result found for review key {review_key!r} (strict mode — "
-              f"filesystem fallback refused; backend_session_id={bound_sid!r})",
-              file=sys.stderr)
+        detail = (f"strict mode — filesystem fallback refused; "
+                  f"backend_session_id={bound_sid!r}")
     elif not bound_sid:
-        print(f"no result for review key {review_key!r} (oracle start 后才有)", file=sys.stderr)
+        detail = "oracle start 后才有（no bound backend session）"
     else:
-        print(f"no result for review key {review_key!r} (session {bound_sid!r} not "
-              f"found; no mailbox REPORT; no matching session file)", file=sys.stderr)
+        detail = (f"session {bound_sid!r} not found; no mailbox REPORT; "
+                  f"no matching session file")
+    print(json.dumps({
+        "error": "no_result",
+        "review_key": review_key,
+        "strict": strict,
+        "detail": detail,
+    }, indent=2), file=sys.stderr)
     return 1
 
 
@@ -1454,7 +1580,12 @@ def cmd_oracle_watch(args: argparse.Namespace) -> int:
         runtime_id = info.get("runtime_id", "")
         session_id = info.get("session_id", "")
     except GatewayError as exc:
-        print(f"error: {exc.code}: {exc.message}", file=sys.stderr)
+        # U3: error output is JSON to stderr.
+        print(json.dumps({
+            "error": exc.code,
+            "message": exc.message,
+            "review_key": review_key,
+        }, indent=2), file=sys.stderr)
         return 1
 
     from codeagent.gateway.cli import cmd_events_watch
@@ -1587,6 +1718,80 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
 # ── release ────────────────────────────────────────────────────────────
 
 
+def _tmux_kill_oracle_runtime(review_key: str) -> tuple[bool, list[str]]:
+    """I1: gateway 不可达时的泄漏防御——尽力终止 review 的 tmux runtime。
+
+    1. PID 级：扫描 ``$XDG_STATE_HOME/aimeshchat/runtime/*/spec.json``，
+       对 review_key 匹配的 runtime 按其 pid 文件 SIGTERM→SIGKILL。
+       （supervisor 以 start_new_session 启动 omp 子进程，tmux kill-pane
+       只杀 supervisor 本身——PID 级清理才能保证 OMP 进程真正退出。）
+    2. pane 级：私有 tmux server（aimeshchat-gateway）上按
+       ``ora-<safe>-`` 窗口名前缀 kill-pane（supervisor pane）。
+
+    返回 (是否终止了任何目标, 目标列表)。全部尽力而为，不抛异常。
+    """
+    from codeagent.launchers.tmux import TMUX_SESSION_NAME, kill_pane, tmux_cmd
+
+    targets: list[str] = []
+
+    # 1) PID 级：runtime dir spec.json 匹配 review_key。
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "state"
+    runtime_root = base / "aimeshchat" / "runtime"
+    if runtime_root.is_dir():
+        for spec_path in runtime_root.glob("*/spec.json"):
+            try:
+                spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if spec.get("review_key") != review_key:
+                continue
+            rid = spec.get("runtime_id", "")
+            pid_file = spec_path.parent / f"{rid}.pid"
+            try:
+                pid = int(pid_file.read_text().strip())
+            except (OSError, ValueError):
+                pid = None
+            if pid is None:
+                continue
+            try:
+                os.kill(pid, 15)  # SIGTERM
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except (ProcessLookupError, OSError):
+                        break
+                    time.sleep(0.2)
+                try:
+                    os.kill(pid, 0)
+                    os.kill(pid, 9)  # SIGKILL
+                except (ProcessLookupError, OSError):
+                    pass
+                targets.append(f"pid:{pid}")
+            except (ProcessLookupError, OSError) as exc:
+                log.debug("oracle release: pid kill failed (%s): %s", pid, exc)
+
+    # 2) pane 级：窗口名 ``ora-<safe>-...`` 前缀匹配（与 launchers.tmux
+    #    runtime_sid 的命名一致）。
+    safe = review_key.replace(":", "-")[-12:]
+    prefix = f"ora-{safe}-"
+    try:
+        proc = subprocess.run(
+            tmux_cmd("list-windows", "-t", TMUX_SESSION_NAME, "-F", "#{window_name}|#{pane_id}"),
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                name, sep, pane = line.partition("|")
+                if sep and name.startswith(prefix) and kill_pane(pane):
+                    targets.append(f"pane:{pane}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.debug("oracle release: tmux pane scan failed: %s", exc)
+
+    return bool(targets), targets
+
+
 def cmd_oracle_release(args: argparse.Namespace) -> int:
     """Write terminal state, stop the runtime, release the park lease.
 
@@ -1627,7 +1832,11 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
             pass
 
     # Stop the runtime (gateway) — the only way to terminate it.
+    # I1: gateway 不可达时不再只打 warning 继续释放——尝试 tmux/PID 兜底
+    # 终止（泄漏防御），并在输出 JSON 中如实标记 runtime_leaked。
     stopped = False
+    runtime_leaked = False
+    gateway_unreachable = False
     if manifest:
         try:
             info = _gateway().call("runtime.info", {"review_key": review_key})
@@ -1636,7 +1845,31 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
                 _gateway().call("runtime.stop", {"runtime_id": rid, "reason": "oracle release"})
                 stopped = True
         except GatewayError as exc:
+            # NOT_FOUND = gateway 正常但 runtime 本就不存在（无泄漏）；
+            # GATEWAY_DOWN/CONNECT_FAILED = gateway 不可达（可能泄漏）。
+            if exc.code in ("GATEWAY_DOWN", "GATEWAY_CONNECT_FAILED"):
+                gateway_unreachable = True
             print(f"warning: runtime stop failed: {exc.code}: {exc.message}", file=sys.stderr)
+        except Exception as exc:
+            gateway_unreachable = True
+            print(f"warning: runtime stop failed: {exc}", file=sys.stderr)
+        if not stopped and gateway_unreachable:
+            # I1: 泄漏防御——PID 级终止 + tmux kill-pane。
+            killed, targets = _tmux_kill_oracle_runtime(review_key)
+            if killed:
+                stopped = True
+                print(
+                    f"warning: gateway unreachable — terminated leaked runtime "
+                    f"({', '.join(targets)})",
+                    file=sys.stderr,
+                )
+            else:
+                runtime_leaked = True
+                print(
+                    "warning: gateway unreachable and no leaked runtime found to "
+                    "terminate — the tmux OMP process may still be running",
+                    file=sys.stderr,
+                )
 
     # Release the park lease.
     purge = bool(getattr(args, "purge", False))
@@ -1655,6 +1888,7 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
     print(json.dumps({
         "review_key": review_key,
         "runtime_stopped": stopped,
+        "runtime_leaked": runtime_leaked,  # I1
         "park_released": manifest is not None,
         "release_mode": release_mode,
         "session_purged": purge and manifest is not None,
@@ -1666,13 +1900,16 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
 
 
 def _purge_omp_session(manifest: ParkManifest) -> list[str]:
-    """P1-1: 硬销毁——删除 OMP session 文件（--purge）。
+    """P1-1: 硬销毁——删除 OMP session 文件 + swarm session 目录（--purge）。
 
     删除对象（存在才删，返回实际删除路径列表）：
     - manifest.omp_session_path（若已记录）
     - _find_session_file(backend_session_id) 命中的 ``*_{sid}.jsonl``
     - 同目录下 ``*_{sid}`` 命名的会话子目录（``<ts>_<sid>/``，含 __advisor
       等附属文件）
+    - I5: swarm session 目录（mailbox session dir + _outbox/_dead_letter
+      附属目录）——purge 必须把 mailbox 痕迹一起清掉，否则重新 start 同
+      review_key 会撞见陈旧的 inbox/history。
     """
     removed: list[str] = []
     targets: set[Path] = set()
@@ -1694,6 +1931,18 @@ def _purge_omp_session(manifest: ParkManifest) -> list[str]:
                     if child.is_dir() and child not in targets:
                         targets.add(child)
 
+    # I5: swarm session 目录 + 其 outbox/dead-letter 附属目录。
+    swarm_id = getattr(manifest, "swarm_session_id", "") or ""
+    if swarm_id:
+        store = MailboxStore()
+        for p in (
+            store.session_dir(swarm_id),
+            store.root / "_outbox" / swarm_id,
+            store.root / "_dead_letter" / swarm_id,
+        ):
+            if p.exists():
+                targets.add(p)
+
     for p in sorted(targets, key=str):
         try:
             if p.is_dir():
@@ -1706,19 +1955,34 @@ def _purge_omp_session(manifest: ParkManifest) -> list[str]:
     return removed
 
 
+def _is_runtime_alive(manifest: "ParkManifest") -> bool:
+    """D1: 检查 park manifest 对应的 runtime 是否真正 alive。
+
+    通过 gateway runtime.info 查询，而非仅信任 lifecycle 标记。
+    gateway 不可达时保守返回 False（降级到 warm/cold）。
+    """
+    try:
+        info = _gateway().call("runtime.info", {
+            "review_key": manifest.review_key,
+        })
+        health = info.get("runtime_health", {})
+        return info.get("status") == "active" and health.get("alive", False)
+    except Exception:
+        return False
+
+
 def cmd_oracle_revive(args: argparse.Namespace) -> int:
     """P1-2: 从 RELEASED_SOFT / COLD_RESUMABLE 复活。
 
-    路由：
-    - absent        → error not_found（需 start）
-    - HOT_PARKED    → error already_active（用 ask）
-    - RELEASED_HARD → error purged（需 start）
-    - BROKEN        → error broken（purge 后 start）
-    - 有 backend_session_id → warm（复用原生会话）；无 → cold（快照重建）
+    D1: 使用 revive_or_spawn 决策树（含 runtime alive 检查），
+    而非内联重复路由逻辑。
+    D2: 输出加 declared: true/false（gateway presence 声明结果）。
 
     mode: bg（默认）/pane 走 RuntimeRegistry.spawn（监督式 runtime）；
-    resume 走 ``omp --resume`` 前台附着（绕过 postmesh）。
+    resume 走 ``omp --resume`` 前台附着（绕过 aimeshchat）。
     """
+    from codeagent.park.router import revive_or_spawn
+
     review_key = args.review_key
     mode = getattr(args, "mode", "bg") or "bg"
     registry = ParkRegistry()
@@ -1726,10 +1990,6 @@ def cmd_oracle_revive(args: argparse.Namespace) -> int:
 
     if manifest is None:
         print(json.dumps({"error": "not_found", "hint": "use 'oracle start' first"}, indent=2),
-              file=sys.stderr)
-        return 1
-    if manifest.lifecycle == Lifecycle.HOT_PARKED:
-        print(json.dumps({"error": "already_active", "hint": "use 'oracle ask' to deliver a prompt"}, indent=2),
               file=sys.stderr)
         return 1
     if manifest.lifecycle == Lifecycle.RELEASED_HARD:
@@ -1741,20 +2001,49 @@ def cmd_oracle_revive(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
 
-    # A1: warm 前置 — meta.json 绑定的 backend session 复用（manifest 优先）。
-    # 缺少 manifest 字段但 meta 有绑定时仍走 warm，避免冷重建丢失上下文。
-    bound_sid = _resolve_bound_session_id(review_key, manifest)
-    method = "warm" if bound_sid else "cold"
+    # D1: 用 revive_or_spawn 做路由决策（含 runtime alive 检查）。
+    decision = revive_or_spawn(review_key, is_alive=_is_runtime_alive)
+
+    if decision.method == "hot":
+        # HOT_PARKED 且 runtime alive → 不做 revive，提示用 ask。
+        print(json.dumps({
+            "error": "already_active",
+            "hint": "use 'oracle ask' to deliver a prompt",
+            "review_key": review_key,
+        }, indent=2), file=sys.stderr)
+        return 1
+
+    # D1: method 由 decision 决定（warm/cold），不再手算 bound_sid。
+    method = decision.method
+    declared: Optional[bool] = None  # D2: gateway presence 声明结果
     try:
         if method == "warm":
             runtime_id, backend_session_id, model_chain = _revive_warm(review_key, manifest, mode)
         else:
             runtime_id, backend_session_id, model_chain = _revive_cold(review_key, manifest, mode)
+        declared = True  # D2: revive 完成（resume 模式 gateway 声明也成功）
+    except RuntimeError as exc:
+        # D2: _attach_omp_session 上浮的 A7 门拒绝等真实错误。
+        err_msg = str(exc)
+        declared = False
+        # resume 模式下 A7 门拒绝是致命错误。
+        if mode == "resume":
+            print(json.dumps({
+                "error": "declare_failed",
+                "review_key": review_key,
+                "message": err_msg,
+                "declared": declared,
+            }, indent=2), file=sys.stderr)
+            return 1
+        # bg/pane 模式下 gateway 声明失败不阻塞 spawn，只警告。
+        log.warning("oracle revive: gateway declare failed (%s)", err_msg)
     except Exception as exc:
+        declared = False
         print(json.dumps({
             "error": f"{method}_failed",
             "review_key": review_key,
             "message": str(exc),
+            "declared": declared,
         }, indent=2), file=sys.stderr)
         return 1
 
@@ -1772,6 +2061,7 @@ def cmd_oracle_revive(args: argparse.Namespace) -> int:
         "runtime_id": runtime_id,
         "backend_session_id": backend_session_id,
         "model_chain": model_chain,
+        "declared": declared,  # D2: gateway presence 声明结果
     }, indent=2))
     return 0
 
@@ -1824,7 +2114,10 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
     bound_sid = _resolve_bound_session_id(review_key, manifest)
 
     if mode == "resume":
-        _attach_omp_session(bound_sid, review_key, manifest.workdir)
+        # D2: 传播 _attach_omp_session 的错误（A7 门拒绝等）。
+        declare_err = _attach_omp_session(bound_sid, review_key, manifest.workdir)
+        if declare_err:
+            raise RuntimeError(declare_err)
         return "", bound_sid, []
 
     # ── Model fallback chain (reuse retry.fallbackChains from OMP config) ──
@@ -1921,29 +2214,29 @@ def _flip_to_hot(review_key: str, manifest: ParkManifest, sid: str,
     会拒绝回迁（仅 RELEASED_SOFT 允许重新 acquire）；update 与
     cmd_oracle_ask 的 warm 路径一致。
     """
-    ParkRegistry().update(review_key, ParkManifest(
-        review_key=review_key,
+    # D3: replace() preserves every untouched field — the old manual copy
+    # dropped/needed defensive getattr for omp_session_path.
+    ParkRegistry().update(review_key, replace(
+        manifest,
         swarm_session_id=sid,
-        agent_type=manifest.agent_type,
-        model=manifest.model,
-        host=manifest.host,
-        workdir=manifest.workdir,
         lifecycle=Lifecycle.HOT_PARKED,
         backend_session_id=backend_session_id,
         round=manifest.round + 1,
-        created_at=manifest.created_at,
         last_activity_at=time.time(),
         release_mode="",
-        omp_session_path=getattr(manifest, "omp_session_path", "") or "",
     ))
 
 
-def _attach_omp_session(session_id: str, review_key: str, workdir: str = "") -> None:
-    """P1-3: resume 模式——前台 ``omp --resume`` 附着（绕过 postmesh）。
+def _attach_omp_session(session_id: str, review_key: str, workdir: str = "") -> Optional[str]:
+    """P1-3: resume 模式——前台 ``omp --resume`` 附着（绕过 aimeshchat）。
 
     设计稿的 ``omp -s <sid>`` 在真实 omp CLI（v17）中不存在：交互式续接
     旗标是 ``-r/--resume=<sid>``，这里用实际旗标。附带向 gateway 声明
     presence（runtime.declare 是 Phase 3 可选 API，失败静默降级）。
+
+    D2: 返回 None 表示声明成功；返回错误字符串表示失败。
+    区分「gateway 不可达」（静默降级，返回 None）和「A7 门拒绝/其他真实
+    错误」（返回错误描述，上浮给调用方）。
     """
     try:
         subprocess.Popen(
@@ -1959,5 +2252,14 @@ def _attach_omp_session(session_id: str, review_key: str, workdir: str = "") -> 
             "mode": "native_resume",
             "agent_id": _ORACLE_AGENT,
         })
-    except Exception as exc:
+        return None  # D2: declared successfully
+    except (ConnectionError, OSError, FileNotFoundError) as exc:
+        # D2: gateway 不可达 — 静默降级（非致命）。
         log.debug("oracle revive: gateway presence declare skipped (%s)", exc)
+        return None
+    except GatewayError as exc:
+        # D2: A7 门拒绝或结构化 gateway 错误 — 上浮。
+        return f"gateway declare failed: {exc.code}: {exc.message}"
+    except Exception as exc:
+        # D2: 未预期错误 — 上浮（不再掩盖）。
+        return f"gateway declare failed: {exc}"
