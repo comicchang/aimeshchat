@@ -1548,6 +1548,20 @@ class AgentGateway:
             "runtime_health": health,
         }
 
+    def runtime_event_stats(self, params: dict) -> dict:
+        """Generation-scoped per-kind event stats (oracle 卡死/停滞检测用).
+
+        一次 SQL 扫描返回各 kind 的计数 + 最新事件时间戳，避免客户端翻
+        完整事件尾。``generation`` 缺省时聚合所有代（调用方传 runtime.info
+        的当前 generation）。
+        """
+        runtime_id = params.get("runtime_id", "")
+        if not runtime_id:
+            raise GatewayError(ERR_PROTOCOL, "runtime.event_stats requires runtime_id")
+        generation = params.get("generation")
+        gen = int(generation) if generation is not None else None
+        return self._events.kind_stats(runtime_id, gen)
+
     # ── events ─────────────────────────────────────────────────────────
 
     def events_list(self, params: dict) -> dict:
@@ -2188,6 +2202,7 @@ class AgentGateway:
             "runtime.stop": self.runtime_stop,
             "runtime.purge_stopped": self.runtime_purge_stopped,  # 释放时清理旧 stopped 记录
             "runtime.info": self.runtime_info,
+            "runtime.event_stats": self.runtime_event_stats,  # 卡死/停滞检测
             "runtime.status": self.runtime_status,
             "runtime.list": self.runtimes_list,
             "events.list": self.events_list,

@@ -375,6 +375,39 @@ class EventStore:
             "last_event_payload": json.loads(last[3]) if last else {},
         }
 
+    def kind_stats(self, runtime_id: str, generation: Optional[int] = None) -> dict[str, Any]:
+        """Per-kind counts + newest event per kind for a runtime (卡死检测用).
+
+        oracle status 的停滞检测用它在单次 SQL 扫描里拿到各 kind 的计数和
+        最新时间戳，避免客户端翻完整事件尾。``generation=None`` 聚合所有代。
+        """
+        gen_where = " AND generation = ?" if generation is not None else ""
+        gen_args: tuple[Any, ...] = (generation,) if generation is not None else ()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT kind, COUNT(*) FROM runtime_events "
+                f"WHERE runtime_id = ?{gen_where} GROUP BY kind",
+                (runtime_id, *gen_args),
+            ).fetchall()
+            # 每个 kind 的最新事件（event_id 单调递增，即时间序）。
+            newest_ids = conn.execute(
+                "SELECT kind, MAX(event_id) FROM runtime_events "
+                f"WHERE runtime_id = ?{gen_where} GROUP BY kind",
+                (runtime_id, *gen_args),
+            ).fetchall()
+            newest: dict[str, str] = {}
+            for kind, max_id in newest_ids:
+                row = conn.execute(
+                    "SELECT created_at FROM runtime_events WHERE event_id = ?",
+                    (int(max_id),),
+                ).fetchone()
+                if row is not None:
+                    newest[kind] = row[0]
+        return {
+            "counts": {k: int(c) for k, c in rows},
+            "newest": newest,
+        }
+
     # ── retention ──────────────────────────────────────────────────────
 
     def sweep(self, now: Optional[float] = None) -> int:

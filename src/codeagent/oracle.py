@@ -48,6 +48,24 @@ from codeagent.runtime.registry import RuntimeRegistry
 
 _ORACLE_AGENT = "oracle"
 
+# ── 卡死/停滞检测（操作层防御；只告警，不自动 recover）─────────────
+# 强信号：同 generation 连续 ≥3 个 interrupt_skipped（advisory 跳过工具）
+#   事件且期间无成功 TOOL_FINISHED/ASSISTANT_PROGRESS → 疑似卡死。
+_STUCK_SKIP_MIN = 3
+# 弱信号：非终态 + runtime alive + 排除 heartbeat 后 ≥15 分钟无 work 事件
+#   （TURN_STARTED/ASSISTANT_PROGRESS/TOOL_*）+ 无 in-flight tool → 疑似停滞。
+_STALL_IDLE_SECONDS = 15 * 60
+# work 事件种类（gateway 事件不落库 heartbeat，天然排除心跳干扰）。
+_WORK_EVENT_KINDS = frozenset({
+    "TURN_STARTED", "ASSISTANT_PROGRESS", "TOOL_STARTED", "TOOL_FINISHED",
+})
+# 终态（turn 结束 / 会话退出）——oracle 等待下一条 ask 是正常态，不告警。
+_TERMINAL_TASK_STATES = frozenset({
+    "agent_end", "agent_stop", "session_shutdown", "process_exit",
+})
+# OMP createSkippedToolResult() 的固定文案（interrupt_skipped 特征）。
+_SKIP_TEXT_MARKER = "Skipped due to pending system advisory"
+
 
 def _kernel_and_store():
     from codeagent.cli import _get_swarm_kernel
@@ -1279,6 +1297,196 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── 卡死/停滞检测（操作层防御；只告警，不自动 recover）─────────────
+
+
+def _parse_iso_ts(value: str) -> Optional[float]:
+    """ISO-8601 Z 时间戳 → epoch 秒。
+
+    gateway created_at 无毫秒（``...Z``），OMP 转录带毫秒
+    （``...548Z``），统一解析为 epoch 便于跨源比较。
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_interrupt_skip(text: str) -> bool:
+    """判断工具结果文本是否为 interrupt_skipped（advisory 跳过工具）。
+
+    OMP harness 在 system advisory 抢占式打断工具批次时生成两种载荷：
+      - ``createSkippedToolResult()`` 固定文案（尚未开始的串行工具被跳过）；
+      - JSON 载荷 ``{__synthetic: true, source: "interrupt_skipped", ...}``
+        或 ``{__interrupted: true, source: "interrupt_skipped", ...}``。
+    要求文本自身就是载荷（以固定文案或 ``{`` 开头），避免把 grep/read
+    输出中恰好包含该字符串的内容误判为 skip。
+    """
+    t = text.strip()
+    if t.startswith(_SKIP_TEXT_MARKER):
+        return True
+    if t.startswith("{") and '"source": "interrupt_skipped"' in t:
+        return "__synthetic" in t or "__interrupted" in t
+    return False
+
+
+def _scan_session_stuck_events(path: Path, since_epoch: float) -> list[tuple[str, float]]:
+    """扫描 OMP 会话转录，返回 generation 窗口内的 ``(kind, ts)`` 事件序列。
+
+    kind: ``skip``（interrupt_skipped）| ``tool_ok``（成功工具结果）|
+    ``output``（assistant 文本消息）。
+
+    为什么不用 gateway 的 TOOL_FINISHED 判“成功”：插件在 ``tool_result``
+    hook 上对 skip 结果同样上报 TOOL_FINISHED（空 payload，无法区分），
+    因此“成功”进度只能以转录为准。
+    """
+    events: list[tuple[str, float]] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if obj.get("type") != "message":
+                    continue
+                ts = _parse_iso_ts(obj.get("timestamp", ""))
+                if ts is None or ts < since_epoch:
+                    continue
+                msg = obj.get("message", {}) or {}
+                role = msg.get("role")
+                if role == "toolResult":
+                    text = "".join(
+                        c.get("text", "") for c in (msg.get("content") or [])
+                        if isinstance(c, dict) and c.get("type") == "text"
+                    )
+                    events.append(("skip" if _is_interrupt_skip(text) else "tool_ok", ts))
+                elif role == "assistant":
+                    content = msg.get("content") or []
+                    text = "".join(
+                        c.get("text", "") for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"
+                    )
+                    if text.strip():
+                        events.append(("output", ts))
+    except OSError:
+        return []
+    events.sort(key=lambda e: e[1])  # 时间序
+    return events
+
+
+def _detect_oracle_stuck(review_key: str, info: dict) -> Optional[dict]:
+    """卡死/停滞检测（只告警，不自动 recover——避免探针制造更多 advisory）。
+
+    强信号（卡死）：同 generation 连续 ≥3 个 interrupt_skipped 事件且期间
+      无成功 TOOL_FINISHED/ASSISTANT_PROGRESS（转录级：成功工具结果 /
+      assistant 文本），说明 oracle 正被 advisory 反复跳过工具。
+      判定“当前仍在进行”：从最新事件向前延伸连续 skip 段，遇进度事件即断。
+    弱信号（停滞）：非终态 + runtime alive + 无 in-flight tool +
+      排除 heartbeat 后 ≥15 分钟无 work 事件（TURN_STARTED/ASSISTANT_PROGRESS/TOOL_*）。
+
+    返回 ``{"detected": True, "signal": ..., "detail": ..., "hint": ...}``，
+    无信号返回 None（向后兼容：status JSON 不输出 stuck 字段）。
+    """
+    runtime_id = info.get("runtime_id", "")
+    generation = info.get("generation")
+    if not runtime_id or generation is None:
+        return None
+    agg = info.get("last_event") or {}
+    last_kind = agg.get("last_event_kind", "")
+    last_payload = agg.get("last_event_payload") or {}
+
+    # 非工作态不告警：hot-park 的 oracle 在 idle 时靠 heartbeat 保活、
+    # 静默等待下一条 ask（无 work 事件是正常态）——只有 agent_running
+    # 且事件流停滞才值得告警。ended/agent_end 等终态同理。
+    working = info.get("agent_state") == "agent_running"
+    terminal = (
+        info.get("status") == "stopped"
+        or not working
+        or (last_kind == "TASK_STATE"
+            and last_payload.get("state") in _TERMINAL_TASK_STATES)
+    )
+    alive = bool((info.get("runtime_health") or {}).get("alive"))
+
+    # ── 强信号：转录中的 interrupt_skipped 连续段（generation 窗口内）──
+    strong_detail = ""
+    backend_sid = info.get("backend_session_id", "")
+    if backend_sid:
+        session_path = _find_session_file(backend_sid)
+        since = _parse_iso_ts(agg.get("first_seen_at", ""))
+        if session_path is not None and since is not None:
+            events = _scan_session_stuck_events(session_path, since)
+            run = 0  # 当前仍在进行的连续 skip 段（从最新事件向前数）
+            for kind, _ts in reversed(events):
+                if kind == "skip":
+                    run += 1
+                else:
+                    break
+            if run >= _STUCK_SKIP_MIN:
+                strong_detail = (
+                    f"同 generation 连续 {run} 个 interrupt_skipped"
+                    "（advisory 跳过工具）事件，期间无成功"
+                    " TOOL_FINISHED/ASSISTANT_PROGRESS"
+                )
+
+    # ── 弱信号：gateway 事件统计（heartbeat 不落库，天然排除）──────────
+    weak_detail = ""
+    if not terminal and alive and not strong_detail:
+        stats: dict = {}
+        try:
+            stats = _gateway().call("runtime.event_stats", {
+                "runtime_id": runtime_id,
+                "generation": generation,
+            })
+        except Exception as exc:
+            log.warning("oracle: runtime.event_stats failed: %s", exc)
+        newest = stats.get("newest") or {}
+        work_ts = []
+        for kind, ts in newest.items():
+            if kind in _WORK_EVENT_KINDS:
+                epoch = _parse_iso_ts(ts)
+                if epoch is not None:
+                    work_ts.append(epoch)
+        # in-flight tool：最新事件是 TOOL_STARTED（尚无更新 TOOL_FINISHED）。
+        in_flight = last_kind == "TOOL_STARTED"
+        if work_ts and not in_flight:
+            idle_s = time.time() - max(work_ts)
+            if idle_s >= _STALL_IDLE_SECONDS:
+                weak_detail = (
+                    f"runtime alive 但 {int(idle_s // 60)} 分钟无 work 事件"
+                    "（TURN_STARTED/ASSISTANT_PROGRESS/TOOL_*，排除 heartbeat）"
+                    "且无 in-flight tool"
+                )
+
+    if strong_detail:
+        return {
+            "detected": True,
+            "signal": "strong",
+            "detail": strong_detail,
+            "hint": (
+                f"疑似卡死（advisory 跳过工具）：建议 `aimeshchat oracle release"
+                f" {review_key}` 后 `aimeshchat oracle revive {review_key}` 恢复；"
+                "仅告警不自动 recover（避免探针制造更多 advisory）"
+            ),
+        }
+    if weak_detail:
+        return {
+            "detected": True,
+            "signal": "weak",
+            "detail": weak_detail,
+            "hint": (
+                f"疑似停滞：建议 `aimeshchat oracle release {review_key}` 后"
+                f" `aimeshchat oracle revive {review_key}` 恢复；仅告警不自动 recover"
+            ),
+        }
+    return None
+
+
 def cmd_oracle_status(args: argparse.Namespace) -> int:
     """Aggregate receipt/progress/park for a review key."""
     review_key = args.review_key
@@ -1330,6 +1538,22 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
             out["runtime"] = {"status": "unavailable", "error": exc.message}
     except Exception as exc:
         out["runtime"] = {"status": "unavailable", "error": str(exc)}
+
+    # 卡死/停滞检测（操作层防御；只告警，不自动 recover）。
+    # 仅当 runtime.info 真正成功（非 gateway_down/unavailable 降级）才检测；
+    # 检测失败不阻塞 status 输出（向后兼容，无卡死时不输出 stuck 字段）。
+    if out["runtime"].get("status") not in ("gateway_down", "unavailable"):
+        try:
+            stuck = _detect_oracle_stuck(review_key, info)
+            if stuck:
+                out["stuck"] = stuck
+                print(
+                    f"[oracle] {stuck['detail']}\n"
+                    f"  → {stuck['hint']}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            log.warning("oracle: stuck detection skipped: %s", exc)
 
     # Request ledger (terminal truth).
     store = MailboxStore()
