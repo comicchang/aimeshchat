@@ -529,6 +529,36 @@ def ensure_omp_memory_config(apply: bool = False) -> dict:
     return report
 
 
+# ── A1: oracle overlay config（防日志爆炸）──────────────────────────────
+
+_ORACLE_OVERLAY_CONTENT = """\
+# oracle overlay — 自动生成，勿手动编辑。
+# 杀 advisor.jsonl（499MB 被动二评）+ 溢出大 tool 结果 + 减少显示噪声。
+advisor:
+  enabled: false
+display:
+  hideToolActivity: true
+tools:
+  artifactSpillThreshold: 50
+"""
+
+
+def _ensure_oracle_overlay() -> Path:
+    """A1: 确保 ~/.omp/oracle/oracle-overlay.yml 存在（幂等写入）。
+
+    overlay 内容：advisor.enabled=false（杀 __advisor.jsonl）、
+    display.hideToolActivity=true、tools.artifactSpillThreshold=50。
+    已存在时跳过写入（避免无谓 I/O）。返回 overlay 路径。
+    """
+    overlay = Path.home() / ".omp" / "oracle" / "oracle-overlay.yml"
+    if overlay.exists():
+        return overlay
+    overlay.parent.mkdir(parents=True, exist_ok=True)
+    overlay.write_text(_ORACLE_OVERLAY_CONTENT, encoding="utf-8")
+    log.debug("oracle: wrote overlay config → %s", overlay)
+    return overlay
+
+
 # ── start ──────────────────────────────────────────────────────────────
 
 
@@ -908,6 +938,13 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     # ── Spawn runtime (native path) ───────────────────────────────────
     reg = RuntimeRegistry()
     spawn_env = {**memory_env, **chain_env}
+    # Q6/A1: omp 后端注入防日志爆炸 overlay（advisor.enabled=false 杀
+    # __advisor.jsonl；artifactSpillThreshold 溢出大 tool 结果；
+    # hideToolActivity 减少显示噪声）。仅 omp 接受 --config。
+    profile_args: list[str] = []
+    if backend == "omp":
+        overlay = _ensure_oracle_overlay()
+        profile_args = ["--config", str(overlay)]
     handle = reg.spawn(backend, {
         "session_id": sid,
         "agent_id": _ORACLE_AGENT,
@@ -922,6 +959,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "owner_pid": os.getpid(),
         "nonce": uuid4().hex[:12],
         "short_task": False,
+        "profile_args": profile_args,
         "env": spawn_env,
     })
 
@@ -2500,6 +2538,7 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
     # Release the park lease.
     purge = bool(getattr(args, "purge", False))
     release_mode = "soft"
+    strip_report: dict = {"removed": []}
     if manifest:
         if purge:
             # P1-1: 硬销毁——删 OMP session 文件 + 删 park 行。
@@ -2508,6 +2547,8 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
             release_mode = "hard"
         else:
             # P1-1: 软释放（默认）——RELEASED_SOFT，session 文件保留可 revive。
+            # B: 释放前 strip bash/eval 全量 artifact + __advisor 转录（保主 jsonl）。
+            strip_report = _strip_oracle_transcript(manifest)
             registry.release(review_key, mode="soft")
             release_mode = "soft"
 
@@ -2518,6 +2559,7 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
         "park_released": manifest is not None,
         "release_mode": release_mode,
         "session_purged": purge and manifest is not None,
+        "transcript_stripped": strip_report,  # B: 事后精简结果
     }, indent=2))
     return 0
 
@@ -2579,6 +2621,19 @@ def _purge_omp_session(manifest: ParkManifest) -> list[str]:
         except OSError as exc:
             print(f"warning: purge session file failed: {p}: {exc}", file=sys.stderr)
     return removed
+
+
+def _strip_oracle_transcript(manifest: ParkManifest) -> dict:
+    """B: 事后精简 oracle 会话——委托 ``oracle_transcript_strip`` 独立脚本。
+
+    释放路径：删除 bash-original、truncate bash.log/eval.log/read.* 到 2KB、
+    过滤主 jsonl（保留 user/assistant + session identity 头行）、删 __advisor。
+
+    force=True：release 路径调用时 runtime 已停止（cmd_oracle_release 确保）。
+    """
+    from codeagent.scripts.oracle_transcript_strip import strip_for_manifest
+
+    return strip_for_manifest(manifest, force=True)
 
 
 def _is_runtime_alive(manifest: "ParkManifest") -> bool:
