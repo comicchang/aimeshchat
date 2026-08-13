@@ -14,6 +14,9 @@ import pytest
 from codeagent.gateway.client import GatewayClient, rpc_stdio
 from codeagent.gateway.events import EventStore
 from codeagent.gateway.model import (
+    ERR_GENERATION_STALE,
+    ERR_NOT_FOUND,
+    ERR_PROTOCOL,
     GATEWAY_PROTOCOL_VERSION,
     GatewayError,
     GatewayRequest,
@@ -21,7 +24,21 @@ from codeagent.gateway.model import (
     RuntimeEventDraft,
 )
 from codeagent.gateway.server import GatewayServer
-from codeagent.gateway.service import AgentGateway
+from codeagent.gateway.service import (
+    CMD_ACK_CHAIN,
+    CMD_AMBIGUOUS,
+    CMD_CLAIMED,
+    CMD_FAILED_SAFE,
+    CMD_QUEUED,
+    CMD_REVIVING,
+    CMD_TRIGGERING,
+    CMD_TRIGGER_UNKNOWN,
+    CMD_TURN_TRIGGERED,
+    ERR_IDEMPOTENCY_CONFLICT,
+    _advance_ack_chain,
+    _sha256,
+    AgentGateway,
+)
 from codeagent.mailbox.store import MailboxStore
 
 
@@ -430,3 +447,308 @@ class _LineReader:
             return self._line
         return ""
 
+
+
+# ── _advance_ack_chain（P1-2 统一 ack 协议状态机）───────────────────────
+# 规范链 QUEUED→CLAIMED→REVIVING→TRIGGERING→TURN_TRIGGERED；插件可跳级
+# 上报，gateway 沿链原子补齐中间态；非法迁移（反向/自环/终态/链外）拒绝。
+
+class TestAdvanceAckChain:
+    """_advance_ack_chain：ack 规范链推进/跳级补齐/非法迁移拒绝。"""
+
+    def test_single_step_progression(self):
+        """逐级推进：每一步返回 (目标态, 无中间态)。"""
+        assert _advance_ack_chain(CMD_QUEUED, CMD_CLAIMED) == (CMD_CLAIMED, [])
+        assert _advance_ack_chain(CMD_CLAIMED, CMD_REVIVING) == (CMD_REVIVING, [])
+        assert _advance_ack_chain(CMD_REVIVING, CMD_TRIGGERING) == (CMD_TRIGGERING, [])
+        assert _advance_ack_chain(CMD_TRIGGERING, CMD_TURN_TRIGGERED) == (CMD_TURN_TRIGGERED, [])
+
+    def test_skip_level_fills_intermediates(self):
+        """跳级上报：返回终态 + 补齐的中间态列表（按链序）。"""
+        got = _advance_ack_chain(CMD_QUEUED, CMD_TURN_TRIGGERED)
+        assert got == (CMD_TURN_TRIGGERED, [CMD_CLAIMED, CMD_REVIVING, CMD_TRIGGERING])
+        # 中间跳级：CLAIMED 直接 TURN_TRIGGERED → 补 REVIVING/TRIGGERING
+        got = _advance_ack_chain(CMD_CLAIMED, CMD_TURN_TRIGGERED)
+        assert got == (CMD_TURN_TRIGGERED, [CMD_REVIVING, CMD_TRIGGERING])
+        got = _advance_ack_chain(CMD_QUEUED, CMD_TRIGGERING)
+        assert got == (CMD_TRIGGERING, [CMD_CLAIMED, CMD_REVIVING])
+
+    def test_exhaustive_chain_pairs_advance(self):
+        """链上任意 i<j 对都可推进（跳级补齐 = 链中间段）——验证整条链连通。"""
+        for i in range(len(CMD_ACK_CHAIN)):
+            for j in range(i + 1, len(CMD_ACK_CHAIN)):
+                got = _advance_ack_chain(CMD_ACK_CHAIN[i], CMD_ACK_CHAIN[j])
+                assert got is not None, f"{CMD_ACK_CHAIN[i]}→{CMD_ACK_CHAIN[j]} 应可推进"
+                assert got[0] == CMD_ACK_CHAIN[j]
+                assert got[1] == list(CMD_ACK_CHAIN[i + 1 : j])
+
+    def test_reverse_rejected(self):
+        """反向迁移拒绝（状态机不可回退）。"""
+        assert _advance_ack_chain(CMD_CLAIMED, CMD_QUEUED) is None
+        assert _advance_ack_chain(CMD_TURN_TRIGGERED, CMD_TRIGGERING) is None
+        assert _advance_ack_chain(CMD_TRIGGERING, CMD_REVIVING) is None
+
+    def test_self_loop_rejected(self):
+        """自环迁移拒绝。"""
+        for state in CMD_ACK_CHAIN:
+            assert _advance_ack_chain(state, state) is None, f"{state}→{state} 应拒绝"
+
+    def test_terminal_state_rejected(self):
+        """终态（TURN_TRIGGERED）不可再迁移。"""
+        assert _advance_ack_chain(CMD_TURN_TRIGGERED, CMD_QUEUED) is None
+        assert _advance_ack_chain(CMD_TURN_TRIGGERED, CMD_CLAIMED) is None
+        assert _advance_ack_chain(CMD_TURN_TRIGGERED, CMD_TURN_TRIGGERED) is None
+
+    def test_off_chain_states_rejected(self):
+        """链外状态（terminal 旁路态）不参与 ack 链：作起点或终点均拒绝。"""
+        for off in (CMD_FAILED_SAFE, CMD_AMBIGUOUS, CMD_TRIGGER_UNKNOWN):
+            assert _advance_ack_chain(off, CMD_CLAIMED) is None
+            assert _advance_ack_chain(CMD_QUEUED, off) is None
+
+    def test_unknown_states_rejected(self):
+        """完全未知的状态名 → None（fail-closed）。"""
+        assert _advance_ack_chain("NOPE", CMD_CLAIMED) is None
+        assert _advance_ack_chain(CMD_QUEUED, "NOPE") is None
+        assert _advance_ack_chain("", "") is None
+
+    def test_consecutive_chain_hops_are_legal_transitions(self):
+        """链上相邻跳必须都在 CMD_TRANSITIONS 合法迁移表内（契约一致性）。"""
+        from codeagent.gateway.service import CMD_TRANSITIONS
+
+        for i in range(len(CMD_ACK_CHAIN) - 1):
+            src, dst = CMD_ACK_CHAIN[i], CMD_ACK_CHAIN[i + 1]
+            assert dst in CMD_TRANSITIONS[src], f"合法链 {src}→{dst} 缺迁移表条目"
+
+
+# ── runtime.send 幂等（IDEMPOTENCY_CONFLICT，设计 §3）─────────────────
+# 幂等键 = request_id + payload_hash：同键重放返回原 command（不重复注入）；
+# 同 request_id 不同 payload → IDEMPOTENCY_CONFLICT。
+
+def _register_test_runtime(gw: AgentGateway, runtime_id: str = "rt-idem",
+                           session_id: str = "s-idem", agent_id: str = "worker",
+                           generation: int = 1, review_key: str = "rk-idem") -> None:
+    """注册一个可用的测试 runtime（session.ensure + runtime.register）。"""
+    gw.session_ensure({
+        "session_id": session_id, "manager_id": "manager",
+        "roster": [agent_id],
+    })
+    gw.runtime_register({
+        "session_id": session_id, "agent_id": agent_id,
+        "runtime_id": runtime_id, "generation": generation,
+        "review_key": review_key, "runtime": "omp",
+        "owner_pid": 1234, "nonce": "n-idem",
+        "capabilities": ["park_revive", "correlated_turn_ack"],
+    })
+
+
+class TestRuntimeSendIdempotency:
+    """runtime.send：request_id+payload_hash 幂等键 + 冲突拒绝。"""
+
+    def test_same_request_id_same_payload_replays_cached(self, tmp_path: Path):
+        """同 request_id+payload → 第二次返回原 command/state，不重复注入。"""
+        gw, _server, _sock = _make_gateway(tmp_path)
+        _register_test_runtime(gw)
+        first = gw.runtime_send({
+            "runtime_id": "rt-idem", "request_id": "req-1",
+            "body": "review the diff", "from": "manager",
+        })
+        assert first["request_id"] == "req-1"
+        second = gw.runtime_send({
+            "runtime_id": "rt-idem", "request_id": "req-1",
+            "body": "review the diff", "from": "manager",
+        })
+        # 幂等重放：同一 command_id，同一 state（不产生第二条命令）
+        assert second["command_id"] == first["command_id"]
+        assert second["state"] == first["state"]
+        commands = gw._control.list_commands(runtime_id="rt-idem")
+        assert len(commands) == 1, "幂等重放不得重复入队"
+
+    def test_same_request_id_different_payload_conflict(self, tmp_path: Path):
+        """同 request_id 不同 payload → IDEMPOTENCY_CONFLICT（带 state 上下文）。"""
+        gw, _server, _sock = _make_gateway(tmp_path)
+        _register_test_runtime(gw)
+        gw.runtime_send({
+            "runtime_id": "rt-idem", "request_id": "req-c",
+            "body": "payload v1", "from": "manager",
+        })
+        with pytest.raises(GatewayError) as ei:
+            gw.runtime_send({
+                "runtime_id": "rt-idem", "request_id": "req-c",
+                "body": "payload v2 DIFFERENT", "from": "manager",
+            })
+        assert ei.value.code == ERR_IDEMPOTENCY_CONFLICT
+        assert ei.value.context.get("request_id") == "req-c"
+        assert "state" in ei.value.context
+
+    def test_payload_hash_auto_derived_from_body(self, tmp_path: Path):
+        """未显式传 payload_hash → 由 body 的 sha256 自动派生并落库。"""
+        gw, _server, _sock = _make_gateway(tmp_path)
+        _register_test_runtime(gw)
+        gw.runtime_send({
+            "runtime_id": "rt-idem", "request_id": "req-h",
+            "body": "same body", "from": "manager",
+        })
+        row = gw._control.get_command("req-h")
+        assert row["payload_hash"] == _sha256("same body")
+        assert row["payload_hash"] != _sha256("different body")
+
+    def test_explicit_payload_hash_wins(self, tmp_path: Path):
+        """显式 payload_hash 优先于 body 派生。"""
+        gw, _server, _sock = _make_gateway(tmp_path)
+        _register_test_runtime(gw)
+        explicit = _sha256("explicitly hashed")
+        gw.runtime_send({
+            "runtime_id": "rt-idem", "request_id": "req-x",
+            "body": "raw body", "payload_hash": explicit, "from": "manager",
+        })
+        row = gw._control.get_command("req-x")
+        assert row["payload_hash"] == explicit
+
+    def test_sha256_stable_and_derives_from_empty(self):
+        """_sha256：确定性 + 空文本也产出稳定 64 位 hex。"""
+        assert _sha256("a") == _sha256("a")
+        assert _sha256("a") != _sha256("b")
+        h = _sha256("")
+        assert len(h) == 64
+
+    def test_send_requires_request_id(self, tmp_path: Path):
+        """缺 request_id/runtime_id → PROTOCOL（fail-closed）。"""
+        gw, _server, _sock = _make_gateway(tmp_path)
+        _register_test_runtime(gw)
+        with pytest.raises(GatewayError) as ei:
+            gw.runtime_send({"runtime_id": "rt-idem", "body": "x"})
+        assert ei.value.code == ERR_PROTOCOL
+
+
+# ── runtime.context set/get（Q5b：主 agent 模型上下文）─────────────────
+# 插件在 model_change/thinking_level 时经 runtime.context_set 原子上报
+# provider/model/variant/epoch；oracle CLI 经 runtime.context_get 继承。
+# 带 generation 校验（防陈旧代际覆盖）；stopped 记录视为不存在。
+
+class TestRuntimeContext:
+    """runtime.context：model_context 原子读写 + 持久化。"""
+
+    def _gw_with_runtime(self, tmp_path: Path, runtime_id: str = "rt-ctx",
+                         review_key: str = "rk-ctx", generation: int = 1):
+        gw, _server, _sock = _make_gateway(tmp_path)
+        _register_test_runtime(gw, runtime_id=runtime_id, generation=generation,
+                               review_key=review_key)
+        return gw
+
+    def test_set_get_roundtrip(self, tmp_path: Path):
+        """context_set → context_get 原样返回 model_context 快照。"""
+        gw = self._gw_with_runtime(tmp_path)
+        out = gw.runtime_context_set({
+            "runtime_id": "rt-ctx", "provider": "prov-a",
+            "model": "model-b", "variant": "thinking", "epoch": 2,
+        })
+        assert out["model_context"] == {
+            "provider": "prov-a", "model": "model-b",
+            "variant": "thinking", "epoch": 2,
+        }
+        got = gw.runtime_context_get({"runtime_id": "rt-ctx"})
+        assert got["model_context"] == {
+            "provider": "prov-a", "model": "model-b",
+            "variant": "thinking", "epoch": 2,
+        }
+        assert got["runtime_id"] == "rt-ctx"
+
+    def test_get_by_review_key(self, tmp_path: Path):
+        """context_get 支持 review_key 定位（多个候选取最近活跃）。"""
+        gw = self._gw_with_runtime(tmp_path, runtime_id="rt-ctx", review_key="rk-ctx")
+        gw.runtime_context_set({
+            "runtime_id": "rt-ctx", "provider": "p", "model": "m", "variant": "", "epoch": 1,
+        })
+        got = gw.runtime_context_get({"review_key": "rk-ctx"})
+        assert got["model_context"]["model"] == "m"
+
+    def test_set_unknown_runtime_not_found(self, tmp_path: Path):
+        """context_set 未知 runtime → NOT_FOUND。"""
+        gw = self._gw_with_runtime(tmp_path)
+        with pytest.raises(GatewayError) as ei:
+            gw.runtime_context_set({"runtime_id": "ghost", "model": "m"})
+        assert ei.value.code == ERR_NOT_FOUND
+
+    def test_set_stale_generation_rejected(self, tmp_path: Path):
+        """context_set 陈旧 generation → GENERATION_STALE（防代际覆盖）。"""
+        gw = self._gw_with_runtime(tmp_path, generation=3)
+        with pytest.raises(GatewayError) as ei:
+            gw.runtime_context_set({
+                "runtime_id": "rt-ctx", "model": "m", "generation": 1,
+            })
+        assert ei.value.code == ERR_GENERATION_STALE
+        # 匹配 generation 则放行
+        ok = gw.runtime_context_set({
+            "runtime_id": "rt-ctx", "model": "m", "generation": 3,
+        })
+        assert ok["model_context"]["model"] == "m"
+
+    def test_set_bad_epoch_rejected(self, tmp_path: Path):
+        """epoch 非 int → PROTOCOL。"""
+        gw = self._gw_with_runtime(tmp_path)
+        with pytest.raises(GatewayError) as ei:
+            gw.runtime_context_set({"runtime_id": "rt-ctx", "epoch": "abc"})
+        assert ei.value.code == ERR_PROTOCOL
+
+    def test_get_stopped_runtime_not_found(self, tmp_path: Path):
+        """stopped 记录视为不存在（sweep 前不报旧答案）。"""
+        gw = self._gw_with_runtime(tmp_path)
+        gw.runtime_context_set({
+            "runtime_id": "rt-ctx", "provider": "p", "model": "m", "epoch": 1,
+        })
+        with gw._runtimes_lock:
+            gw._runtimes["rt-ctx"].status = "stopped"
+        with pytest.raises(GatewayError) as ei:
+            gw.runtime_context_get({"runtime_id": "rt-ctx"})
+        assert ei.value.code == ERR_NOT_FOUND
+
+    def test_get_without_report_returns_empty(self, tmp_path: Path):
+        """已注册但未上报 model_context → 空 dict（由调用方决定降级）。"""
+        gw = self._gw_with_runtime(tmp_path)
+        got = gw.runtime_context_get({"runtime_id": "rt-ctx"})
+        assert got["model_context"] == {}
+
+    def test_set_persists_to_control_store(self, tmp_path: Path):
+        """context_set 同步持久化到 ControlStore.runtime_generations。"""
+        gw = self._gw_with_runtime(tmp_path)
+        gw.runtime_context_set({
+            "runtime_id": "rt-ctx", "provider": "prov", "model": "mdl",
+            "variant": "v1", "epoch": 5,
+        })
+        stored = gw._control.get_generation("rt-ctx")
+        assert stored is not None
+        assert stored["model_context"] == {
+            "provider": "prov", "model": "mdl", "variant": "v1", "epoch": 5,
+        }
+
+
+class TestRuntimeSendIdempotencyGuards:
+    """runtime.send 前置校验（fail-closed 分支）。"""
+
+    def test_send_empty_body_still_derives_hash(self, tmp_path: Path):
+        """body 为空且未显式 payload_hash → 由空文本派生 sha256（_sha256 恒非空）。"""
+        gw, _server, _sock = _make_gateway(tmp_path)
+        _register_test_runtime(gw)
+        out = gw.runtime_send({
+            "runtime_id": "rt-idem", "request_id": "req-e", "body": "",
+        })
+        assert out["request_id"] == "req-e"
+        assert gw._control.get_command("req-e")["payload_hash"] == _sha256("")
+
+
+class TestRuntimeContextGuards:
+    """runtime.context 前置校验分支。"""
+
+    def test_set_missing_runtime_id(self, tmp_path: Path):
+        """context_set 缺 runtime_id → PROTOCOL。"""
+        gw, _server, _sock = _make_gateway(tmp_path)
+        with pytest.raises(GatewayError) as ei:
+            gw.runtime_context_set({"model": "m"})
+        assert ei.value.code == ERR_PROTOCOL
+
+    def test_set_non_int_generation(self, tmp_path: Path):
+        """generation 非 int → PROTOCOL（防类型混乱）。"""
+        gw = TestRuntimeContext()._gw_with_runtime(tmp_path)
+        with pytest.raises(GatewayError) as ei:
+            gw.runtime_context_set({"runtime_id": "rt-ctx", "model": "m", "generation": "abc"})
+        assert ei.value.code == ERR_PROTOCOL

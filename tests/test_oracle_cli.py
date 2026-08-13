@@ -14,7 +14,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from codeagent.domain.park import Lifecycle, ParkManifest
-from codeagent.oracle import cmd_oracle_ask, cmd_oracle_start, cmd_oracle_status, cmd_oracle_release
+from codeagent.oracle import (
+    _detect_oracle_stuck,
+    _is_interrupt_skip,
+    _parse_iso_ts,
+    cmd_oracle_ask,
+    cmd_oracle_start,
+    cmd_oracle_status,
+    cmd_oracle_release,
+)
 from codeagent.runtime.base import RuntimeHandle
 
 
@@ -590,3 +598,274 @@ def test_start_explicit_model_no_agent(tmp_path):
     assert req["model"] == "explicit/gpt-x"
     assert req["variant"] == "thinking"
 
+
+
+# ── 卡死/停滞检测（_detect_oracle_stuck 操作层防御）─────────────────────
+# 强信号：同 generation 连续 ≥3 个 interrupt_skipped 且期间无进度事件；
+# 弱信号：非终态 + runtime alive + ≥15min 无 work 事件 + 无 in-flight tool。
+# 只告警不自动 recover —— 返回 {"detected": True, "signal": ...} 或 None。
+
+
+def _stuck_jsonl(tmp_path: Path, events: list[tuple[str, str]], name: str = "ses.jsonl") -> Path:
+    """写一条 OMP 会话 JSONL：events = [(kind, iso_ts)]，kind ∈ skip/tool_ok/output。"""
+    path = tmp_path / name
+    lines = []
+    for kind, ts in events:
+        if kind == "skip":
+            msg = {"role": "toolResult", "content": [
+                {"type": "text", "text": "Skipped due to pending system advisory"},
+            ]}
+        elif kind == "tool_ok":
+            msg = {"role": "toolResult", "content": [
+                {"type": "text", "text": "command output: ok"},
+            ]}
+        else:  # output
+            msg = {"role": "assistant", "content": [
+                {"type": "text", "text": "working on it..."},
+            ]}
+        lines.append(json.dumps({"type": "message", "timestamp": ts, "message": msg}))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _stuck_info(runtime_id: str = "rt-1", generation: int = 1,
+                agent_state: str = "agent_running", status: str = "active",
+                alive: bool = True, backend_session_id: str = "",
+                last_kind: str = "TOOL_FINISHED", last_payload: dict | None = None,
+                first_seen_at: str = "2026-08-13T00:00:00Z") -> dict:
+    """构造 _detect_oracle_stuck 的 info 参数（默认工作态、无卡死信号）。"""
+    return {
+        "runtime_id": runtime_id,
+        "generation": generation,
+        "agent_state": agent_state,
+        "status": status,
+        "runtime_health": {"alive": alive},
+        "backend_session_id": backend_session_id,
+        "last_event": {
+            "last_event_kind": last_kind,
+            "last_event_payload": last_payload or {},
+            "first_seen_at": first_seen_at,
+        },
+    }
+
+
+def _iso(delta_s: float) -> str:
+    """now + delta_s 秒的 ISO-8601 Z 时间戳（弱信号窗口计算用）。"""
+    from datetime import datetime, timezone, timedelta
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=delta_s)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+
+
+class TestDetectOracleStuck:
+    """_detect_oracle_stuck：强信号（连续 skip ≥3）/ 弱信号（≥15min 无 work）。"""
+
+    def test_strong_signal_three_consecutive_skips(self, tmp_path, monkeypatch):
+        """连续 3 个 interrupt_skipped（最新事件向前数）→ 强信号。"""
+        session = _stuck_jsonl(tmp_path, [
+            ("skip", _iso(-100)), ("skip", _iso(-80)), ("skip", _iso(-60)),
+        ])
+        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid: session)
+        info = _stuck_info(backend_session_id="b-strong")
+        out = _detect_oracle_stuck("rk-strong", info)
+        assert out is not None
+        assert out["detected"] is True
+        assert out["signal"] == "strong"
+        assert "interrupt_skipped" in out["detail"]
+        assert "3" in out["detail"]
+
+    def test_strong_signal_more_than_three(self, tmp_path, monkeypatch):
+        """连续 5 个 skip（含更早的中间进度被后续 skip 覆盖）→ 仍强信号。"""
+        session = _stuck_jsonl(tmp_path, [
+            ("output", _iso(-500)), ("skip", _iso(-100)), ("skip", _iso(-80)),
+            ("skip", _iso(-60)), ("skip", _iso(-40)), ("skip", _iso(-20)),
+        ])
+        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid: session)
+        out = _detect_oracle_stuck("rk-multi", _stuck_info(backend_session_id="b-multi"))
+        assert out is not None and out["signal"] == "strong"
+
+    def test_two_skips_not_enough(self, tmp_path, monkeypatch):
+        """仅 2 个连续 skip → 不达阈值（<3）→ 无强信号。"""
+        session = _stuck_jsonl(tmp_path, [
+            ("skip", _iso(-100)), ("skip", _iso(-60)),
+        ])
+        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid: session)
+        out = _detect_oracle_stuck("rk-two", _stuck_info(backend_session_id="b-two"))
+        assert out is None
+
+    def test_progress_event_breaks_skip_run(self, tmp_path, monkeypatch):
+        """最新事件是进度（assistant 文本）→ 连续段断掉 → 无强信号。"""
+        session = _stuck_jsonl(tmp_path, [
+            ("skip", _iso(-200)), ("skip", _iso(-160)), ("skip", _iso(-120)),
+            ("output", _iso(-60)),
+        ])
+        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid: session)
+        out = _detect_oracle_stuck("rk-brk", _stuck_info(backend_session_id="b-brk"))
+        assert out is None, "进度事件应打断连续 skip 段"
+
+    def test_weak_signal_stall_over_15min(self, tmp_path, monkeypatch):
+        """alive + 非终态 + 最新 work 事件 ≥15min 前 + 无 in-flight → 弱信号。"""
+        newest_work = _iso(-20 * 60)  # 20 分钟前
+        mock_gw = MagicMock()
+        mock_gw.call.return_value = {"newest": {"TOOL_FINISHED": newest_work}}
+        monkeypatch.setattr("codeagent.oracle._gateway", lambda: mock_gw)
+        info = _stuck_info(last_kind="TOOL_FINISHED")  # 非 TOOL_STARTED → 无 in-flight
+        out = _detect_oracle_stuck("rk-weak", info)
+        assert out is not None
+        assert out["detected"] is True
+        assert out["signal"] == "weak"
+        assert "20 分钟" in out["detail"]
+
+    def test_recent_work_no_stall(self, tmp_path, monkeypatch):
+        """1 分钟内有 work 事件 → 无弱信号。"""
+        mock_gw = MagicMock()
+        mock_gw.call.return_value = {"newest": {"ASSISTANT_PROGRESS": _iso(-60)}}
+        monkeypatch.setattr("codeagent.oracle._gateway", lambda: mock_gw)
+        out = _detect_oracle_stuck("rk-fresh", _stuck_info())
+        assert out is None
+
+    def test_in_flight_tool_suppresses_weak(self, tmp_path, monkeypatch):
+        """最新事件是 TOOL_STARTED（in-flight tool）→ 即使久无 work 也不告警。"""
+        mock_gw = MagicMock()
+        mock_gw.call.return_value = {"newest": {"TOOL_STARTED": _iso(-30 * 60)}}
+        monkeypatch.setattr("codeagent.oracle._gateway", lambda: mock_gw)
+        info = _stuck_info(last_kind="TOOL_STARTED")
+        out = _detect_oracle_stuck("rk-inflight", info)
+        assert out is None, "in-flight tool 不算停滞"
+
+    def test_terminal_state_no_weak_signal(self, tmp_path, monkeypatch):
+        """agent_state 非 running（等 ask 的正常态）→ 终态不告警。"""
+        mock_gw = MagicMock()
+        mock_gw.call.return_value = {"newest": {"TOOL_FINISHED": _iso(-60 * 60)}}
+        monkeypatch.setattr("codeagent.oracle._gateway", lambda: mock_gw)
+        info = _stuck_info(agent_state="idle", last_kind="TOOL_FINISHED")
+        out = _detect_oracle_stuck("rk-idle", info)
+        assert out is None
+
+    def test_stopped_runtime_no_weak_signal(self, tmp_path, monkeypatch):
+        """status=stopped → 终态：弱信号不触发（停滞只告警活着的 runtime）。"""
+        mock_gw = MagicMock()
+        mock_gw.call.return_value = {"newest": {"TOOL_FINISHED": _iso(-60 * 60)}}
+        monkeypatch.setattr("codeagent.oracle._gateway", lambda: mock_gw)
+        info = _stuck_info(status="stopped", last_kind="TOOL_FINISHED")
+        out = _detect_oracle_stuck("rk-stop", info)
+        assert out is None
+
+    def test_missing_runtime_or_generation_no_signal(self):
+        """缺 runtime_id 或 generation → 直接 None（无法界定代际窗口）。"""
+        assert _detect_oracle_stuck("rk-none", {"runtime_id": "rt-1"}) is None
+        assert _detect_oracle_stuck("rk-none", {"generation": 1}) is None
+
+    def test_dead_runtime_no_weak_signal(self, tmp_path, monkeypatch):
+        """runtime 不 alive → 弱信号不触发（停滞仅针对活着的 runtime）。"""
+        mock_gw = MagicMock()
+        mock_gw.call.return_value = {"newest": {"TOOL_FINISHED": _iso(-30 * 60)}}
+        monkeypatch.setattr("codeagent.oracle._gateway", lambda: mock_gw)
+        info = _stuck_info(alive=False, last_kind="TOOL_FINISHED")
+        assert _detect_oracle_stuck("rk-dead", info) is None
+
+
+# ── 卡死检测辅助函数（_is_interrupt_skip / _parse_iso_ts / 事件扫描）────
+
+class TestStuckHelpers:
+    """卡死检测底层原语：skip 载荷识别 / 时间戳解析 / JSONL 事件扫描。"""
+
+    def test_interrupt_skip_fixed_marker(self):
+        """OMP createSkippedToolResult 固定文案 → skip。"""
+        assert _is_interrupt_skip("Skipped due to pending system advisory") is True
+        assert _is_interrupt_skip("  Skipped due to pending system advisory\n") is True
+
+    def test_interrupt_skip_json_payload(self):
+        """JSON 载荷（__synthetic/__interrupted + source）→ skip。"""
+        assert _is_interrupt_skip(
+            '{"__synthetic": true, "source": "interrupt_skipped"}'
+        ) is True
+        assert _is_interrupt_skip(
+            '{"__interrupted": true, "source": "interrupt_skipped"}'
+        ) is True
+
+    def test_interrupt_skip_rejects_non_payload(self):
+        """非载荷文本（含 marker 但不以其开头 / 无 source 字段）→ 非 skip。"""
+        assert _is_interrupt_skip("grep output: Skipped due to pending system advisory") is False
+        assert _is_interrupt_skip('{"__synthetic": true}') is False
+        assert _is_interrupt_skip("normal tool result") is False
+        assert _is_interrupt_skip("") is False
+
+    def test_parse_iso_ts_both_precisions(self):
+        """gateway 秒级（无毫秒）与 OMP 毫秒级时间戳统一解析为 epoch。"""
+        import time as _t
+
+        s = _parse_iso_ts("2026-08-13T00:00:00Z")
+        ms = _parse_iso_ts("2026-08-13T00:00:00.548Z")
+        assert s is not None and ms is not None
+        assert abs(ms - s - 0.548) < 0.001
+        assert _parse_iso_ts("") is None
+        assert _parse_iso_ts("not-a-date") is None
+        assert _parse_iso_ts(None) is None
+
+    def test_scan_session_stuck_events_classification(self, tmp_path):
+        """事件扫描：skip/tool_ok/output 分类 + 时间序 + since 窗口过滤 + 脏行容忍。"""
+        from codeagent.oracle import _scan_session_stuck_events
+
+        session = _stuck_jsonl(tmp_path, [
+            ("skip", "2026-08-13T00:00:02Z"),
+            ("tool_ok", "2026-08-13T00:00:01Z"),
+            ("output", "2026-08-13T00:00:03Z"),
+            ("skip", "2026-08-13T00:00:00Z"),  # 早于 since → 窗口外
+        ])
+        # 追加脏行：空行 / 非法 JSON / 非 message 类型 —— 扫描须跳过不崩溃
+        session.write_text(session.read_text(encoding="utf-8") + "\n\n{not-json\n", encoding="utf-8")
+        with session.open("a", encoding="utf-8") as f:
+            f.write('{"type": "event", "timestamp": "2026-08-13T00:00:04Z"}\n')
+        since = _parse_iso_ts("2026-08-13T00:00:00.500Z")
+        events = _scan_session_stuck_events(session, since)
+        # 返回的 ts 已是 epoch 浮点（内部已解析）；窗口过滤掉最早的 skip，
+        # 脏行被跳过，剩余按时间序排列
+        assert [(k, round(ts, 3)) for k, ts in events] == [
+            ("tool_ok", _parse_iso_ts("2026-08-13T00:00:01Z")),
+            ("skip", _parse_iso_ts("2026-08-13T00:00:02Z")),
+            ("output", _parse_iso_ts("2026-08-13T00:00:03Z")),
+        ]
+
+    def test_scan_session_stuck_events_missing_file(self, tmp_path):
+        """会话文件不存在/不可读 → 返回 []（不抛异常，检测静默跳过）。"""
+        from codeagent.oracle import _scan_session_stuck_events
+
+        assert _scan_session_stuck_events(tmp_path / "no-such.jsonl", 0.0) == []
+
+
+class TestReadTailLines:
+    """_read_tail_lines：尾部 N 行读取（大文件截断行丢弃 + 缺失文件容错）。"""
+
+    def test_returns_last_n_lines_in_order(self, tmp_path):
+        """常规文件：返回最后 n 行，保持原顺序。"""
+        from codeagent.oracle import _read_tail_lines
+
+        p = tmp_path / "tail.jsonl"
+        p.write_text("\n".join(f"line-{i}" for i in range(10)) + "\n", encoding="utf-8")
+        assert _read_tail_lines(p, 3) == ["line-7", "line-8", "line-9"]
+        assert _read_tail_lines(p, 200) == [f"line-{i}" for i in range(10)]
+
+    def test_big_file_drops_truncated_first_line(self, tmp_path):
+        """超过读取块的文件：首行被截断 → 丢弃后返回最后 n 行（内容完整）。"""
+        from codeagent.oracle import _read_tail_lines
+
+        p = tmp_path / "big.jsonl"
+        # 每行 ~300B，共 8 行（~2.4KB）> n*1KB（n=2 → 2KB）且行数 > n
+        lines = [json.dumps({"type": "message", "timestamp": "2026-08-13T00:00:00Z",
+                             "message": {"role": "toolResult", "content": [
+                                 {"type": "text", "text": "x" * 280}]}})
+                 for _ in range(8)]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        got = _read_tail_lines(p, 2)
+        assert len(got) == 2
+        # 尾部两行必须是完整 JSON（首行截断被丢弃）
+        for line in got:
+            assert json.loads(line)["type"] == "message"
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        """文件不存在 → []（不抛异常）。"""
+        from codeagent.oracle import _read_tail_lines
+
+        assert _read_tail_lines(tmp_path / "absent.jsonl", 10) == []

@@ -152,3 +152,226 @@ def teardown_module(module):
             os.environ.pop(key, None)
         else:
             os.environ[key] = val
+
+
+# ── ControlStore（控制面存储：runtime_generations / commands）──────────
+# runtime_generations 持久化 runtime.context model_context（重启恢复）；
+# commands 以 request_id 为主键幂等（重复入队返回 False，不产生重复行）。
+
+
+def test_7_control_store_runtime_generations_model_context_roundtrip(tmp_path):
+    """runtime_generations：model_context 持久化 + 读回（JSON 解析）。"""
+    from codeagent.gateway.control_store import ControlStore
+
+    store = ControlStore(db_path=tmp_path / "control.sqlite3")
+    try:
+        store.upsert_generation(
+            runtime_id="rt-ctx-1", current_generation=3, owner_nonce="nonce-a",
+            presence="alive", binding="bound", backend_session_id="b1",
+            binding_epoch=2, agent_state="agent_running",
+            model_context=json.dumps({
+                "provider": "prov-x", "model": "mdl-y",
+                "variant": "thinking", "epoch": 7,
+            }, ensure_ascii=False),
+        )
+        got = store.get_generation("rt-ctx-1")
+        assert got is not None
+        assert got["current_generation"] == 3
+        assert got["binding_epoch"] == 2
+        assert got["binding"] == "bound"
+        assert got["presence"] == "alive"
+        assert got["model_context"] == {
+            "provider": "prov-x", "model": "mdl-y",
+            "variant": "thinking", "epoch": 7,
+        }
+    finally:
+        store.close()
+
+
+def test_8_control_store_model_context_empty_upsert_preserves(tmp_path):
+    """空 model_context 的归约不覆盖已持久化的上下文（保留逻辑）。"""
+    from codeagent.gateway.control_store import ControlStore
+
+    store = ControlStore(db_path=tmp_path / "control.sqlite3")
+    try:
+        store.upsert_generation(
+            runtime_id="rt-ctx-2", current_generation=1,
+            model_context=json.dumps({"model": "m1", "provider": "p1", "variant": "", "epoch": 1}),
+        )
+        # 无上下文的状态归约（如 heartbeat）→ 不应抹掉已上报的 model_context
+        store.upsert_generation(
+            runtime_id="rt-ctx-2", current_generation=2,
+            presence="stale", model_context="",
+        )
+        got = store.get_generation("rt-ctx-2")
+        assert got["current_generation"] == 2
+        assert got["presence"] == "stale"
+        assert got["model_context"] == {"model": "m1", "provider": "p1", "variant": "", "epoch": 1}
+        # 显式传入新上下文 → 覆盖
+        store.upsert_generation(
+            runtime_id="rt-ctx-2", current_generation=3,
+            model_context=json.dumps({"model": "m2", "provider": "p1", "variant": "", "epoch": 2}),
+        )
+        assert store.get_generation("rt-ctx-2")["model_context"]["model"] == "m2"
+    finally:
+        store.close()
+
+
+def test_9_control_store_last_state_seq_monotonic(tmp_path):
+    """last_state_seq 单调递增（每次归约 +1，恢复顺序可判定）。"""
+    from codeagent.gateway.control_store import ControlStore
+
+    store = ControlStore(db_path=tmp_path / "control.sqlite3")
+    try:
+        store.upsert_generation("rt-seq", current_generation=1)
+        store.upsert_generation("rt-seq", current_generation=1)
+        store.upsert_generation("rt-seq", current_generation=2)
+        assert store.get_generation("rt-seq")["last_state_seq"] == 3
+        store.delete_generation("rt-seq")
+        assert store.get_generation("rt-seq") is None
+    finally:
+        store.close()
+
+
+def test_10_control_store_commands_enqueue_idempotent(tmp_path):
+    """commands 幂等：同 request_id 二次入队 → False 且只有一行。"""
+    from codeagent.gateway.control_store import ControlStore
+
+    store = ControlStore(db_path=tmp_path / "control.sqlite3")
+    try:
+        created = store.enqueue_command(
+            request_id="req-1", command_id="cmd-1", msg_id="m1",
+            runtime_id="rt-c", generation=1, payload_hash="hash-a",
+            state="QUEUED", binding_epoch=0, backend_session_id="b1",
+        )
+        assert created is True
+        # 同 request_id 再次入队（不同 command_id/payload）→ 幂等拒绝
+        again = store.enqueue_command(
+            request_id="req-1", command_id="cmd-DUP", msg_id="m2",
+            runtime_id="rt-c", generation=1, payload_hash="hash-B",
+            state="QUEUED",
+        )
+        assert again is False
+        row = store.get_command("req-1")
+        assert row["command_id"] == "cmd-1"          # 首条保留
+        assert row["payload_hash"] == "hash-a"
+        cmds = store.list_commands(runtime_id="rt-c")
+        assert len(cmds) == 1, "幂等入队不得产生重复行"
+    finally:
+        store.close()
+
+
+def test_11_control_store_commands_update_and_list(tmp_path):
+    """commands：update_command 推进状态 + list 过滤/分页。"""
+    from codeagent.gateway.control_store import ControlStore
+
+    store = ControlStore(db_path=tmp_path / "control.sqlite3")
+    try:
+        store.enqueue_command(
+            request_id="r-a", command_id="c-a", runtime_id="rt-u",
+            generation=1, payload_hash="h-a", state="QUEUED",
+            created_at="2026-08-13T00:00:01Z",
+        )
+        store.enqueue_command(
+            request_id="r-b", command_id="c-b", runtime_id="rt-u",
+            generation=1, payload_hash="h-b", state="QUEUED",
+            created_at="2026-08-13T00:00:02Z",
+        )
+        store.enqueue_command(
+            request_id="r-other", command_id="c-o", runtime_id="rt-other",
+            generation=1, payload_hash="h-o", state="QUEUED",
+            created_at="2026-08-13T00:00:03Z",
+        )
+        updated = store.update_command("r-a", state="CLAIMED", msg_id="msg-a")
+        assert updated["state"] == "CLAIMED"
+        assert updated["msg_id"] == "msg-a"
+        # 按 runtime 过滤 + 最新在前（created_at DESC）
+        cmds = store.list_commands(runtime_id="rt-u")
+        assert [c["request_id"] for c in cmds] == ["r-b", "r-a"]
+        # state 过滤
+        claimed = store.list_commands(runtime_id="rt-u", state="CLAIMED")
+        assert [c["request_id"] for c in claimed] == ["r-a"]
+        # 分页：limit=1 offset=1 → 第二页
+        page2 = store.list_commands(runtime_id="rt-u", limit=1, offset=1)
+        assert [c["request_id"] for c in page2] == ["r-a"]
+    finally:
+        store.close()
+
+
+def test_12_control_store_persistence_across_instances(tmp_path):
+    """跨实例持久化：close 后新 ControlStore 同库读回数据（重启恢复语义）。"""
+    from codeagent.gateway.control_store import ControlStore
+
+    db = tmp_path / "control.sqlite3"
+    store = ControlStore(db_path=db)
+    store.upsert_generation(
+        runtime_id="rt-persist", current_generation=5,
+        model_context=json.dumps({"model": "mdl", "provider": "prov", "variant": "", "epoch": 3}),
+    )
+    store.enqueue_command(
+        request_id="req-persist", command_id="cmd-p", runtime_id="rt-persist",
+        generation=5, payload_hash="hash-p", state="TURN_TRIGGERED",
+    )
+    store.close()
+
+    reopened = ControlStore(db_path=db)
+    try:
+        gen = reopened.get_generation("rt-persist")
+        assert gen is not None
+        assert gen["current_generation"] == 5
+        assert gen["model_context"] == {"model": "mdl", "provider": "prov", "variant": "", "epoch": 3}
+        cmd = reopened.get_command("req-persist")
+        assert cmd is not None
+        assert cmd["state"] == "TURN_TRIGGERED"
+        assert cmd["payload_hash"] == "hash-p"
+    finally:
+        reopened.close()
+
+
+def test_13_control_store_update_command_full_fields(tmp_path):
+    """update_command：turn_id/binding_epoch/backend_session_id/detail 分支 + 空 set 透传。"""
+    from codeagent.gateway.control_store import ControlStore
+
+    store = ControlStore(db_path=tmp_path / "control.sqlite3")
+    try:
+        store.enqueue_command(
+            request_id="r-full", command_id="c-full", runtime_id="rt-f",
+            generation=1, payload_hash="h-full", state="QUEUED",
+        )
+        # 一次性推进全部字段（None 字段保持不动）
+        updated = store.update_command(
+            "r-full", state="TRIGGERING", turn_id="t-9",
+            binding_epoch=3, backend_session_id="b-new",
+            detail={"gate": "hot"},
+        )
+        assert updated["state"] == "TRIGGERING"
+        assert updated["turn_id"] == "t-9"
+        assert updated["binding_epoch"] == 3
+        assert updated["backend_session_id"] == "b-new"
+        assert updated["detail"] == {"gate": "hot"}
+        # 无任何字段 → 直接读回（透传 get_command，不写库）
+        assert store.update_command("r-full")["state"] == "TRIGGERING"
+    finally:
+        store.close()
+
+
+def test_14_control_store_get_generation_corrupt_context_fallback(tmp_path):
+    """get_generation：model_context 列损坏（非 JSON）→ 容错回退空 dict。"""
+    import sqlite3 as _sqlite3
+
+    from codeagent.gateway.control_store import ControlStore
+
+    store = ControlStore(db_path=tmp_path / "control.sqlite3")
+    try:
+        store.upsert_generation("rt-bad", current_generation=1, model_context='{"model": "ok"}')
+        # 直接 SQL 灌入非法 JSON（模拟旧库/手工损坏）
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE runtime_generations SET model_context = ? WHERE runtime_id = ?",
+                ("{not-json", "rt-bad"),
+            )
+        got = store.get_generation("rt-bad")
+        assert got is not None
+        assert got["model_context"] == {}  # 解析失败 → 空 dict，不抛
+    finally:
+        store.close()
