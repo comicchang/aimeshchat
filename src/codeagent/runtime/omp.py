@@ -68,6 +68,7 @@ class OMPRuntimeAdapter(RuntimeAdapter):
             host_alias=request.get("host_alias", "__local__"),
             capabilities=list(_SHORT_TASK_CAPS if short_task else _FULL_CAPS),
             env={str(k): str(v) for k, v in (request.get("env", {}) or {}).items()},
+            session_dir=request.get("session_dir", ""),
         )
         if short_task:
             return self._spawn_short_task(request, runtime_id)
@@ -81,7 +82,7 @@ class OMPRuntimeAdapter(RuntimeAdapter):
             capabilities=_SHORT_TASK_CAPS if short_task else _FULL_CAPS,
             supervisor="tmux",
             mode=mode,
-            extra={"spec_path": spec.spec_path},
+            extra={"spec_path": spec.spec_path, "session_dir": spec.session_dir},
         )
 
     def _spawn_short_task(self, request: dict, runtime_id: str) -> RuntimeHandle:
@@ -203,6 +204,7 @@ class OMPRuntimeAdapter(RuntimeAdapter):
             mode="interactive_plugin",
             host_alias=handle.host_alias,
             capabilities=list(_FULL_CAPS),
+            session_dir=handle.extra.get("session_dir", ""),
         )
         new_handle = spawn_runtime(spec)
         return RuntimeHandle(

@@ -56,12 +56,24 @@ _TERMINAL_CUSTOM_TYPES = frozenset({
 
 # ── 定位 ──────────────────────────────────────────────────────────────
 
-def _locate_session_dir(sid: str) -> Optional[Path]:
+def _locate_session_dir(sid: str, session_dir: str = "") -> Optional[Path]:
     """定位 sid 的会话目录。
 
     递归扫描 ``~/.omp/agent/sessions/**`` 找 ``*_<sid>.jsonl``，
     返回其父目录（mtime 最新的匹配）。
+
+    When *session_dir* is non-empty, ONLY that directory is searched — this
+    prevents stale matches from old sessions in the default root.
     """
+    if session_dir:
+        search_root = Path(session_dir)
+        if not search_root.is_dir():
+            return None
+        # Non-recursive: the session_dir IS the session directory.
+        # Just verify that the expected JSONL exists there.
+        for f in search_root.glob(f"*_{sid}.jsonl"):
+            return search_root
+        return None
     if not _SESSIONS_ROOT.is_dir():
         return None
 
@@ -262,6 +274,7 @@ def strip_oracle_session(
     head_bytes: int = _DEFAULT_HEAD_BYTES,
     force: bool = False,
     dry_run: bool = False,
+    session_dir: str = "",
 ) -> dict:
     """精简 oracle 会话——删除 bash-original、truncate sidecar、过滤 jsonl、删 advisor。
 
@@ -286,14 +299,14 @@ def strip_oracle_session(
         report["error"] = "empty_sid"
         return report
 
-    session_dir = _locate_session_dir(sid)
-    if session_dir is None:
+    session_dir_path = _locate_session_dir(sid, session_dir=session_dir)
+    if session_dir_path is None:
         report["error"] = "session_not_found"
         return report
-    report["session_dir"] = str(session_dir)
+    report["session_dir"] = str(session_dir_path)
 
     # ── live guard ────────────────────────────────────────────────────
-    jsonl_path = _locate_session_jsonl(sid, session_dir)
+    jsonl_path = _locate_session_jsonl(sid, session_dir_path)
     if jsonl_path is not None and not force:
         if not _is_session_terminal(jsonl_path):
             report["live_guard"] = "refused"
@@ -308,10 +321,10 @@ def strip_oracle_session(
         report["live_guard"] = "forced"
 
     # ── 步骤 2：删除 bash-original.log ────────────────────────────────
-    report["removed"] = _delete_bash_original(session_dir, sid)
+    report["removed"] = _delete_bash_original(session_dir_path, sid)
 
     # ── 步骤 3：truncate sidecar logs ─────────────────────────────────
-    report["truncated"] = _truncate_sidecar_logs(session_dir, sid,
+    report["truncated"] = _truncate_sidecar_logs(session_dir_path, sid,
                                                  head_bytes=head_bytes)
 
     # ── 步骤 4：过滤 JSONL ───────────────────────────────────────────
@@ -323,7 +336,7 @@ def strip_oracle_session(
                            "note": "jsonl_not_found"}
 
     # ── 步骤 5：删除 __advisor.jsonl ──────────────────────────────────
-    report["advisors_removed"] = _delete_advisor_files(session_dir, sid)
+    report["advisors_removed"] = _delete_advisor_files(session_dir_path, sid)
 
     return report
 
@@ -335,8 +348,12 @@ def strip_for_manifest(manifest, *, head_bytes: int = _DEFAULT_HEAD_BYTES,
     ``force=True`` 默认：release 路径调用时 runtime 已停止，允许跳过 live guard。
     """
     sid = getattr(manifest, "backend_session_id", "") or ""
+    # Extract session_dir from manifest.omp_session_path (parent directory).
+    raw_path = getattr(manifest, "omp_session_path", "") or ""
+    sd = str(Path(raw_path).parent) if raw_path else ""
     return strip_oracle_session(sid, head_bytes=head_bytes,
-                                force=force, dry_run=dry_run)
+                                force=force, dry_run=dry_run,
+                                session_dir=sd)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────

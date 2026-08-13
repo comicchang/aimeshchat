@@ -73,3 +73,4 @@ class ParkManifest:
     provider: str = ""               # Q5: 模型供应商（从 model 前缀提取；向后兼容默认空串）
     variant: str = ""                # Q5: 模型变体（reasoning/thinking；空串=默认）
     system_prompt: str = ""          # Q5: 系统提示词（空串=不设置）
+    omp_session_dir: str = ""        # P-SI: OMP 会话隔离目录（空串=使用默认路径）

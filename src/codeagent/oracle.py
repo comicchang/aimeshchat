@@ -697,6 +697,18 @@ def _oracle_meta_path(review_key: str) -> Path:
     return Path.home() / ".omp" / "oracle" / safe / "meta.json"
 
 
+def _oracle_session_dir(review_key: str) -> str:
+    """P-SI: dedicated OMP session directory for an oracle review.
+
+    Returns ``~/.omp/agent/sessions/_oracle/<safe-key>/`` — each oracle
+    review gets its own isolated session directory so OMP sessions don't
+    bleed across reviews.  The directory is NOT created here; callers
+    must ``mkdir -p`` before passing to ``omp --session-dir``.
+    """
+    safe = review_key.replace(":", "-").replace("/", "-").replace("\\", "-")
+    return str(Path.home() / ".omp" / "agent" / "sessions" / "_oracle" / safe)
+
+
 def _read_oracle_meta(review_key: str) -> dict:
     """A1: read the bound-session meta for a review key ({} when absent)."""
     try:
@@ -1019,6 +1031,13 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     if backend == "omp":
         overlay = _ensure_oracle_overlay()
         profile_args = ["--config", str(overlay)]
+    # P-SI: compute isolated session directory for this oracle review.
+    # CLI --session-dir overrides; otherwise use the default per-review path.
+    session_dir = getattr(args, "session_dir", "") or ""
+    if not session_dir and backend == "omp":
+        session_dir = _oracle_session_dir(review_key)
+    if session_dir:
+        Path(session_dir).mkdir(parents=True, exist_ok=True)
     handle = reg.spawn(backend, {
         "session_id": sid,
         "agent_id": _ORACLE_AGENT,
@@ -1035,6 +1054,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         "short_task": False,
         "profile_args": profile_args,
         "env": spawn_env,
+        "session_dir": session_dir,  # P-SI: 会话隔离目录
     })
 
     # ── A1: session_id 同步绑定 ──────────────────────────────────────
@@ -1084,6 +1104,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             variant=spec.variant,
             system_prompt=spec.system_prompt,
             config_fingerprint=_config_fingerprint(agent),  # P1-4: 配置变更即时感知
+            omp_session_dir=session_dir,  # P-SI: 会话隔离目录
         )
         registry.update(review_key, manifest)
     else:
@@ -1103,6 +1124,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             variant=spec.variant,
             system_prompt=spec.system_prompt,
             config_fingerprint=_config_fingerprint(agent),  # P1-4: 配置变更即时感知
+            omp_session_dir=session_dir,  # P-SI: 会话隔离目录
         )
         registry.acquire(review_key, manifest)
 
@@ -1237,6 +1259,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             if getattr(args, "wait", False):
                 return _wait_for_new_output(
                     review_key, info["runtime_id"], info.get("session_id", ""),
+                    session_dir=_get_session_dir(ParkRegistry().lookup(review_key)),
                 )
             return 0
         # Runtime not alive: if it died of quota exhaustion, say so
@@ -1260,6 +1283,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     # ── Warm: native backend session resume ───────────────────────────
     registry = ParkRegistry()
     manifest = registry.lookup(review_key)
+    session_dir = _get_session_dir(manifest)
     # A1: warm 前置 — meta.json 绑定的 backend session 复用（manifest 优先）。
     bound_sid = _resolve_bound_session_id(review_key, manifest)
     if manifest and bound_sid:
@@ -1401,6 +1425,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             if getattr(args, "wait", False):
                 return _wait_for_new_output(
                     review_key, warm_handle.runtime_id, sid,
+                    session_dir=session_dir,
                 )
             return 0
         except Exception as exc:
@@ -1551,6 +1576,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     if getattr(args, "wait", False):
         return _wait_for_new_output(
             review_key, handle.runtime_id, cold_sid,
+            session_dir=session_dir,
         )
     return 0
 
@@ -1662,7 +1688,8 @@ def _scan_session_stuck_events(path: Path, since_epoch: float,
     return events
 
 
-def _detect_oracle_stuck(review_key: str, info: dict) -> Optional[dict]:
+def _detect_oracle_stuck(review_key: str, info: dict,
+                         session_dir: str = "") -> Optional[dict]:
     """卡死/停滞检测（只告警，不自动 recover——避免探针制造更多 advisory）。
 
     强信号（卡死）：同 generation 连续 ≥3 个 interrupt_skipped 事件且期间
@@ -1699,7 +1726,7 @@ def _detect_oracle_stuck(review_key: str, info: dict) -> Optional[dict]:
     strong_detail = ""
     backend_sid = info.get("backend_session_id", "")
     if backend_sid:
-        session_path = _find_session_file(backend_sid)
+        session_path = _find_session_file(backend_sid, session_dir=session_dir)
         since = _parse_iso_ts(agg.get("first_seen_at", ""))
         if session_path is not None and since is not None:
             events = _scan_session_stuck_events(session_path, since)
@@ -1776,6 +1803,7 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
 
     registry = ParkRegistry()
     manifest = registry.lookup(review_key)
+    session_dir = _get_session_dir(manifest)
     out["park"] = (
         {
             "lifecycle": manifest.lifecycle.value,
@@ -1835,7 +1863,7 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
     # 检测失败不阻塞 status 输出（向后兼容，无卡死时不输出 stuck 字段）。
     if out["runtime"].get("status") not in ("gateway_down", "unavailable"):
         try:
-            stuck = _detect_oracle_stuck(review_key, info)
+            stuck = _detect_oracle_stuck(review_key, info, session_dir=session_dir)
             if stuck:
                 out["stuck"] = stuck
                 print(
@@ -1967,20 +1995,44 @@ def cmd_oracle_list(args: argparse.Namespace) -> int:
 # ── result：从 OMP 会话转录提取最新回答 ───────────────────────────────
 
 
-def _find_session_file(backend_session_id: str) -> Optional[Path]:
+def _get_session_dir(manifest) -> str:
+    """Extract the OMP session directory from a park manifest.
+
+    Returns the parent directory of ``manifest.omp_session_path`` (the
+    ``~/.omp/agent/sessions/<dir>/`` containing the session JSONL).
+    Empty string means "use the default global root" — callers MUST
+    treat a non-empty return as the SOLE search root to prevent stale
+    matches from old sessions in the default directory.
+    """
+    raw = getattr(manifest, "omp_session_path", "") or ""
+    if not raw:
+        return ""
+    return str(Path(raw).parent)
+
+
+def _find_session_file(backend_session_id: str,
+                       session_dir: str = "") -> Optional[Path]:
     """Locate the OMP session transcript file for a backend session id.
 
     Session files live under ~/.omp/agent/sessions/<dir>/*_<session_id>.jsonl
     where <dir> is the cwd-derived name (e.g. -src-codeagent-py). Falls back
     to scanning all session dirs when the derived dir misses.
+
+    When *session_dir* is non-empty, ONLY that directory is searched — this
+    prevents stale matches from old sessions in the default root.
     """
-    sessions_root = Path.home() / ".omp" / "agent" / "sessions"
-    if not sessions_root.is_dir():
-        return None
+    if session_dir:
+        search_root = Path(session_dir)
+        if not search_root.is_dir():
+            return None
+    else:
+        search_root = Path.home() / ".omp" / "agent" / "sessions"
+        if not search_root.is_dir():
+            return None
 
     def _candidate_dirs() -> list[Path]:
         dirs: list[Path] = []
-        for d in sessions_root.iterdir():
+        for d in search_root.iterdir():
             if not d.is_dir():
                 continue
             if any(f.name.endswith(f"_{backend_session_id}.jsonl") for f in d.iterdir()):
@@ -2028,12 +2080,13 @@ def _extract_assistant_messages(path: Path, max_messages: int = 1) -> list[str]:
     return msgs[-max_messages:]
 
 
-def _fallback_find_session_for_key(review_key: str, since: Optional[float] = None) -> Optional[Path]:
+def _fallback_find_session_for_key(review_key: str, since: Optional[float] = None,
+                                   session_dir: str = "") -> Optional[Path]:
     """A2-③ filesystem source: recursive scan, EXACT review_key match, start-time window.
 
-    Recursively walks ~/.omp/agent/sessions/ (``os.walk``) for .jsonl files
-    and scores candidates instead of first-hit matching — a short tail
-    segment (e.g. ``blur`` from ``proj:oracle:gfx:blur``) previously matched
+    Recursively walks the session root for .jsonl files and scores
+    candidates instead of first-hit matching — a short tail segment
+    (e.g. ``blur`` from ``proj:oracle:gfx:blur``) previously matched
     unrelated sessions mentioning that word.  Scoring:
       +100  full *review_key* appears EXACTLY (word-boundary, not substring)
       +10   file lives under an oracle session dir (``ora-*`` / ``__advisor``)
@@ -2042,14 +2095,22 @@ def _fallback_find_session_for_key(review_key: str, since: Optional[float] = Non
     started. A key-derived signal (full-key exact OR specific tail) is
     REQUIRED — the ``ora-*`` dir bonus alone never matches an unrelated key.
     Returns the best-scoring file (or ``None`` when nothing scores).
+
+    When *session_dir* is non-empty, ONLY that directory is walked — this
+    prevents stale matches from old sessions in the default root.
     """
-    sessions_root = Path.home() / ".omp" / "agent" / "sessions"
-    if not sessions_root.is_dir():
-        return None
+    if session_dir:
+        search_root = Path(session_dir)
+        if not search_root.is_dir():
+            return None
+    else:
+        search_root = Path.home() / ".omp" / "agent" / "sessions"
+        if not search_root.is_dir():
+            return None
 
     # A2: recursive walk — every session file anywhere under the root.
     all_files: list[Path] = []
-    for dirpath, _dirnames, filenames in os.walk(sessions_root):
+    for dirpath, _dirnames, filenames in os.walk(search_root):
         for name in filenames:
             if name.endswith(".jsonl"):
                 all_files.append(Path(dirpath) / name)
@@ -2283,6 +2344,7 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     raw_mode = bool(getattr(args, "raw", False))
     include_digest = bool(getattr(args, "include_digest", False))
     manifest = ParkRegistry().lookup(review_key)
+    session_dir = _get_session_dir(manifest)
     start_since = _review_start_ts(review_key, manifest)
     max_msgs = 10**6 if want_all else 1
     # P1: 截断上限——--all 跳过上限，否则读环境变量或默认值
@@ -2306,7 +2368,7 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     bound_sid = _resolve_bound_session_id(review_key, manifest)
     if bound_sid:
         out["meta"]["session_id"] = bound_sid
-        path = _find_session_file(bound_sid)
+        path = _find_session_file(bound_sid, session_dir=session_dir)
         if path is not None:
             msgs = _extract_assistant_messages(path, max_messages=max_msgs)
             if msgs:
@@ -2371,7 +2433,8 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     # ── ③ filesystem（递归 + 精确 key + start 后时间窗）──────────────
     if not strict:
         try:
-            path = _fallback_find_session_for_key(review_key, since=start_since)
+            path = _fallback_find_session_for_key(review_key, since=start_since,
+                                                  session_dir=session_dir)
         except Exception:  # pragma: no cover — defensive
             path = None
         if path is not None:
@@ -2463,7 +2526,7 @@ def cmd_oracle_watch(args: argparse.Namespace) -> int:
 # ── wait（B1：阻塞到 agent_end 事件，然后内联最终文本）────────────────
 
 
-def _wait_final_text(review_key: str) -> Optional[str]:
+def _wait_final_text(review_key: str, session_dir: str = "") -> Optional[str]:
     """B1: extract the latest assistant text for inline printing on agent_end.
 
     Same sources as ``oracle result`` (primary backend session transcript,
@@ -2475,10 +2538,10 @@ def _wait_final_text(review_key: str) -> Optional[str]:
     # manifest/meta stayed empty and _find_session_file("") fell through to
     # the score-based fallback, which could pick a stale __advisor session.
     backend_id = _resolve_bound_session_id(review_key, manifest)
-    path = _find_session_file(backend_id) if backend_id else None
+    path = _find_session_file(backend_id, session_dir=session_dir) if backend_id else None
     if path is None:
         try:
-            path = _fallback_find_session_for_key(review_key)
+            path = _fallback_find_session_for_key(review_key, session_dir=session_dir)
         except Exception:  # pragma: no cover — defensive
             path = None
     if path is None:
@@ -2490,7 +2553,8 @@ def _wait_final_text(review_key: str) -> Optional[str]:
 def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                          timeout: float = 300.0, interval: float = 5.0,
                          max_bytes: int = 0, info: Optional[dict] = None,
-                         auto_recover: bool = False) -> int:
+                         auto_recover: bool = False,
+                         session_dir: str = "") -> int:
     """A15: 等待 oracle 新产出并内联打印——供 cmd_oracle_wait 和 ask --wait 共用。
 
     等待方式：boot drain 设高水位 cursor，主轮询只看 cursor 后新事件。
@@ -2523,7 +2587,7 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
         })
         for ev in boot.get("events", []):
             if ev.get("kind") == "TASK_STATE" and (ev.get("payload") or {}).get("state") == "agent_end":
-                final = _wait_final_text(review_key)
+                final = _wait_final_text(review_key, session_dir=session_dir)
                 if final is not None:
                     trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
                     print(_trunc_notice(trunc, was_trunc, t_bytes, total))
@@ -2556,7 +2620,7 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                 # cursor 后的 ASSISTANT_PROGRESS 一定是新 turn 产出，无需 baseline 文本对比
                 # （baseline 对比曾因 JSONL 更新/截断误触发旧内容返回）。
                 # P2-0d: 不打印 quick——避免与 final 重叠；quick 仅作产出存在信号。
-                final = _wait_final_text(review_key)
+                final = _wait_final_text(review_key, session_dir=session_dir)
                 if final is not None:
                     trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
                     print(_trunc_notice(trunc, was_trunc, t_bytes, total))
@@ -2572,7 +2636,7 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                     return 0
                 continue  # 无文本（罕见）——继续等
             if kind == "TASK_STATE" and payload.get("state") == "agent_end":
-                final = _wait_final_text(review_key)
+                final = _wait_final_text(review_key, session_dir=session_dir)
                 if final is not None:
                     trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
                     print(_trunc_notice(trunc, was_trunc, t_bytes, total))  # B1: 内联最终文本
@@ -2586,7 +2650,7 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                 info = _gateway().call("runtime.info", {"review_key": review_key})
             except GatewayError:
                 pass
-            stuck = _detect_oracle_stuck(review_key, info)
+            stuck = _detect_oracle_stuck(review_key, info, session_dir=session_dir)
             if stuck and stuck.get("signal") == "strong":
                 # P1-1: auto-recover — 仅尝试一次
                 if auto_recover and not _recovered:
@@ -2679,6 +2743,7 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
     ``{status: timeout, suggestion: "use oracle result"}`` and returns 1.
     """
     review_key = args.review_key
+    session_dir = _get_session_dir(ParkRegistry().lookup(review_key))
     interval = max(0.1, float(getattr(args, "interval", 5.0) or 5.0))
     timeout = max(0.0, float(getattr(args, "timeout", 300.0) or 300.0))
     # P1: 截断上限（--all 跳过上限）
@@ -2718,7 +2783,8 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
     return _wait_for_new_output(review_key, runtime_id, session_id,
                                 timeout=timeout, interval=interval,
                                 max_bytes=max_bytes, info=info,
-                                auto_recover=auto_recover)
+                                auto_recover=auto_recover,
+                                session_dir=session_dir)
 
 
 # ── release ────────────────────────────────────────────────────────────
@@ -3190,22 +3256,31 @@ _ADVISOR_EVIDENCE_MIN_CHARS = 200
 _DIGEST_MAX_BYTES = 2048
 
 
-def _find_advisor_session_file(backend_session_id: str) -> Optional[Path]:
+def _find_advisor_session_file(backend_session_id: str,
+                               session_dir: str = "") -> Optional[Path]:
     """P2-2: locate the __advisor JSONL file for a backend session id.
 
-    Scans the OMP sessions tree (``~/.omp/agent/sessions/``) for files
-    matching ``*__advisor*_{backend_session_id}.jsonl`` or any
-    ``__advisor*.jsonl`` in the same directory as the main session file.
+    Scans the OMP sessions tree for files matching
+    ``*__advisor*_{backend_session_id}.jsonl`` or any ``__advisor*.jsonl``
+    in the same directory as the main session file.
     Returns the most recent matching file, or None.
+
+    When *session_dir* is non-empty, ONLY that directory is searched — this
+    prevents stale matches from old sessions in the default root.
     """
     if not backend_session_id:
         return None
-    sessions_root = Path.home() / ".omp" / "agent" / "sessions"
-    if not sessions_root.is_dir():
-        return None
+    if session_dir:
+        search_root = Path(session_dir)
+        if not search_root.is_dir():
+            return None
+    else:
+        search_root = Path.home() / ".omp" / "agent" / "sessions"
+        if not search_root.is_dir():
+            return None
     # Strategy: find the main session directory first, then look for
     # __advisor files in the same directory.
-    main = _find_session_file(backend_session_id)
+    main = _find_session_file(backend_session_id, session_dir=session_dir)
     if main is not None:
         parent = main.parent
         advisor_files = sorted(
@@ -3216,7 +3291,7 @@ def _find_advisor_session_file(backend_session_id: str) -> Optional[Path]:
         if advisor_files:
             return advisor_files[0]
     # Fallback: recursive scan for __advisor files mentioning the sid.
-    for dirpath, _dirs, files in os.walk(sessions_root):
+    for dirpath, _dirs, files in os.walk(search_root):
         for name in files:
             if "__advisor" in name.lower() and backend_session_id in name:
                 return Path(dirpath) / name
@@ -3335,7 +3410,8 @@ def _save_advisor_digest(review_key: str, manifest) -> Optional[dict]:
     sid = manifest.backend_session_id or ""
     if not sid:
         return None
-    advisor_path = _find_advisor_session_file(sid)
+    sd = _get_session_dir(manifest)
+    advisor_path = _find_advisor_session_file(sid, session_dir=sd)
     if advisor_path is None:
         log.debug("_save_advisor_digest: no advisor session for sid=%s", sid)
         return None
@@ -3802,7 +3878,8 @@ def _purge_omp_session(manifest: ParkManifest, *,
 
     sid = manifest.backend_session_id or ""
     if sid:
-        found = _find_session_file(sid)
+        sd = _get_session_dir(manifest)
+        found = _find_session_file(sid, session_dir=sd)
         if found is not None:
             targets.add(found)
             parent = found.parent
@@ -4083,6 +4160,7 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
         "nonce": uuid4().hex[:12],
         "short_task": False,
         "env": chain_env,
+        "session_dir": manifest.omp_session_dir,  # P-SI: 会话隔离目录
     })
     try:
         # P2-11 同款保护：session id 提取窗口失败时保留原值，避免破坏续接点。
@@ -4153,6 +4231,7 @@ def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
         "nonce": uuid4().hex[:12],
         "short_task": False,
         "env": chain_env,
+        "session_dir": manifest.omp_session_dir,  # P-SI: 会话隔离目录
     })
     try:
         _flip_to_hot(review_key, manifest, sid=sid,

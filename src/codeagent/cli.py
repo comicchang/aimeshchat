@@ -278,6 +278,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_start.add_argument("--prompt", default="", help="Initial prompt (default empty — first TASK comes via ask)（初始 prompt；oracle 慢启动时 backend session 绑定需 ≤60s，绑定超时返回 binding=pending 不杀 runtime）")
     ora_start.add_argument("--apply-memory-config", action="store_true", dest="apply_memory_config",
                            help="D4: auto-merge missing OMP memory config keys (default: detect + warn only)")
+    ora_start.add_argument("--session-dir", default="", dest="session_dir",
+                           help="P-SI: OMP session isolation directory (default: ~/.omp/agent/sessions/_oracle/<safe-key>/)")
 
     ora_ask = ora_sub.add_parser("ask", help="Hot/warm/cold deliver a prompt to the review")
     ora_ask.add_argument("review_key")

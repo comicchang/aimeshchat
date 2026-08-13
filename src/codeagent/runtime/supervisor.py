@@ -59,6 +59,7 @@ class RuntimeSpec:
     capabilities: list[str] = field(default_factory=list)
     spec_path: str = ""
     env: dict[str, str] = field(default_factory=dict)
+    session_dir: str = ""  # P-SI: OMP 会话隔离目录（空串=使用默认路径）
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +82,7 @@ class RuntimeSpec:
             "capabilities": list(self.capabilities),
             "spec_path": self.spec_path,
             "env": dict(self.env),
+            "session_dir": self.session_dir,
         }
 
     @classmethod
@@ -105,6 +107,7 @@ class RuntimeSpec:
             capabilities=list(d.get("capabilities", []) or []),
             spec_path=d.get("spec_path", ""),
             env={str(k): str(v) for k, v in (d.get("env", {}) or {}).items()},
+            session_dir=d.get("session_dir", ""),
         )
 
 
@@ -222,6 +225,8 @@ def _build_agent_argv(spec: RuntimeSpec) -> list[str]:
             argv += ["--resume", spec.backend_session_id]
         if spec.workdir:
             argv += ["--cwd", spec.workdir]
+        if spec.session_dir:
+            argv += ["--session-dir", spec.session_dir]
         if spec.model:
             argv += ["--model", spec.model]
         argv += list(spec.profile_args)

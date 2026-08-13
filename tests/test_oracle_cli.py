@@ -666,9 +666,9 @@ class TestDetectOracleStuck:
         session = _stuck_jsonl(tmp_path, [
             ("skip", _iso(-100)), ("skip", _iso(-80)), ("skip", _iso(-60)),
         ])
-        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid: session)
+        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid, session_dir='': session)
         info = _stuck_info(backend_session_id="b-strong")
-        out = _detect_oracle_stuck("rk-strong", info)
+        out = _detect_oracle_stuck("rk-strong", info, session_dir="")
         assert out is not None
         assert out["detected"] is True
         assert out["signal"] == "strong"
@@ -681,8 +681,8 @@ class TestDetectOracleStuck:
             ("output", _iso(-500)), ("skip", _iso(-100)), ("skip", _iso(-80)),
             ("skip", _iso(-60)), ("skip", _iso(-40)), ("skip", _iso(-20)),
         ])
-        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid: session)
-        out = _detect_oracle_stuck("rk-multi", _stuck_info(backend_session_id="b-multi"))
+        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid, session_dir='': session)
+        out = _detect_oracle_stuck("rk-multi", _stuck_info(backend_session_id="b-multi"), session_dir="")
         assert out is not None and out["signal"] == "strong"
 
     def test_two_skips_not_enough(self, tmp_path, monkeypatch):
@@ -690,8 +690,8 @@ class TestDetectOracleStuck:
         session = _stuck_jsonl(tmp_path, [
             ("skip", _iso(-100)), ("skip", _iso(-60)),
         ])
-        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid: session)
-        out = _detect_oracle_stuck("rk-two", _stuck_info(backend_session_id="b-two"))
+        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid, session_dir='': session)
+        out = _detect_oracle_stuck("rk-two", _stuck_info(backend_session_id="b-two"), session_dir="")
         assert out is None
 
     def test_progress_event_breaks_skip_run(self, tmp_path, monkeypatch):
@@ -700,8 +700,8 @@ class TestDetectOracleStuck:
             ("skip", _iso(-200)), ("skip", _iso(-160)), ("skip", _iso(-120)),
             ("output", _iso(-60)),
         ])
-        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid: session)
-        out = _detect_oracle_stuck("rk-brk", _stuck_info(backend_session_id="b-brk"))
+        monkeypatch.setattr("codeagent.oracle._find_session_file", lambda _sid, session_dir='': session)
+        out = _detect_oracle_stuck("rk-brk", _stuck_info(backend_session_id="b-brk"), session_dir="")
         assert out is None, "进度事件应打断连续 skip 段"
 
     def test_weak_signal_stall_over_15min(self, tmp_path, monkeypatch):
