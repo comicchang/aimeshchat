@@ -68,7 +68,7 @@ class _NS:
 class TestOracleStart:
     def test_start_creates_runtime_and_park(self, tmp_path: Path, monkeypatch):
         ns = _NS(review_key="proj:oracle:gfx:blur", agent="oracle", backend="omp",
-                 workdir=str(tmp_path), model="", prompt="hi")
+                 workdir=str(tmp_path), model="m/x", prompt="hi")
         from codeagent.park.registry import ParkRegistry
 
         with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
@@ -92,7 +92,7 @@ class TestOracleStart:
         registry = ParkRegistry()
         registry.acquire("k1", _manifest("k1"))
         ns = _NS(review_key="k1", agent="oracle", backend="omp",
-                 workdir=str(tmp_path), model="", prompt="")
+                 workdir=str(tmp_path), model="m/x", prompt="")
         with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
              patch("codeagent.oracle.RuntimeRegistry.spawn", return_value=_handle()), \
              patch("codeagent.cli._get_swarm_kernel") as mock_kernel:
@@ -529,24 +529,6 @@ def test_fallback_session_scoring_avoids_short_tail_mismatch(tmp_path, monkeypat
 # ── B1: CLI 强制显式 ExecutionSpec（去 role）──────────────────────────
 
 
-def test_cli_require_explicit_spec_errors_without_model_or_agent(capsys):
-    """无 --model 且无 --agent → 报错，不静默回落 agent profile 默认模型。"""
-    from codeagent.cli import _require_explicit_spec
-
-    assert _require_explicit_spec(_NS(model="", agent="")) == 1
-    err = capsys.readouterr().err
-    assert "--model" in err and "--agent" in err
-
-
-def test_cli_require_explicit_spec_accepts_model_or_agent(capsys):
-    """有 --model 或 --agent 任一 → 校验通过（--agent 便捷名仍兼容）。"""
-    from codeagent.cli import _require_explicit_spec
-
-    assert _require_explicit_spec(_NS(model="m/x", agent="")) == 0
-    assert _require_explicit_spec(_NS(model="", agent="oracle")) == 0
-    assert capsys.readouterr().err == ""
-
-
 def test_cli_warns_deprecated_agent(capsys):
     """传 --agent → 弃用告警引导 --model/--variant；未传则不告警。"""
     from codeagent.cli import _warn_deprecated_agent
@@ -557,18 +539,6 @@ def test_cli_warns_deprecated_agent(capsys):
     _warn_deprecated_agent(_NS(agent=""))
     assert capsys.readouterr().err == ""
 
-
-def test_cmd_oracle_rejects_implicit_start(capsys, tmp_path):
-    """oracle start 无 --model/--agent → dispatch 层拦截报错，不触发 handler。"""
-    from codeagent.cli import _cmd_oracle
-
-    ns = _NS(ora_cmd="start", review_key="k-b1", agent="", model="",
-             backend="omp", workdir=str(tmp_path), prompt="")
-    with patch("codeagent.oracle.cmd_oracle_start") as handler:
-        assert _cmd_oracle(ns) == 1
-        handler.assert_not_called()
-    err = capsys.readouterr().err
-    assert "--model" in err
 
 
 def test_cmd_oracle_start_explicit_model_dispatches(capsys, tmp_path):

@@ -264,15 +264,15 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_start = ora_sub.add_parser("start", help="Create review/session/runtime（含 A1 绑定窗口）")
     ora_start.add_argument("review_key", help="Review key (e.g. project:oracle:domain:topic)")
     ora_start.add_argument("--agent", default="", metavar="PROFILE",
-                           help="DEPRECATED（弃用）: agent profile 名——模型/提示词策略已归 skill，"
-                                "请用 --model/--variant 显式指定；此参数仅保留为便捷 profile 名，"
-                                "不再作为默认模型来源（传了会打弃用告警）")
+                           help="DEPRECATED（弃用）: 兼容占位参数，无模型语义——模型/提示词策略已归 skill，"
+                                "请用 --model/--variant 显式指定；此参数不再参与模型解析"
+                                "（传了会打弃用告警）")
     ora_start.add_argument("--backend", default="omp", help="Runtime backend (omp|opencode)")
     ora_start.add_argument("--workdir", default="", help="Working directory")
-    ora_start.add_argument("--model", default="", help="B1: 显式指定模型（推荐；替代已弃用的 --agent 默认模型；覆盖 agent profile）")
+    ora_start.add_argument("--model", default="", help="B1: 显式指定模型（推荐；无 --model 时走 runtime.context → execution-context 继承）")
     ora_start.add_argument("--model-strict", action="store_true", default=False, dest="model_strict",
                            help="P0: 无 --model 且 runtime.context 查询失败时直接报 MODEL_CONTEXT_UNAVAILABLE "
-                                "(默认回退 execution-context → agent profile，不 fatal)")
+                                "(默认回退 execution-context，不 fatal)")
     ora_start.add_argument("--variant", default="", help="Q5: model variant (e.g. reasoning/thinking; default empty)")
     ora_start.add_argument("--system", default="", help="Q5: system prompt (prepended to prompt; default empty)")
     ora_start.add_argument("--prompt", default="", help="Initial prompt (default empty — first TASK comes via ask)（初始 prompt；oracle 慢启动时 backend session 绑定需 ≤60s，绑定超时返回 binding=pending 不杀 runtime）")
@@ -285,10 +285,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # 忘记 prompt 时终端挂起（非交互 stdin 会一直阻塞）。
     ora_ask.add_argument("prompt", help="Prompt text (required — no stdin fallback)")
     ora_ask.add_argument("--agent", default="", metavar="PROFILE",
-                         help="DEPRECATED（弃用）: 便捷 profile 名——请用 --model/--variant 显式指定（传了会打弃用告警）")
+                         help="DEPRECATED（弃用）: 兼容占位参数，无模型语义——请用 --model/--variant 显式指定（传了会打弃用告警）")
     ora_ask.add_argument("--backend", default="omp")
     ora_ask.add_argument("--model", default="",
-                         help="显式指定模型（推荐；替代已弃用的 --agent 默认模型）")
+                         help="显式指定模型（推荐；覆盖 manifest 已落盘模型）")
     ora_ask.add_argument("--wait-binding", action="store_true", default=False,
                         help="Block until backend session binding completes (≤60s) before "
                              "steering; avoids the binding_pending silent-drop window")
@@ -2112,34 +2112,15 @@ def _warn_deprecated_agent(args: argparse.Namespace) -> None:
     """B1: --agent 弃用告警——不删除参数（向后兼容），但明确引导 --model/--variant。
 
     模型/提示词策略已归 skill，CLI 只保留执行/路由/会话/mailbox；--agent
-    仅保留为便捷 profile 名，不再作为默认模型来源。
+    仅保留为兼容占位参数，无模型语义（完全去 role，不再参与模型解析）。
     """
     agent = getattr(args, "agent", "") or ""
     if agent:
         print(
             f"warning: --agent 已弃用——模型/提示词策略归 skill，请用 --model/--variant "
-            f"显式指定；--agent {agent!r} 仅保留为便捷 profile 名（不再作为默认模型来源）",
+            f"显式指定；--agent {agent!r} 仅保留为兼容占位参数（无模型语义，不参与模型解析）",
             file=sys.stderr,
         )
-
-
-def _require_explicit_spec(args: argparse.Namespace) -> int:
-    """B1: 强制显式 ExecutionSpec——无 --model 且无 --agent 时报错，不静默回落。
-
-    去 role 后 CLI 不再静默读取 agent profile 的默认模型；调用方必须显式
-    给出 --model（推荐）或 --agent 便捷名。返回 0 = 校验通过；1 = 已输出
-    错误（调用方直接 return 1）。
-    """
-    model = getattr(args, "model", "") or ""
-    agent = getattr(args, "agent", "") or ""
-    if not model and not agent:
-        print(
-            "error: oracle start/ask 需要显式 --model（推荐）或 --agent 便捷名——"
-            "模型/提示词策略已归 skill，不再静默读取 agent profile 默认模型",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
 
 
 def _cmd_oracle(args: argparse.Namespace) -> int:
@@ -2174,11 +2155,11 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
         "attach": cmd_oracle_attach,
     }
     if cmd in ("start", "ask"):
-        # B1: 去 role——CLI 强制显式 ExecutionSpec：--agent 传了打弃用告警
-        # （仍兼容放行）；无 --model 且无 --agent 时报错，不静默回落 profile。
+        # P0-B/P1-B: 去 role——--agent 无模型语义（仅兼容占位，传了打弃用
+        # 告警）；不再强制显式 --model（模型经 ExecutionSpec 解析链：显式
+        # --model → runtime.context → execution-context 继承），全部缺失时
+        # 由 cmd_oracle_start 报错要求 --model。
         _warn_deprecated_agent(args)
-        if _require_explicit_spec(args):
-            return 1
     return handlers[cmd](args)
 
 

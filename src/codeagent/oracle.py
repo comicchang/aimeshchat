@@ -131,9 +131,12 @@ def _review_sid(review_key: str) -> str:
     I3: previously ``replace(':', '-')[-12:]`` truncated the review key —
     two keys sharing the same 12-char suffix collided on the same swarm
     session id. A sha256 prefix is collision-safe for the same entropy.
+
+    P0-A: 确定性 id——去掉 uuid4 随机后缀，仅用 sha256(review_key) 前 16
+    位；同一 review_key 每次得到相同 sid，冷路径不再产生 session 碎片。
     """
-    digest = hashlib.sha256(review_key.encode("utf-8")).hexdigest()[:12]
-    return f"ora-{digest}-{uuid4().hex[:10]}"
+    digest = hashlib.sha256(review_key.encode("utf-8")).hexdigest()[:16]
+    return f"ora-{digest}"
 
 
 def _adopt_runtime(review_key: str, sid: str, handle, backend: str) -> bool | str:
@@ -790,13 +793,13 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     # ── Q5: ExecutionSpec — 不可变执行规格（去 role 化核心） ───────────
     # Q5b: 显式 --model/--variant 优先；无显式时若在 gateway runtime 内
     # （AIMESHCHAT_RUNTIME_ID）继承主 agent 当前模型（runtime.context）。
-    # P0: runtime.context 查询失败（gateway socket 不可达等）默认回退
-    # execution-context 文件 → agent profile，不 fatal；仅显式
-    # --model-strict 才报 MODEL_CONTEXT_UNAVAILABLE。
+    # P0-B: 完全去 role——不再回落 agent profile（不传 resolve_agent_model）。
+    # 无 --model 时仅走 runtime.context（来源 2）→ execution-context（来源 3），
+    # 全部缺失则下方报错要求 --model。--model-strict 仍控制 runtime.context
+    # 查询失败是否 fatal（MODEL_CONTEXT_UNAVAILABLE）。
     try:
         spec = ExecutionSpec.from_args(
             args,
-            resolve_agent_model=lambda a: (_resolve_oracle_model_chain(a, "") or [""])[0],
             resolve_runtime_context=_runtime_context_model,
             runtime_context_strict=bool(getattr(args, "model_strict", False)),
         )
@@ -804,15 +807,22 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
         # 仅 --model-strict 可达：显式要求 runtime.context 缺失即失败。
         print(f"MODEL_CONTEXT_UNAVAILABLE: {exc}", file=sys.stderr)
         return 1
+    if not spec.model:
+        # P0-B/P1-B: 显式 --model / runtime.context / execution-context 全部
+        # 缺失——报错要求 --model，不再回落 agent profile。
+        print(
+            "error: oracle start 未能解析模型——请显式 --model"
+            "（runtime.context 与 execution-context 均无可用模型；已不再回落 agent profile）",
+            file=sys.stderr,
+        )
+        return 1
     log.debug("oracle start: ExecutionSpec(provider=%s, model=%s, variant=%s, system=%r)",
               spec.provider, spec.model, spec.variant, spec.system_prompt[:40] if spec.system_prompt else "")
 
     # ── B2: ExecutionSpec 显式为主路径 ─────────────────────────────────
     # 主路径 = ExecutionSpec.from_args 解析出的 spec.model（显式 --model /
-    # runtime.context / execution-context / agent profile fallback 已在
-    # from_args 内部处理）。不再调用 _resolve_oracle_model_chain 重推导。
-    # --agent 便捷名 fallback 在 from_args 的 resolve_agent_model 回调中
-    # 已走 _resolve_oracle_model_chain（仅缺 --model 时触发）。
+    # runtime.context / execution-context 已在 from_args 内部处理；source4
+    # agent profile 回落已移除）。不再调用 _resolve_oracle_model_chain 重推导。
     primary_model = spec.model
     model_chain = [primary_model] if primary_model else []
     chain_env: dict[str, str] = {}
@@ -1289,10 +1299,13 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     cold_chain_env: dict[str, str] = {}
     if ask_model_chain:
         cold_chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(ask_model_chain)
+    # P0-A: 冷路径 sid 确定性——复用 manifest 已落盘的 swarm_session_id
+    # （对齐 warm 路径），否则用确定性 _review_sid（无 uuid4 后缀）。
+    cold_sid = (manifest.swarm_session_id if manifest else "") or _review_sid(review_key)
     try:
         reg = RuntimeRegistry()
         handle = reg.spawn(_resolve_backend(args.agent, args.backend), {
-            "session_id": _review_sid(review_key),
+            "session_id": cold_sid,
             "agent_id": _ORACLE_AGENT,
             "review_key": review_key,
             "workdir": manifest.workdir if manifest else os.getcwd(),
@@ -1320,8 +1333,24 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
         print(json.dumps(cold_fail, indent=2), file=sys.stderr)
         return 1
     # I2: surface adoption failure in the success JSON.
-    adopted = _adopt_runtime(review_key, _review_sid(review_key), handle,
+    adopted = _adopt_runtime(review_key, cold_sid, handle,
                              _resolve_backend(args.agent, args.backend))
+    # P1-C: 冷路径持久化 manifest——spawn+adopt 后 update（对齐
+    # revive_cold/_flip_to_hot），避免冷路径每次 ask 重建 session 却不落盘，
+    # 导致后续 ask 仍走冷路径（session 碎片化）。
+    if manifest is not None:
+        try:
+            registry.update(review_key, replace(
+                manifest,
+                swarm_session_id=cold_sid,
+                lifecycle=Lifecycle.HOT_PARKED,
+                backend_session_id=handle.backend_session_id or "",
+                round=manifest.round + 1,
+                last_activity_at=time.time(),
+                release_mode="",
+            ))
+        except Exception as exc:
+            log.warning("oracle ask: cold manifest persist failed (%s)", exc)
     print(json.dumps({
         "method": "cold",
         "review_key": review_key,
@@ -1335,7 +1364,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     # A15: --wait — 投递成功后阻塞等新产出内联返回
     if getattr(args, "wait", False):
         return _wait_for_new_output(
-            review_key, handle.runtime_id, _review_sid(review_key),
+            review_key, handle.runtime_id, cold_sid,
         )
     return 0
 

@@ -1204,6 +1204,27 @@ class AgentGateway:
             # 并发入队：另一线程先到 → 走幂等重放。
             return self._command_result(self._control.get_command(request_id))
 
+        # ── 2) hot 门控前置：非 OMP backend 判 unsupported（先于 mailbox 写入）─
+        # P1-D：非 omp backend（opencode/generic/native）无插件 consumer，
+        # 若先写 mailbox 再 raise，TASK 已持久化却永无人消费，滞留 inbox 造成
+        # 潜在双重注入。故此处提前判 unsupported 并 FAILED_SAFE（未触发、可安全
+        # 重试），让调用方（oracle ask）降级走 warm native --session 路径。
+        if record.runtime not in ("", "omp"):
+            self._control.update_command(
+                request_id, state=CMD_FAILED_SAFE,
+                detail={
+                    "gate": "no_plugin_consumer", "backend": record.runtime,
+                    "presence": record.presence, "binding": record.binding,
+                    "agent_state": record.agent_state,
+                },
+            )
+            raise GatewayError(
+                ERR_UNSUPPORTED_RUNTIME,
+                f"runtime {runtime_id} backend={record.runtime} 无插件"
+                " consumer，hot/mailbox 投递不可用 — 请走 warm native"
+                " 路径（oracle ask 自动降级）",
+            )
+
         # ── 2) 持久队列：mailbox 写入（真实投递载体）────────────────────
         try:
             receipt = self._svc.send(
@@ -1263,24 +1284,6 @@ class AgentGateway:
                     detail={"gate": "binding_pending", **gate_detail},
                 )
                 return self._command_result(self._control.get_command(request_id))
-            if record.runtime not in ("", "omp"):
-                # P1-3：非 omp backend 无插件 consumer —— mailbox 已写入但
-                # 永无人消费（TASK 滞留）。标记 FAILED_SAFE（未触发、可安全
-                # 重试）并快速失败，让调用方（oracle ask）降级走 warm native
-                # --session 路径。
-                self._control.update_command(
-                    request_id, state=CMD_FAILED_SAFE,
-                    detail={
-                        "gate": "no_plugin_consumer", "backend": record.runtime,
-                        **gate_detail,
-                    },
-                )
-                raise GatewayError(
-                    ERR_UNSUPPORTED_RUNTIME,
-                    f"runtime {runtime_id} backend={record.runtime} 无插件"
-                    " consumer，hot/mailbox 投递不可用 — 请走 warm native"
-                    " 路径（oracle ask 自动降级）",
-                )
             # presence 非 alive → 仅持久队列（mailbox_persisted）。
             self._control.update_command(
                 request_id, state=CMD_QUEUED,
@@ -1468,11 +1471,12 @@ class AgentGateway:
             log.warning("gateway: runtime_probe registry probe failed for %s: %s", runtime_id, exc)
             # A2: status='unknown' (park-restored placeholder) must NEVER
             # report alive without a REAL probe — only genuinely registered
-            # runtimes (active + heartbeat) get the liveness fallback.
+            # P1-E：alive 判定窗口与 sweep offline 超时对齐（_offline_timeout），
+            # 消除 120-300s 窗口内 active 却 alive=False 的误降级。
             alive = (
                 record.status == "active"
                 and record.last_activity > 0
-                and (time.time() - record.last_activity) < 120
+                and (time.time() - record.last_activity) <= self._offline_timeout
             )
             health = {
                 "alive": alive,
@@ -1595,11 +1599,12 @@ class AgentGateway:
             # Plugin-registered runtimes have no registry handle — fall back
             # to the gateway record's own liveness signal (recent heartbeat).
             # A2: status='unknown' (park-restored placeholder) must never
-            # report alive without a REAL probe.
+            # P1-E：alive 判定窗口与 sweep offline 超时对齐（_offline_timeout），
+            # 消除 120-300s 窗口内 active 却 alive=False 的误降级。
             alive = (
                 record.status == "active"
                 and record.last_activity > 0
-                and (time.time() - record.last_activity) < 120
+                and (time.time() - record.last_activity) <= self._offline_timeout
             )
             health = {
                 "alive": alive,

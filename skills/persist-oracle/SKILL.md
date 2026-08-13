@@ -23,17 +23,18 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
 
 ## 模型一致性（防漂移，2026-08 design 结论）
 
-模型单一决定源 = **skill 的 ExecutionSpec 模板**（见下文"各档位 ExecutionSpec 推荐"）。
+模型单一决定源 = **agents/*.md 的 `model:` 字段**（代码 `_read_agent_model()` 读取
+`agents/<agent_type>.md`，不解析 `config.yml` 的 `fallbackChains` / `modelRoles`）。
 **oracle 语义（review/验收/咨询）禁止依赖默认 `modelRoles.task`（= mimo）**，
 调用方必须显式传 `--model`（及 `--variant`/`--system`），由 skill 按档位提供默认值。
 
-改模型需修改 skill ExecutionSpec 模板 + 校验一致性：
+改模型需修改 agents/*.md 的 `model:` 字段 + 校验一致性：
 ```bash
-# 校验 skill 模板与实际调用一致
-grep -rE 'ppio/pa/gpt-5.6-sol|claude-opus-4-8|deepseek-v4-pro' \
-  ~/.omp/agent/config.yml ~/.config/opencode/oh-my-openagent.json
+# 校验 agent profile 的 model: 与 skill 推荐值一致（不再 grep config.yml）
+grep -E '^model:' ~/.omp/agents/oracle.md ~/.omp/agents/oracle-lite.md ~/.omp/agents/oracle-opus.md
 ```
-- oracle / oracle-opus / oracle-lite 三档模型由 skill ExecutionSpec 统一管理。
+- oracle / oracle-opus / oracle-lite 三档模型由 `agents/*.md` 的 `model:` 字段统一管理。
+- 显式 `--model` 优先级 > 主 agent runtime context 继承 > agents/*.md `model:` 兜底 > 报错。
 - 默认未指定 `--model` → 继承主 agent runtime context（不回退 mimo）。
 
 ## 绑定语义（A1，2026-08-12 修复）
@@ -133,7 +134,7 @@ aimeshchat oracle release "$KEY" --purge   # 硬销毁：删 OMP session + swarm
 
 - 档位选择：`oracle` / `oracle-lite` / `oracle-opus`——由 skill ExecutionSpec 模板决定
   模型（`--model`）、变种（`--variant`）、系统提示词（`--system`），
-  调用时显式传参，不依赖 agent profile。
+  调用时显式传参，agent profile `model:` 仅作兜底。
 - OMP 提供 full hot/in-loop；OMP 不可用时 OpenCode 明确降级为 turn 间 follow-up；
   generic 因无 warm 仅显式指定时允许。
 
@@ -215,11 +216,11 @@ aimeshchat oracle start "$KEY" --model v4-pro --prompt '...'
 # 实际使用 v4-pro，覆盖 skill 默认值
 ```
 
-优先级链：**用户 CLI 显式指定 > skill ExecutionSpec > 主 agent runtime context > 报错**
+优先级链：**用户 CLI 显式指定 > skill ExecutionSpec > 主 agent runtime context > agents/*.md `model:` 兜底 > 报错**
 
 ### 迁移提示（完全去 role）
 
 - `--agent oracle | oracle-lite | oracle-opus` **已废弃**——不再作为默认用法。
 - 所有启动/追加/复活命令均通过 `--model`/`--variant`/`--system`/`--prompt` 显式传参。
 - skill 按档位提供 ExecutionSpec 模板（见上表），调用时展开为 CLI 参数。
-- 模型决定优先级链不变：**用户 CLI 显式指定 > skill ExecutionSpec > 主 agent runtime context > 报错**。
+- 模型决定优先级链不变：**用户 CLI 显式指定 > skill ExecutionSpec > 主 agent runtime context > agents/*.md `model:` 兜底 > 报错**。
