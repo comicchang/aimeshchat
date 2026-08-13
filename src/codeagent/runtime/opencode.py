@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 from typing import Any, Iterator, Optional
 from uuid import uuid4
@@ -69,55 +70,58 @@ class OpenCodeRuntimeAdapter(RuntimeAdapter):
         if task:
             argv.append(task)  # positional prompt — required for a real run
 
+        # 修复 PIPE 排空停滞：stderr→DEVNULL 消除 stderr 死锁；
+        # stdout 由 daemon drain 线程持续读到 EOF，防止 >64KB 填满
+        # 管道缓冲阻塞子进程 write() 导致停滞。
         try:
             proc = subprocess.Popen(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, cwd=cwd, env=spawn_env,
             )
         except (OSError, FileNotFoundError) as exc:
             raise RuntimeError(f"opencode spawn failed: {exc}") from exc
 
         # First run: extract session id from the JSONL event stream.
-        # NO hard timeout: the session-id extraction has a bounded WINDOW
-        # (select-based, non-blocking) — a slow-thinking opencode is never
-        # killed ("no hard timeout" requirement). If no session id appears
-        # within the window, the handle is returned warm-capable with an
-        # empty backend id; a later probe refreshes it.
+        # NO hard timeout: bounded Event-based WINDOW — a slow-thinking
+        # opencode is never killed ("no hard timeout" requirement).
+        # Daemon drain thread continuously reads stdout to EOF, teeing
+        # lines into stdout_buf + capturing the first sessionID.
+        # 绝不死锁：线程持续消费 stdout 管道，主进程仅 wait(Event)。
         found_session = session_id
         stdout_buf: list[str] = []
         session_window = 30.0  # bounded extraction window, not a kill timeout
-        if not session_id:
-            import select as _sel
+        session_found = threading.Event()
 
-            deadline = time.monotonic() + session_window
+        if not session_id:
             assert proc.stdout is not None
-            while time.monotonic() < deadline:
-                try:
-                    ready, _, _ = _sel.select([proc.stdout], [], [], 0.5)
-                except (ValueError, OSError, TypeError):
-                    # Non-selectable stream (tests / pipes without fileno) —
-                    # degrade to a direct read.
-                    ready = True
-                if not ready:
-                    continue
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                stdout_buf.append(line)
-                try:
-                    obj = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                # OpenCode emits sessionID on EVERY frame (session/assistant/
-                # error/result) — capture it from any of them.
-                if not found_session and obj.get("sessionID"):
-                    found_session = str(obj["sessionID"])
-                if obj.get("type") == "session" and obj.get("id"):
-                    found_session = obj.get("id")
-                    break
-                if found_session:
-                    break
-        stderr_tail = ""
+
+            def _drain_stdout() -> None:
+                """Daemon: 持续读 stdout 到 EOF，tee到 buf + 捕获 sessionID。"""
+                nonlocal found_session
+                for line in proc.stdout:  # type: ignore[union-attr]
+                    stdout_buf.append(line)
+                    if found_session:
+                        continue  # 已找到 sessionID，仅 drain 不再解析
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    # OpenCode 在每帧（session/assistant/error/result）都发
+                    # sessionID — 从任意帧捕获即可。
+                    if obj.get("sessionID"):
+                        found_session = str(obj["sessionID"])
+                        session_found.set()
+                    elif obj.get("type") == "session" and obj.get("id"):
+                        found_session = obj["id"]
+                        session_found.set()
+
+            t = threading.Thread(target=_drain_stdout, daemon=True)
+            t.start()
+            # 等待 sessionID 出现（最多 session_window 秒）；drain 线程
+            # 持续消费 stdout，此处仅阻塞在 Event.wait 上，绝不会死锁。
+            session_found.wait(timeout=session_window)
+
+        stderr_tail = ""  # stderr 已 DEVNULL，无尾部
         stdout_text = "".join(stdout_buf)
         # P0-5: keep a persistent reference to the spawned process on the
         # handle so stop()/probe() can reach it. Without this the opencode

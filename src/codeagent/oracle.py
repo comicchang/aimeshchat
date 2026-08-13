@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -2519,6 +2520,160 @@ def _tmux_kill_oracle_runtime(review_key: str) -> tuple[bool, list[str]]:
     return bool(targets), targets
 
 
+# ── OpenCode 会话作用域清理（release 时，oracle-lite 设计）──────────────
+# opencode.db 全局无界增长根因：event/event_sequence 按 aggregate_id 聚合，
+# 不在 session 级联下——删 session 行清不掉 event。FK 链独立：
+#   event.aggregate_id → event_sequence.aggregate_id（ON DELETE CASCADE），
+#   但 event_sequence 无外键指向 session。
+# 本函数在 release 时按 session_id 作用域清理，不修全局。
+
+# opencode.db 默认路径（~/.local/share/opencode/opencode.db）。
+_OPENCODE_DB_PATH = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+
+# OpenCode session ID 前缀（"ses_" 开头，如 ses_011149b70ffevYGk4czfPUSxTz）。
+_OPENCODE_SID_PREFIX = "ses_"
+
+
+def _is_opencode_session_id(sid: str) -> bool:
+    """判断 backend_session_id 是否为 OpenCode 会话格式（"ses_" 前缀）。"""
+    return sid.startswith(_OPENCODE_SID_PREFIX)
+
+
+def _cleanup_opencode_session_on_release(review_key: str, manifest,
+                                         *, strip_only: bool) -> dict:
+    """release 时按需清理该 oracle 的 OpenCode 会话（仅 opencode backend）。
+
+    解析 backend_session_id：manifest → meta.json → gateway runtime.info。
+    仅当 sid 命中 OpenCode 会话格式（"ses_" 前缀）才清理；否则返回
+    {"skipped": reason} 幂等跳过（OMP backend 走现有 strip 路径）。
+    """
+    sid = getattr(manifest, "backend_session_id", "") or ""
+    if not sid:
+        meta = _read_oracle_meta(review_key)
+        sid = (meta or {}).get("backend_session_id", "") or ""
+    if not sid:
+        try:
+            info = _gateway().call("runtime.info", {"review_key": review_key})
+            sid = info.get("backend_session_id", "") or ""
+        except Exception as exc:
+            log.debug("oracle release: backend session resolve failed: %s", exc)
+    if not sid:
+        return {"skipped": "no backend_session_id"}
+    if not _is_opencode_session_id(sid):
+        return {"skipped": f"not an opencode session ({sid!r})"}
+
+    cleanup = _purge_opencode_session(sid, strip_only=strip_only)
+    cleanup["backend_session_id"] = sid
+    cleanup["strip_only"] = strip_only
+    return cleanup
+
+
+def _purge_opencode_session(backend_session_id: str, *,
+                            strip_only: bool = False) -> dict:
+    """清理 OpenCode 会话的 opencode.db 数据（作用域级，非全局）。
+
+    两种模式：
+    - strip_only=False（hard purge / 默认）：删 session 行（级联 message/part/
+      session_message/session_input/session_context_epoch/todo/session_share）
+      + 删 event_sequence 行（级联 event）。完整清理。
+    - strip_only=True（soft release）：仅删 event_sequence（级联 event）——
+      清理 event 膨胀数据，保留 session/message 可 revive。
+
+    安全措施：
+    - 写前备份 opencode.db（.bak，覆盖旧备份）。
+    - 单事务执行，失败回滚。
+    - 幂等：session 不存在跳过（不报错）。
+
+    返回 {"deleted_session": bool, "deleted_events": bool,
+           "backup": str, "error": str | None}。
+    """
+    result: dict = {
+        "deleted_session": False,
+        "deleted_events": False,
+        "backup": "",
+        "error": None,
+    }
+    db_path = _OPENCODE_DB_PATH
+    if not db_path.exists():
+        result["error"] = "opencode.db not found"
+        return result
+    if not backend_session_id:
+        result["error"] = "empty backend_session_id"
+        return result
+
+    # 写前备份（覆盖旧 .bak，与现有 _merge_flat_yaml 备份惯例一致）。
+    bak_path = db_path.with_suffix(".db.bak")
+    # 先 PASSIVE checkpoint 把 WAL 折叠进主库，保证备份包含未 checkpoint 数据。
+    # PASSIVE 不阻塞（opencode 若在跑也能并发生效），失败不影响后续清理。
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        conn.close()
+    except sqlite3.Error:
+        pass
+    try:
+        shutil.copy2(str(db_path), str(bak_path))
+        result["backup"] = str(bak_path)
+    except OSError as exc:
+        log.warning("opencode session cleanup: backup failed: %s", exc)
+        # 备份失败不阻塞清理——数据已确认要删，备份只是防御。
+        result["backup"] = f"failed: {exc}"
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=30)
+        # 启用 FK 级联（opencode.db 默认 PRAGMA foreign_keys=0）。
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sid = backend_session_id
+
+            # ① 删 event_sequence（级联删 event）—— 两种模式都做。
+            #    event_sequence.aggregate_id = session_id（独立 FK 链）。
+            cur = conn.execute(
+                "DELETE FROM event_sequence WHERE aggregate_id = ?", (sid,)
+            )
+            result["deleted_events"] = cur.rowcount > 0
+
+            if not strip_only:
+                # ② hard purge：删 session 行（级联 message/part/session_message/
+                #    session_input/session_context_epoch/todo/session_share）。
+                cur = conn.execute("DELETE FROM session WHERE id = ?", (sid,))
+                result["deleted_session"] = cur.rowcount > 0
+
+            conn.commit()
+            log.info(
+                "opencode session cleanup: sid=%s strip_only=%s "
+                "deleted_session=%s deleted_events=%s",
+                sid, strip_only,
+                result["deleted_session"], result["deleted_events"],
+            )
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        result["error"] = f"sqlite error: {exc}"
+        log.error("opencode session cleanup failed: sid=%s: %s",
+                  backend_session_id, exc)
+    except Exception as exc:
+        result["error"] = str(exc)
+        log.error("opencode session cleanup failed: sid=%s: %s",
+                  backend_session_id, exc)
+
+    # WAL checkpoint：释放 freelist 页（不 VACUUM——太慢，WAL checkpoint 够用）。
+    if result["error"] is None:
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=10)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.close()
+        except sqlite3.Error:
+            # checkpoint 失败不影响清理结果——下次 SQLite 自然 checkpoint。
+            pass
+
+    return result
+
+
 def cmd_oracle_release(args: argparse.Namespace) -> int:
     """Write terminal state, stop the runtime, release the park lease.
 
@@ -2605,16 +2760,27 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
     purge = bool(getattr(args, "purge", False))
     release_mode = "soft"
     strip_report: dict = {"removed": []}
+    opencode_cleanup: dict = {}
     if manifest:
         if purge:
             # P1-1: 硬销毁——删 OMP session 文件 + 删 park 行。
             _purge_omp_session(manifest)
+            # MFT: OpenCode backend —— 作用域清理 opencode.db 会话数据
+            # （删 session 行 + event/event_sequence，按 aggregate_id 独立删）。
+            opencode_cleanup = _cleanup_opencode_session_on_release(
+                review_key, manifest, strip_only=False,
+            )
             registry.release(review_key, mode="hard")
             release_mode = "hard"
         else:
             # P1-1: 软释放（默认）——RELEASED_SOFT，session 文件保留可 revive。
             # B: 释放前 strip bash/eval 全量 artifact + __advisor 转录（保主 jsonl）。
             strip_report = _strip_oracle_transcript(manifest)
+            # MFT: OpenCode backend —— soft release 仅清理 event 膨胀数据
+            # （保留 session/message 可 warm revive）。
+            opencode_cleanup = _cleanup_opencode_session_on_release(
+                review_key, manifest, strip_only=True,
+            )
             registry.release(review_key, mode="soft")
             release_mode = "soft"
 
@@ -2626,6 +2792,7 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
         "release_mode": release_mode,
         "session_purged": purge and manifest is not None,
         "transcript_stripped": strip_report,  # B: 事后精简结果
+        "opencode_cleanup": opencode_cleanup,  # MFT: 会话作用域清理结果
     }, indent=2))
     return 0
 
