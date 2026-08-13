@@ -42,6 +42,7 @@ from codeagent.gateway.model import GatewayError
 from codeagent.mailbox.store import MailboxStore, RequestLedger, resolve_root
 from codeagent.park.registry import ParkRegistry
 from codeagent.park.inject import build_cold_context
+from codeagent.park.snapshot import ReviewSnapshot, latest_snapshot, save_snapshot
 from codeagent.domain import ExecutionSpec, ModelContextUnavailable
 from codeagent.domain.park import Lifecycle, ParkManifest
 from codeagent.runtime.base import CAP_WARM_RESUME
@@ -70,6 +71,25 @@ _SKIP_TEXT_MARKER = "Skipped due to pending system advisory"
 _STUCK_SCAN_TAIL_LINES = 200
 # P1: oracle result 输出截断上限（字节），可通过 ORACLE_RESULT_MAX_BYTES 覆盖。
 _DEFAULT_RESULT_MAX_BYTES = 32768  # 32KB; was 8KB — oracle output is long
+# P2-3: snapshot staleness threshold for cold revive quality warning (days).
+_SNAPSHOT_STALE_DAYS = 7
+
+
+def _snapshot_age_days(manifest) -> float:
+    """P2-3: days since the latest snapshot for *manifest*'s review_key.
+
+    Returns ``-1.0`` when no snapshot exists (callers treat negative as
+    "unknown / no snapshot").
+    """
+    try:
+        snap = latest_snapshot(manifest.review_key)
+    except Exception:
+        return -1.0
+    if not snap:
+        return -1.0
+    if not snap.generated_at:
+        return -1.0
+    return (time.time() - snap.generated_at) / 86400.0
 
 
 def _kernel_and_store():
@@ -1347,6 +1367,18 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 last_activity_at=time.time(),
                 config_fingerprint=_config_fingerprint(manifest.agent_type or ""),  # P1-4: 刷新指纹
             ))
+            # P2-3: snapshot after successful ask — ensures cold revive
+            # gets the latest context even after a crash (previously only
+            # saved on eviction).
+            try:
+                save_snapshot(ReviewSnapshot(
+                    review_key=review_key,
+                    round=manifest.round + 1,
+                    last_question=prompt,
+                    generated_at=time.time(),
+                ))
+            except Exception as exc:
+                log.debug("oracle ask warm: snapshot save failed (%s)", exc)
             # I2: surface adoption failure in the success JSON.
             adopted = _adopt_runtime(review_key, sid, warm_handle,
                                      _resolve_backend(args.agent, args.backend))
@@ -1494,6 +1526,17 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             ))
         except Exception as exc:
             log.warning("oracle ask: cold manifest persist failed (%s)", exc)
+        # P2-3: snapshot after successful ask — ensures cold revive
+        # gets the latest context even after a crash.
+        try:
+            save_snapshot(ReviewSnapshot(
+                review_key=review_key,
+                round=manifest.round + 1,
+                last_question=prompt,
+                generated_at=time.time(),
+            ))
+        except Exception as exc:
+            log.debug("oracle ask cold: snapshot save failed (%s)", exc)
     print(json.dumps({
         "method": "cold",
         "review_key": review_key,
@@ -1743,6 +1786,15 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
         }
         if manifest else None
     )
+    # P2-3: snapshot freshness — surface age so users can see how stale
+    # the cold-revive context would be.
+    if manifest:
+        age = _snapshot_age_days(manifest)
+        out["snapshot"] = {
+            "age_days": round(age, 1) if age >= 0 else None,
+            "stale": age > _SNAPSHOT_STALE_DAYS if age >= 0 else True,
+            "threshold_days": _SNAPSHOT_STALE_DAYS,
+        }
 
     # Runtime observability (EventStore aggregation).
     try:
@@ -2229,12 +2281,18 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     strict = bool(getattr(args, "strict", False))
     want_all = bool(getattr(args, "all", False))
     raw_mode = bool(getattr(args, "raw", False))
+    include_digest = bool(getattr(args, "include_digest", False))
     manifest = ParkRegistry().lookup(review_key)
     start_since = _review_start_ts(review_key, manifest)
     max_msgs = 10**6 if want_all else 1
     # P1: 截断上限——--all 跳过上限，否则读环境变量或默认值
     max_bytes = 0 if want_all else int(
         os.environ.get("ORACLE_RESULT_MAX_BYTES", _DEFAULT_RESULT_MAX_BYTES))
+
+    # P2-2: pre-load advisor digest (once) when --include-digest requested.
+    _cached_digest: Optional[dict] = None
+    if include_digest:
+        _cached_digest = _load_advisor_digest(review_key)
 
     out: dict = {
         "review_key": review_key,
@@ -2268,10 +2326,20 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
                     out["hint"] = "use --all for full result"
                 else:
                     out["truncated"] = False
+                # P2-2: inject advisor digest into result when requested.
+                if _cached_digest is not None:
+                    out["advisor_digest"] = _cached_digest
                 if raw_mode:
                     print(_trunc_notice(trunc_text, was_trunc, trunc_bytes, total_bytes))
                 else:
                     print(json.dumps(out, indent=2))
+                # P2-1: 运行时裁剪已完成 turn 的旧 event（防 opencode.db 无界增长）。
+                # strip 失败绝不阻塞主流程——任何异常都吞掉。
+                try:
+                    if bound_sid and _is_opencode_session_id(bound_sid):
+                        _strip_running_session(bound_sid)
+                except Exception:
+                    pass
                 return 0
 
     # ── ② mailbox REPORT（reply_to == review_key 的终端信封）─────────
@@ -2291,6 +2359,9 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
             out["hint"] = "use --all for full result"
         else:
             out["truncated"] = False
+        # P2-2: inject advisor digest into result when requested.
+        if _cached_digest is not None:
+            out["advisor_digest"] = _cached_digest
         if raw_mode:
             print(_trunc_notice(trunc_text, was_trunc, trunc_bytes, total_bytes))
         else:
@@ -2323,6 +2394,9 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
                     out["hint"] = "use --all for full result"
                 else:
                     out["truncated"] = False
+                # P2-2: inject advisor digest into result when requested.
+                if _cached_digest is not None:
+                    out["advisor_digest"] = _cached_digest
                 if raw_mode:
                     print(_trunc_notice(trunc_text, was_trunc, trunc_bytes, total_bytes))
                 else:
@@ -2486,6 +2560,15 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                 if final is not None:
                     trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
                     print(_trunc_notice(trunc, was_trunc, t_bytes, total))
+                    # P2-1: 运行时裁剪已完成 turn 的旧 event（防 opencode.db 无界增长）。
+                    # strip 失败绝不阻塞主流程——任何异常都吞掉。
+                    try:
+                        _manifest = ParkRegistry().lookup(review_key)
+                        _backend_sid = _resolve_bound_session_id(review_key, _manifest)
+                        if _backend_sid and _is_opencode_session_id(_backend_sid):
+                            _strip_running_session(_backend_sid)
+                    except Exception:
+                        pass
                     return 0
                 continue  # 无文本（罕见）——继续等
             if kind == "TASK_STATE" and payload.get("state") == "agent_end":
@@ -2735,6 +2818,18 @@ _OPENCODE_DB_PATH = Path.home() / ".local" / "share" / "opencode" / "opencode.db
 # OpenCode session ID 前缀（"ses_" 开头，如 ses_011149b70ffevYGk4czfPUSxTz）。
 _OPENCODE_SID_PREFIX = "ses_"
 
+# OpenCode 新 turn/generation 起点的 event.type 标记（P2-1 运行时精简用）。
+# OpenCode 在每次开始新一轮生成时发出 session.next.agent.switched.1 /
+# session.next.model.switched.1（语义等同 gateway 的 TURN_STARTED）。
+# 同一 turn 起点可同时发出两者（seq 相差 1-2），故按 seq 间隙去重，
+# 避免把同一起点算成两个 turn。
+_TURN_START_EVENT_TYPES = frozenset({
+    "session.next.agent.switched.1",
+    "session.next.model.switched.1",
+})
+# 相邻 turn-start marker 的 seq 间隙阈值：<= 此值视为同一 turn 起点。
+_TURN_MARKER_DEDUP_GAP = 3
+
 
 def _is_opencode_session_id(sid: str) -> bool:
     """判断 backend_session_id 是否为 OpenCode 会话格式（"ses_" 前缀）。"""
@@ -2904,6 +2999,128 @@ def _purge_opencode_session(backend_session_id: str, *,
     return result
 
 
+def _is_turn_completed(events: list, idx: int) -> bool:
+    """True when ``events[idx]`` 之后已有新 turn-start marker（turn 已完成）。
+
+    *events* 是按 seq 升序排列的该会话 event 行（每项含 ``type``）。一个 turn
+    只有在其后出现了新的 turn-start marker（``session.next.*.switched.1``，
+    语义等同 gateway 的 TURN_STARTED）才算完成——即该 turn 已结束、新一轮开始。
+    最后一个 in-flight turn 之后没有 marker，本函数对它恒返回 False，
+    从而保证 in-flight 数据永不误删。
+    """
+    if idx < 0 or idx >= len(events):
+        return False
+    return any(ev.get("type") in _TURN_START_EVENT_TYPES
+               for ev in events[idx + 1:])
+
+
+def _strip_running_session(backend_session_id: str, keep_recent: int = 2) -> dict:
+    """P2-1: 运行时精简 OpenCode 会话——删除已完成 turn 的旧 event 数据。
+
+    release 时的 ``_purge_opencode_session`` 一次性清空该会话全部 event；
+    本函数在 oracle 运行期间被调用（每完成一个 turn 触发一次），只裁剪已
+    确认完成的旧 turn，保留最近 ``keep_recent`` 个 turn（含当前 in-flight
+    turn），从而阻止 opencode.db 的 ``event`` 表随长会话无界增长。
+
+    与 release 清理的差异：
+    - 只删 ``event`` 表旧行，绝不触碰 ``event_sequence``（单行 seq 计数器）
+      以及 session/message/part（warm revive 依赖的转录数据）。
+    - 安全：仅删除"已确认完成"的 turn（其后已有新 turn-start marker）；
+      in-flight turn 永不删除。
+
+    注：opencode.db 的 event_sequence 每个会话仅一行（aggregate_id 为主键，
+    记录 seq 计数器），逐 turn 数据实际存放在 ``event`` 表。因此"裁剪旧
+    turn"落实为按 seq 删除 ``event`` 旧行，而非删除 event_sequence 行。
+
+    返回 {"trimmed": 删除的 event 行数, "kept": 保留的 event 行数,
+          "error": str | None}。
+    """
+    result: dict = {"trimmed": 0, "kept": 0, "error": None}
+    keep_recent = max(1, keep_recent)
+    db_path = _OPENCODE_DB_PATH
+    if not db_path.exists():
+        result["error"] = "opencode.db not found"
+        return result
+    if not backend_session_id:
+        result["error"] = "empty backend_session_id"
+        return result
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        # 启用 FK（opencode.db 默认 PRAGMA foreign_keys=0）；本函数直接删
+        # event 行，不依赖级联，但保持与 _purge_opencode_session 一致。
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            rows = conn.execute(
+                "SELECT seq, type FROM event "
+                "WHERE aggregate_id = ? ORDER BY seq ASC",
+                (backend_session_id,),
+            ).fetchall()
+            if not rows:
+                # 无 event 可裁（全新会话或已清空）——幂等返回。
+                return result
+
+            events = [{"seq": s, "type": t} for s, t in rows]
+
+            # turn 起点索引：首条事件（session.created）是 turn1 起点；每个
+            # turn-start marker 是新 turn 起点。相邻 marker（seq 间隙 <=
+            # _TURN_MARKER_DEDUP_GAP）属于同一起点，去重。
+            turn_starts = [0]
+            last_marker_seq = events[0]["seq"]
+            for i in range(1, len(events)):
+                ev = events[i]
+                if ev["type"] in _TURN_START_EVENT_TYPES:
+                    if ev["seq"] - last_marker_seq > _TURN_MARKER_DEDUP_GAP:
+                        turn_starts.append(i)
+                    last_marker_seq = ev["seq"]
+
+            num_turns = len(turn_starts)
+            if num_turns <= keep_recent:
+                # turn 数未超过保留上限——全部保留（含 in-flight）。
+                result["kept"] = len(events)
+                return result
+
+            # 保留最近 keep_recent 个 turn 的起点索引。
+            keep_from = turn_starts[num_turns - keep_recent]
+
+            # 安全门：keep_from 之前的 turn 必须全部"已完成"（其后已有新
+            # turn-start marker）；否则放弃裁剪，避免误删 in-flight 数据。
+            to_trim = turn_starts[:num_turns - keep_recent]
+            if not all(_is_turn_completed(events, i) for i in to_trim):
+                result["kept"] = len(events)
+                return result
+
+            cutoff_seq = events[keep_from]["seq"]
+            cur = conn.execute(
+                "DELETE FROM event WHERE aggregate_id = ? AND seq < ?",
+                (backend_session_id, cutoff_seq),
+            )
+            conn.commit()
+            result["trimmed"] = cur.rowcount
+            result["kept"] = len(events) - cur.rowcount
+            log.info(
+                "opencode running session strip: sid=%s trimmed=%d kept=%d "
+                "keep_recent=%d",
+                backend_session_id, result["trimmed"], result["kept"],
+                keep_recent,
+            )
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        result["error"] = f"sqlite error: {exc}"
+        log.debug("opencode running session strip failed: sid=%s: %s",
+                  backend_session_id, exc)
+    except Exception as exc:
+        result["error"] = str(exc)
+        log.debug("opencode running session strip failed: sid=%s: %s",
+                  backend_session_id, exc)
+
+    return result
+
+
 def _lazy_db_cleanup(threshold_mb: int = 100,
                     hard_limit_seconds: int = 30 * 24 * 3600) -> int:
     """P1-2: opencode.db 惰性清理——db > threshold 时清理已释放会话。
@@ -2965,6 +3182,194 @@ def _lazy_db_cleanup(threshold_mb: int = 100,
     return cleaned
 
 
+# ── P2-2: advisor tiered retention（digest 留存）───────────────────────
+
+# P2-2: advisor JSONL 中 toolResult 需含此最小字符数才算"证据"。
+_ADVISOR_EVIDENCE_MIN_CHARS = 200
+# P2-2: digest JSON 最大字节数（UTF-8 安全截断）。
+_DIGEST_MAX_BYTES = 2048
+
+
+def _find_advisor_session_file(backend_session_id: str) -> Optional[Path]:
+    """P2-2: locate the __advisor JSONL file for a backend session id.
+
+    Scans the OMP sessions tree (``~/.omp/agent/sessions/``) for files
+    matching ``*__advisor*_{backend_session_id}.jsonl`` or any
+    ``__advisor*.jsonl`` in the same directory as the main session file.
+    Returns the most recent matching file, or None.
+    """
+    if not backend_session_id:
+        return None
+    sessions_root = Path.home() / ".omp" / "agent" / "sessions"
+    if not sessions_root.is_dir():
+        return None
+    # Strategy: find the main session directory first, then look for
+    # __advisor files in the same directory.
+    main = _find_session_file(backend_session_id)
+    if main is not None:
+        parent = main.parent
+        advisor_files = sorted(
+            parent.glob("*__advisor*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if advisor_files:
+            return advisor_files[0]
+    # Fallback: recursive scan for __advisor files mentioning the sid.
+    for dirpath, _dirs, files in os.walk(sessions_root):
+        for name in files:
+            if "__advisor" in name.lower() and backend_session_id in name:
+                return Path(dirpath) / name
+    return None
+
+
+def _extract_advisor_digest(
+    session_path: Path,
+    *,
+    max_bytes: int = _DIGEST_MAX_BYTES,
+) -> dict:
+    """P2-2: extract a structured digest from an advisor session JSONL.
+
+    Reads the session transcript, extracts the last assistant message
+    (conclusion) and counts tool results that contain substantial
+    analysis/review content (evidence). Returns a compact dict:
+
+        {
+            "conclusion": str,       # last assistant message (≤2KB)
+            "evidence_count": int,   # tool results with ≥200 chars
+            "token_estimate": int,   # rough char/4 estimate
+            "source": str,           # source file path
+            "extracted_at": str,     # ISO timestamp
+        }
+
+    Truncates ``conclusion`` to ``max_bytes`` (UTF-8, line-boundary).
+    """
+    conclusion = ""
+    evidence_count = 0
+    total_chars = 0
+
+    try:
+        with open(session_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                msg = obj.get("message", {})
+                role = msg.get("role", "")
+
+                if role == "assistant":
+                    content = msg.get("content", [])
+                    text = "".join(
+                        c.get("text", "")
+                        for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"
+                    )
+                    if text.strip():
+                        conclusion = text
+                        total_chars += len(text)
+
+                elif role == "toolResult" or obj.get("type") == "tool_result":
+                    # Count tool results with substantial analysis content.
+                    content = msg.get("content", [])
+                    if not content:
+                        # Some formats store text directly in obj["text"]
+                        text = str(obj.get("text", ""))
+                    else:
+                        text = "".join(
+                            c.get("text", "")
+                            for c in content
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        )
+                    if len(text) >= _ADVISOR_EVIDENCE_MIN_CHARS:
+                        evidence_count += 1
+                        total_chars += len(text)
+    except OSError as exc:
+        log.debug("_extract_advisor_digest: read failed: %s", exc)
+        return {
+            "conclusion": "",
+            "evidence_count": 0,
+            "token_estimate": 0,
+            "source": str(session_path),
+            "error": str(exc),
+        }
+
+    # UTF-8 safe truncation to max_bytes.
+    if max_bytes > 0 and len(conclusion.encode("utf-8")) > max_bytes:
+        truncated = conclusion.encode("utf-8")[:max_bytes].decode(
+            "utf-8", errors="ignore",
+        )
+        # Prefer line boundary.
+        nl = truncated.rfind("\n", int(len(truncated) * 0.7))
+        if nl > 0:
+            truncated = truncated[:nl]
+        conclusion = truncated
+
+    return {
+        "conclusion": conclusion,
+        "evidence_count": evidence_count,
+        "token_estimate": total_chars // 4,
+        "source": str(session_path),
+        "extracted_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
+    }
+
+
+def _oracle_digest_path(review_key: str) -> Path:
+    """P2-2: .digest.json path alongside meta.json (~/.omp/oracle/<safe-key>/)."""
+    safe = review_key.replace(":", "-").replace("/", "-").replace("\\", "-")
+    return Path.home() / ".omp" / "oracle" / safe / "digest.json"
+
+
+def _save_advisor_digest(review_key: str, manifest) -> Optional[dict]:
+    """P2-2: extract and persist advisor digest from the session JSONL.
+
+    Locates the advisor session file for the manifest's backend session,
+    extracts key conclusions, and saves to ``.digest.json`` alongside
+    ``meta.json``. Returns the digest dict if successful, None otherwise.
+    """
+    if manifest is None:
+        return None
+    sid = manifest.backend_session_id or ""
+    if not sid:
+        return None
+    advisor_path = _find_advisor_session_file(sid)
+    if advisor_path is None:
+        log.debug("_save_advisor_digest: no advisor session for sid=%s", sid)
+        return None
+
+    digest = _extract_advisor_digest(advisor_path)
+    digest_path = _oracle_digest_path(review_key)
+    try:
+        digest_path.parent.mkdir(parents=True, exist_ok=True)
+        digest_path.write_text(
+            json.dumps(digest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        log.info(
+            "advisor digest saved: review_key=%s conclusion_len=%d evidence=%d",
+            review_key, len(digest.get("conclusion", "")),
+            digest.get("evidence_count", 0),
+        )
+    except OSError as exc:
+        log.warning("_save_advisor_digest: write failed: %s", exc)
+        return None
+    return digest
+
+
+def _load_advisor_digest(review_key: str) -> Optional[dict]:
+    """P2-2: load a previously saved advisor digest (returns None if absent)."""
+    path = _oracle_digest_path(review_key)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def cmd_oracle_release(args: argparse.Namespace) -> int:
     """Write terminal state, stop the runtime, release the park lease.
 
@@ -3003,6 +3408,19 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
             # B2: mailbox unreachable/unreadable — the guard is advisory,
             # never a hard gate on release.
             pass
+
+    # P2-3: snapshot before release — captures final state before lifecycle
+    # change so a subsequent cold revive is not stale.
+    if manifest:
+        try:
+            save_snapshot(ReviewSnapshot(
+                review_key=review_key,
+                round=manifest.round,
+                last_question=getattr(args, "prompt", "") or "",
+                generated_at=time.time(),
+            ))
+        except Exception as exc:
+            log.debug("oracle release: snapshot save failed (%s)", exc)
 
     # Stop the runtime (gateway) — the only way to terminate it.
     # I1: gateway 不可达时不再只打 warning 继续释放——尝试 tmux/PID 兜底
@@ -3049,13 +3467,23 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
 
     # Release the park lease.
     purge = bool(getattr(args, "purge", False))
+    keep_advisor = bool(getattr(args, "keep_advisor", False))
     release_mode = "soft"
     strip_report: dict = {"removed": []}
     opencode_cleanup: dict = {}
+    advisor_digest: Optional[dict] = None
+
+    # P2-2: extract advisor digest BEFORE any deletion — captures the
+    # advisor's conclusions as a compact summary that survives release.
+    if manifest:
+        advisor_digest = _save_advisor_digest(review_key, manifest)
+
     if manifest:
         if purge:
             # P1-1: 硬销毁——删 OMP session 文件 + 删 park 行。
-            _purge_omp_session(manifest)
+            # P2-2: --keep-advisor skips advisor session files from purge
+            # so the full __advisor.jsonl survives for debugging.
+            _purge_omp_session(manifest, skip_advisor=keep_advisor)
             # MFT: OpenCode backend —— 作用域清理 opencode.db 会话数据
             # （删 session 行 + event/event_sequence，按 aggregate_id 独立删）。
             opencode_cleanup = _cleanup_opencode_session_on_release(
@@ -3066,7 +3494,10 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
         else:
             # P1-1: 软释放（默认）——RELEASED_SOFT，session 文件保留可 revive。
             # B: 释放前 strip bash/eval 全量 artifact + __advisor 转录（保主 jsonl）。
-            strip_report = _strip_oracle_transcript(manifest)
+            # P2-2: --keep-advisor skips transcript stripping entirely so the
+            # full __advisor.jsonl survives alongside the digest for debugging.
+            if not keep_advisor:
+                strip_report = _strip_oracle_transcript(manifest)
             # MFT: OpenCode backend —— soft release 仅清理 event 膨胀数据
             # （保留 session/message 可 warm revive）。
             opencode_cleanup = _cleanup_opencode_session_on_release(
@@ -3084,14 +3515,267 @@ def cmd_oracle_release(args: argparse.Namespace) -> int:
         "session_purged": purge and manifest is not None,
         "transcript_stripped": strip_report,  # B: 事后精简结果
         "opencode_cleanup": opencode_cleanup,  # MFT: 会话作用域清理结果
+        "advisor_digest": advisor_digest,  # P2-2: tiered retention digest
+        "keep_advisor": keep_advisor,  # P2-2: advisor files preserved
     }, indent=2))
     return 0
+
+
+# ── doctor（P2-4：三源一致性检查）─────────────────────────────────────
+
+
+def _opencode_session_exists(backend_session_id: str) -> bool:
+    """Check if a session id exists in opencode.db (session table)."""
+    db_path = _OPENCODE_DB_PATH
+    if not db_path.exists():
+        return False
+    if not backend_session_id:
+        return False
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM session WHERE id = ?", (backend_session_id,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+def _doctor_list_all_park_entries() -> list[dict]:
+    """List ALL park entries (any lifecycle) for cross-source validation.
+
+    Returns list of dicts with keys: review_key, lifecycle, backend_session_id.
+    """
+    entries: list[dict] = []
+    try:
+        registry = ParkRegistry()
+        with registry._connect() as conn:
+            rows = conn.execute(
+                "SELECT manifest_json FROM park_leases",
+            ).fetchall()
+        for (mj,) in rows:
+            try:
+                d = json.loads(mj)
+                entries.append({
+                    "review_key": d.get("review_key", ""),
+                    "lifecycle": d.get("lifecycle", ""),
+                    "backend_session_id": d.get("backend_session_id", ""),
+                })
+            except (json.JSONDecodeError, KeyError):
+                continue
+    except Exception as exc:
+        log.debug("doctor: park scan failed: %s", exc)
+    return entries
+
+
+def cmd_oracle_doctor(args: argparse.Namespace) -> int:
+    """P2-4: three-source consistency check.
+
+    Sources:
+    1. Gateway runtime.info — runtime presence/status
+    2. Park registry lifecycle — park lease state
+    3. opencode.db session existence — backend session liveness
+
+    Issue types:
+    - STALE_RUNTIME: gateway says active but park lifecycle is terminal
+    - ORPHAN_DB: opencode.db session exists but no park entry references it
+    - ORPHAN_TMUX: tmux pane exists but no park entry matches
+    - MISSING_DB: park entry has backend_session_id but session not in opencode.db
+
+    Returns 0 if healthy, 1 if issues found, 2 if fix failed.
+    """
+    do_fix = bool(getattr(args, "fix", False))
+    issues: list[dict] = []
+    fix_failed = False
+
+    # 1. Gateway connectivity probe.
+    gw_ok = False
+    try:
+        _gateway().call("capabilities.get")
+        gw_ok = True
+    except Exception as exc:
+        issues.append({
+            "type": "GATEWAY_UNREACHABLE",
+            "review_key": "",
+            "detail": str(exc),
+            "fix_action": "start gateway: aimeshchat gateway start",
+        })
+
+    # 2. Scan ALL park entries for cross-source validation.
+    all_entries = _doctor_list_all_park_entries()
+    active_entries = ParkRegistry().list_active()
+    active_keys = {m.review_key for m in active_entries}
+
+    # Collect all backend_session_ids referenced by any park entry.
+    all_park_sids: set[str] = set()
+
+    for entry in all_entries:
+        review_key = entry["review_key"]
+        lifecycle = entry["lifecycle"]
+        bsid = entry["backend_session_id"]
+        if bsid:
+            all_park_sids.add(bsid)
+
+        # Check ①: lifecycle vs gateway runtime.info status (only for active).
+        if gw_ok and lifecycle == "hot_parked":
+            try:
+                info = _gateway().call("runtime.info", {"review_key": review_key})
+                rt_status = info.get("status", "")
+                if rt_status not in ("active", "not_found", ""):
+                    # Gateway reports a non-active runtime for a HOT_PARKED entry.
+                    issues.append({
+                        "type": "STALE_RUNTIME",
+                        "review_key": review_key,
+                        "detail": f"gateway status={rt_status!r} but lifecycle={lifecycle}",
+                        "fix_action": "runtime.stop",
+                    })
+            except Exception:
+                pass
+
+        # Check ②: backend_session_id existence in opencode.db.
+        if bsid and _is_opencode_session_id(bsid):
+            exists = _opencode_session_exists(bsid)
+            if lifecycle in ("hot_parked", "cold_resumable") and not exists:
+                issues.append({
+                    "type": "MISSING_DB",
+                    "review_key": review_key,
+                    "detail": f"backend_session_id={bsid!r} not found in opencode.db",
+                    "fix_action": "log warning (can't fix missing data)",
+                })
+
+    # Check ③: ORPHAN_DB — sessions in opencode.db with no park reference.
+    if _OPENCODE_DB_PATH.exists():
+        try:
+            conn = sqlite3.connect(str(_OPENCODE_DB_PATH), timeout=5)
+            try:
+                rows = conn.execute(
+                    "SELECT id FROM session WHERE id LIKE ?",
+                    (_OPENCODE_SID_PREFIX + "%",),
+                ).fetchall()
+                for (sid,) in rows:
+                    if sid not in all_park_sids:
+                        issues.append({
+                            "type": "ORPHAN_DB",
+                            "review_key": "",
+                            "detail": f"session {sid!r} in opencode.db but no park entry",
+                            "fix_action": "purge (strip_only=True) if older than 7 days",
+                        })
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            log.debug("doctor: opencode.db scan failed: %s", exc)
+
+    # Check ④: ORPHAN_TMUX — tmux panes matching oracle patterns.
+    from codeagent.launchers.tmux import TMUX_SESSION_NAME, tmux_cmd
+    try:
+        proc = subprocess.run(
+            tmux_cmd("list-windows", "-t", TMUX_SESSION_NAME, "-F",
+                     "#{window_name}|#{pane_id}"),
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                name, sep, pane = line.partition("|")
+                if not sep:
+                    continue
+                if name.startswith("postmesh-") or name.startswith("ora-"):
+                    # Check if any park entry matches this pane name.
+                    matched = False
+                    for entry in all_entries:
+                        if _review_sid(entry["review_key"]) == name:
+                            matched = True
+                            break
+                        old_safe = entry["review_key"].replace(":", "-")[-12:]
+                        if name.startswith(f"ora-{old_safe}-"):
+                            matched = True
+                            break
+                    if not matched:
+                        issues.append({
+                            "type": "ORPHAN_TMUX",
+                            "review_key": "",
+                            "detail": f"tmux pane {pane} (window={name}) has no park entry",
+                            "fix_action": "log warning (refuse auto-kill, too risky)",
+                        })
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.debug("doctor: tmux scan failed: %s", exc)
+
+    # 3. Apply conservative fixes.
+    fix_results: list[dict] = []
+    if do_fix and issues:
+        for issue in issues:
+            itype = issue["type"]
+            if itype == "STALE_RUNTIME":
+                try:
+                    info = _gateway().call("runtime.info",
+                                           {"review_key": issue["review_key"]})
+                    rid = info.get("runtime_id")
+                    if rid:
+                        _gateway().call("runtime.stop",
+                                        {"runtime_id": rid,
+                                         "reason": "oracle doctor fix"})
+                        fix_results.append({
+                            "type": itype, "review_key": issue["review_key"],
+                            "action": "runtime.stop", "success": True,
+                        })
+                except Exception as exc:
+                    fix_failed = True
+                    fix_results.append({
+                        "type": itype, "review_key": issue["review_key"],
+                        "action": "runtime.stop", "success": False,
+                        "error": str(exc),
+                    })
+
+            elif itype == "ORPHAN_DB":
+                # Extract session id from detail.
+                sid = issue["detail"].split("session ")[1].split("'")[0] if "session " in issue["detail"] else ""
+                if sid:
+                    try:
+                        result = _purge_opencode_session(sid, strip_only=True)
+                        if result.get("error"):
+                            fix_failed = True
+                        fix_results.append({
+                            "type": itype, "session_id": sid,
+                            "action": "purge(strip_only=True)",
+                            "success": not result.get("error"),
+                            "detail": result,
+                        })
+                    except Exception as exc:
+                        fix_failed = True
+                        fix_results.append({
+                            "type": itype, "session_id": sid,
+                            "action": "purge(strip_only=True)",
+                            "success": False, "error": str(exc),
+                        })
+
+            elif itype == "ORPHAN_TMUX":
+                log.warning("doctor: ORPHAN_TMUX %s — refusing auto-kill (too risky)",
+                            issue["detail"])
+
+            elif itype == "MISSING_DB":
+                log.warning("doctor: MISSING_DB %s — can't fix missing data",
+                            issue["detail"])
+
+    healthy = len([i for i in issues if i["type"] != "GATEWAY_UNREACHABLE"]) == 0
+    report = {
+        "healthy": len(active_entries) if healthy else len(active_entries) - len(issues),
+        "issues": issues,
+    }
+    if fix_results:
+        report["fix_results"] = fix_results
+    print(json.dumps(report, indent=2))
+    if fix_failed:
+        return 2
+    return 0 if healthy else 1
 
 
 # ── revive（P1-2：RELEASED_SOFT / COLD_RESUMABLE → HOT_PARKED）──────────
 
 
-def _purge_omp_session(manifest: ParkManifest) -> list[str]:
+def _purge_omp_session(manifest: ParkManifest, *,
+                       skip_advisor: bool = False) -> list[str]:
     """P1-1: 硬销毁——删除 OMP session 文件 + swarm session 目录（--purge）。
 
     删除对象（存在才删，返回实际删除路径列表）：
@@ -3102,6 +3786,10 @@ def _purge_omp_session(manifest: ParkManifest) -> list[str]:
     - I5: swarm session 目录（mailbox session dir + _outbox/_dead_letter
       附属目录）——purge 必须把 mailbox 痕迹一起清掉，否则重新 start 同
       review_key 会撞见陈旧的 inbox/history。
+
+    P2-2: ``skip_advisor=True`` preserves ``__advisor*.jsonl`` files when
+    deleting session directories — their conclusions are already captured in
+    the digest but the raw files may be needed for debugging.
     """
     removed: list[str] = []
     targets: set[Path] = set()
@@ -3138,10 +3826,39 @@ def _purge_omp_session(manifest: ParkManifest) -> list[str]:
     for p in sorted(targets, key=str):
         try:
             if p.is_dir():
-                shutil.rmtree(p)
+                if skip_advisor:
+                    # P2-2: selectively delete directory contents, preserving
+                    # __advisor files. Walk children, delete non-advisor first,
+                    # then rmtree if empty.
+                    preserved = False
+                    for child in sorted(p.rglob("*"), reverse=True):
+                        if child.is_file() and "__advisor" in child.name.lower():
+                            preserved = True
+                            continue
+                        if child.is_file():
+                            child.unlink()
+                            removed.append(str(child))
+                        elif child.is_dir():
+                            try:
+                                child.rmdir()  # only succeeds if empty
+                                removed.append(str(child))
+                            except OSError:
+                                pass
+                    # Remove the directory itself if now empty.
+                    if not preserved:
+                        try:
+                            p.rmdir()
+                            removed.append(str(p))
+                        except OSError:
+                            pass
+                else:
+                    shutil.rmtree(p)
+                    removed.append(str(p))
             else:
+                if skip_advisor and "__advisor" in p.name.lower():
+                    continue
                 p.unlink()
-            removed.append(str(p))
+                removed.append(str(p))
         except OSError as exc:
             print(f"warning: purge session file failed: {p}: {exc}", file=sys.stderr)
     return removed
@@ -3393,6 +4110,20 @@ def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
     """
     if mode == "resume":
         mode = "bg"
+    # P2-3: snapshot staleness check — warn if the cold revive context is
+    # older than the threshold (degraded quality, potentially stale).
+    age = _snapshot_age_days(manifest)
+    if age < 0:
+        log.warning(
+            "oracle revive cold %s: no snapshot found — cold revive has "
+            "no prior context to reconstruct from", review_key,
+        )
+    elif age > _SNAPSHOT_STALE_DAYS:
+        log.warning(
+            "oracle revive cold %s: snapshot is %.1f days old (threshold=%d) "
+            "— cold revive quality may be degraded",
+            review_key, age, _SNAPSHOT_STALE_DAYS,
+        )
     sid = _review_sid(review_key)
     # B2: 从 manifest 读 ExecutionSpec 显式字段（start 时落盘），不再重推导。
     # 旧 manifest 无 primary_model 时回退 _model_chain_from_manifest（迁移兼容）。

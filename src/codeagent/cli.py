@@ -340,6 +340,9 @@ def _build_parser() -> argparse.ArgumentParser:
                                   "(default: soft release, revivable)")
     ora_release.add_argument("--force", action="store_true",
                              help="B2: skip the unread-REPORT confirmation before release")
+    ora_release.add_argument("--keep-advisor", action="store_true", dest="keep_advisor",
+                             help="P2-2: preserve advisor session files for debugging "
+                                  "(a digest is always saved before deletion)")
 
     ora_revive = ora_sub.add_parser("revive", help="Revive a released/cold park instance")
     ora_revive.add_argument("review_key")
@@ -356,6 +359,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_result.add_argument("--raw", action="store_true",
                             help="P0: print only the last assistant message as plain text "
                                  "(default: JSON with source/confidence/messages/meta)")
+    ora_result.add_argument("--include-digest", action="store_true", dest="include_digest",
+                            help="P2-2: also return the advisor digest (if available) "
+                                 "in the result JSON")
 
     # P2: unified attach entry — hot send (HOT_PARKED) or revive (released/cold)
     ora_attach = ora_sub.add_parser("attach", help="Attach to an existing oracle session (hot send or revive)")
@@ -364,6 +370,11 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_attach.add_argument("--mode", default="bg", choices=["bg", "pane", "resume"],
                             help="P2: attach mode — bg (default, supervised) | pane (tmux) "
                                  "| resume (omp --resume attach); forwarded to revive when applicable")
+
+    # P2-4: three-source consistency check (gateway ↔ park ↔ opencode.db)
+    ora_doctor = ora_sub.add_parser("doctor", help="P2-4: three-source consistency check")
+    ora_doctor.add_argument("--fix", action="store_true", default=False,
+                            help="Attempt conservative fixes")
 
     return p
 
@@ -2128,10 +2139,11 @@ def _warn_deprecated_agent(args: argparse.Namespace) -> None:
 
 
 def _cmd_oracle(args: argparse.Namespace) -> int:
-    """Dispatch oracle subcommands (start/ask/status/list/watch/wait/release/revive/result/attach)."""
+    """Dispatch oracle subcommands (start/ask/status/list/watch/wait/release/revive/result/attach/doctor)."""
     from codeagent.oracle import (
         cmd_oracle_ask,
         cmd_oracle_attach,
+        cmd_oracle_doctor,
         cmd_oracle_list,
         cmd_oracle_release,
         cmd_oracle_result,
@@ -2144,7 +2156,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
 
     cmd = args.ora_cmd
     if cmd is None:
-        print("oracle: missing subcommand. Try: aimeshchat oracle start|ask|status|list|watch|wait|release|revive|result|attach", file=sys.stderr)
+        print("oracle: missing subcommand. Try: aimeshchat oracle start|ask|status|list|watch|wait|release|revive|result|attach|doctor", file=sys.stderr)
         return 1
     handlers = {
         "start": cmd_oracle_start,
@@ -2157,6 +2169,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
         "revive": cmd_oracle_revive,
         "result": cmd_oracle_result,
         "attach": cmd_oracle_attach,
+        "doctor": cmd_oracle_doctor,
     }
     if cmd in ("start", "ask"):
         # P0-B/P1-B: 去 role——--agent 无模型语义（仅兼容占位，传了打弃用
