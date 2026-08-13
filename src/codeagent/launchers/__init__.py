@@ -2,6 +2,8 @@
 from codeagent.launchers.tmux import (
     PaneConfig,
     TmuxRuntimeHandle,
+    _is_pane_managed,
+    _mark_pane_managed,
     capture_pane,
     create_pane,
     detect_current_tmux,
@@ -21,6 +23,8 @@ from codeagent.launchers.tmux import (
 __all__ = [
     "PaneConfig",
     "TmuxRuntimeHandle",
+    "_is_pane_managed",
+    "_mark_pane_managed",
     "capture_pane",
     "create_pane",
     "detect_current_tmux",

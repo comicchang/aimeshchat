@@ -214,9 +214,16 @@ def spawn_in_current_tmux(
     if not pane_id:
         raise RuntimeError("tmux returned no pane id")
 
-    # Send the command into the pane.
+    # Mark pane as codeagent-managed and enable HIST_IGNORE_SPACE.
+    _mark_pane_managed(pane_id)
+    subprocess.run(
+        ["tmux", "send-keys", "-t", pane_id, " setopt HIST_IGNORE_SPACE", "Enter"],
+        capture_output=True, timeout=10,
+    )
+
+    # Send the command into the pane (leading space prevents history recording).
     rc = subprocess.run(
-        ["tmux", "send-keys", "-t", pane_id, quoted, "Enter"],
+        ["tmux", "send-keys", "-t", pane_id, f" {quoted}", "Enter"],
         capture_output=True, timeout=10,
     ).returncode
     if rc != 0:
@@ -238,9 +245,32 @@ def _tmux(*args: str, timeout: int = 10) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 
+def _mark_pane_managed(pane_id: str) -> None:
+    """Set tmux pane options marking *pane_id* as codeagent-managed.
+
+    Sets two user options:
+    - ``@codeagent_managed=1`` — the pane is owned by codeagent.
+    - ``@codeagent_history_safe=1`` — the pane has HIST_IGNORE_SPACE set.
+    """
+    for opt in ("@codeagent_managed", "@codeagent_history_safe"):
+        _tmux("set-option", "-t", pane_id, opt, "1")
+
+
+def _is_pane_managed(pane_id: str) -> bool:
+    """Check whether *pane_id* is marked as codeagent-managed."""
+    rc, out, _ = _tmux("show-option", "-t", pane_id, "-v", "@codeagent_managed")
+    return rc == 0 and out.strip() == "1"
+
+
 def send_keys(pane_target: str, text: str, enter: bool = True) -> bool:
-    """Send keystrokes to a tmux pane (legacy helper)."""
-    cmd = tmux_cmd("send-keys", "-t", pane_target, text)
+    """Send keystrokes to a tmux pane (legacy helper).
+
+    Prepends a leading space so zsh HIST_IGNORE_SPACE prevents recording.
+    Warns (does not block) if the target pane is not codeagent-managed.
+    """
+    if not _is_pane_managed(pane_target):
+        log.warning("send_keys to unmanaged pane %s — command may pollute shell history", pane_target)
+    cmd = tmux_cmd("send-keys", "-t", pane_target, f" {text}")
     if enter:
         cmd.append("Enter")
     return subprocess.run(cmd, capture_output=True).returncode == 0
@@ -258,7 +288,11 @@ def create_pane(config: PaneConfig) -> Optional[str]:
                        *(("-c", config.cwd) if config.cwd else ()),
                        *(["-P", "-F", "#{pane_id}", config.shell] if config.shell else ()))
     if rc == 0:
-        return out.strip()
+        pane_id = out.strip()
+        if pane_id:
+            _mark_pane_managed(pane_id)
+            _tmux("send-keys", "-t", pane_id, " setopt HIST_IGNORE_SPACE", "Enter")
+        return pane_id
     return None
 
 
@@ -307,10 +341,15 @@ def spawn_runtime(spec_path: Path) -> TmuxRuntimeHandle:
     if not pane_id:
         raise RuntimeError("tmux new-window returned no pane id")
 
+    # Mark pane as codeagent-managed and enable HIST_IGNORE_SPACE.
+    _mark_pane_managed(pane_id)
+    _tmux("send-keys", "-t", pane_id, " setopt HIST_IGNORE_SPACE", "Enter")
+
     # Supervisor command — argv only, never a composed shell string.
+    # Leading space prevents zsh from recording in history.
     supervisor = [sys.executable, "-m", "codeagent.runtime.supervisor", str(spec_path)]
     quoted = " ".join(shlex.quote(a) for a in supervisor)
-    rc, _, err = _tmux("send-keys", "-t", pane_id, quoted, "Enter")
+    rc, _, err = _tmux("send-keys", "-t", pane_id, f" {quoted}", "Enter")
     if rc != 0:
         _tmux("kill-pane", "-t", pane_id)
         raise RuntimeError(f"tmux send-keys failed: {err}")
