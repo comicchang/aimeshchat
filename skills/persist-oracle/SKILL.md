@@ -23,18 +23,24 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
 
 ## 模型一致性（防漂移，2026-08 design 结论）
 
-模型单一决定源 = **agents/*.md 的 `model:` 字段**（代码 `_read_agent_model()` 读取
-`agents/<agent_type>.md`，不解析 `config.yml` 的 `fallbackChains` / `modelRoles`）。
-**oracle 语义（review/验收/咨询）禁止依赖默认 `modelRoles.task`（= mimo）**，
-调用方必须显式传 `--model`（及 `--variant`/`--system`），由 skill 按档位提供默认值。
+模型权威 = **ExecutionSpec 显式字段**：调用方（skill）直接传 `--model`（及
+`--variant`/`--system`/`--prompt`），代码 `ExecutionSpec.from_args` 只解析：
+显式 `--model` → 主 agent runtime context（gateway runtime.context）→
+execution-context（`~/.omp/agent/execution-context.json` 或 `$AIMESHCHAT_EXECUTION_CONTEXT`），
+全部缺失则报错要求 `--model`。**`config.yml` 的 `fallbackChains` / `modelRoles` 完全不解析**；
+`--agent` 仅为兼容占位参数（无模型语义，传了打弃用告警），不参与模型解析。
+oracle 语义（review/验收/咨询）禁止依赖默认 `modelRoles.task`（= mimo），
+调用方必须显式传 `--model`，由 skill 按档位提供默认值。
 
-改模型需修改 agents/*.md 的 `model:` 字段 + 校验一致性：
+`agents/*.md` 的 `model:` 字段仅作向后兼容兜底（`--agent` 便捷名路径
+`_resolve_oracle_model_chain`）与一致性校验对象——三档 skill 推荐值应与其保持一致：
 ```bash
-# 校验 agent profile 的 model: 与 skill 推荐值一致（不再 grep config.yml）
+# 校验 agent profile 的 model: 与 skill 推荐值一致（config.yml 不再参与）
 grep -E '^model:' ~/.omp/agents/oracle.md ~/.omp/agents/oracle-lite.md ~/.omp/agents/oracle-opus.md
 ```
-- oracle / oracle-opus / oracle-lite 三档模型由 `agents/*.md` 的 `model:` 字段统一管理。
-- 显式 `--model` 优先级 > 主 agent runtime context 继承 > agents/*.md `model:` 兜底 > 报错。
+- oracle / oracle-opus / oracle-lite 三档模型由 skill ExecutionSpec 显式传参统一管理（权威）；
+  `agents/*.md` 的 `model:` 字段为兜底与一致性校验源。
+- 优先级：用户显式 `--model` > 主 agent runtime context 继承 > execution-context > agents/*.md `model:` 兜底 > 报错。
 - 默认未指定 `--model` → 继承主 agent runtime context（不回退 mimo）。
 
 ## 绑定语义（A1，2026-08-12 修复）
@@ -216,11 +222,11 @@ aimeshchat oracle start "$KEY" --model v4-pro --prompt '...'
 # 实际使用 v4-pro，覆盖 skill 默认值
 ```
 
-优先级链：**用户 CLI 显式指定 > skill ExecutionSpec > 主 agent runtime context > agents/*.md `model:` 兜底 > 报错**
+优先级链：**用户 CLI 显式指定（--model/--variant/--system）> 主 agent runtime context 继承 > execution-context > agents/*.md `model:` 兜底（--agent 便捷名路径）> 报错**
 
 ### 迁移提示（完全去 role）
 
 - `--agent oracle | oracle-lite | oracle-opus` **已废弃**——不再作为默认用法。
 - 所有启动/追加/复活命令均通过 `--model`/`--variant`/`--system`/`--prompt` 显式传参。
 - skill 按档位提供 ExecutionSpec 模板（见上表），调用时展开为 CLI 参数。
-- 模型决定优先级链不变：**用户 CLI 显式指定 > skill ExecutionSpec > 主 agent runtime context > agents/*.md `model:` 兜底 > 报错**。
+- 模型决定优先级链不变：**用户 CLI 显式指定（--model/--variant/--system）> 主 agent runtime context 继承 > execution-context > agents/*.md `model:` 兜底 > 报错**。

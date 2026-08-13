@@ -6,7 +6,7 @@ Unified CLI for executing AI code agents across local and remote machines, with 
 
 ## Features
 
-- **Multi-backend**: codex, claude, gemini, opencode, omp
+- **Backends**: omp (default), opencode (warm resume), generic (explicit-only)
 - **SSH transport**: Independent ControlMaster per host, no global ControlPersist changes
 - **Session persistence**: SQLite-backed registry, auto-resume by namespace key
 - **Topic routing**: repo-map.json maps topics to host/path, with local detection
@@ -63,8 +63,8 @@ aimeshchat swarm watch s1 --agent w1 --interval 2   # polling loop
 Cross-host: register the worker with its SSH host instead of `__local__`
 (`--host dev-server`) — delivery goes over SSH automatically, same commands.
 
-Optional: topic routing (`repo-map.json`) and model config (`models.json`)
-are only needed for `aimeshchat run`/`route` — see `examples/`.
+Optional: topic routing (`repo-map.json`) is only needed for `aimeshchat run`/`route` — see `examples/`.
+Models are passed per invocation (`--model`/`--variant`/`--system`) — there is no `models.json`.
 
 ## Usage
 
@@ -152,47 +152,33 @@ Place in `{midocs_root}/<TopicName>/.repo-map.json`:
 }
 ```
 
-### models.json
+### Model selection
 
-Agent presets at `~/.codeagent/models.json` (shared with Go codeagent-wrapper):
+There is **no `models.json`** — the CLI never reads one. Models are decided per
+invocation via the `ExecutionSpec`, passed explicitly as CLI flags:
 
-```json
-{
-  "default_backend": "opencode",
-  "default_model": "provider/model-name",
-  "agents": {
-    "explore": {
-      "backend": "opencode",
-      "model": "provider/fast-model",
-      "description": "Code exploration (1M context, low cost)"
-    },
-    "develop": {
-      "backend": "codex",
-      "model": "provider/strong-model",
-      "description": "Code implementation",
-      "yolo": true
-    },
-    "reviewer": {
-      "backend": "claude",
-      "model": "provider/reasoning-model",
-      "description": "Code review"
-    },
-    "oracle": {
-      "backend": "codex",
-      "model": "provider/strong-model",
-      "description": "Persistent context technical advisor",
-      "yolo": true
-    },
-    "oracle-arch": {
-      "backend": "codex",
-      "model": "provider/strong-model",
-      "description": "Architecture decisions"
-    }
-  }
-}
+```bash
+# Explicit model (authoritative — overrides everything else)
+aimeshchat run "analyze the rendering pipeline" --model provider/model-name
+
+# Oracle advisors expand an ExecutionSpec into explicit flags:
+aimeshchat oracle start "$KEY" --model gpt-5.6-sol --variant reasoning \
+  --system "..." --prompt "..."
 ```
 
-Use `--agent <name>` to select a preset. The `oracle` preset with session persistence enables cross-consultation context.
+Without `--model`, the resolution order is: the caller's `runtime.context`
+(gateway mechanism) → `~/.omp/agent/execution-context.json` /
+`$AIMESHCHAT_EXECUTION_CONTEXT` → as a backward-compat fallback only, the OMP
+agent profile's `model:` field in `agents/<agent_type>.md` (`_read_agent_model()`).
+If all are absent the command fails and asks for `--model`.
+
+- `config.yml` `fallbackChains` / `modelRoles` are **never parsed**.
+- `--agent` is a deprecated compatibility placeholder with **no model
+  semantics** (passing it emits a deprecation warning). Pass
+  `--model`/`--variant`/`--system` explicitly.
+- Oracle advisors (`oracle` / `oracle-lite` / `oracle-opus`) work the same
+  way — the skill owns the model/prompt strategy and passes it explicitly;
+  see `skills/persist-oracle/SKILL.md`.
 
 ## Session Management
 
@@ -239,7 +225,7 @@ Socket path: `$XDG_RUNTIME_DIR/aimeshchat/ssh/<host-hash>.sock`
 │  CLI / Runners                                                      │
 │  ├─ config/repo_map.py       # repo-map.json loader                │
 │  ├─ routing/resolver.py      # topic → host → path resolution      │
-│  ├─ runners/go_wrapper.py    # Go codeagent-wrapper                 │
+│  ├─ runners/base.py                # runner interface (omp/opencode)│
 │  ├─ runners/omp.py           # omp CLI                             │
 │  ├─ session/registry.py      # SQLite session store                 │
 │  └─ remote_exec.py           # remote helper (deployed to hosts)    │
@@ -438,7 +424,7 @@ launcher, not to the agent's reasoning.
 
 ## Relationship to code-route
 
-`aimeshchat` replaces `code_route.py` as the routing/execution layer. The Go `codeagent-wrapper` binary is preserved as-is for codex/claude/gemini/opencode backends.
+`aimeshchat` replaces `code_route.py` as the routing/execution layer. Execution runs on the native `omp` / `opencode` runners — there is no Go `codeagent-wrapper`.
 
 | Old command | New command |
 |-------------|-------------|
@@ -454,16 +440,6 @@ uv run aimeshchat --version # Verify CLI
 ```
 
 ## ACKNOWLEDGEMENTS
-
-### codeagent-wrapper / myclaude
-
-This project builds on **[stellarlinkco/myclaude](https://github.com/stellarlinkco/myclaude)**,
-the Go-based `codeagent-wrapper` binary distributed as an npm package.
-
-- **What we use**: `GoWrapperRunner` (`src/codeagent/runners/go_wrapper.py`) wraps the Go
-  `codeagent-wrapper` binary to execute AI code agents through a unified interface.
-- **Installation**: Wrapper is installed via `npx github:stellarlinkco/myclaude` (GitHub npm package, not public registry).
-- **License**: Upstream wrapper is AGPL-3.0. codeagent-py calls it as an independent subprocess.
 
 ### tmux-agent-skills
 

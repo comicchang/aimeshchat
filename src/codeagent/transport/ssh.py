@@ -433,9 +433,11 @@ def _run_ssh_wire(
             result_stderr = msg.stderr
             exit_code = msg.exit_code
         elif msg.type == MSG_ERROR:
+            # P1-2: 远端显式报错，必须返回非零码。
+            # 不用 -1 哨兵值，否则回落到 proc.returncode（通常为 0）。
             got_terminal = True
             result_stderr = msg.message
-            exit_code = -1
+            exit_code = 1
 
     # P1-3: got_terminal invariant — EOF without a terminal frame (frame
     # dropped by the >1MiB guard, truncated output, garbage-only stream)

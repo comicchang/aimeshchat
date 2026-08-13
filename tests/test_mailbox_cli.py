@@ -175,7 +175,9 @@ class TestMailboxHealth:
             monkeypatch.setenv("OMP_MAILBOX_IDENTITY_FILE", str(identity))
         return store
 
-    def test_diagnose_healthy(self, tmp_path):
+    def test_diagnose_healthy(self, tmp_path, monkeypatch):
+        # 隔离宿主环境变量泄漏：健康配置下不应误判 identity 已设置
+        monkeypatch.delenv("OMP_MAILBOX_IDENTITY_FILE", raising=False)
         store = self._healthy_store(tmp_path)
         checks = mailbox_health.diagnose(store, "s1", "w1")
         assert checks["root_exists"] is True

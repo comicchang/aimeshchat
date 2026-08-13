@@ -18,7 +18,7 @@ PROTOCOL_VERSION = 2
 VALID_KINDS = frozenset({"TASK", "REPORT", "PROGRESS", "EVIDENCE", "QUESTION", "RESPONSE", "NOTICE", "RECEIPT"})
 VALID_STATES = frozenset({"IDLE", "BUSY", "DONE", "BLOCKED"})
 REQUIRED_FIELDS = frozenset({"session_id", "from", "to", "subject", "body", "kind", "msg_id", "created_at"})
-OPTIONAL_FIELDS = frozenset({"protocol_version", "require_ack", "receipt_type", "reply_to", "run_id", "request_id", "trace_id", "causation_id", "attachments"})
+OPTIONAL_FIELDS = frozenset({"protocol_version", "require_ack", "receipt_type", "reply_to", "run_id", "request_id", "command_id", "trace_id", "causation_id", "attachments"})
 # Per-kind field requirements beyond the global REQUIRED_FIELDS.
 # Keys are kind strings; values are sets of field names that MUST be present
 # (and non-empty-string) when a message carries that kind.
@@ -121,6 +121,9 @@ class Message:
     reply_to: str = ""
     run_id: str = ""
     request_id: str = ""
+    # P1-1: gateway runtime_send 写入时携带 command_id（= request_id），
+    # 插件以此对齐命令表主键回传 ack（runtime.command_ack）。
+    command_id: str = ""
     trace_id: str = ""
     causation_id: str = ""
     attachments: list[AttachmentRef] = field(default_factory=list)
@@ -149,6 +152,8 @@ class Message:
             d["run_id"] = self.run_id
         if self.request_id:
             d["request_id"] = self.request_id
+        if self.command_id:
+            d["command_id"] = self.command_id
         if self.trace_id:
             d["trace_id"] = self.trace_id
         if self.causation_id:
@@ -171,6 +176,7 @@ class Message:
             reply_to=d.get("reply_to", ""),
             run_id=d.get("run_id", ""),
             request_id=d.get("request_id", ""),
+            command_id=d.get("command_id", ""),
             trace_id=d.get("trace_id", ""),
             causation_id=d.get("causation_id", ""),
             attachments=[AttachmentRef.from_dict(a) for a in d.get("attachments", []) if isinstance(a, dict)],

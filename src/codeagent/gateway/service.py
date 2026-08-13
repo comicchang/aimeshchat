@@ -729,6 +729,7 @@ class AgentGateway:
         # Initial task: the oldest TASK addressed to this agent, if any.
         initial_task = ""
         initial_task_msg_id = ""
+        initial_task_command_id = ""  # P1-1: 关联键（= request_id，命令表主键）
         try:
             inbox = self._store.agent_subdir(session_id, agent_id, "inbox")
             files = self._store.list_messages(inbox)
@@ -740,6 +741,9 @@ class AgentGateway:
                 if msg.get("kind") == "TASK":
                     initial_task = msg.get("body", "")
                     initial_task_msg_id = msg.get("msg_id", "")
+                    # P1-1: 消息携带 Gateway runtime_send 写入的 command_id
+                    # （= request_id），插件以此对齐命令表主键回传 ack。
+                    initial_task_command_id = msg.get("command_id", "")
                     break
         except Exception as exc:
             log.warning("gateway: initial task scan failed: %s", exc)
@@ -759,6 +763,7 @@ class AgentGateway:
             "generation": generation,
             "initial_task": initial_task,
             "initial_task_msg_id": initial_task_msg_id,
+            "initial_task_command_id": initial_task_command_id,
         }
 
     def runtime_declare(self, params: dict) -> dict:
@@ -1141,6 +1146,45 @@ class AgentGateway:
                     record.binding = bind
             if (record.presence, record.binding, record.agent_state) != before:
                 self._persist_control_state(record)
+            # P1-1：消费 TURN_TRIGGERED 事件推进命令状态机（向后兼容——
+            # 旧插件仍走 runtime.event 上报；新插件走 runtime.command_ack，
+            # 此为双通道冗余）。关联键：payload.command_id 或事件
+            # request_id（均为 = request_id，即命令表主键）。best-effort：
+            # 命令未知/已终态/非法迁移时仅告警，不因事件失败影响插件。
+            if draft.kind == "TURN_TRIGGERED":
+                payload = draft.payload if isinstance(draft.payload, dict) else {}
+                cmd_key = payload.get("command_id", "") or draft.request_id
+                if cmd_key:
+                    try:
+                        crow = self._control.get_command(cmd_key)
+                        if crow is None:
+                            log.warning(
+                                "gateway: TURN_TRIGGERED event for unknown command %s",
+                                cmd_key,
+                            )
+                        elif crow["state"] != CMD_TURN_TRIGGERED:
+                            advanced = _advance_ack_chain(crow["state"], CMD_TURN_TRIGGERED)
+                            if advanced is None:
+                                log.warning(
+                                    "gateway: TURN_TRIGGERED event cannot advance %s from %s",
+                                    cmd_key, crow["state"],
+                                )
+                            else:
+                                final_state, intermediates = advanced
+                                self._control.update_command(
+                                    cmd_key, state=final_state,
+                                    turn_id=payload.get("turn_id", "") or crow.get("turn_id", ""),
+                                    detail={
+                                        "ack": CMD_TURN_TRIGGERED, "ack_at": _now_iso(),
+                                        "via": "runtime_event",
+                                        "advanced_from": crow["state"],
+                                        "advanced_through": intermediates,
+                                    },
+                                )
+                    except Exception as exc:
+                        log.warning(
+                            "gateway: TURN_TRIGGERED event advance failed: %s", exc,
+                        )
         return {"event_id": ev.event_id, "source_sequence": ev.source_sequence}
 
     def runtime_send(self, params: dict) -> dict:
@@ -1163,8 +1207,10 @@ class AgentGateway:
           ambiguous          可能已触发，禁止自动重投
 
         不承诺虚假 exactly-once：TRIGGERING 崩溃后重查 → AMBIGUOUS。
-        TURN_TRIGGERED ack 链（插件相关 ack 握手）为 TODO —— 本方法只
-        返回已确认阶段，绝不把未确认投递报成 turn_triggered。
+        P1-1：TURN_TRIGGERED ack 链已打通 —— mailbox 消息带 command_id
+        （= request_id），插件 turn_start 后经 runtime.command_ack 上报
+        TURN_TRIGGERED，gateway 沿 ack 链推进命令状态。本方法只返回
+        已确认阶段，绝不把未确认投递报成 turn_triggered。
         """
         runtime_id = params.get("runtime_id", "")
         request_id = params.get("request_id", "")
@@ -1237,6 +1283,10 @@ class AgentGateway:
                 reply_to=params.get("reply_to", ""),
                 run_id=params.get("run_id", ""),
                 request_id=request_id,
+                # P1-1: 关联键对齐 —— mailbox 消息携带 command_id（= request_id），
+                # 插件 ack 时以 msg.command_id 回传 runtime.command_ack，
+                # 命中命令表主键（request_id）推进状态机。
+                command_id=request_id,
                 require_ack=bool(params.get("require_ack", False)),
             )
             if receipt.status == "failed":
@@ -1332,9 +1382,11 @@ class AgentGateway:
                 return self._command_result(self._control.get_command(request_id))
 
         # ── 5) hot（agent_running/idle）：mailbox 持久队列已写入 ────────
-        # OMP turn 关联需插件精确 claim + TURN_TRIGGERED ack（ack 链 TODO）；
+        # P1-1：OMP turn 关联已打通 —— 插件精确 claim 后，turn_start 经
+        # runtime.command_ack 上报 TURN_TRIGGERED 推进命令状态机。此处
         # 不承诺虚假 exactly-once → 保持 QUEUED，返回 mailbox_persisted，
-        # 后续经 runtime.command_ack 推进状态。
+        # 后续由插件 ack 推进（QUEUED→CLAIMED→REVIVING→TRIGGERING→
+        # TURN_TRIGGERED，跳级自动补齐中间态）。
         return self._command_result(self._control.get_command(request_id))
 
     def runtime_lifecycle(self, params: dict) -> dict:
@@ -1387,8 +1439,11 @@ class AgentGateway:
         TRIGGERING → TURN_TRIGGERED），而非 PROTOCOL_CONFLICT 拒绝
         （统一 ack 协议：插件可跳级，gateway 在 claim/revive/dispatch
         边界补齐）。
-        TURN_TRIGGERED 的 turn_id 与 OMP turn_start 的关联校验（correlated
-        ack 握手）为 TODO —— 插件侧未实现前仅做机械状态推进。
+        P1-1：关联键已对齐 —— 插件 ack 的 request_id 取自 mailbox 消息的
+        command_id（= gateway runtime_send 写入的 request_id，即命令表主
+        键），TURN_TRIGGERED ack 可达、可推进命令状态。turn_id 与 OMP
+        turn_start 的精确关联校验仍为 TODO —— 插件侧 OMP turn_start 不
+        暴露 turn_id，Gateway 通过时间窗口关联。
         """
         request_id = params.get("request_id", "")
         state = params.get("state", "")

@@ -141,6 +141,7 @@ class MailboxService:
         reply_to: str = "",
         run_id: str = "",
         request_id: str = "",
+        command_id: str = "",  # P1-1: 透传给 store.send（gateway 写 command 消息时 = request_id）
         trace_id: str = "",
         causation_id: str = "",
         attachments: Optional[list] = None,
@@ -167,6 +168,7 @@ class MailboxService:
                 reply_to=reply_to,
                 run_id=run_id,
                 request_id=request_id,
+                command_id=command_id,
                 trace_id=trace_id,
                 causation_id=causation_id,
                 attachments=attachments,

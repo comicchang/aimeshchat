@@ -963,7 +963,8 @@ class TestRunSSHWire:
             backend="opencode",
         )
         assert result.stderr == "workdir not found"
-        assert result.returncode == 0
+        # P1-2: MSG_ERROR 是远端显式报错 → 非零码（1），不再吞成 returncode=0
+        assert result.returncode == 1
 
 
 # ---------------------------------------------------------------------------

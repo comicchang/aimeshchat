@@ -46,11 +46,11 @@ requires:
 # 路由
 aimeshchat route list
 aimeshchat route where <topic>
-printf '%s\n' '<task>' | aimeshchat route <topic> --repo 0 --backend codex --agent explore
+printf '%s\n' '<task>' | aimeshchat route <topic> --repo 0 --model <provider/model>
 aimeshchat route <topic> '<task>' --dry-run
 
 # 直接执行
-aimeshchat run '<task>' <workdir> --host <host> --backend codex --agent develop
+aimeshchat run '<task>' <workdir> --host <host> --model <provider/model>
 
 # Session 管理
 aimeshchat sessions list [--host H] [--topic T]

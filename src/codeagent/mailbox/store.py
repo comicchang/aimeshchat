@@ -40,6 +40,29 @@ from codeagent.mailbox.protocol import (
 
 log = logging.getLogger(__name__)
 
+# P1-6: mailbox 敏感数据权限收敛 —— 目录 0700、消息文件 0600。
+# 对照既有收敛（control socket 0700、identity.json 0600），避免消息体
+# 以 0644/0755 落盘被同机其他用户窥探。
+_DIR_MODE_0700 = 0o700
+_FILE_MODE_0600 = 0o600
+
+
+def _mkdir_0700(d: Path) -> None:
+    """P1-6: 保留原 mkdir（parents/exist_ok）语义，追加 chmod 0700。"""
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, _DIR_MODE_0700)
+    except OSError:
+        pass  # 非 POSIX / 只读挂载 —— 尽力而为
+
+
+def _chmod_0600(p: Path) -> None:
+    """P1-6: 消息体/元数据文件权限收紧为 0600。"""
+    try:
+        os.chmod(p, _FILE_MODE_0600)
+    except OSError:
+        pass  # 非 POSIX —— 尽力而为
+
 
 def resolve_root(root: Optional[Path] = None) -> Path:
     if root is not None:
@@ -190,6 +213,13 @@ class MailboxStore:
     def agent_subdir(self, session_id: str, agent_id: str, sub: str) -> Path:
         return self.agent_dir(session_id, agent_id) / sub
 
+    def _ensure_agent_dirs(self, session_id: str, agent_id: str) -> None:
+        """P1-6: 创建 agent 目录及其 inbox/processing/archive/_corrupt 子目录，
+        全部收敛 0700（保留原 parents=True/exist_ok mkdir 语义）。"""
+        _mkdir_0700(self.agent_dir(session_id, agent_id))
+        for sub in ("inbox", "processing", "archive", "_corrupt"):
+            _mkdir_0700(self.agent_subdir(session_id, agent_id, sub))
+
     def list_messages(self, inbox: Path) -> list[Path]:
         if not inbox.exists():
             return []
@@ -229,8 +259,9 @@ class MailboxStore:
         # a home, and the lock is acquired BEFORE any existence check — a
         # merger can no longer beat a creator into the same dir and crash on
         # a missing session.json, nor can two creators double-write it.
-        sd.mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(str(sd / ".session.lock"), os.O_CREAT | os.O_RDWR)
+        _mkdir_0700(sd)  # P1-6: 会话目录 0700
+        _mkdir_0700(self.root)  # P1-6: mailbox 根目录由 parents=True 隐式创建，一并收敛 0700
+        lock_fd = os.open(str(sd / ".session.lock"), os.O_CREAT | os.O_RDWR, _FILE_MODE_0600)
         try:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -262,8 +293,7 @@ class MailboxStore:
                 if added:
                     # Create subdirs for newly added agents only
                     for aid in added:
-                        for sub in ("inbox", "processing", "archive", "_corrupt"):
-                            self.agent_subdir(session_id, aid, sub).mkdir(parents=True, exist_ok=True)
+                        self._ensure_agent_dirs(session_id, aid)
 
                 # Rewrite session.json with merged roster (+acl if provided)
                 existing["agents"] = merged
@@ -283,7 +313,9 @@ class MailboxStore:
                     f.write(json.dumps(existing, indent=2, ensure_ascii=False))
                     f.flush()
                     os.fsync(f.fileno())
+                _chmod_0600(tmp)  # P1-6: session.json 0600（含 acl 等敏感元数据）
                 os.replace(str(tmp), str(sd / "session.json"))
+                _chmod_0600(sd / "session.json")  # P1-6: 覆盖既有文件的旧权限
                 self._fsync_dir(sd)  # P2-4
 
                 if added:
@@ -310,14 +342,14 @@ class MailboxStore:
                 f.write(json.dumps(meta, indent=2, ensure_ascii=False))
                 f.flush()
                 os.fsync(f.fileno())
+            _chmod_0600(tmp)  # P1-6: session.json 0600
             os.replace(str(tmp), str(sd / "session.json"))
+            _chmod_0600(sd / "session.json")  # P1-6
             self._fsync_dir(sd)  # P2-4
 
             for aid in meta["agents"]:
-                for sub in ("inbox", "processing", "archive", "_corrupt"):
-                    self.agent_subdir(session_id, aid, sub).mkdir(parents=True, exist_ok=True)
-            for sub in ("inbox", "processing", "archive", "_corrupt"):
-                self.agent_subdir(session_id, manager_id, sub).mkdir(parents=True, exist_ok=True)
+                self._ensure_agent_dirs(session_id, aid)
+            self._ensure_agent_dirs(session_id, manager_id)
 
             return f"session {session_id} created: manager={manager_id}, agents={meta['agents']}"
         finally:
@@ -343,6 +375,7 @@ class MailboxStore:
         self, session_id: str, from_id: str, to_id: str,
         subject: str, body: str, kind: str = "REPORT",
         reply_to: str = "", run_id: str = "", request_id: str = "",
+        command_id: str = "",  # P1-1: 关联键（gateway 写 command 消息时 = request_id）
         trace_id: str = "", causation_id: str = "",
         attachments: Optional[list] = None,
         msg_id: Optional[str] = None,
@@ -444,6 +477,7 @@ class MailboxStore:
                     and existing.get("reply_to", "") == (reply_to or "")
                     and existing.get("run_id", "") == (run_id or "")
                     and existing.get("request_id", "") == (request_id or "")
+                    and existing.get("command_id", "") == (command_id or "")
                     and existing.get("trace_id", "") == (trace_id or "")
                     and existing.get("causation_id", "") == (causation_id or "")
                     and bool(existing.get("require_ack", False)) == bool(require_ack)
@@ -472,7 +506,9 @@ class MailboxStore:
                         f.write(json.dumps(existing, indent=2, ensure_ascii=False))
                         f.flush()
                         os.fsync(f.fileno())
+                    _chmod_0600(tmp)  # P1-6: 消息体信封 0600
                     os.replace(str(tmp), str(dest))
+                    _chmod_0600(dest)  # P1-6: 覆盖既有文件的旧权限
                     backfilled += 1
                 # P2-4: backfilled envelopes durable before returning.
                 for rid in recipients:
@@ -497,6 +533,7 @@ class MailboxStore:
             subject=subject, body=body, kind=kind, msg_id=msg_id,
             created_at=datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
             reply_to=reply_to, run_id=run_id, request_id=request_id,
+            command_id=command_id,
             trace_id=trace_id, causation_id=causation_id,
             attachments=refs,
             require_ack=require_ack,
@@ -521,7 +558,9 @@ class MailboxStore:
                 f.write(json.dumps(payload, indent=2, ensure_ascii=False))
                 f.flush()
                 os.fsync(f.fileno())
+            _chmod_0600(tmp)  # P1-6: 消息体信封 0600
             os.replace(str(tmp), str(dest))
+            _chmod_0600(dest)  # P1-6: 覆盖既有文件的旧权限
         # P2-4: envelope renames must be durable before the cursor — which
         # readers trust for ordering — is committed.
         for rid in recipients:
@@ -537,7 +576,9 @@ class MailboxStore:
                 f.write(json.dumps(payload, indent=2, ensure_ascii=False))
                 f.flush()
                 os.fsync(f.fileno())
+            _chmod_0600(tmp)  # P1-6: 消息体信封 0600
             os.replace(str(tmp), str(dest))
+            _chmod_0600(dest)  # P1-6: 覆盖既有文件的旧权限
         # P2-4: cursor-stamped envelopes durable before history is appended.
         for rid in recipients:
             self._fsync_dir(self.agent_subdir(session_id, rid, "inbox"))
@@ -564,7 +605,7 @@ class MailboxStore:
         duplicate seq values.
         """
         sd = self.session_dir(session_id)
-        sd.mkdir(parents=True, exist_ok=True)
+        _mkdir_0700(sd)  # P1-6: 会话目录 0700
         cursor_file = sd / STREAM_CURSOR_FILE
 
         now_ms = int(time.time() * 1000)
@@ -601,7 +642,9 @@ class MailboxStore:
                 f.write(json.dumps(new_data, ensure_ascii=False))
                 f.flush()
                 os.fsync(f.fileno())
+            _chmod_0600(tmp)  # P1-6: 流游标 0600
             os.replace(str(tmp), str(cursor_file))
+            _chmod_0600(cursor_file)  # P1-6
             self._fsync_dir(sd)  # P2-4
         finally:
             try:
@@ -658,7 +701,7 @@ class MailboxStore:
         self._validate_msg_id(message["msg_id"])
 
         hd = sd / "history"
-        hd.mkdir(parents=True, exist_ok=True)
+        _mkdir_0700(hd)  # P1-6: history 目录 0700
         dest = hd / f"{message['msg_id']}.json"
         if dest.exists():
             raise ValueError(f"history entry already exists: {message['msg_id']}")
@@ -668,9 +711,11 @@ class MailboxStore:
                 f.write(json.dumps(message, indent=2, ensure_ascii=False))
                 f.flush()
                 os.fsync(f.fileno())
+            _chmod_0600(tmp)  # P1-6: history 消息体 0600
         except FileExistsError:
             raise ValueError(f"history entry already exists: {message['msg_id']}")
         os.replace(str(tmp), str(dest))
+        _chmod_0600(dest)  # P1-6
         self._fsync_dir(hd)  # P2-4
         return f"history: {message['msg_id']}"
 
@@ -739,6 +784,9 @@ class MailboxStore:
                     "kind": msg.get("kind", "?"),
                     "subject": msg.get("subject", "")[:max_subject],
                     "msg_id": msg.get("msg_id", f.stem),
+                    # P1-1: 关联键透出 —— 插件以 command_id（= request_id）
+                    # 回传 runtime.command_ack 命中命令表主键。
+                    "command_id": msg.get("command_id", ""),
                 })
             except (json.JSONDecodeError, UnicodeDecodeError):
                 summaries.append({"from": "?", "kind": "?", "subject": "(unreadable)", "msg_id": f.stem})
@@ -791,7 +839,7 @@ class MailboxStore:
             except FileNotFoundError:
                 continue  # P2-7: another reader claimed it between list and read
             except (json.JSONDecodeError, UnicodeDecodeError):
-                corrupt_dir.mkdir(parents=True, exist_ok=True)
+                _mkdir_0700(corrupt_dir)  # P1-6: _corrupt 目录 0700
                 try:
                     os.replace(str(target), str(corrupt_dir / target.name))
                 except OSError:
@@ -801,7 +849,7 @@ class MailboxStore:
             # Full validation: session + recipient + filename
             ok, reason = validate_message(msg, session_id, agent_id, target.name)
             if not ok:
-                corrupt_dir.mkdir(parents=True, exist_ok=True)
+                _mkdir_0700(corrupt_dir)  # P1-6: _corrupt 目录 0700
                 os.replace(str(target), str(corrupt_dir / target.name))
                 continue
 
@@ -820,11 +868,11 @@ class MailboxStore:
                     "(session %s, agent %s)",
                     target.name, msg.get("from", ""), session_id, agent_id,
                 )
-                corrupt_dir.mkdir(parents=True, exist_ok=True)
+                _mkdir_0700(corrupt_dir)  # P1-6: _corrupt 目录 0700
                 os.replace(str(target), str(corrupt_dir / target.name))
                 continue
 
-            processing.mkdir(parents=True, exist_ok=True)
+            _mkdir_0700(processing)  # P1-6: processing 目录 0700
             dest = processing / target.name
             # Unique tmp claim to avoid concurrent collision
             import random as _rand
@@ -842,6 +890,7 @@ class MailboxStore:
                     fc.write(json.dumps(claim_meta))
                     fc.flush()
                     os.fsync(fc.fileno())
+                _chmod_0600(tmp_claim)  # P1-6: claim 0600（hard link 后 claim 文件同权限）
             except FileExistsError:
                 tmp_claim.unlink(missing_ok=True)
                 continue
@@ -882,6 +931,7 @@ class MailboxStore:
                         fc.write(json.dumps(claim_meta))
                         fc.flush()
                         os.fsync(fc.fileno())
+                    _chmod_0600(claim_file)  # P1-6: claim 0600
                 except FileExistsError:
                     tmp_claim.unlink(missing_ok=True)
                     # P1-1: same expired-claim reap as the os.link path above.
@@ -999,7 +1049,7 @@ class MailboxStore:
         if claim.get("owner") != owner:
             raise ValueError(f"owner mismatch: claim={claim.get('owner')} vs {owner}")
 
-        archive.mkdir(parents=True, exist_ok=True)
+        _mkdir_0700(archive)  # P1-6: archive 目录 0700
         os.replace(str(target), str(archive / target.name))
         claim_file.unlink(missing_ok=True)
         # P2-4: processing → archive rename durable before returning.
@@ -1052,7 +1102,7 @@ class MailboxStore:
                     f"msg {msg_id} has an active foreign claim; use finalize() instead"
                 )
 
-        archive.mkdir(parents=True, exist_ok=True)
+        _mkdir_0700(archive)  # P1-6: archive 目录 0700
         os.replace(str(src), str(archive / src.name))
         # P2-4: inbox/processing → archive rename durable before returning.
         self._fsync_dir(src.parent)
@@ -1140,7 +1190,9 @@ class MailboxStore:
                     f.write(json.dumps(claim, indent=2, ensure_ascii=False))
                     f.flush()
                     os.fsync(f.fileno())
+                _chmod_0600(tmp)  # P1-6: claim 0600
                 os.replace(str(tmp), str(claim_file))
+                _chmod_0600(claim_file)  # P1-6
                 self._fsync_dir(processing)  # P2-4
             except OSError:
                 tmp.unlink(missing_ok=True)
@@ -1285,7 +1337,9 @@ class MailboxStore:
             f.write(json.dumps(status.to_dict(), indent=2, ensure_ascii=False))
             f.flush()
             os.fsync(f.fileno())
+        _chmod_0600(tmp)  # P1-6: status.json 0600（含 current_task/last_conclusion 等敏感内容）
         os.replace(str(tmp), str(dest))
+        _chmod_0600(dest)  # P1-6
         self._fsync_dir(ad)  # P2-4
         return f"status: {state}"
 
@@ -1520,11 +1574,11 @@ class MailboxStore:
                 if not ok:
                     raise ValueError(reason)
             except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
-                corrupt_dir.mkdir(parents=True, exist_ok=True)
+                _mkdir_0700(corrupt_dir)  # P1-6: _corrupt 目录 0700
                 os.replace(str(entry), str(corrupt_dir / filename))
                 continue
 
-            archive.mkdir(parents=True, exist_ok=True)
+            _mkdir_0700(archive)  # P1-6: archive 目录 0700
             os.replace(str(entry), str(archive / filename))
             results.append(msg)
 
@@ -1583,9 +1637,10 @@ class RequestLedger:
         concurrent processes writing to the same request_id directory.
         """
         events_dir = self._events_dir(request_id)
-        events_dir.mkdir(parents=True, exist_ok=True)
+        _mkdir_0700(events_dir)  # P1-6: events 目录 0700
         lock_path = events_dir / ".lock"
         lock_fd = open(lock_path, "w")
+        _chmod_0600(lock_path)  # P1-6: 锁文件 0600
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             if event in TERMINAL_STATES:
@@ -1766,7 +1821,7 @@ class RequestLedger:
             "meta": meta,
         }
         d = self._events_dir(request_id)
-        d.mkdir(parents=True, exist_ok=True)
+        _mkdir_0700(d)  # P1-6: events 目录 0700
         with open(self._events_file(request_id), "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             # P2-11: fsync the append — without it a crash could lose the
@@ -1775,6 +1830,7 @@ class RequestLedger:
             # considered it finished.
             f.flush()
             os.fsync(f.fileno())
+        _chmod_0600(self._events_file(request_id))  # P1-6: events.jsonl 0600
 
     def _read_entries(self, request_id: str, run_id: str) -> list[dict]:
         """Read entries filtered to a specific run_id."""
