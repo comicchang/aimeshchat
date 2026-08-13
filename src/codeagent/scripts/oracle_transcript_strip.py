@@ -42,7 +42,7 @@ _DEFAULT_HEAD_BYTES = 2048
 _SESSIONS_ROOT = Path.home() / ".omp" / "agent" / "sessions"
 
 # JSONL 中应保留的 message role 集合
-_KEEP_ROLES = frozenset({"user", "assistant"})
+_KEEP_ROLES = frozenset({"user", "assistant", "toolResult"})
 
 # JSONL 中应保留的元数据行 type 集合（session identity，≈0.5KB）
 _KEEP_HEADER_TYPES = frozenset({"title", "session"})
@@ -201,14 +201,19 @@ def _filter_session_jsonl(jsonl_path: Path,
                 kept_lines.append(raw)
                 kept += 1
                 continue
-            # 保留：message 且 role in {user, assistant}
+            # 保留：message 且 role in {user, assistant, toolResult}
             if t == "message":
                 role = obj.get("message", {}).get("role", "")
                 if role in _KEEP_ROLES:
                     kept_lines.append(raw)
                     kept += 1
                     continue
-            # 丢弃：toolResult / developer / custom / custom_message 等
+            # 保留：tool_execution_start（tool call 参数/命令——审计"做了什么"）
+            if t == "custom" and obj.get("customType", "") == "tool_execution_start":
+                kept_lines.append(raw)
+                kept += 1
+                continue
+            # 丢弃：developer / custom_message / 其他 custom 等
             dropped += 1
 
     # 计算过滤后大小（dry_run 也需要报告）

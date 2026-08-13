@@ -533,13 +533,11 @@ def ensure_omp_memory_config(apply: bool = False) -> dict:
 
 _ORACLE_OVERLAY_CONTENT = """\
 # oracle overlay — 自动生成，勿手动编辑。
-# 杀 advisor.jsonl（499MB 被动二评）+ 溢出大 tool 结果 + 减少显示噪声。
+# MFT：唯一落盘相关键 = advisor.enabled=false（杀 499MB __advisor.jsonl 被动二评）。
+# display.hideToolActivity（仅 TUI）/ compaction.strategy（仅上下文）不落盘，是文档噪音。
+# tool 结果溢出/截断走 OMP 默认（>50KB 溢出到 artifact，jsonl 保留 head20KB+tail20KB，审计够用且 jsonl 小）。
 advisor:
   enabled: false
-display:
-  hideToolActivity: true
-tools:
-  artifactSpillThreshold: 50
 """
 
 
