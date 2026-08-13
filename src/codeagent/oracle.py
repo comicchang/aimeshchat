@@ -67,6 +67,8 @@ _TERMINAL_TASK_STATES = frozenset({
 _SKIP_TEXT_MARKER = "Skipped due to pending system advisory"
 # P2-C: 卡死检测只扫描 JSONL 尾部 N 行（避免大文件全量读取开销）。
 _STUCK_SCAN_TAIL_LINES = 200
+# P1: oracle result 输出截断上限（字节），可通过 ORACLE_RESULT_MAX_BYTES 覆盖。
+_DEFAULT_RESULT_MAX_BYTES = 8192
 
 
 def _kernel_and_store():
@@ -2075,6 +2077,32 @@ def _scan_mailbox_report(review_key: str, manifest) -> Optional[str]:
     return None
 
 
+def _truncate_result(text: str, max_bytes: int) -> tuple[str, bool, int, int]:
+    """P1: UTF-8 安全截断——行边界优先，退让空白。
+
+    返回 (truncated_text, was_truncated, truncated_bytes, total_bytes)。
+    max_bytes <= 0 表示不截断。
+    """
+    if max_bytes <= 0:
+        return text, False, 0, len(text.encode("utf-8"))
+    total = len(text.encode("utf-8"))
+    if total <= max_bytes:
+        return text, False, 0, total
+    # 截断：找 max_bytes 边界，不劈多字节
+    truncated = text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    # 优先行边界：从末尾向前找最近的 \n（在后 30% 范围内）
+    search_start = max(0, int(len(truncated) * 0.7))
+    nl_pos = truncated.rfind("\n", search_start)
+    if nl_pos > search_start:
+        truncated = truncated[:nl_pos]
+    else:
+        # 退让空白字符
+        ws_pos = truncated.rfind(" ", search_start)
+        if ws_pos > search_start:
+            truncated = truncated[:ws_pos]
+    return truncated, True, len(truncated.encode("utf-8")), total
+
+
 def cmd_oracle_result(args: argparse.Namespace) -> int:
     """A2: unified result extraction — session transcript → mailbox REPORT → FS scan.
 
@@ -2096,6 +2124,9 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     manifest = ParkRegistry().lookup(review_key)
     start_since = _review_start_ts(review_key, manifest)
     max_msgs = 10**6 if want_all else 1
+    # P1: 截断上限——--all 跳过上限，否则读环境变量或默认值
+    max_bytes = 0 if want_all else int(
+        os.environ.get("ORACLE_RESULT_MAX_BYTES", _DEFAULT_RESULT_MAX_BYTES))
 
     out: dict = {
         "review_key": review_key,
@@ -2113,14 +2144,24 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
         if path is not None:
             msgs = _extract_assistant_messages(path, max_messages=max_msgs)
             if msgs:
+                display_text = msgs[-1] if len(msgs) == 1 else "\n".join(msgs)
+                trunc_text, was_trunc, trunc_bytes, total_bytes = _truncate_result(
+                    display_text, max_bytes)
                 out.update({
                     "source": "session_transcript",
                     "confidence": 0.95,
-                    "messages": msgs,
+                    "messages": [trunc_text],
                 })
                 out["meta"]["path"] = str(path)
+                if was_trunc:
+                    out["truncated"] = True
+                    out["truncated_bytes"] = trunc_bytes
+                    out["total_bytes"] = total_bytes
+                    out["hint"] = "use --all for full result"
+                else:
+                    out["truncated"] = False
                 if raw_mode:
-                    print(msgs[-1])
+                    print(trunc_text)
                 else:
                     print(json.dumps(out, indent=2))
                 return 0
@@ -2128,13 +2169,22 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     # ── ② mailbox REPORT（reply_to == review_key 的终端信封）─────────
     report = _scan_mailbox_report(review_key, manifest)
     if report:
+        trunc_text, was_trunc, trunc_bytes, total_bytes = _truncate_result(
+            report, max_bytes)
         out.update({
             "source": "mailbox_report",
             "confidence": 0.9,
-            "messages": [report],
+            "messages": [trunc_text],
         })
+        if was_trunc:
+            out["truncated"] = True
+            out["truncated_bytes"] = trunc_bytes
+            out["total_bytes"] = total_bytes
+            out["hint"] = "use --all for full result"
+        else:
+            out["truncated"] = False
         if raw_mode:
-            print(report)
+            print(trunc_text)
         else:
             print(json.dumps(out, indent=2))
         return 0
@@ -2148,15 +2198,25 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
         if path is not None:
             msgs = _extract_assistant_messages(path, max_messages=max_msgs)
             if msgs:
+                display_text = msgs[-1] if len(msgs) == 1 else "\n".join(msgs)
+                trunc_text, was_trunc, trunc_bytes, total_bytes = _truncate_result(
+                    display_text, max_bytes)
                 out.update({
                     "source": "filesystem",
                     "confidence": 0.7,
-                    "messages": msgs,
+                    "messages": [trunc_text],
                 })
                 out["meta"]["path"] = str(path)
                 out["meta"]["since"] = start_since
+                if was_trunc:
+                    out["truncated"] = True
+                    out["truncated_bytes"] = trunc_bytes
+                    out["total_bytes"] = total_bytes
+                    out["hint"] = "use --all for full result"
+                else:
+                    out["truncated"] = False
                 if raw_mode:
-                    print(msgs[-1])
+                    print(trunc_text)
                 else:
                     print(json.dumps(out, indent=2))
                 return 0
@@ -2246,7 +2306,8 @@ def _wait_final_text(review_key: str) -> Optional[str]:
 
 
 def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
-                         timeout: float = 300.0, interval: float = 5.0) -> int:
+                         timeout: float = 300.0, interval: float = 5.0,
+                         max_bytes: int = 0) -> int:
     """A15: 等待 oracle 新产出并内联打印——供 cmd_oracle_wait 和 ask --wait 共用。
 
     复用 cmd_oracle_wait 的 baseline 过滤逻辑：baseline = ask 前主会话最新
@@ -2272,7 +2333,8 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
             if ev.get("kind") == "TASK_STATE" and (ev.get("payload") or {}).get("state") == "agent_end":
                 final = _wait_final_text(review_key)
                 if final is not None:
-                    print(final)
+                    trunc, _, _, _ = _truncate_result(final, max_bytes)
+                    print(trunc)
                 return 0
         cursor = int(boot.get("cursor") or 0)
     except GatewayError:
@@ -2300,13 +2362,15 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                 # __advisor.jsonl——主会话文本不变。baseline 比对过滤噪声。
                 final = _wait_final_text(review_key)
                 if final is not None and final != baseline_text:
-                    print(final)
+                    trunc, _, _, _ = _truncate_result(final, max_bytes)
+                    print(trunc)
                     return 0
                 continue  # advisor 噪声或无新主输出——继续等
             if kind == "TASK_STATE" and payload.get("state") == "agent_end":
                 final = _wait_final_text(review_key)
                 if final is not None:
-                    print(final)  # B1: 内联最终文本
+                    trunc, _, _, _ = _truncate_result(final, max_bytes)
+                    print(trunc)  # B1: 内联最终文本
                 return 0
         cursor = int(result.get("cursor") or cursor or 0)
         if time.monotonic() >= deadline:
@@ -2333,6 +2397,9 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
     review_key = args.review_key
     interval = max(0.1, float(getattr(args, "interval", 5.0) or 5.0))
     timeout = max(0.0, float(getattr(args, "timeout", 300.0) or 300.0))
+    # P1: 截断上限（oracle wait 无 --all，始终应用上限）
+    max_bytes = int(os.environ.get("ORACLE_RESULT_MAX_BYTES",
+                                   _DEFAULT_RESULT_MAX_BYTES))
 
     try:
         info = _gateway().call("runtime.info", {"review_key": review_key})
@@ -2364,7 +2431,8 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
 
     # A15: 委托给共享的 _wait_for_new_output 辅助函数
     return _wait_for_new_output(review_key, runtime_id, session_id,
-                                timeout=timeout, interval=interval)
+                                timeout=timeout, interval=interval,
+                                max_bytes=max_bytes)
 
 
 # ── release ────────────────────────────────────────────────────────────
