@@ -330,6 +330,8 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="B1: poll interval in seconds (default 5)")
     ora_wait.add_argument("--all", action="store_true", default=False,
                           help="P0-2: skip result truncation; print full answer without MAX_OUTPUT_BYTES cap")
+    ora_wait.add_argument("--auto-recover", action="store_true", default=False,
+                          help="P1-1: on stuck signal, auto release+revive then retry")
 
     ora_release = ora_sub.add_parser("release", help="Terminal state + release park + stop runtime")
     ora_release.add_argument("review_key")

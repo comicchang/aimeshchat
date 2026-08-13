@@ -274,6 +274,35 @@ def _normalize_oracle_agent(agent_type: str) -> str:
     return agent_type
 
 
+# ── P1-4: config fingerprint — 检测配置变更以即时生效 ─────────────────
+
+
+def _config_fingerprint() -> str:
+    """P1-4: 读取 ~/.omp/agent/config.yml 中模型相关配置的 SHA256 指纹。
+
+    只哈希影响模型解析的 section：modelRoles、fallbackChains、
+    retry.fallbackChains。返回 hex[:16]；文件缺失返回空串。
+    用于 manifest 落盘——ask 时比较当前指纹与 manifest 指纹，
+    不同则重新从配置推导 model chain（忽略 manifest 缓存）。
+    """
+    config_path = Path.home() / ".omp" / "agent" / "config.yml"
+    if not config_path.exists():
+        return ""
+    try:
+        parsed = _parse_flat_yaml(config_path)
+    except OSError:
+        return ""
+    # 只取影响模型解析的 key，忽略其他配置变更。
+    relevant: dict = {}
+    for section in ("modelRoles", "fallbackChains", "retry"):
+        if section in parsed:
+            relevant[section] = parsed[section]
+    if not relevant:
+        return ""
+    raw = json.dumps(relevant, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 # ── Q5b: default 继承主 agent 模型（runtime.context 机制）─────────────
 
 
@@ -378,11 +407,15 @@ def _ask_model_chain_realtime(agent_type: str, manifest, explicit_override: str 
     模型作为实时修正源；查询失败（gateway 不可达）或非 gateway 调用 →
     回退 manifest（旧行为，向后兼容）。
 
+    P1-4: 配置变更即时感知——比较当前 config.yml 指纹与 manifest 落盘指纹，
+    不同则跳过 manifest 缓存，重新从配置推导 model chain。
+
     优先级：
     1. 显式 --model（manifest.model / explicit_override）→ 永远优先。
     2. AIMESHCHAT_RUNTIME_ID 下 runtime.context_get 命中 → [实时模型]。
-    3. manifest 落盘模型（start 时解析的 primary_model / model）。
-    4. 旧 manifest 无 primary_model → 现场解析 agent profile。
+    3. P1-4: config fingerprint 不匹配 → 重新从配置推导（忽略 manifest 缓存）。
+    4. manifest 落盘模型（start 时解析的 primary_model / model）。
+    5. 旧 manifest 无 primary_model → 现场解析 agent profile。
     """
     explicit = (manifest.model if manifest else "") or explicit_override
     if explicit:
@@ -394,6 +427,16 @@ def _ask_model_chain_realtime(agent_type: str, manifest, explicit_override: str 
         ctx = None
     if ctx and ctx[0]:
         return [ctx[0]]
+    # P1-4: config fingerprint 比较——配置变更时忽略 manifest 缓存。
+    if manifest and manifest.config_fingerprint:
+        current_fp = _config_fingerprint()
+        if current_fp and current_fp != manifest.config_fingerprint:
+            log.warning(
+                "oracle: config fingerprint changed (manifest=%s, current=%s) — "
+                "re-deriving model chain from config (ignoring manifest cache)",
+                manifest.config_fingerprint, current_fp,
+            )
+            return _resolve_oracle_model_chain(agent_type, "")
     return _model_chain_from_manifest(agent_type, manifest, "")
 
 
@@ -1010,6 +1053,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             provider=spec.provider,
             variant=spec.variant,
             system_prompt=spec.system_prompt,
+            config_fingerprint=_config_fingerprint(),  # P1-4: 配置变更即时感知
         )
         registry.update(review_key, manifest)
     else:
@@ -1028,6 +1072,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             provider=spec.provider,
             variant=spec.variant,
             system_prompt=spec.system_prompt,
+            config_fingerprint=_config_fingerprint(),  # P1-4: 配置变更即时感知
         )
         registry.acquire(review_key, manifest)
 
@@ -1219,8 +1264,28 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             # （迁移兼容）。
             explicit_model = getattr(args, "model", "") or ""
             if manifest and manifest.primary_model:
-                ask_primary = explicit_model or manifest.primary_model
-                ask_model_chain = [ask_primary]
+                # P1-4: config fingerprint 比较——配置变更时重新推导。
+                if not explicit_model and manifest.config_fingerprint:
+                    cur_fp = _config_fingerprint()
+                    if cur_fp and cur_fp != manifest.config_fingerprint:
+                        log.warning(
+                            "oracle ask warm: config fingerprint changed "
+                            "(manifest=%s, current=%s) — re-deriving from config",
+                            manifest.config_fingerprint, cur_fp,
+                        )
+                        ask_agent_type = (manifest.agent_type or "") or args.agent
+                        ask_model_chain = _resolve_oracle_model_chain(ask_agent_type, "")
+                        if ask_model_chain:
+                            ask_primary = ask_model_chain[0]
+                        else:
+                            ask_primary = manifest.primary_model
+                            ask_model_chain = [ask_primary]
+                    else:
+                        ask_primary = manifest.primary_model
+                        ask_model_chain = [ask_primary]
+                else:
+                    ask_primary = explicit_model or manifest.primary_model
+                    ask_model_chain = [ask_primary]
             else:
                 # 旧 manifest 迁移兼容：走原有解析链
                 ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
@@ -1270,6 +1335,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 backend_session_id=new_backend_session_id,
                 round=manifest.round + 1,
                 last_activity_at=time.time(),
+                config_fingerprint=_config_fingerprint(),  # P1-4: 刷新指纹
             ))
             # I2: surface adoption failure in the success JSON.
             adopted = _adopt_runtime(review_key, sid, warm_handle,
@@ -1333,8 +1399,28 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     # （迁移兼容）。
     explicit_model = getattr(args, "model", "") or ""
     if manifest and manifest.primary_model:
-        cold_primary = explicit_model or manifest.primary_model
-        ask_model_chain = [cold_primary]
+        # P1-4: config fingerprint 比较——配置变更时重新推导。
+        if not explicit_model and manifest.config_fingerprint:
+            cur_fp = _config_fingerprint()
+            if cur_fp and cur_fp != manifest.config_fingerprint:
+                log.warning(
+                    "oracle ask cold: config fingerprint changed "
+                    "(manifest=%s, current=%s) — re-deriving from config",
+                    manifest.config_fingerprint, cur_fp,
+                )
+                ask_agent_type = (manifest.agent_type or "") or args.agent
+                ask_model_chain = _resolve_oracle_model_chain(ask_agent_type, "")
+                if ask_model_chain:
+                    cold_primary = ask_model_chain[0]
+                else:
+                    cold_primary = manifest.primary_model
+                    ask_model_chain = [cold_primary]
+            else:
+                cold_primary = manifest.primary_model
+                ask_model_chain = [cold_primary]
+        else:
+            cold_primary = explicit_model or manifest.primary_model
+            ask_model_chain = [cold_primary]
     else:
         # 旧 manifest 迁移兼容：走原有解析链
         ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
@@ -1394,6 +1480,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 round=manifest.round + 1,
                 last_activity_at=time.time(),
                 release_mode="",
+                config_fingerprint=_config_fingerprint(),  # P1-4: 刷新指纹
             ))
         except Exception as exc:
             log.warning("oracle ask: cold manifest persist failed (%s)", exc)
@@ -1809,6 +1896,20 @@ def cmd_oracle_list(args: argparse.Namespace) -> int:
             "last_activity_at": m.last_activity_at,
         })
     print(json.dumps({"reviews": reviews}, indent=2))
+
+    # P1-2: 惰性清理——list 时顺便检查 opencode.db 大小，超阈值则清理已释放会话。
+    try:
+        db_cleaned = _lazy_db_cleanup()
+        if db_cleaned > 0:
+            try:
+                db_mb = round(_OPENCODE_DB_PATH.stat().st_size / (1024 * 1024), 1)
+            except OSError:
+                db_mb = 0
+            print(json.dumps({"db_cleanup": {"cleaned": db_cleaned, "db_size_mb": db_mb}}),
+                  file=sys.stderr)
+    except Exception as exc:
+        log.debug("oracle list: lazy_db_cleanup failed: %s", exc)
+
     return 0
 
 
@@ -2315,7 +2416,8 @@ def _wait_final_text(review_key: str) -> Optional[str]:
 
 def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                          timeout: float = 300.0, interval: float = 5.0,
-                         max_bytes: int = 0, info: Optional[dict] = None) -> int:
+                         max_bytes: int = 0, info: Optional[dict] = None,
+                         auto_recover: bool = False) -> int:
     """A15: 等待 oracle 新产出并内联打印——供 cmd_oracle_wait 和 ask --wait 共用。
 
     等待方式：boot drain 设高水位 cursor，主轮询只看 cursor 后新事件。
@@ -2357,6 +2459,9 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
     except GatewayError:
         pass  # 落入主循环重试
 
+    # P1-1: auto-recover 一次性标志
+    _recovered = False
+
     # 主轮询循环：TASK_STATE + ASSISTANT_PROGRESS 双 filter
     while True:
         try:
@@ -2394,10 +2499,75 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                 return 0
         cursor = int(result.get("cursor") or cursor or 0)
         polls += 1
-        # 每 3 次轮询内联卡死检测：强信号 → 输出 stuck 并返回 1（不自动 recover）。
+        # 每 3 次轮询内联卡死检测。
         if polls % 3 == 0:
             stuck = _detect_oracle_stuck(review_key, info)
             if stuck and stuck.get("signal") == "strong":
+                # P1-1: auto-recover — 仅尝试一次
+                if auto_recover and not _recovered:
+                    _recovered = True
+                    print(json.dumps({"status": "recovering", "reason": "stuck",
+                                      "hint": stuck.get("hint", "")}, indent=2))
+                    # Step 1: soft release（停 runtime + 置 park 为 released_soft）
+                    try:
+                        _info = _gateway().call("runtime.info",
+                                                {"review_key": review_key})
+                        _rid = _info.get("runtime_id")
+                        if _rid:
+                            _gateway().call("runtime.stop",
+                                            {"runtime_id": _rid,
+                                             "reason": "auto-recover stuck"})
+                            _gateway().call("runtime.purge_stopped",
+                                            {"review_key": review_key})
+                    except Exception as exc:
+                        print(json.dumps({"status": "recover_failed",
+                                          "phase": "release",
+                                          "error": str(exc)}, indent=2))
+                        return 1
+                    try:
+                        ParkRegistry().release(review_key, mode="soft")
+                    except Exception as exc:
+                        print(json.dumps({"status": "recover_failed",
+                                          "phase": "release_park",
+                                          "error": str(exc)}, indent=2))
+                        return 1
+                    # Step 2: revive（warm 或 cold，复用 cmd_oracle_revive 决策树）
+                    try:
+                        from codeagent.park.router import revive_or_spawn as _ros
+                        manifest = ParkRegistry().lookup(review_key)
+                        if manifest is None:
+                            raise RuntimeError("park row gone after release")
+                        decision = _ros(review_key,
+                                        is_alive=_is_runtime_alive)
+                        if decision.method == "warm":
+                            _revive_warm(review_key, manifest, "bg")
+                        else:
+                            _revive_cold(review_key, manifest, "bg")
+                    except Exception as exc:
+                        print(json.dumps({"status": "recover_failed",
+                                          "phase": "revive",
+                                          "error": str(exc)}, indent=2))
+                        return 1
+                    # Step 3: 刷新 runtime 信息，继续主循环
+                    try:
+                        info = _gateway().call("runtime.info",
+                                               {"review_key": review_key})
+                        runtime_id = info.get("runtime_id", "")
+                        session_id = info.get("session_id", "")
+                        if info.get("status") != "active":
+                            print(json.dumps(
+                                {"status": "recover_failed",
+                                 "phase": "post_revive",
+                                 "error": "runtime not active after revive"},
+                                indent=2))
+                            return 1
+                    except Exception as exc:
+                        print(json.dumps({"status": "recover_failed",
+                                          "phase": "post_revive",
+                                          "error": str(exc)}, indent=2))
+                        return 1
+                    continue  # 主循环将用新 runtime 继续轮询
+                # auto_recover=False（默认）或已尝试过：保持原行为
                 print(json.dumps({"status": "stuck",
                                   "hint": stuck.get("hint", "")}, indent=2))
                 return 1
@@ -2458,9 +2628,11 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
         # non-fatal: keep waiting (binding may complete; ASSISTANT_PROGRESS still fires)
 
     # A15: 委托给共享的 _wait_for_new_output 辅助函数
+    auto_recover = bool(getattr(args, "auto_recover", False))
     return _wait_for_new_output(review_key, runtime_id, session_id,
                                 timeout=timeout, interval=interval,
-                                max_bytes=max_bytes, info=info)
+                                max_bytes=max_bytes, info=info,
+                                auto_recover=auto_recover)
 
 
 # ── release ────────────────────────────────────────────────────────────
@@ -2688,7 +2860,7 @@ def _purge_opencode_session(backend_session_id: str, *,
         log.error("opencode session cleanup failed: sid=%s: %s",
                   backend_session_id, exc)
 
-    # WAL checkpoint：释放 freelist 页（不 VACUUM——太慢，WAL checkpoint 够用）。
+    # WAL checkpoint：释放 freelist 页。
     if result["error"] is None:
         try:
             conn = sqlite3.connect(str(db_path), timeout=10)
@@ -2698,7 +2870,89 @@ def _purge_opencode_session(backend_session_id: str, *,
             # checkpoint 失败不影响清理结果——下次 SQLite 自然 checkpoint。
             pass
 
+    # P1-2: 大库 VACUUM——仅当 db 文件 > 100MB 时物理收缩。
+    # WAL checkpoint 只释放 freelist 页回 OS，不缩小文件；
+    # VACUUM 重建整个数据库文件，是唯一物理收缩手段。
+    # 必须用独立连接（VACUUM 不能在事务内执行）。
+    if result["error"] is None:
+        try:
+            db_size = db_path.stat().st_size
+            if db_size > 100 * 1024 * 1024:  # > 100MB
+                vacuum_conn = sqlite3.connect(str(db_path), timeout=60)
+                try:
+                    vacuum_conn.execute("VACUUM")
+                    new_size = db_path.stat().st_size
+                    result["vacuum"] = True
+                    result["vacuum_before_mb"] = round(db_size / (1024 * 1024), 1)
+                    result["vacuum_after_mb"] = round(new_size / (1024 * 1024), 1)
+                    log.info(
+                        "opencode session cleanup: VACUUM %s %.1fMB → %.1fMB",
+                        backend_session_id,
+                        db_size / (1024 * 1024),
+                        new_size / (1024 * 1024),
+                    )
+                finally:
+                    vacuum_conn.close()
+        except (sqlite3.Error, OSError) as exc:
+            result["vacuum"] = False
+            result["vacuum_error"] = str(exc)
+            log.warning("opencode session cleanup: VACUUM failed: %s", exc)
+
     return result
+
+
+def _lazy_db_cleanup(threshold_mb: int = 100) -> int:
+    """P1-2: opencode.db 惰性清理——db > threshold 时清理已释放会话。
+
+    扫描 ParkRegistry 中 lifecycle=RELEASED_SOFT 且 backend_session_id
+    为 OpenCode 格式（"ses_" 前缀）的条目，对每个执行 hard purge
+    （strip_only=False），物理删除 session + event 数据。
+    RELEASED_HARD 行已被 delete() 真销毁，不在扫描范围内。
+
+    仅当 opencode.db 存在且超过阈值时触发（避免无谓 IO）。
+    返回已清理的会话数。
+    """
+    db_path = _OPENCODE_DB_PATH
+    if not db_path.exists():
+        return 0
+    try:
+        db_size_mb = db_path.stat().st_size / (1024 * 1024)
+    except OSError:
+        return 0
+    if db_size_mb < threshold_mb:
+        return 0
+
+    cleaned = 0
+    try:
+        registry = ParkRegistry()
+        # 直接查 park_leases 表中 released_soft 行——list_active 仅返回 HOT_PARKED。
+        with registry._connect() as conn:
+            rows = conn.execute(
+                "SELECT manifest_json FROM park_leases "
+                "WHERE lifecycle = 'released_soft'",
+            ).fetchall()
+        for row in rows:
+            try:
+                d = json.loads(row[0])
+                sid = d.get("backend_session_id", "")
+                if sid and _is_opencode_session_id(sid):
+                    _purge_opencode_session(sid, strip_only=False)
+                    cleaned += 1
+            except Exception as exc:
+                log.debug("lazy_db_cleanup: skip entry: %s", exc)
+    except Exception as exc:
+        log.debug("lazy_db_cleanup: registry scan failed: %s", exc)
+
+    if cleaned > 0:
+        try:
+            final_mb = round(db_path.stat().st_size / (1024 * 1024), 1)
+        except OSError:
+            final_mb = 0
+        log.info(
+            "lazy_db_cleanup: cleaned %d sessions, db_size_mb=%.1f, final_mb=%.1f",
+            cleaned, db_size_mb, final_mb,
+        )
+    return cleaned
 
 
 def cmd_oracle_release(args: argparse.Namespace) -> int:
@@ -3008,6 +3262,13 @@ def cmd_oracle_revive(args: argparse.Namespace) -> int:
         "model_chain": model_chain,
         "declared": declared,  # D2: gateway presence 声明结果
     }, indent=2))
+
+    # P1-2: 顺便惰性清理 opencode.db（revive 成功说明有活跃使用，趁机清理已释放会话）。
+    try:
+        _lazy_db_cleanup()
+    except Exception as exc:
+        log.debug("oracle revive: lazy_db_cleanup failed: %s", exc)
+
     return 0
 
 
@@ -3183,6 +3444,7 @@ def _flip_to_hot(review_key: str, manifest: ParkManifest, sid: str,
         round=manifest.round + 1,
         last_activity_at=time.time(),
         release_mode="",
+        config_fingerprint=_config_fingerprint(),  # P1-4: 刷新指纹
     ))
 
 
