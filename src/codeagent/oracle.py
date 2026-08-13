@@ -277,14 +277,25 @@ def _normalize_oracle_agent(agent_type: str) -> str:
 # ── P1-4: config fingerprint — 检测配置变更以即时生效 ─────────────────
 
 
-def _config_fingerprint() -> str:
-    """P1-4: 读取 ~/.omp/agent/config.yml 中模型相关配置的 SHA256 指纹。
+def _config_fingerprint(agent_type: str = "") -> str:
+    """P1-4: 读取 agent profile 文件内容的 SHA256 指纹。
 
-    只哈希影响模型解析的 section：modelRoles、fallbackChains、
-    retry.fallbackChains。返回 hex[:16]；文件缺失返回空串。
+    优先哈希 agents/<agent_type>.md 文件内容（与 _read_agent_model
+    解析的源一致）；profile 不存在或为空时，回退哈希 config.yml 中
+    modelRoles section。返回 hex[:16]；两者均缺失返回空串。
     用于 manifest 落盘——ask 时比较当前指纹与 manifest 指纹，
     不同则重新从配置推导 model chain（忽略 manifest 缓存）。
     """
+    if agent_type:
+        profile_path = Path.home() / ".omp" / "agent" / "agents" / f"{agent_type}.md"
+        if profile_path.exists():
+            try:
+                content = profile_path.read_text(encoding="utf-8").strip()
+                if content:
+                    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+            except OSError:
+                pass
+    # Fallback: hash config.yml modelRoles section.
     config_path = Path.home() / ".omp" / "agent" / "config.yml"
     if not config_path.exists():
         return ""
@@ -292,7 +303,6 @@ def _config_fingerprint() -> str:
         parsed = _parse_flat_yaml(config_path)
     except OSError:
         return ""
-    # 只取影响模型解析的 key，忽略其他配置变更。
     relevant: dict = {}
     for section in ("modelRoles", "fallbackChains", "retry"):
         if section in parsed:
@@ -429,7 +439,7 @@ def _ask_model_chain_realtime(agent_type: str, manifest, explicit_override: str 
         return [ctx[0]]
     # P1-4: config fingerprint 比较——配置变更时忽略 manifest 缓存。
     if manifest and manifest.config_fingerprint:
-        current_fp = _config_fingerprint()
+        current_fp = _config_fingerprint(agent_type)
         if current_fp and current_fp != manifest.config_fingerprint:
             log.warning(
                 "oracle: config fingerprint changed (manifest=%s, current=%s) — "
@@ -747,7 +757,7 @@ def _scan_runtime_log_for_session_id(log_path: Optional[Path]) -> str:
         return backend_matches[-1].strip()
     for g in reversed(re.findall(r"session_id\s*=\s*([^\s,;\"']+)", text)):
         g = g.strip().strip('"').strip("'")
-        if g and not g.startswith("postmesh-"):
+        if g and not g.startswith(("postmesh-", "ora-")):
             return g
     return ""
 
@@ -1053,7 +1063,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             provider=spec.provider,
             variant=spec.variant,
             system_prompt=spec.system_prompt,
-            config_fingerprint=_config_fingerprint(),  # P1-4: 配置变更即时感知
+            config_fingerprint=_config_fingerprint(agent),  # P1-4: 配置变更即时感知
         )
         registry.update(review_key, manifest)
     else:
@@ -1072,7 +1082,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             provider=spec.provider,
             variant=spec.variant,
             system_prompt=spec.system_prompt,
-            config_fingerprint=_config_fingerprint(),  # P1-4: 配置变更即时感知
+            config_fingerprint=_config_fingerprint(agent),  # P1-4: 配置变更即时感知
         )
         registry.acquire(review_key, manifest)
 
@@ -1266,7 +1276,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             if manifest and manifest.primary_model:
                 # P1-4: config fingerprint 比较——配置变更时重新推导。
                 if not explicit_model and manifest.config_fingerprint:
-                    cur_fp = _config_fingerprint()
+                    cur_fp = _config_fingerprint(ask_agent_type)
                     if cur_fp and cur_fp != manifest.config_fingerprint:
                         log.warning(
                             "oracle ask warm: config fingerprint changed "
@@ -1335,7 +1345,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 backend_session_id=new_backend_session_id,
                 round=manifest.round + 1,
                 last_activity_at=time.time(),
-                config_fingerprint=_config_fingerprint(),  # P1-4: 刷新指纹
+                config_fingerprint=_config_fingerprint(manifest.agent_type or ""),  # P1-4: 刷新指纹
             ))
             # I2: surface adoption failure in the success JSON.
             adopted = _adopt_runtime(review_key, sid, warm_handle,
@@ -1401,7 +1411,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     if manifest and manifest.primary_model:
         # P1-4: config fingerprint 比较——配置变更时重新推导。
         if not explicit_model and manifest.config_fingerprint:
-            cur_fp = _config_fingerprint()
+            cur_fp = _config_fingerprint(ask_agent_type)
             if cur_fp and cur_fp != manifest.config_fingerprint:
                 log.warning(
                     "oracle ask cold: config fingerprint changed "
@@ -1480,7 +1490,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 round=manifest.round + 1,
                 last_activity_at=time.time(),
                 release_mode="",
-                config_fingerprint=_config_fingerprint(),  # P1-4: 刷新指纹
+                config_fingerprint=_config_fingerprint((manifest.agent_type or "") if manifest else ""),  # P1-4: 刷新指纹
             ))
         except Exception as exc:
             log.warning("oracle ask: cold manifest persist failed (%s)", exc)
@@ -1897,18 +1907,7 @@ def cmd_oracle_list(args: argparse.Namespace) -> int:
         })
     print(json.dumps({"reviews": reviews}, indent=2))
 
-    # P1-2: 惰性清理——list 时顺便检查 opencode.db 大小，超阈值则清理已释放会话。
-    try:
-        db_cleaned = _lazy_db_cleanup()
-        if db_cleaned > 0:
-            try:
-                db_mb = round(_OPENCODE_DB_PATH.stat().st_size / (1024 * 1024), 1)
-            except OSError:
-                db_mb = 0
-            print(json.dumps({"db_cleanup": {"cleaned": db_cleaned, "db_size_mb": db_mb}}),
-                  file=sys.stderr)
-    except Exception as exc:
-        log.debug("oracle list: lazy_db_cleanup failed: %s", exc)
+
 
     return 0
 
@@ -2069,7 +2068,7 @@ def _fallback_find_session_for_key(review_key: str, since: Optional[float] = Non
         if key_score == 0:
             continue  # no key signal — skip regardless of dir bonus
         score = key_score
-        if "postmesh-" in f.name.lower() or "postmesh-" in str(f.parent).lower():
+        if any(p in f.name.lower() or p in str(f.parent).lower() for p in ("postmesh-", "ora-")):
             score += 10
         if score > best_score:
             best, best_score, best_key_score = f, score, key_score
@@ -2482,9 +2481,7 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
             if kind == "ASSISTANT_PROGRESS":
                 # cursor 后的 ASSISTANT_PROGRESS 一定是新 turn 产出，无需 baseline 文本对比
                 # （baseline 对比曾因 JSONL 更新/截断误触发旧内容返回）。
-                quick = payload.get("text") or ""
-                if quick:
-                    print(quick)  # 快速反馈：流式文本先内联打印
+                # P2-0d: 不打印 quick——避免与 final 重叠；quick 仅作产出存在信号。
                 final = _wait_final_text(review_key)
                 if final is not None:
                     trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
@@ -2501,6 +2498,11 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
         polls += 1
         # 每 3 次轮询内联卡死检测。
         if polls % 3 == 0:
+            # P2-0d-2: re-fetch info from gateway to ensure stuck detection uses fresh state.
+            try:
+                info = _gateway().call("runtime.info", {"review_key": review_key})
+            except GatewayError:
+                pass
             stuck = _detect_oracle_stuck(review_key, info)
             if stuck and stuck.get("signal") == "strong":
                 # P1-1: auto-recover — 仅尝试一次
@@ -2566,6 +2568,7 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                                           "phase": "post_revive",
                                           "error": str(exc)}, indent=2))
                         return 1
+                    deadline = time.monotonic() + timeout  # P2-0d-3: reset deadline for new runtime
                     continue  # 主循环将用新 runtime 继续轮询
                 # auto_recover=False（默认）或已尝试过：保持原行为
                 print(json.dumps({"status": "stuck",
@@ -2901,12 +2904,16 @@ def _purge_opencode_session(backend_session_id: str, *,
     return result
 
 
-def _lazy_db_cleanup(threshold_mb: int = 100) -> int:
+def _lazy_db_cleanup(threshold_mb: int = 100,
+                    hard_limit_seconds: int = 30 * 24 * 3600) -> int:
     """P1-2: opencode.db 惰性清理——db > threshold 时清理已释放会话。
 
     扫描 ParkRegistry 中 lifecycle=RELEASED_SOFT 且 backend_session_id
-    为 OpenCode 格式（"ses_" 前缀）的条目，对每个执行 hard purge
-    （strip_only=False），物理删除 session + event 数据。
+    为 OpenCode 格式（"ses_" 前缀）的条目：
+    - 释放时间 < hard_limit_seconds（30 天）→ strip_only=True（保留会话
+      数据以支持 warm revive，只精简转录文本）。
+    - 释放时间 >= hard_limit_seconds → strip_only=False（hard purge，
+      物理删除 session + event 数据）。
     RELEASED_HARD 行已被 delete() 真销毁，不在扫描范围内。
 
     仅当 opencode.db 存在且超过阈值时触发（避免无谓 IO）。
@@ -2923,12 +2930,13 @@ def _lazy_db_cleanup(threshold_mb: int = 100) -> int:
         return 0
 
     cleaned = 0
+    now = time.time()
     try:
         registry = ParkRegistry()
         # 直接查 park_leases 表中 released_soft 行——list_active 仅返回 HOT_PARKED。
         with registry._connect() as conn:
             rows = conn.execute(
-                "SELECT manifest_json FROM park_leases "
+                "SELECT manifest_json, released_at FROM park_leases "
                 "WHERE lifecycle = 'released_soft'",
             ).fetchall()
         for row in rows:
@@ -2936,7 +2944,9 @@ def _lazy_db_cleanup(threshold_mb: int = 100) -> int:
                 d = json.loads(row[0])
                 sid = d.get("backend_session_id", "")
                 if sid and _is_opencode_session_id(sid):
-                    _purge_opencode_session(sid, strip_only=False)
+                    released_at = row[1] if len(row) > 1 and row[1] else 0
+                    old_enough = (now - released_at) >= hard_limit_seconds if released_at else False
+                    _purge_opencode_session(sid, strip_only=not old_enough)
                     cleaned += 1
             except Exception as exc:
                 log.debug("lazy_db_cleanup: skip entry: %s", exc)
@@ -3444,7 +3454,7 @@ def _flip_to_hot(review_key: str, manifest: ParkManifest, sid: str,
         round=manifest.round + 1,
         last_activity_at=time.time(),
         release_mode="",
-        config_fingerprint=_config_fingerprint(),  # P1-4: 刷新指纹
+        config_fingerprint=_config_fingerprint(manifest.agent_type or ""),  # P1-4: 刷新指纹
     ))
 
 
