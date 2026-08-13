@@ -1,6 +1,6 @@
 ---
 name: persist-oracle
-description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshchat oracle start/ask/status/list/watch/wait/result/revive/attach/release。OMP 用 omp-config memory + parked-revive，OpenCode 用原生 --session 续接；oh-my-openagent 不加额外 session 字段。
+description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshchat oracle start/ask/status/list/watch/wait/result/revive/attach/release。显式 --model/--variant/--system/--prompt 传参（去 role）。OMP 用 omp-config memory + parked-revive，OpenCode 用原生 --session 续接；oh-my-openagent 不加额外 session 字段。
 ---
 
 # persist-oracle — 持久化多轮 Oracle Review
@@ -23,19 +23,18 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
 
 ## 模型一致性（防漂移，2026-08 design 结论）
 
-模型单一决定源 = OMP agent 定义（`agents/oracle*.md` 的 `model:` 字段）。
+模型单一决定源 = **skill 的 ExecutionSpec 模板**（见下文"各档位 ExecutionSpec 推荐"）。
 **oracle 语义（review/验收/咨询）禁止依赖默认 `modelRoles.task`（= mimo）**，
-调用方必须显式 `--agent oracle | oracle-lite | oracle-opus`，否则 oracle.md 的
-模型不生效。
+调用方必须显式传 `--model`（及 `--variant`/`--system`），由 skill 按档位提供默认值。
 
-改模型需三处同步（校验命令，三处各出一行即一致）：
+改模型需修改 skill ExecutionSpec 模板 + 校验一致性：
 ```bash
+# 校验 skill 模板与实际调用一致
 grep -rE 'ppio/pa/gpt-5.6-sol|claude-opus-4-8|deepseek-v4-pro' \
-  ~/.omp/agent/config.yml ~/.omp/agent/agents/oracle*.md \
-  ~/.config/opencode/oh-my-openagent.json
+  ~/.omp/agent/config.yml ~/.config/opencode/oh-my-openagent.json
 ```
-- oracle / oracle-opus / oracle-lite 三个 agent 配置已全部一致（scout 实锤历史状态）。
-- 默认未指定 agent → `modelRoles.task = mimo` 保持（task 通用执行者语义），不改。
+- oracle / oracle-opus / oracle-lite 三档模型由 skill ExecutionSpec 统一管理。
+- 默认未指定 `--model` → 继承主 agent runtime context（不回退 mimo）。
 
 ## 绑定语义（A1，2026-08-12 修复）
 
@@ -62,7 +61,7 @@ worker 角色。若用 CLI 主会话（模式 A）且不希望继承 worker 身�
 ```bash
 # 模式 A（CLI 主会话，不参与 swarm）：
 unset OMP_WORKER_ID
-aimeshchat oracle start "$KEY" --agent oracle --prompt '...'
+aimeshchat oracle start "$KEY" --model gpt-5.6-sol --variant reasoning --system "你是一位资深架构顾问..." --prompt '...'
 # 模式 B（swarm worker，走 mailbox REPORT）：保留 OMP_WORKER_ID，由 manager 派发
 ```
 
@@ -72,7 +71,8 @@ aimeshchat oracle start "$KEY" --agent oracle --prompt '...'
 KEY='<project>:oracle:<domain>:<topic>[:<model_suffix>]'
 
 # 首轮：新建 review/session/runtime（hot 交互式，初始 prompt 即首轮任务）
-aimeshchat oracle start "$KEY" --agent oracle --prompt '初始问题'
+# skill 按档位生成 ExecutionSpec，通过 --model/--variant/--system/--prompt 显式透传
+aimeshchat oracle start "$KEY" --model gpt-5.6-sol --variant reasoning --system "你是一位资深架构顾问..." --prompt '初始问题'
 
 # 追加/追问：hot in-loop send（同 backend session，不新开进程）。
 #   binding pending（sid 空）时 ask 返回 status=binding_pending 退出码 1（静默丢弃保护）；
@@ -131,9 +131,9 @@ aimeshchat oracle release "$KEY" --purge   # 硬销毁：删 OMP session + swarm
 
 ## Oracle 类型
 
-- 识别：`agent.startswith("oracle")`（覆盖 oracle / oracle-lite / oracle-opus），
-  仅用于 profile/required-capability 选择（warm_resume 必需，preferred omp→opencode），
-  不硬编码 OMP runner。
+- 档位选择：`oracle` / `oracle-lite` / `oracle-opus`——由 skill ExecutionSpec 模板决定
+  模型（`--model`）、变种（`--variant`）、系统提示词（`--system`），
+  调用时显式传参，不依赖 agent profile。
 - OMP 提供 full hot/in-loop；OMP 不可用时 OpenCode 明确降级为 turn 间 follow-up；
   generic 因无 warm 仅显式指定时允许。
 
@@ -143,12 +143,12 @@ aimeshchat oracle release "$KEY" --purge   # 硬销毁：删 OMP session + swarm
 
 aimeshchat CLI 去 role 化后，**模型与工作负载提示词策略由 skill 决定**，aimeshchat 只保留
 执行/路由/会话/mailbox 能力。oracle 顾问会话启动时，skill 生成 `ExecutionSpec`（含
-provider/model/variant/system/full_prompt），通过 CLI 参数透传给 aimeshchat。
+provider/model/variant/system/full_prompt），通过 CLI 参数显式透传给 aimeshchat。
 
 这确保：
 - 模型选择由 skill 按顾问档位/场景自主决策，不在 aimeshchat 硬编码。
 - 提示词策略（系统提示词、完整提示词模板）由 skill 维护，aimeshchat 不干预。
-- 调用方只需选择档位（`--agent oracle | oracle-lite | oracle-opus`）或显式覆盖模型。
+- **不使用 `--agent role`**——调用方直接传 `--model`/`--variant`/`--system`/`--prompt`。
 
 ### ExecutionSpec 结构
 
@@ -206,8 +206,8 @@ aimeshchat oracle start "$KEY" \
 aimeshchat oracle start "$KEY" --prompt '...'
 # 实际使用主 agent 的 model（如主 agent 正在用 claude-sonnet → oracle 也用 claude-sonnet）
 
-# 场景 2：skill 显式指定 model → 使用 skill 指定的模型
-aimeshchat oracle start "$KEY" --model gpt-5.6-sol --prompt '...'
+# 场景 2：skill 显式指定 model（推荐） → 使用 skill ExecutionSpec 的模型
+aimeshchat oracle start "$KEY" --model gpt-5.6-sol --variant reasoning --system "你是一位资深架构顾问..." --prompt '...'
 # 实际使用 gpt-5.6-sol
 
 # 场景 3：用户 CLI 显式指定 model → 优先级最高
@@ -217,18 +217,9 @@ aimeshchat oracle start "$KEY" --model v4-pro --prompt '...'
 
 优先级链：**用户 CLI 显式指定 > skill ExecutionSpec > 主 agent runtime context > 报错**
 
-### 迁移提示
+### 迁移提示（完全去 role）
 
-- `--agent oracle | oracle-lite | oracle-opus` **保留为 profile 名**——它读取
-  `agents/oracle*.md` 的默认模型配置（`model:` 字段），用于未显式指定 `--model` 时的
-  兜底继承。
-- 显式 `--model` / `--variant` **优先级高于** `--agent` profile 读取的默认值。
-- 迁移后，**三处模型配置仍需同步**（见"模型一致性"段），但 skill 的
-  ExecutionSpec 成为运行时唯一决定源，profile 仅作兜底。
-
-```bash
-# 迁移前后对比：
-# 旧：--agent oracle → 读 agents/oracle.md → 使用 ppio/pa/gpt-5.6-sol
-# 新：--agent oracle → 读 agents/oracle.md → 使用 ppio/pa/gpt-5.6-sol（兜底）
-#     但 skill 可通过 ExecutionSpec 覆盖 → --model claude-opus-4-8 优先
-```
+- `--agent oracle | oracle-lite | oracle-opus` **已废弃**——不再作为默认用法。
+- 所有启动/追加/复活命令均通过 `--model`/`--variant`/`--system`/`--prompt` 显式传参。
+- skill 按档位提供 ExecutionSpec 模板（见上表），调用时展开为 CLI 参数。
+- 模型决定优先级链不变：**用户 CLI 显式指定 > skill ExecutionSpec > 主 agent runtime context > 报错**。

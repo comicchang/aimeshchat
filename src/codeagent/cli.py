@@ -38,8 +38,6 @@ from codeagent.mailbox.store import MailboxStore, resolve_root
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_ORACLE_AGENT = "oracle"
-
 _router = TransportRouter()
 
 
@@ -265,10 +263,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ora_start = ora_sub.add_parser("start", help="Create review/session/runtime（含 A1 绑定窗口）")
     ora_start.add_argument("review_key", help="Review key (e.g. project:oracle:domain:topic)")
-    ora_start.add_argument("--agent", default=_DEFAULT_ORACLE_AGENT, help="Oracle agent profile")
+    ora_start.add_argument("--agent", default="", metavar="PROFILE",
+                           help="DEPRECATED（弃用）: agent profile 名——模型/提示词策略已归 skill，"
+                                "请用 --model/--variant 显式指定；此参数仅保留为便捷 profile 名，"
+                                "不再作为默认模型来源（传了会打弃用告警）")
     ora_start.add_argument("--backend", default="omp", help="Runtime backend (omp|opencode)")
     ora_start.add_argument("--workdir", default="", help="Working directory")
-    ora_start.add_argument("--model", default="", help="Model override (explicit model; overrides agent profile)")
+    ora_start.add_argument("--model", default="", help="B1: 显式指定模型（推荐；替代已弃用的 --agent 默认模型；覆盖 agent profile）")
     ora_start.add_argument("--model-strict", action="store_true", default=False, dest="model_strict",
                            help="P0: 无 --model 且 runtime.context 查询失败时直接报 MODEL_CONTEXT_UNAVAILABLE "
                                 "(默认回退 execution-context → agent profile，不 fatal)")
@@ -283,9 +284,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # U1: prompt 必填（去掉 nargs='?'）——不再 fallback 读 stdin，避免
     # 忘记 prompt 时终端挂起（非交互 stdin 会一直阻塞）。
     ora_ask.add_argument("prompt", help="Prompt text (required — no stdin fallback)")
-    ora_ask.add_argument("--agent", default=_DEFAULT_ORACLE_AGENT)
+    ora_ask.add_argument("--agent", default="", metavar="PROFILE",
+                         help="DEPRECATED（弃用）: 便捷 profile 名——请用 --model/--variant 显式指定（传了会打弃用告警）")
     ora_ask.add_argument("--backend", default="omp")
-    ora_ask.add_argument("--model", default="")
+    ora_ask.add_argument("--model", default="",
+                         help="显式指定模型（推荐；替代已弃用的 --agent 默认模型）")
     ora_ask.add_argument("--wait-binding", action="store_true", default=False,
                         help="Block until backend session binding completes (≤60s) before "
                              "steering; avoids the binding_pending silent-drop window")
@@ -2105,6 +2108,40 @@ def _cmd_runtime(args: argparse.Namespace) -> int:
     return 1
 
 
+def _warn_deprecated_agent(args: argparse.Namespace) -> None:
+    """B1: --agent 弃用告警——不删除参数（向后兼容），但明确引导 --model/--variant。
+
+    模型/提示词策略已归 skill，CLI 只保留执行/路由/会话/mailbox；--agent
+    仅保留为便捷 profile 名，不再作为默认模型来源。
+    """
+    agent = getattr(args, "agent", "") or ""
+    if agent:
+        print(
+            f"warning: --agent 已弃用——模型/提示词策略归 skill，请用 --model/--variant "
+            f"显式指定；--agent {agent!r} 仅保留为便捷 profile 名（不再作为默认模型来源）",
+            file=sys.stderr,
+        )
+
+
+def _require_explicit_spec(args: argparse.Namespace) -> int:
+    """B1: 强制显式 ExecutionSpec——无 --model 且无 --agent 时报错，不静默回落。
+
+    去 role 后 CLI 不再静默读取 agent profile 的默认模型；调用方必须显式
+    给出 --model（推荐）或 --agent 便捷名。返回 0 = 校验通过；1 = 已输出
+    错误（调用方直接 return 1）。
+    """
+    model = getattr(args, "model", "") or ""
+    agent = getattr(args, "agent", "") or ""
+    if not model and not agent:
+        print(
+            "error: oracle start/ask 需要显式 --model（推荐）或 --agent 便捷名——"
+            "模型/提示词策略已归 skill，不再静默读取 agent profile 默认模型",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def _cmd_oracle(args: argparse.Namespace) -> int:
     """Dispatch oracle subcommands (start/ask/status/list/watch/wait/release/revive/result/attach)."""
     from codeagent.oracle import (
@@ -2136,6 +2173,12 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
         "result": cmd_oracle_result,
         "attach": cmd_oracle_attach,
     }
+    if cmd in ("start", "ask"):
+        # B1: 去 role——CLI 强制显式 ExecutionSpec：--agent 传了打弃用告警
+        # （仍兼容放行）；无 --model 且无 --agent 时报错，不静默回落 profile。
+        _warn_deprecated_agent(args)
+        if _require_explicit_spec(args):
+            return 1
     return handlers[cmd](args)
 
 

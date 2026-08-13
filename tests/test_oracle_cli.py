@@ -524,3 +524,99 @@ def test_fallback_session_scoring_avoids_short_tail_mismatch(tmp_path, monkeypat
     expected = tmp_path / ".omp" / "agent" / "sessions" / "ora-new" / "session.jsonl"
     assert found is not None
     assert found == expected, "full-key match（ora-* 目录）必须胜过短 tail 误匹配"
+
+
+# ── B1: CLI 强制显式 ExecutionSpec（去 role）──────────────────────────
+
+
+def test_cli_require_explicit_spec_errors_without_model_or_agent(capsys):
+    """无 --model 且无 --agent → 报错，不静默回落 agent profile 默认模型。"""
+    from codeagent.cli import _require_explicit_spec
+
+    assert _require_explicit_spec(_NS(model="", agent="")) == 1
+    err = capsys.readouterr().err
+    assert "--model" in err and "--agent" in err
+
+
+def test_cli_require_explicit_spec_accepts_model_or_agent(capsys):
+    """有 --model 或 --agent 任一 → 校验通过（--agent 便捷名仍兼容）。"""
+    from codeagent.cli import _require_explicit_spec
+
+    assert _require_explicit_spec(_NS(model="m/x", agent="")) == 0
+    assert _require_explicit_spec(_NS(model="", agent="oracle")) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_cli_warns_deprecated_agent(capsys):
+    """传 --agent → 弃用告警引导 --model/--variant；未传则不告警。"""
+    from codeagent.cli import _warn_deprecated_agent
+
+    _warn_deprecated_agent(_NS(agent="oracle"))
+    err = capsys.readouterr().err
+    assert "--agent" in err and "--model" in err and "--variant" in err
+    _warn_deprecated_agent(_NS(agent=""))
+    assert capsys.readouterr().err == ""
+
+
+def test_cmd_oracle_rejects_implicit_start(capsys, tmp_path):
+    """oracle start 无 --model/--agent → dispatch 层拦截报错，不触发 handler。"""
+    from codeagent.cli import _cmd_oracle
+
+    ns = _NS(ora_cmd="start", review_key="k-b1", agent="", model="",
+             backend="omp", workdir=str(tmp_path), prompt="")
+    with patch("codeagent.oracle.cmd_oracle_start") as handler:
+        assert _cmd_oracle(ns) == 1
+        handler.assert_not_called()
+    err = capsys.readouterr().err
+    assert "--model" in err
+
+
+def test_cmd_oracle_start_explicit_model_dispatches(capsys, tmp_path):
+    """oracle start 带显式 --model（无 --agent）→ 放行并派发 handler。"""
+    from codeagent.cli import _cmd_oracle
+
+    ns = _NS(ora_cmd="start", review_key="k-b1", agent="", model="m/x",
+             backend="omp", workdir=str(tmp_path), prompt="")
+    with patch("codeagent.oracle.cmd_oracle_start", return_value=0) as handler:
+        assert _cmd_oracle(ns) == 0
+        handler.assert_called_once_with(ns)
+    assert capsys.readouterr().err == ""
+
+
+def test_cmd_oracle_ask_deprecation_warning_still_dispatches(capsys):
+    """ask 传 --agent → 打弃用告警但仍派发（向后兼容，不破坏现有调用）。"""
+    from codeagent.cli import _cmd_oracle
+
+    ns = _NS(ora_cmd="ask", review_key="k1", prompt="p", agent="oracle",
+             backend="omp", model="")
+    with patch("codeagent.oracle.cmd_oracle_ask", return_value=0) as handler:
+        assert _cmd_oracle(ns) == 0
+        handler.assert_called_once_with(ns)
+    err = capsys.readouterr().err
+    assert "--agent" in err and "--model" in err
+
+
+def test_start_explicit_model_no_agent(tmp_path):
+    """B1: 显式 --model（无 --agent）→ model_source=explicit，manifest 落盘 primary_model。"""
+    from codeagent.park.registry import ParkRegistry
+
+    ns = _NS(review_key="k-exp", agent="", backend="omp", workdir=str(tmp_path),
+             model="explicit/gpt-x", variant="thinking", system="", prompt="hi")
+    with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+         patch("codeagent.oracle.RuntimeRegistry.spawn", return_value=_handle()) as spawn, \
+         patch("codeagent.cli._get_swarm_kernel") as mock_kernel:
+        kernel = MagicMock()
+        store = MagicMock()
+        store.root = tmp_path / "mb"
+        mock_kernel.return_value = (kernel, store)
+        assert cmd_oracle_start(ns) == 0
+
+    m = ParkRegistry().lookup("k-exp")
+    assert m is not None
+    assert m.model == "explicit/gpt-x"          # 显式 --model 持久化
+    assert m.primary_model == "explicit/gpt-x"  # chain[0] = 显式模型（不被 profile 覆盖）
+    assert m.variant == "thinking"
+    req = spawn.call_args[0][1]
+    assert req["model"] == "explicit/gpt-x"
+    assert req["variant"] == "thinking"
+

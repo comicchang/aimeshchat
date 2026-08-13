@@ -303,6 +303,11 @@ def _runtime_context_model(agent: str) -> Optional[tuple[str, str, str]]:
 def _resolve_oracle_model_chain(agent_type: str, explicit_model: str) -> list[str]:
     """Resolve the primary model chain for an oracle agent（M-model）。
 
+    B2: 此函数已非主路径——主路径使用 ExecutionSpec 显式字段
+    （spec.model / manifest.primary_model / manifest.variant / manifest.system_prompt）。
+    保留仅供 ``--agent`` 便捷名 fallback：缺 --model 时读 agent profile
+    的 model: 字段（向后兼容）。
+
     模型解析两条路径，不再依赖 config.yml 的 retry.fallbackChains：
 
     - ``explicit_model`` 非空 → 单元素 ``[explicit_model]``（用户显式
@@ -326,12 +331,17 @@ def _resolve_oracle_model_chain(agent_type: str, explicit_model: str) -> list[st
 def _model_chain_from_manifest(agent_type: str, manifest, explicit_override: str = "") -> list[str]:
     """M-model: 从 manifest 读已落盘模型，revive/ask 不再重推导。
 
+    B2: 此函数已非主路径——主路径直接读 manifest Q5 字段
+    （manifest.primary_model / manifest.model / manifest.variant /
+    manifest.system_prompt）。保留仅供旧 manifest（无 primary_model 且无
+    spec 字段）的迁移兼容 fallback。
+
     优先级：
     1. ``manifest.model``（start 时显式 --model 的持久化）或
        ``explicit_override``（调用方本次 --model）→ 单元素 ``[该模型]``
        （显式覆盖永远优先）。
-    2. ``manifest.primary_model``（start 落盘的 chain[0]，agent profile
-       权威结果）→ 单元素 ``[primary_model]``。
+    2. ``manifest.primary_model``（start 落盘的 chain[0]，ExecutionSpec
+       解析结果）→ 单元素 ``[primary_model]``。
     3. 旧 manifest 无 primary_model（升级前创建）→ 现场解析一次
        （_resolve_oracle_model_chain），迁移兼容；不写回 manifest。
     """
@@ -345,6 +355,10 @@ def _model_chain_from_manifest(agent_type: str, manifest, explicit_override: str
 
 def _ask_model_chain_realtime(agent_type: str, manifest, explicit_override: str = "") -> list[str]:
     """P1: ask 时实时修正 model_chain——runtime.context 优先，manifest 仅 fallback。
+
+    B2: 此函数已非主路径——主路径直接读 manifest Q5 字段
+    （manifest.primary_model / manifest.model）+ 显式 --model 覆盖。
+    保留仅供旧 manifest（无 primary_model 且无 spec 字段）的迁移兼容 fallback。
 
     manifest 落盘的 primary_model 是 start 时刻的解析结果，主 agent 换模型后
     会过期。ask（warm/cold spawn）先用 runtime.context_get 继承当前主 agent
@@ -793,12 +807,14 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     log.debug("oracle start: ExecutionSpec(provider=%s, model=%s, variant=%s, system=%r)",
               spec.provider, spec.model, spec.variant, spec.system_prompt[:40] if spec.system_prompt else "")
 
-    # ── M-model: agent profile model: 为唯一权威源（显式 --model 仍覆盖）──
-    # Q5b: 以 ExecutionSpec 最终解析结果（spec.model，可能是显式、继承的
-    # runtime.context 或 profile）作为 primary；revive/ask 从 manifest 的
-    # primary_model 直接读，不再重推导。
-    model_chain = _resolve_oracle_model_chain(agent, spec.model)
-    primary_model = model_chain[0] if model_chain else spec.model
+    # ── B2: ExecutionSpec 显式为主路径 ─────────────────────────────────
+    # 主路径 = ExecutionSpec.from_args 解析出的 spec.model（显式 --model /
+    # runtime.context / execution-context / agent profile fallback 已在
+    # from_args 内部处理）。不再调用 _resolve_oracle_model_chain 重推导。
+    # --agent 便捷名 fallback 在 from_args 的 resolve_agent_model 回调中
+    # 已走 _resolve_oracle_model_chain（仅缺 --model 时触发）。
+    primary_model = spec.model
+    model_chain = [primary_model] if primary_model else []
     chain_env: dict[str, str] = {}
     if model_chain:
         chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(model_chain)
@@ -1140,14 +1156,21 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 )
             except Exception as exc:
                 print(f"warning: warm task enqueue failed: {exc}", file=sys.stderr)
-            # M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导；
-            # P1: manifest 可能过期——先经 runtime.context_get 实时修正，
-            # 查询失败/非 gateway 调用时 manifest 仅作 fallback。
-            # 显式 --model / manifest.model 覆盖仍优先。
-            ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
-            ask_model_chain = _ask_model_chain_realtime(
-                ask_agent_type, manifest, explicit_override=getattr(args, "model", "") or "")
-            ask_primary = ask_model_chain[0] if ask_model_chain else (manifest.model or "")
+            # B2: 从 manifest 读 ExecutionSpec 显式字段，不再重推导。
+            # 显式 --model 覆盖 > manifest.primary_model（start 落盘的
+            # spec.model）> manifest.model（start 时的显式 --model）。
+            # 旧 manifest 无 primary_model 时回退 _ask_model_chain_realtime
+            # （迁移兼容）。
+            explicit_model = getattr(args, "model", "") or ""
+            if manifest and manifest.primary_model:
+                ask_primary = explicit_model or manifest.primary_model
+                ask_model_chain = [ask_primary]
+            else:
+                # 旧 manifest 迁移兼容：走原有解析链
+                ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
+                ask_model_chain = _ask_model_chain_realtime(
+                    ask_agent_type, manifest, explicit_override=explicit_model)
+                ask_primary = ask_model_chain[0] if ask_model_chain else (manifest.model or "")
             ask_chain_env: dict[str, str] = {}
             if ask_model_chain:
                 ask_chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(ask_model_chain)
@@ -1247,15 +1270,22 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
     # peer_agent_id=..."），round3 起该提示被当成首轮 prompt 注入重建
     # 实例（回归）。这里直接生成 snapshot 上下文，忽略决策层的 context。
     cold_context = build_cold_context(review_key)
-    # M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导；
-    # P1: manifest 可能过期——先经 runtime.context_get 实时修正，
-    # 查询失败/非 gateway 调用时 manifest 仅作 fallback。
-    # 显式 --model / manifest.model 覆盖仍优先。
-    ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
-    ask_model_chain = _ask_model_chain_realtime(
-        ask_agent_type, manifest, explicit_override=getattr(args, "model", "") or "")
-    cold_primary = ask_model_chain[0] if ask_model_chain else (
-        (manifest.model if manifest else "") or (getattr(args, "model", "") or ""))
+    # B2: 从 manifest 读 ExecutionSpec 显式字段，不再重推导。
+    # 显式 --model 覆盖 > manifest.primary_model（start 落盘的
+    # spec.model）> manifest.model（start 时的显式 --model）。
+    # 旧 manifest 无 primary_model 时回退 _ask_model_chain_realtime
+    # （迁移兼容）。
+    explicit_model = getattr(args, "model", "") or ""
+    if manifest and manifest.primary_model:
+        cold_primary = explicit_model or manifest.primary_model
+        ask_model_chain = [cold_primary]
+    else:
+        # 旧 manifest 迁移兼容：走原有解析链
+        ask_agent_type = (manifest.agent_type if manifest and manifest.agent_type else "") or args.agent
+        ask_model_chain = _ask_model_chain_realtime(
+            ask_agent_type, manifest, explicit_override=explicit_model)
+        cold_primary = ask_model_chain[0] if ask_model_chain else (
+            (manifest.model if manifest else "") or explicit_model)
     cold_chain_env: dict[str, str] = {}
     if ask_model_chain:
         cold_chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(ask_model_chain)
@@ -2653,10 +2683,16 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
             raise RuntimeError(declare_err)
         return "", bound_sid, []
 
-    # ── M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导 ──
+    # B2: 从 manifest 读 ExecutionSpec 显式字段（start 时落盘），不再重推导。
+    # 旧 manifest 无 primary_model 时回退 _model_chain_from_manifest（迁移兼容）。
     agent_type = manifest.agent_type or _ORACLE_AGENT
-    model_chain = _model_chain_from_manifest(agent_type, manifest)
-    primary_model = model_chain[0] if model_chain else (manifest.model or "")
+    if manifest.primary_model:
+        primary_model = manifest.primary_model
+        model_chain = [primary_model]
+    else:
+        # 旧 manifest 迁移兼容：走原有解析链
+        model_chain = _model_chain_from_manifest(agent_type, manifest)
+        primary_model = model_chain[0] if model_chain else (manifest.model or "")
     chain_env: dict[str, str] = {}
     if model_chain:
         chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(model_chain)
@@ -2670,6 +2706,7 @@ def _revive_warm(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
         "workdir": manifest.workdir or os.getcwd(),
         "task": "",
         "model": primary_model,
+        "variant": manifest.variant or "",  # B2: ExecutionSpec variant 透传
         "backend_session_id": bound_sid,
         "gateway_socket": str(control_socket_path()),
         "owner_pid": os.getpid(),
@@ -2704,10 +2741,16 @@ def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
     if mode == "resume":
         mode = "bg"
     sid = _review_sid(review_key)
-    # ── M-model: 从 manifest 读已落盘模型（start 时解析），不再重推导 ──
+    # B2: 从 manifest 读 ExecutionSpec 显式字段（start 时落盘），不再重推导。
+    # 旧 manifest 无 primary_model 时回退 _model_chain_from_manifest（迁移兼容）。
     agent_type = manifest.agent_type or _ORACLE_AGENT
-    model_chain = _model_chain_from_manifest(agent_type, manifest)
-    primary_model = model_chain[0] if model_chain else (manifest.model or "")
+    if manifest.primary_model:
+        primary_model = manifest.primary_model
+        model_chain = [primary_model]
+    else:
+        # 旧 manifest 迁移兼容：走原有解析链
+        model_chain = _model_chain_from_manifest(agent_type, manifest)
+        primary_model = model_chain[0] if model_chain else (manifest.model or "")
     chain_env: dict[str, str] = {}
     if model_chain:
         chain_env["OMP_MODEL_FALLBACK_CHAIN"] = ",".join(model_chain)
@@ -2720,6 +2763,7 @@ def _revive_cold(review_key: str, manifest: ParkManifest, mode: str) -> tuple[st
         "workdir": manifest.workdir or os.getcwd(),
         "task": build_cold_context(review_key),
         "model": primary_model,
+        "variant": manifest.variant or "",  # B2: ExecutionSpec variant 透传
         "gateway_socket": str(control_socket_path()),
         "owner_pid": os.getpid(),
         "nonce": uuid4().hex[:12],
