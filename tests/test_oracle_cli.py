@@ -54,7 +54,7 @@ def _manifest(review_key="k", backend_session_id="b1", lifecycle=Lifecycle.HOT_P
 
     return ParkManifest(
         review_key=review_key,
-        swarm_session_id=f"ora-{review_key[:8]}-abc",
+        swarm_session_id=f"postmesh-{review_key[:8]}-abc",
         agent_type="oracle",
         backend_session_id=backend_session_id,
         lifecycle=lifecycle,
@@ -497,7 +497,7 @@ def test_fallback_session_scoring_avoids_short_tail_mismatch(tmp_path, monkeypat
 
     sessions = tmp_path / "sessions"
     (sessions / "old-proj").mkdir(parents=True)
-    (sessions / "ora-new").mkdir()
+    (sessions / "postmesh-new").mkdir()
 
     unrelated = sessions / "old-proj" / "old.jsonl"
     unrelated.write_text(
@@ -505,7 +505,7 @@ def test_fallback_session_scoring_avoids_short_tail_mismatch(tmp_path, monkeypat
         '[{"type":"text","text":"blur is a gaussian filter"}]}}\n',
         encoding="utf-8",
     )
-    correct = sessions / "ora-new" / "session.jsonl"
+    correct = sessions / "postmesh-new" / "session.jsonl"
     correct.write_text(
         '{"type":"message","message":{"role":"assistant","content":'
         '[{"type":"text","text":"proj:oracle:gfx:blur discussion here"}]}}\n',
@@ -529,9 +529,9 @@ def test_fallback_session_scoring_avoids_short_tail_mismatch(tmp_path, monkeypat
     _sh.copytree(sessions, tmp_path / ".omp" / "agent" / "sessions")
 
     found = _fallback_find_session_for_key("proj:oracle:gfx:blur")
-    expected = tmp_path / ".omp" / "agent" / "sessions" / "ora-new" / "session.jsonl"
+    expected = tmp_path / ".omp" / "agent" / "sessions" / "postmesh-new" / "session.jsonl"
     assert found is not None
-    assert found == expected, "full-key match（ora-* 目录）必须胜过短 tail 误匹配"
+    assert found == expected, "full-key match（postmesh-* 目录）必须胜过短 tail 误匹配"
 
 
 # ── B1: CLI 强制显式 ExecutionSpec（去 role）──────────────────────────

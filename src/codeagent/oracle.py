@@ -141,7 +141,7 @@ def _review_sid(review_key: str) -> str:
     位；同一 review_key 每次得到相同 sid，冷路径不再产生 session 碎片。
     """
     digest = hashlib.sha256(review_key.encode("utf-8")).hexdigest()[:16]
-    return f"ora-{digest}"
+    return f"postmesh-{digest}"
 
 
 def _adopt_runtime(review_key: str, sid: str, handle, backend: str) -> bool | str:
@@ -704,7 +704,7 @@ def _scan_runtime_log_for_session_id(log_path: Optional[Path]) -> str:
         return backend_matches[-1].strip()
     for g in reversed(re.findall(r"session_id\s*=\s*([^\s,;\"']+)", text)):
         g = g.strip().strip('"').strip("'")
-        if g and not g.startswith("ora-"):
+        if g and not g.startswith("postmesh-"):
             return g
     return ""
 
@@ -1968,7 +1968,7 @@ def _fallback_find_session_for_key(review_key: str, since: Optional[float] = Non
         if key_score == 0:
             continue  # no key signal — skip regardless of dir bonus
         score = key_score
-        if "ora-" in f.name.lower() or "ora-" in str(f.parent).lower():
+        if "postmesh-" in f.name.lower() or "postmesh-" in str(f.parent).lower():
             score += 10
         if score > best_score:
             best, best_score, best_key_score = f, score, key_score
@@ -2497,9 +2497,9 @@ def _tmux_kill_oracle_runtime(review_key: str) -> tuple[bool, list[str]]:
     # 2) pane 级：窗口名前缀匹配。
     #    P2-D: 主前缀用 _review_sid（sha256[:16] 确定性，与 P0-A 对齐），
     #    保留旧前缀（replace(':','-')[-12:]）匹配 pre-P0-A 残留 pane。
-    new_prefix = _review_sid(review_key)  # "ora-{sha256[:16]}"
+    new_prefix = _review_sid(review_key)  # "postmesh-{sha256[:16]}"
     old_safe = review_key.replace(":", "-")[-12:]
-    old_prefix = f"ora-{old_safe}-"
+    old_prefix = f"ora-{old_safe}-"  # backward compat for pre-rename panes
     try:
         proc = subprocess.run(
             tmux_cmd("list-windows", "-t", TMUX_SESSION_NAME, "-F", "#{window_name}|#{pane_id}"),
