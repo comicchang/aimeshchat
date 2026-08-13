@@ -2040,6 +2040,16 @@ def _find_session_file(backend_session_id: str,
         return dirs
 
     candidates = _candidate_dirs()
+    # Fallback: if not found in primary root, also check _oracle/ subdirectories
+    # (historical sessions migrated to _oracle/<project>/ layout)
+    if not candidates and not session_dir:
+        oracle_root = search_root / "_oracle"
+        if oracle_root.is_dir():
+            for d in oracle_root.iterdir():
+                if not d.is_dir():
+                    continue
+                if any(f.name.endswith(f"_{backend_session_id}.jsonl") for f in d.iterdir()):
+                    candidates.append(d)
     if not candidates:
         return None
     best: Optional[Path] = None
