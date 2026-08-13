@@ -275,6 +275,25 @@ class ParkRegistry:
                 if self._evict_one(key, mj, "cold_resumable"):
                     evicted.append(key)
 
+            # 1b. P2-F: COLD_RESUMABLE 硬过期清理——TTL 阶段仅将 HOT_PARKED
+            # 降级为 COLD_RESUMABLE，但若 hard_expires 也已过期则应直接删除。
+            # hard_expires 是绝对生命周期上限，超期的 cold_resumable 行无法
+            # 再被 warm resume（backend session 已过期），继续保留只会浪费空间。
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM park_leases "
+                    "WHERE lifecycle = 'cold_resumable' "
+                    "AND hard_expires > 0 AND hard_expires < ?",
+                    (now,),
+                )
+                conn.commit()
+                if cur.rowcount:
+                    log.info(
+                        "park sweep: purged %d cold_resumable rows "
+                        "(hard_expires exceeded)",
+                        cur.rowcount,
+                    )
+
             # 2. LRU 驱逐（超限）——P3-16: 一次查询取超额 LRU 头部，
             # 替代原 while 循环逐条查询驱逐（O(n²) → O(n)）。
             max_hot = PARK_DEFAULTS["max_hot_parked"]

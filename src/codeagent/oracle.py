@@ -65,6 +65,8 @@ _TERMINAL_TASK_STATES = frozenset({
 })
 # OMP createSkippedToolResult() 的固定文案（interrupt_skipped 特征）。
 _SKIP_TEXT_MARKER = "Skipped due to pending system advisory"
+# P2-C: 卡死检测只扫描 JSONL 尾部 N 行（避免大文件全量读取开销）。
+_STUCK_SCAN_TAIL_LINES = 200
 
 
 def _kernel_and_store():
@@ -255,11 +257,16 @@ def _normalize_oracle_agent(agent_type: str) -> str:
     """未显式指定 agent 时给明确默认（oracle），不再静默回落 default/mimo。
 
     空值 / ``default`` 归一为 ``oracle``（与 CLI ``--agent`` 默认值一致），
-    并打 warning 提示；其余类型原样透传。
+    其余类型原样透传。
+
+    P2-B: 降为 debug——本函数在 ``cmd_oracle_start`` 中无条件调用（即使
+    用户显式传了 ``--model``），此时 agent 不参与模型解析，warning 是
+    噪声。仅在 ``_resolve_oracle_model_chain`` 的实际解析路径中，agent
+    归一才影响结果，但该路径已有显式 ``--model`` 的 early-return 保护。
     """
     if not agent_type or agent_type == "default":
-        log.warning("oracle: no explicit agent specified — defaulting to %r "
-                    "(agent profile model: is the single authority)", _ORACLE_AGENT)
+        log.debug("oracle: no explicit agent specified — defaulting to %r "
+                  "(agent profile model: is the single authority)", _ORACLE_AGENT)
         return _ORACLE_AGENT
     return agent_type
 
@@ -1404,48 +1411,72 @@ def _is_interrupt_skip(text: str) -> bool:
     return False
 
 
-def _scan_session_stuck_events(path: Path, since_epoch: float) -> list[tuple[str, float]]:
+def _read_tail_lines(path: Path, n: int) -> list[str]:
+    """P2-C: 读取文件尾部 n 行（seek 到末尾反向扫描，避免全量加载大文件）。"""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)  # SEEK_END
+            size = f.tell()
+            # 每行约 200-500 字节 JSONL；向上估算读取块大小
+            chunk = min(size, n * 1024)  # 最多读 n*1KB
+            f.seek(max(0, size - chunk))
+            data = f.read().decode("utf-8", errors="replace")
+            lines = data.splitlines()
+            # 第一行可能被截断（从块中间开始），丢弃
+            if len(lines) > n and size > chunk:
+                lines = lines[1:]
+            return lines[-n:]
+    except OSError:
+        return []
+
+
+def _scan_session_stuck_events(path: Path, since_epoch: float,
+                               tail_lines: int = _STUCK_SCAN_TAIL_LINES,
+                               ) -> list[tuple[str, float]]:
     """扫描 OMP 会话转录，返回 generation 窗口内的 ``(kind, ts)`` 事件序列。
 
     kind: ``skip``（interrupt_skipped）| ``tool_ok``（成功工具结果）|
     ``output``（assistant 文本消息）。
 
-    为什么不用 gateway 的 TOOL_FINISHED 判“成功”：插件在 ``tool_result``
+    为什么不用 gateway 的 TOOL_FINISHED 判"成功"：插件在 ``tool_result``
     hook 上对 skip 结果同样上报 TOOL_FINISHED（空 payload，无法区分），
-    因此“成功”进度只能以转录为准。
+    因此"成功"进度只能以转录为准。
+
+    P2-C: 仅读取尾部 ``tail_lines`` 行（默认 200），避免大 JSONL 全量
+    扫描开销。卡死/停滞检测只关心最近 generation 的事件，尾部足够覆盖。
     """
     events: list[tuple[str, float]] = []
     try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if obj.get("type") != "message":
-                    continue
-                ts = _parse_iso_ts(obj.get("timestamp", ""))
-                if ts is None or ts < since_epoch:
-                    continue
-                msg = obj.get("message", {}) or {}
-                role = msg.get("role")
-                if role == "toolResult":
-                    text = "".join(
-                        c.get("text", "") for c in (msg.get("content") or [])
-                        if isinstance(c, dict) and c.get("type") == "text"
-                    )
-                    events.append(("skip" if _is_interrupt_skip(text) else "tool_ok", ts))
-                elif role == "assistant":
-                    content = msg.get("content") or []
-                    text = "".join(
-                        c.get("text", "") for c in content
-                        if isinstance(c, dict) and c.get("type") == "text"
-                    )
-                    if text.strip():
-                        events.append(("output", ts))
+        lines = _read_tail_lines(path, tail_lines)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if obj.get("type") != "message":
+                continue
+            ts = _parse_iso_ts(obj.get("timestamp", ""))
+            if ts is None or ts < since_epoch:
+                continue
+            msg = obj.get("message", {}) or {}
+            role = msg.get("role")
+            if role == "toolResult":
+                text = "".join(
+                    c.get("text", "") for c in (msg.get("content") or [])
+                    if isinstance(c, dict) and c.get("type") == "text"
+                )
+                events.append(("skip" if _is_interrupt_skip(text) else "tool_ok", ts))
+            elif role == "assistant":
+                content = msg.get("content") or []
+                text = "".join(
+                    c.get("text", "") for c in content
+                    if isinstance(c, dict) and c.get("type") == "text"
+                )
+                if text.strip():
+                    events.append(("output", ts))
     except OSError:
         return []
     events.sort(key=lambda e: e[1])  # 时间序
@@ -2357,10 +2388,12 @@ def _tmux_kill_oracle_runtime(review_key: str) -> tuple[bool, list[str]]:
             except (ProcessLookupError, OSError) as exc:
                 log.debug("oracle release: pid kill failed (%s): %s", pid, exc)
 
-    # 2) pane 级：窗口名 ``ora-<safe>-...`` 前缀匹配（与 launchers.tmux
-    #    runtime_sid 的命名一致）。
-    safe = review_key.replace(":", "-")[-12:]
-    prefix = f"ora-{safe}-"
+    # 2) pane 级：窗口名前缀匹配。
+    #    P2-D: 主前缀用 _review_sid（sha256[:16] 确定性，与 P0-A 对齐），
+    #    保留旧前缀（replace(':','-')[-12:]）匹配 pre-P0-A 残留 pane。
+    new_prefix = _review_sid(review_key)  # "ora-{sha256[:16]}"
+    old_safe = review_key.replace(":", "-")[-12:]
+    old_prefix = f"ora-{old_safe}-"
     try:
         proc = subprocess.run(
             tmux_cmd("list-windows", "-t", TMUX_SESSION_NAME, "-F", "#{window_name}|#{pane_id}"),
@@ -2369,8 +2402,13 @@ def _tmux_kill_oracle_runtime(review_key: str) -> tuple[bool, list[str]]:
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():
                 name, sep, pane = line.partition("|")
-                if sep and name.startswith(prefix) and kill_pane(pane):
-                    targets.append(f"pane:{pane}")
+                if not sep:
+                    continue
+                # 新前缀精确匹配或旧前缀前缀匹配（兼容遗留 pane）
+                if (name == new_prefix or name.startswith(new_prefix)
+                        or name.startswith(old_prefix)):
+                    if kill_pane(pane):
+                        targets.append(f"pane:{pane}")
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.debug("oracle release: tmux pane scan failed: %s", exc)
 

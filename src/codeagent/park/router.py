@@ -110,8 +110,3 @@ def revive_or_spawn(
 def park_revive(review_key: str, prompt: str = "") -> ReviveResult:
     """Public API: revive or spawn a park instance."""
     return revive_or_spawn(review_key, prompt)
-
-
-def park_revive(review_key: str, prompt: str = "") -> ReviveResult:
-    """Public API: revive or spawn a park instance."""
-    return revive_or_spawn(review_key, prompt)

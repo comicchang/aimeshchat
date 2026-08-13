@@ -364,8 +364,13 @@ class ControlStore:
         return self.get_command(request_id)
 
     def list_commands(self, runtime_id: str = "", state: Optional[str] = None,
-                      limit: int = 100) -> list[dict]:
-        """按 runtime/state 列出命令（观测用，最新在前）。"""
+                      limit: int = 100, offset: int = 0) -> list[dict]:
+        """按 runtime/state 列出命令（观测用，最新在前）。
+
+        P2-E 修复：支持游标分页（offset）。调用方可通过 offset 翻页，
+        每次返回 limit 条；返回空列表表示已到末尾。向后兼容——省略
+        offset 等价于从头开始。
+        """
         where: list[str] = []
         args: list[Any] = []
         if runtime_id:
@@ -381,8 +386,13 @@ class ControlStore:
         )
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY created_at DESC LIMIT ?"
-        args.append(max(1, min(int(limit), 1000)))
+        # P2-E: ORDER BY 必须确定性（created_at DESC + request_id 作 tiebreaker），
+        # 配合 OFFSET/LIMIT 实现稳定分页。
+        sql += " ORDER BY created_at DESC, request_id DESC LIMIT ? OFFSET ?"
+        safe_limit = max(1, min(int(limit), 1000))
+        safe_offset = max(0, int(offset))
+        args.append(safe_limit)
+        args.append(safe_offset)
         with self._connect() as conn:
             rows = conn.execute(sql, args).fetchall()
         return [self._command_row(r) for r in rows]

@@ -376,37 +376,38 @@ class EventStore:
         }
 
     def kind_stats(self, runtime_id: str, generation: Optional[int] = None) -> dict[str, Any]:
-        """Per-kind counts + newest event per kind for a runtime (卡死检测用).
+        """Per-kind counts + newest event per kind for a runtime (卡死检测用)。
 
         oracle status 的停滞检测用它在单次 SQL 扫描里拿到各 kind 的计数和
         最新时间戳，避免客户端翻完整事件尾。``generation=None`` 聚合所有代。
+
+        P2-G 修复：原来先 GROUP BY 取 MAX(event_id)，再逐个 SELECT
+        created_at（N+1 查询）。现合并为单条窗口函数查询——子查询取
+        COUNT + MAX(event_id) per kind，外层 JOIN 回 runtime_events
+        拿 created_at，一次完成。
         """
         gen_where = " AND generation = ?" if generation is not None else ""
         gen_args: tuple[Any, ...] = (generation,) if generation is not None else ()
+        # P2-G: 单查询——子查询聚合计数和最大 event_id，JOIN 回主表取 created_at。
+        sql = (
+            "SELECT s.kind, s.cnt, re.created_at "
+            "FROM ("
+            "  SELECT kind, COUNT(*) AS cnt, MAX(event_id) AS max_id "
+            "  FROM runtime_events "
+            f" WHERE runtime_id = ?{gen_where} "
+            "  GROUP BY kind"
+            ") s "
+            "LEFT JOIN runtime_events re ON re.event_id = s.max_id"
+        )
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT kind, COUNT(*) FROM runtime_events "
-                f"WHERE runtime_id = ?{gen_where} GROUP BY kind",
-                (runtime_id, *gen_args),
-            ).fetchall()
-            # 每个 kind 的最新事件（event_id 单调递增，即时间序）。
-            newest_ids = conn.execute(
-                "SELECT kind, MAX(event_id) FROM runtime_events "
-                f"WHERE runtime_id = ?{gen_where} GROUP BY kind",
-                (runtime_id, *gen_args),
-            ).fetchall()
-            newest: dict[str, str] = {}
-            for kind, max_id in newest_ids:
-                row = conn.execute(
-                    "SELECT created_at FROM runtime_events WHERE event_id = ?",
-                    (int(max_id),),
-                ).fetchone()
-                if row is not None:
-                    newest[kind] = row[0]
-        return {
-            "counts": {k: int(c) for k, c in rows},
-            "newest": newest,
-        }
+            rows = conn.execute(sql, (runtime_id, *gen_args)).fetchall()
+        counts: dict[str, int] = {}
+        newest: dict[str, str] = {}
+        for kind, cnt, created_at in rows:
+            counts[kind] = int(cnt)
+            if created_at is not None:
+                newest[kind] = created_at
+        return {"counts": counts, "newest": newest}
 
     # ── retention ──────────────────────────────────────────────────────
 
