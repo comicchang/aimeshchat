@@ -69,7 +69,7 @@ _SKIP_TEXT_MARKER = "Skipped due to pending system advisory"
 # P2-C: 卡死检测只扫描 JSONL 尾部 N 行（避免大文件全量读取开销）。
 _STUCK_SCAN_TAIL_LINES = 200
 # P1: oracle result 输出截断上限（字节），可通过 ORACLE_RESULT_MAX_BYTES 覆盖。
-_DEFAULT_RESULT_MAX_BYTES = 8192
+_DEFAULT_RESULT_MAX_BYTES = 32768  # 32KB; was 8KB — oracle output is long
 
 
 def _kernel_and_store():
@@ -2104,6 +2104,13 @@ def _truncate_result(text: str, max_bytes: int) -> tuple[str, bool, int, int]:
     return truncated, True, len(truncated.encode("utf-8")), total
 
 
+def _trunc_notice(text: str, was_trunc: bool, trunc_bytes: int, total_bytes: int) -> str:
+    """P0-2: append tail notice when truncation occurred."""
+    if was_trunc:
+        return f"{text}\n\n…[truncated {trunc_bytes}/{total_bytes} bytes]"
+    return text
+
+
 def cmd_oracle_result(args: argparse.Namespace) -> int:
     """A2: unified result extraction — session transcript → mailbox REPORT → FS scan.
 
@@ -2162,7 +2169,7 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
                 else:
                     out["truncated"] = False
                 if raw_mode:
-                    print(trunc_text)
+                    print(_trunc_notice(trunc_text, was_trunc, trunc_bytes, total_bytes))
                 else:
                     print(json.dumps(out, indent=2))
                 return 0
@@ -2185,7 +2192,7 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
         else:
             out["truncated"] = False
         if raw_mode:
-            print(trunc_text)
+            print(_trunc_notice(trunc_text, was_trunc, trunc_bytes, total_bytes))
         else:
             print(json.dumps(out, indent=2))
         return 0
@@ -2217,7 +2224,7 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
                 else:
                     out["truncated"] = False
                 if raw_mode:
-                    print(trunc_text)
+                    print(_trunc_notice(trunc_text, was_trunc, trunc_bytes, total_bytes))
                 else:
                     print(json.dumps(out, indent=2))
                 return 0
@@ -2308,7 +2315,7 @@ def _wait_final_text(review_key: str) -> Optional[str]:
 
 def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                          timeout: float = 300.0, interval: float = 5.0,
-                         max_bytes: int = 0) -> int:
+                         max_bytes: int = 0, info: Optional[dict] = None) -> int:
     """A15: 等待 oracle 新产出并内联打印——供 cmd_oracle_wait 和 ask --wait 共用。
 
     等待方式：boot drain 设高水位 cursor，主轮询只看 cursor 后新事件。
@@ -2316,11 +2323,19 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
     不做 baseline 文本对比（JSONL 更新/截断曾误触发旧内容返回）。
     cursor 后的 ASSISTANT_PROGRESS 一定是新 turn 的产出。
 
-    返回 0 = 命中新产出并打印, 1 = 超时, 130 = KeyboardInterrupt。
+    返回 0 = 命中新产出并打印, 1 = 超时或强卡死信号, 130 = KeyboardInterrupt。
     """
     # boot drain：设高水位 cursor，后续只看新事件（不再 baseline 文本对比）。
     cursor: int = 0
     deadline = time.monotonic() + timeout
+
+    # 内联卡死检测所需 runtime info——未传时回退拉取（供 ask --wait 等路径）。
+    if info is None:
+        try:
+            info = _gateway().call("runtime.info", {"review_key": review_key})
+        except GatewayError:
+            info = {}
+    polls: int = 0
 
     # P1-1: 初始全量 drain——先检查是否已有 agent_end 事件落地
     try:
@@ -2335,8 +2350,8 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
             if ev.get("kind") == "TASK_STATE" and (ev.get("payload") or {}).get("state") == "agent_end":
                 final = _wait_final_text(review_key)
                 if final is not None:
-                    trunc, _, _, _ = _truncate_result(final, max_bytes)
-                    print(trunc)
+                    trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
+                    print(_trunc_notice(trunc, was_trunc, t_bytes, total))
                 return 0
         cursor = int(boot.get("cursor") or 0)
     except GatewayError:
@@ -2362,19 +2377,30 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
             if kind == "ASSISTANT_PROGRESS":
                 # cursor 后的 ASSISTANT_PROGRESS 一定是新 turn 产出，无需 baseline 文本对比
                 # （baseline 对比曾因 JSONL 更新/截断误触发旧内容返回）。
+                quick = payload.get("text") or ""
+                if quick:
+                    print(quick)  # 快速反馈：流式文本先内联打印
                 final = _wait_final_text(review_key)
                 if final is not None:
-                    trunc, _, _, _ = _truncate_result(final, max_bytes)
-                    print(trunc)
+                    trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
+                    print(_trunc_notice(trunc, was_trunc, t_bytes, total))
                     return 0
                 continue  # 无文本（罕见）——继续等
             if kind == "TASK_STATE" and payload.get("state") == "agent_end":
                 final = _wait_final_text(review_key)
                 if final is not None:
-                    trunc, _, _, _ = _truncate_result(final, max_bytes)
-                    print(trunc)  # B1: 内联最终文本
+                    trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
+                    print(_trunc_notice(trunc, was_trunc, t_bytes, total))  # B1: 内联最终文本
                 return 0
         cursor = int(result.get("cursor") or cursor or 0)
+        polls += 1
+        # 每 3 次轮询内联卡死检测：强信号 → 输出 stuck 并返回 1（不自动 recover）。
+        if polls % 3 == 0:
+            stuck = _detect_oracle_stuck(review_key, info)
+            if stuck and stuck.get("signal") == "strong":
+                print(json.dumps({"status": "stuck",
+                                  "hint": stuck.get("hint", "")}, indent=2))
+                return 1
         if time.monotonic() >= deadline:
             print(json.dumps({"status": "timeout",
                               "suggestion": "use oracle result"}, indent=2))
@@ -2399,9 +2425,9 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
     review_key = args.review_key
     interval = max(0.1, float(getattr(args, "interval", 5.0) or 5.0))
     timeout = max(0.0, float(getattr(args, "timeout", 300.0) or 300.0))
-    # P1: 截断上限（oracle wait 无 --all，始终应用上限）
-    max_bytes = int(os.environ.get("ORACLE_RESULT_MAX_BYTES",
-                                   _DEFAULT_RESULT_MAX_BYTES))
+    # P1: 截断上限（--all 跳过上限）
+    max_bytes = 0 if getattr(args, "all", False) else int(
+        os.environ.get("ORACLE_RESULT_MAX_BYTES", _DEFAULT_RESULT_MAX_BYTES))
 
     try:
         info = _gateway().call("runtime.info", {"review_key": review_key})
@@ -2434,7 +2460,7 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
     # A15: 委托给共享的 _wait_for_new_output 辅助函数
     return _wait_for_new_output(review_key, runtime_id, session_id,
                                 timeout=timeout, interval=interval,
-                                max_bytes=max_bytes)
+                                max_bytes=max_bytes, info=info)
 
 
 # ── release ────────────────────────────────────────────────────────────
