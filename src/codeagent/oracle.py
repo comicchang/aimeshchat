@@ -2311,13 +2311,14 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                          max_bytes: int = 0) -> int:
     """A15: 等待 oracle 新产出并内联打印——供 cmd_oracle_wait 和 ask --wait 共用。
 
-    复用 cmd_oracle_wait 的 baseline 过滤逻辑：baseline = ask 前主会话最新
-    assistant 文本，轮询 gateway events.list 的 ASSISTANT_PROGRESS（新产出，
-    取 _wait_final_text，与 baseline 相同则继续）或 agent_end 兜底。
+    等待方式：boot drain 设高水位 cursor，主轮询只看 cursor 后新事件。
+    ASSISTANT_PROGRESS（新产出）或 agent_end（兜底）触发返回。
+    不做 baseline 文本对比（JSONL 更新/截断曾误触发旧内容返回）。
+    cursor 后的 ASSISTANT_PROGRESS 一定是新 turn 的产出。
 
     返回 0 = 命中新产出并打印, 1 = 超时, 130 = KeyboardInterrupt。
     """
-    baseline_text = _wait_final_text(review_key) or ""
+    # boot drain：设高水位 cursor，后续只看新事件（不再 baseline 文本对比）。
     cursor: int = 0
     deadline = time.monotonic() + timeout
 
@@ -2359,14 +2360,14 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
             kind = ev.get("kind")
             payload = ev.get("payload") or {}
             if kind == "ASSISTANT_PROGRESS":
-                # __advisor 也会发 ASSISTANT_PROGRESS，但写的是独立
-                # __advisor.jsonl——主会话文本不变。baseline 比对过滤噪声。
+                # cursor 后的 ASSISTANT_PROGRESS 一定是新 turn 产出，无需 baseline 文本对比
+                # （baseline 对比曾因 JSONL 更新/截断误触发旧内容返回）。
                 final = _wait_final_text(review_key)
-                if final is not None and final != baseline_text:
+                if final is not None:
                     trunc, _, _, _ = _truncate_result(final, max_bytes)
                     print(trunc)
                     return 0
-                continue  # advisor 噪声或无新主输出——继续等
+                continue  # 无文本（罕见）——继续等
             if kind == "TASK_STATE" and payload.get("state") == "agent_end":
                 final = _wait_final_text(review_key)
                 if final is not None:
