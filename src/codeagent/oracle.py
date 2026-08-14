@@ -1163,6 +1163,15 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
             "system_prompt": spec.system_prompt[:80] + "…" if len(spec.system_prompt) > 80 else spec.system_prompt,
         },
     }, indent=2))
+
+    # Auto-trigger gc on agent start (clean stale sessions).
+    if _gc_throttle():
+        try:
+            import threading
+            threading.Thread(target=_run_gc_silent, daemon=True).start()
+        except Exception:
+            pass
+
     return 0
 
 
