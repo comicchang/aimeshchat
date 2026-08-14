@@ -112,15 +112,18 @@ aimeshchat oracle gc [--dry-run] [--json]
 
 ## 触发条件
 
+> **前提**：以下命令仅在已进入持久 review 会话时使用。
+> 首次咨询走 `oracle-consult` 的 `task` 直接调用，不走本表。
+
 | 用户说 | 行为 |
 |--------|------|
-| "多轮 oracle review X" / "找 oracle 验收" | `oracle start` |
-| "追加信息" / "追问" / 新证据 | `oracle ask` |
-| "oracle 现在怎么样" | `oracle status` |
-| "有哪些进行中的 oracle review" | `oracle list` |
-| "oracle 回答了什么" / "取结果" | `oracle result` / `oracle wait` |
-| "唤醒已释放的 review" | `oracle revive` / `oracle attach` |
-| "结束 review" / "释放" | `oracle release` |
+| "persist-oracle" / "持久化这个 review" / "用 persist-oracle 工具" | `oracle start`（进入持久会话） |
+| （已在持久会话内）"追加信息" / "追问" / 新证据 | `oracle ask` |
+| （已在持久会话内）"oracle 现在怎么样" | `oracle status` |
+| （已在持久会话内）"有哪些进行中的 oracle review" | `oracle list` |
+| （已在持久会话内）"oracle 回答了什么" / "取结果" | `oracle result` / `oracle wait` |
+| （已在持久会话内）"唤醒已释放的 review" | `oracle revive` / `oracle attach` |
+| （已在持久会话内）"结束 review" / "释放" | `oracle release` |
 
 ## GC 自动清理
 
