@@ -1,13 +1,13 @@
 ---
 name: persist-oracle
-description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshchat oracle start/ask/status/list/watch/wait/result/revive/attach/release。何时咨询、选档见 oracle-consult skill。
+description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshchat oracle start/ask/status/list/watch/wait/result/revive/attach/release。仅在用户明确说「persist-oracle」「持久化这个 review」时使用；默认咨询走 oracle-consult 的 task 直接调用。
 ---
 
 # persist-oracle — 持久化多轮 Oracle Review
 
-> Oracle 推理较慢（30-60 分钟常见）。长任务由 gateway+tmux 监督，**没有 hard timeout**；
-> 只有显式 `oracle release` 才能终止 runtime。禁止回退 OMP task 子 Agent、
-> 一次性 shell 或 `communicate()`。
+> **使用时机**：仅在用户明确说「persist-oracle」「持久化这个 review」「用 persist-oracle 工具」时使用。
+> 默认的 oracle 咨询走 `oracle-consult` skill 的 `task` 直接调用，不走本 skill。
+>
 > 何时咨询、按困难程度路由、提问模板与追问技巧 → 见 `oracle-consult` skill。
 
 ## 原生优先原则

@@ -1,24 +1,46 @@
 ---
 name: oracle-consult
-description: 何时、如何向 Oracle 提问，并按困难程度路由到 oracle-lite / oracle / oracle-opus。覆盖调用纪律、上下文收集、标准 prompt 模板与追问技巧。实际启动/持久化/追问命令与模型映射见 persist-oracle。
+description: 何时、如何向 Oracle 提问，并按困难程度路由到 oracle-lite / oracle。覆盖调用纪律、上下文收集、标准 prompt 模板与追问技巧。默认用 task 直接咨询，不走 persist-oracle 除非用户明确要求。
 ---
 
 # oracle-consult — Oracle 咨询工作流
 
-> 本 skill 管「该不该问、问哪个档、怎么组织问题」。启动/持久化/追问/降级的具体命令
-> 与三档模型映射见 `persist-oracle` skill。
+> 本 skill 管「该不该问、问哪个档、怎么组织问题、怎么追问」。
+> 启动/持久化/追问的具体命令与模型映射见 `persist-oracle` skill。
 
-## 默认行为：持久 Oracle
+## 模型选择（成本优先）
 
-默认使用持久化 Oracle（上下文跨轮保留）。只有用户明确说「一次性」「one-shot」
-「不持久化」「新实例」时才 spawn 一次性 Oracle。
+| 档位 | 模型 | 适用场景 | 成本 |
+|------|------|----------|------|
+| **oracle-lite**（默认） | deepseek-v4-pro | 代码审查、文档质量、测试覆盖、格式审查、日常问题 | 低 |
+| **oracle** | gpt-5.6-sol | 架构 trade-off、根因分析、风险评审、跨领域问题 | 中 |
+| **oracle-opus** | claude-opus-4-8 | **仅用户明确要求时使用**（太贵） | 高 |
 
-| 用户意图 | 行为 |
-|----------|------|
-| "咨询 oracle" / "问 oracle" / "oracle review" / "找 oracle 验收" | 持久 Oracle（默认） |
-| "继续 review" / "追问" / "补充证据" | 持久 Oracle（复用同一实例） |
-| "一次性 oracle" / "one-shot" / "新实例" | 一次性 Oracle（不 park） |
-| "独立第二意见" / "换模型" | 新持久实例（新 review key） |
+**默认规则**：用户说「咨询 oracle」→ 用 `oracle-lite`。
+只有场景命中高难度行或用户明确说「用 oracle」「用 full oracle」时才升级。
+**oracle-opus 除非用户明确说「用 opus」「用 oracle-opus」，否则禁止使用。**
+
+## 咨询方式（task 直接调用）
+
+### 默认：task 直接咨询
+
+用户说「咨询 oracle」「问 oracle」「oracle review」「找 oracle 验收」时：
+1. 用 `task` 工具直接 spawn oracle agent（不走 persist-oracle CLI）
+2. 在 task prompt 中包含收集好的上下文
+3. 记录返回的 `agent://<id>`，告知用户已创建咨询
+
+### 追问：复用同一 task agent
+
+用户说「追问」「继续补充」「再问一次」「补充证据」时：
+1. 用 `hub send` 向之前的 `agent://<id>` 发送增量问题
+2. 不要重新 spawn——复用同一实例
+3. 格式：补充新证据 + 已落实建议 + 未落实原因
+
+### 持久化：仅用户明确要求时
+
+用户说「persist-oracle」「持久化这个 review」「用 persist-oracle 工具」时：
+1. 才使用 `persist-oracle` skill 的 CLI 命令（`aimeshchat oracle start/ask/wait`）
+2. 这时走完整的持久化流程（park/revive/session-dir 隔离）
 
 ## 调用纪律
 
@@ -51,13 +73,11 @@ Agent 主动咨询 → 需全部满足：
 | 同一问题多次修复失败 | `oracle` | 需要跳出当前思路 |
 | 上线前风险评审 | `oracle` | 需要独立视角 |
 | 跨领域问题（并发+网络+存储） | `oracle` | 需要综合判断 |
-| 安全审计 / 合规检查 / 高风险变更 | `oracle-opus` | 需证据链与严格形式化 |
-| 用户明确指定档位（oracle / oracle-opus） | 按用户指定 | 无条件执行 |
+| 用户明确指定档位（oracle / oracle-lite） | 按用户指定 | 无条件执行 |
+| 用户说「用 opus」「用 oracle-opus」 | `oracle-opus` | 无条件执行（贵，需明确要求） |
 
 **用户说「咨询 oracle」时**：默认 `oracle-lite`，除非明确指定档位
-（「用 oracle」「用 oracle-opus」）或场景命中上表高难度行。
-
-三档对应的 model/variant/system 见 `persist-oracle` 的 ExecutionSpec 推荐表。
+（「用 oracle」「用 full oracle」）或场景命中上表高难度行。
 
 ## 咨询前上下文收集
 
@@ -118,7 +138,7 @@ memory_search / history / git log。只追加：
 
 ## 追问技巧
 
-沿用同一实例（持久模式），不重发全部上下文：
+沿用同一实例（task agent），不重发全部上下文：
 - 补证据：「我验证了 X，结果是 Y；这是否改变你的推荐？」
 - 收敛方案：「请只在方案 A 的前提下给出最小落地步骤」
 - 风险展开：「关于兼容性风险，请列出必须测试的用例」
@@ -131,13 +151,7 @@ memory_search / history / git log。只追加：
 |------|------|
 | 先 explore 再 Oracle | explore 收集后一次性传给 Oracle |
 | 压缩上下文 | 只传相关文件/函数，不传整个目录 |
-| 非关键用 oracle-lite | 文档/格式/测试覆盖不需要最强模型 |
+| 默认 oracle-lite | 文档/格式/测试覆盖不需要最强模型 |
 | 限制轮次 | 同一 session 不超过 3-5 轮追问 |
 | 持久化复用 | 多轮 review 复用同一实例，避免重复上下文 |
-
-## 交付模式
-
-- 持久模式（默认）：首轮启动后记录 review key，后续轮复用；命令见 `persist-oracle`。
-- 一次性模式（用户显式要求）：spawn → 收回答 → 结束（不 park，不支持后续追问）。
-- 降级（hot→warm→cold）由 `persist-oracle` 的 CLI 自动处理——本 skill 只声明
-  「追问自动走 hot→warm→cold」，不重复其机制。
+| 禁止 oracle-opus | 除非用户明确要求，否则不使用（太贵） |
