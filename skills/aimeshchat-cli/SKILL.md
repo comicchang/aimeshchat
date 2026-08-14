@@ -49,14 +49,15 @@ aimeshchat route where <topic>
 printf '%s\n' '<task>' | aimeshchat route <topic> --repo 0 --model <provider/model>
 aimeshchat route <topic> '<task>' --dry-run
 
-# 路由（异步，后台执行，立即返回 job ID）
-aimeshchat route <topic> '<task>' --background
-aimeshchat job status <job_id>    # 查进度
-aimeshchat job wait <job_id>      # 等完成
+# 异步执行（route 无 --background；先 where 查映射，再 run --background）
+aimeshchat route where <topic>                        # 查 host/path
+aimeshchat run '<task>' <workdir> --host <host> --background   # 立即返回 job ID（stderr）
+aimeshchat job list                                   # 列出后台 job
+aimeshchat job status <job_id>                        # 查进度（不阻塞）
+aimeshchat job wait <job_id> [--timeout <秒>]         # 阻塞到完成，结果在 JSON 的 stdout 字段
 
-# 直接执行（同步/异步）
+# 直接执行（同步）
 aimeshchat run '<task>' <workdir> --host <host> --model <provider/model>
-aimeshchat run '<task>' <workdir> --background  # 异步
 
 # Session 管理
 aimeshchat sessions list [--host H] [--topic T]
@@ -69,33 +70,52 @@ aimeshchat ssh warm <host...>
 aimeshchat ssh status
 aimeshchat ssh stop <host...>
 
-# Mailbox（跨主机通信）
-aimeshchat mailbox send --session s1 --from manager --to w1 --kind TASK ... --host dev-server
-aimeshchat mailbox peek --session s1 --agent w1 [--host dev-server]
-aimeshchat mailbox read --session s1 --agent w1 --owner w1 [--host dev-server]
+# Mailbox（跨主机通信；--host 省略=本地）
+aimeshchat mailbox session-init --session <sid> --manager manager --agents w1,w2 --host <H>
+aimeshchat mailbox send --session <sid> --from manager --to w1 --kind TASK \
+  --subject '...' --body '{"request_id":"req1","run_id":"r1"}' --host <H>
+aimeshchat mailbox peek --session <sid> --agent w1 --host <H>      # 非破坏：数量+预览
+aimeshchat mailbox read --session <sid> --agent manager --owner manager --host <H> --json  # manager 拉 REPORT
+aimeshchat mailbox read --session <sid> --agent w1 --owner w1 --host <H>                   # worker 消费
+aimeshchat mailbox finalize --session <sid> --agent w1 --msg-id <id> --owner w1 --host <H>
+aimeshchat mailbox release --session <sid> --agent w1 --msg-id <id> --owner w1 --host <H>  # 处理失败退回 inbox
+aimeshchat mailbox stats --session <sid> --agent w1 --host <H>     # inbox/processing/archive/_corrupt 计数
+aimeshchat mailbox recover-stale --session <sid> --agent w1 --host <H>  # >300s 租约回收
+aimeshchat mailbox clear --session <sid> --agent w1 --host <H>     # 仅任务+回执完全处理完后清 archive
 
-# Swarm IPC（高级 IPC）
-aimeshchat swarm create-session s1 --manager mgr --members w1,w2
-aimeshchat swarm register s1 --agent w1 --host dev-server
-aimeshchat swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body "..."
-aimeshchat swarm poll s1 --agent w1
-aimeshchat swarm watch s1 --agent w1 --interval 2
+# Swarm IPC（高级 IPC，SessionManifest-aware）
+aimeshchat swarm create-session <sid> --manager manager --members w1,w2
+aimeshchat swarm register <sid> --agent w1 --host <H> --backend omp
+aimeshchat swarm direct <sid> --from manager --to w1 --kind TASK --subject '...' --body '...'
+aimeshchat swarm poll <sid> --agent w1                 # local-only 轮询
+aimeshchat swarm watch <sid> --agent w1 --interval 2   # 轮询循环
+aimeshchat swarm launch <sid> --bootstrap --pull --poll-interval 5   # 一键 bootstrap 远端 worker + manager-pull
+
+# Artifact（REPORT 附件拉取与校验）
+aimeshchat artifact pull --host <H> --artifact-id <id> --relative-path <p> \
+  --size <n> --sha256 <hex> --dest <local-path>
+aimeshchat artifact verify --file <local-path> --size <n> --sha256 <hex>
 
 # Gateway（跨设备运行时控制面，v2）
 aimeshchat gateway ensure --host <H>      # 远端预检（wire v2）+ 启动 gateway
 aimeshchat gateway status                 # 本机 gateway 状态
 aimeshchat gateway rpc --stdio            # SSH 有界控制（session.ensure/runtime.spawn/send/stop）
-aimeshchat events watch --session <id> --cursor <c> --jsonl   # 观察事件流（断线补流）
+aimeshchat events watch --session <sid> --cursor <c> --jsonl   # 观察事件流（断线补流）
+
+# Park（auto-exit:false 实例生命周期，如 oracle 系列）
+aimeshchat park acquire <review_key> --agent-type oracle --peer-id <id>
+aimeshchat park renew <review_key>
+aimeshchat park release <review_key>
+aimeshchat park sweep
 ```
 
-## Mailbox & Swarm
+## Mailbox & Swarm 关系
 
-`aimeshchat mailbox` 和 `aimeshchat swarm` 是跨主机通信的核心工具。详见 `skill://agent-swarm/` 编排协议。
-
-- `aimeshchat mailbox ... --host <alias>`: 跨主机 mailbox 操作（底层 SSH wire protocol）
-- `aimeshchat swarm ...`: 高级 IPC（session/roster/ACL/routing、delivery engine）
-- `aimeshchat gateway ...`: 跨设备运行时控制面（v2，见上）
-- 本地 mailbox: 直接使用 `mailbox` CLI（PATH command）
+`mailbox`（leaf transport）与 `swarm`（SessionManifest-aware routing）是两层：
+- 跨主机必须走 `swarm` 或 `mailbox --host <H>`；本地共用 FS 时 PATH 命令 `mailbox` 即可
+- Manager 的唯一入口是 `swarm` 子命令；bare `mailbox send` 仅用于 bootstrap 和故障诊断
+- Worker 的唯一入口是 `mailbox read` + 两阶段消费
+- 详见 `skill://agent-swarm/`
 
 **默认拓扑**: 跨主机（无共享 FS）。如需 Shared FS (Mode A)，必须显式设置 `MAILBOX_ROOT=.mailbox`。详见 `skill://agent-swarm/SKILL.md#deployment-modes`。
 
@@ -125,9 +145,10 @@ aimeshchat events watch --session <id> --cursor <c> --jsonl   # 观察事件流�
 每 5 秒循环，直到收到匹配 `request_id` 的 REPORT：
 
 ```bash
-# ① 拉 REPORT（两阶段消费）
+# ① 拉 REPORT（两阶段消费第一步）
 aimeshchat mailbox read --session <sid> --agent manager --owner manager --host <H> --json
-# ② 验证：REPORT 的 request_id 匹配 TASK；AttachmentRef 的 sha256/size 与实物一致
+# ② 验证：REPORT 的 request_id 匹配 TASK；附件用 artifact pull 拉取，sha256/size 与实物一致
+aimeshchat artifact pull --host <H> --artifact-id <id> --relative-path <p> --size <n> --sha256 <hex> --dest <local>
 # ③ finalize 归档（未验证前不要 finalize）
 aimeshchat mailbox finalize --session <sid> --agent manager --msg-id <id> --owner manager --host <H>
 ```
@@ -135,7 +156,7 @@ aimeshchat mailbox finalize --session <sid> --agent manager --msg-id <id> --owne
 - 终态以收到匹配 `request_id` 的 REPORT 为准，**不是** status DONE
 - REPORT 校验失败（sha256/size 不符）→ 拒绝并要求 worker 重发，不进入下一任务
 - v2 替代：`aimeshchat gateway ensure --host <H>` + `aimeshchat events watch --session <sid> --cursor <c> --jsonl` 事件流观察
-- `aimeshchat job wait <job_id>` 只适用于 `route --background` 场景，与 mailbox worker 无关
+- `aimeshchat job wait <job_id>` 只适用于 `run --background` 场景，与 mailbox worker 无关
 
 ### Dispatch Gate（避免打断）
 
@@ -166,38 +187,12 @@ aimeshchat mailbox finalize --session <sid> --agent manager --msg-id <id> --owne
 
 显式 `--session-key` 推荐格式：`<project>:<role>:<domain-or-topic>`。不要只写 `oracle`。
 
-## 异步执行模式（重要）
-
-远程任务可能需要数分钟甚至更长时间。**不要用同步模式等待**，会超时。
-
-正确做法：
-```bash
-# 1. 提交异步任务（立即返回 job ID 到 stderr）
-aimeshchat route 12-OHOS '分析 SpatialGlass 效果调用链' --background
-# stderr: [background] route job submitted: <12位hex> (pid=NNN)
-
-# 2. 查进度（不阻塞）
-aimeshchat job status <job_id>
-
-# 3. 等完成（阻塞，结果在 stdout JSON 的 stdout 字段）
-aimeshchat job wait <job_id>
-
-# 4. 取结果（job wait 返回的 JSON 包含 stdout）
-# 或直接读: $XDG_STATE_HOME/aimeshchat/jobs/<job_id>/result.json
-```
-
-**关键**：
-- `--background` 立即返回 job ID（在 stderr），任务在后台运行
-- `job wait` 返回 JSON，结果在 `stdout` 字段
-- `job list` 列出所有后台 job
-- `job wait --timeout <秒>` 可设超时（默认 0=永久）
-
 ## 输出过滤禁令
 
 **调用 aimeshchat 命令时，禁止使用提前退出的管道（`| head`/`| tail`/`| grep`）过滤输出。**
 
 原因：
-- `route --background` 的 job ID 打印到 **stderr**，stdout 为空，`| tail` 抓不到 job ID
+- `run --background` 的 job ID 打印到 **stderr**，stdout 为空，`| tail` 抓不到 job ID
 - 提前退出消费者（如 `| head`）会触发 SIGPIPE 杀死命令
 
 允许的管道：
@@ -210,7 +205,7 @@ aimeshchat oracle gc --json | jq '.cleaned'
 禁止的管道：
 ```bash
 # ✗ 提前退出过滤
-aimeshchat route 12-OHOS '任务' --background | tail -5
+aimeshchat run '任务' <workdir> --background | tail -5
 aimeshchat oracle status "$KEY" | grep "runtime_id"
 ```
 

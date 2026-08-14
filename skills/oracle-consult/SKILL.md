@@ -8,29 +8,39 @@ description: 何时、如何向 Oracle 提问，并按困难程度路由到 orac
 > 本 skill 管「该不该问、问哪个档、怎么组织问题、怎么追问」。
 > 启动/持久化/追问的具体命令与模型映射见 `persist-oracle` skill。
 
+## 调用纪律（该不该问）
+
+用户明确要求 → 无条件执行。
+
+Agent 主动咨询 → 需全部满足：
+1. 已穷尽自身推理（2-3 种思路都已走通/证伪）
+2. 是决策性的（存在 trade-off）
+3. 不重复（之前没问过相同问题）
+4. 上下文已就绪（见下方收集流程）
+
+禁止：
+- 每步都问「下一步」
+- 同题换说法反复问
+- 用 oracle / oracle-opus 做 explore / 格式审查（这类走本地工具或 oracle-lite）
+- 咨询可本地 5 分钟验证的低价值问题
+
 ## 模型选择（成本优先）
 
-| 档位 | 模型（provider/model） | 适用场景 | 成本 |
-|------|------------------------|----------|------|
-| **oracle-lite**（默认） | `Mify/deepseek/deepseek-v4-pro` | 代码审查、文档质量、测试覆盖、格式审查、日常问题 | 低 |
-| **oracle** | `bytecat-gpt/gpt-5.6-sol` | 架构 trade-off、根因分析、风险评审、跨领域问题 | 中 |
-| **oracle-opus** | `bytecat/claude-opus-4-8` | **仅用户明确要求时使用**（太贵） | 高 |
+| 档位 | 模型（provider/model） | task `agent=` | 适用场景 | 成本 |
+|------|------------------------|---------------|----------|------|
+| **oracle-lite**（默认） | `Mify/deepseek/deepseek-v4-pro` | `oracle-lite` | 代码审查、文档质量、测试覆盖、格式审查、日常问题 | 低 |
+| **oracle** | `bytecat-gpt/gpt-5.6-sol` | `oracle` | 架构 trade-off、根因分析、风险评审、跨领域问题 | 中 |
+| **oracle-opus** | `bytecat/claude-opus-4-8` | `oracle-opus` | **仅用户明确要求时使用**（太贵） | 高 |
 
 > 实际模型以 `~/.omp/agent/agents/<profile>.md` 的 `model:` 为准。
 > 改模型后跑 `grep -E '^model:' ~/.omp/agent/agents/oracle*.md` 校验一致性。
 
-**默认规则**：用户说「咨询 oracle」→ 用 `oracle-lite`。
-只有场景命中高难度行或用户明确说「用 oracle」「用 full oracle」时才升级。
-**oracle-opus 除非用户明确说「用 opus」「用 oracle-opus」，否则禁止使用。**
+**默认规则**：用户说「咨询 oracle」→ 用 `oracle-lite`，除非：
+- 场景命中高难度行（架构 trade-off / 同题多次失败 / 上线前风险评审 / 跨领域），或
+- 用户明确说「用 oracle」「用 full oracle」
+- **oracle-opus 除非用户明确说「用 opus」「用 oracle-opus」，否则禁止使用。**
 
-### task 调用时的档位映射
-
-用 `task` 工具直接咨询时，`agent` 参数决定模型：
-- `agent="oracle-lite"` → `Mify/deepseek/deepseek-v4-pro`
-- `agent="oracle"` → `bytecat-gpt/gpt-5.6-sol`
-- `agent="oracle-opus"` → `bytecat/claude-opus-4-8`
-
-未指定 `agent` 时默认 `oracle-lite`。
+`task` 工具咨询时，`agent` 参数决定模型（未指定默认 `oracle-lite`），映射见上表。
 
 ## 咨询方式（task 直接调用）
 
@@ -54,42 +64,11 @@ description: 何时、如何向 Oracle 提问，并按困难程度路由到 orac
 1. 才使用 `persist-oracle` skill 的 CLI 命令（`aimeshchat oracle start/ask/wait`）
 2. 这时走完整的持久化流程（park/revive/session-dir 隔离）
 
-## 调用纪律
-
-用户明确要求 → 无条件执行。
-
-Agent 主动咨询 → 需全部满足：
-1. 已穷尽自身推理（2-3 种思路都已走通/证伪）
-2. 是决策性的（存在 trade-off）
-3. 不重复（之前没问过相同问题）
-4. 上下文已就绪（见下方收集流程）
-
-禁止：
-- 每步都问「下一步」
-- 同题换说法反复问
-- 用 oracle / oracle-opus 做 explore / 格式审查（这类走本地工具或 oracle-lite）
-- 咨询可本地 5 分钟验证的低价值问题
-
 ## 边界（Oracle 是什么 / 不是什么）
 
 - **Oracle 只提供建议，不实施改动**——需要实现时另 spawn worker（源自 agent profile 约束）。
 - **Oracle 建议需人工复核**——它是独立视角的输入，不是最终结论；高风险决策以验证过的证据为准。
 - **上下文不足时 Oracle 会先指出缺失项**——不要替它脑补，把缺失信息补齐再问。
-
-## 路由决策树
-
-| 场景 | 路由 | 说明 |
-|------|------|------|
-| 代码审查 / 文档质量 / 测试覆盖 / 格式审查 | `oracle-lite` | 日常审查，够用且省 |
-| 架构 trade-off | `oracle` | 需要权衡判断 |
-| 同一问题多次修复失败 | `oracle` | 需要跳出当前思路 |
-| 上线前风险评审 | `oracle` | 需要独立视角 |
-| 跨领域问题（并发+网络+存储） | `oracle` | 需要综合判断 |
-| 用户明确指定档位（oracle / oracle-lite） | 按用户指定 | 无条件执行 |
-| 用户说「用 opus」「用 oracle-opus」 | `oracle-opus` | 无条件执行（贵，需明确要求） |
-
-**用户说「咨询 oracle」时**：默认 `oracle-lite`，除非明确指定档位
-（「用 oracle」「用 full oracle」）或场景命中上表高难度行。
 
 ## 咨询前上下文收集
 
@@ -112,7 +91,7 @@ memory_search / history / git log。只追加：
 
 ### 3. 拼装 prompt
 
-用下方标准模板，将上面收集的内容填入对应槽位。
+用下方标准模板，将上面收集的内容填入对应槽位。一次只问**一个**决策问题；多个问题拆成多轮。
 
 ## 标准 Prompt 模板
 
@@ -175,16 +154,20 @@ aimeshchat mailbox session-init --session "$SID" --manager manager --agents <w> 
 
 # 3. INIT 握手 → 验证 IDLE 后派发 TASK（body 带 request_id/run_id）
 aimeshchat mailbox send --session "$SID" --from manager --to <w> --kind TASK \
-  --subject "验证 <结论>" --body '<{"request_id":"req1","run_id":"r1",...}>' --host <H>
+  --subject "验证 <结论>" --body '{"request_id":"req1","run_id":"r1","target":"..."}' --host <H>
 
-# 4. 轮询等待 REPORT（每 5s）→ 验证 request_id 匹配 + 证据/产物 → finalize
+# 4. 轮询等待 REPORT（每 5s）：read → 验证 request_id + 附件 → finalize
 aimeshchat mailbox read --session "$SID" --agent manager --owner manager --host <H> --json
+aimeshchat artifact pull --host <H> --artifact-id <id> --relative-path <p> \
+  --size <n> --sha256 <hex> --dest <local>          # 附件验证
+aimeshchat mailbox finalize --session "$SID" --agent manager --msg-id <id> --owner manager --host <H>
 ```
 
 ### 纪律
 
 - 派发前确认目标 worker `state != BUSY` 且无未消费 REPORT（Dispatch Gate，见 aimeshchat-cli）
 - 验证类任务要求 REPORT 附证据引用（AttachmentRef：source_host/remote_root/relative_path/size/sha256），核对一致才算验证通过
+- REPORT 未经验证（request_id 匹配 + sha256/size）**不要 finalize**；校验失败 → 拒绝并要求 worker 重发
 - 结论落地需要并行验证多个点 → 拆多个 worker 并行派发，不串行排队
 
 ## 成本优化
