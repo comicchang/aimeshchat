@@ -446,7 +446,7 @@ uv run aimeshchat --version # Verify CLI
 The v3 session-based direct-inbox mailbox protocol, standalone CLI, and manager/worker skills
 were previously maintained at **[comicchang/tmux-agent-skills](https://github.com/comicchang/tmux-agent-skills)**
 (now archived). The protocol lives on in `src/codeagent/mailbox/` and
-`skills/tmux-agent-manager/`, `skills/tmux-agent-worker/`.
+已合并进 `skills/agent-swarm/`.
 
 A unified `agent-swarm` skill (formerly `tmux-agent`, renamed in v0.2.x) merges
 manager and worker into a single skill with role-based dispatch. Use
