@@ -99,6 +99,59 @@ aimeshchat events watch --session <id> --cursor <c> --jsonl   # 观察事件流�
 
 **默认拓扑**: 跨主机（无共享 FS）。如需 Shared FS (Mode A)，必须显式设置 `MAILBOX_ROOT=.mailbox`。详见 `skill://agent-swarm/SKILL.md#deployment-modes`。
 
+## 远程 Worker 管理
+
+编排远程 Worker（跨主机 mailbox-worker）时，**禁止 `ssh + tmux send-keys` 向远程 OMP 进程注入任务**：
+
+- send-keys 写入 worker 进程 stdin，会**打断正在生成的 assistant 回合**（任务被腰斩）
+- send-keys 成功既不证明送达也不证明读取；只有 mailbox 文件和 status/REPORT 能证明进度
+- 远程主机没有共享 tmux socket，send-keys 路径**根本不存在**
+- `capture-pane` 读终端文本推断状态同样禁止——状态只从 status.json + inbox 读取
+
+### 状态源（判断在线 / 空闲 / 忙碌）
+
+| 信息 | 命令 | 含义 |
+|---|---|---|
+| Worker 计数 | `aimeshchat mailbox stats --session <sid> --agent <w> --host <H>` | inbox/processing/archive/_corrupt 计数 |
+| 状态快照 | `ssh <H> "cat <mailbox-root>/<sid>/<w>/status.json"` | 5 字段：state/current_task/last_conclusion/updated_at |
+| 待收 REPORT | `aimeshchat mailbox peek --session <sid> --agent manager --host <H>` | manager 在远程 host 的 inbox 是否有未消费消息 |
+
+**IDLE 判定 = 三者同时成立**：`status.json.state == IDLE` + `stats` 中 inbox=0 + manager inbox 无未消费 REPORT。
+
+注意：`mailbox status` 是**只写**命令（worker 自报状态）；Manager 侧读状态用 `stats` + ssh cat status.json。status.json 只是 availability snapshot，任务终态以 mailbox 事件账本（REPORT + request_id）为准。
+
+### 等待完成（manager-pull 轮询）
+
+每 5 秒循环，直到收到匹配 `request_id` 的 REPORT：
+
+```bash
+# ① 拉 REPORT（两阶段消费）
+aimeshchat mailbox read --session <sid> --agent manager --owner manager --host <H> --json
+# ② 验证：REPORT 的 request_id 匹配 TASK；AttachmentRef 的 sha256/size 与实物一致
+# ③ finalize 归档（未验证前不要 finalize）
+aimeshchat mailbox finalize --session <sid> --agent manager --msg-id <id> --owner manager --host <H>
+```
+
+- 终态以收到匹配 `request_id` 的 REPORT 为准，**不是** status DONE
+- REPORT 校验失败（sha256/size 不符）→ 拒绝并要求 worker 重发，不进入下一任务
+- v2 替代：`aimeshchat gateway ensure --host <H>` + `aimeshchat events watch --session <sid> --cursor <c> --jsonl` 事件流观察
+- `aimeshchat job wait <job_id>` 只适用于 `route --background` 场景，与 mailbox worker 无关
+
+### Dispatch Gate（避免打断）
+
+任务体**永远**经 `aimeshchat mailbox send --host <H>` 进 inbox；inbox 是 append-only 队列，worker 两阶段消费（read→finalize），新任务只是排队，**天然不打断**正在执行的任务。
+
+- 仅当 `status IDLE/DONE/BLOCKED` 且无未处理 REPORT 时派发新 TASK；`BUSY` 一律不发
+- send-keys 仅允许对**本地** worker 发 `MAILBOX_PENDING` 唤醒（可选加速，不证明送达）；远程 worker 禁止
+
+### 任务队列
+
+**不需要自建队列**。mailbox inbox 就是持久化队列：消息不可变、append-only、两阶段消费保证至少一次处理。
+
+- 单 worker 串行，多 TASK 自然排队；Manager 用 `request_id`/`run_id` 跟踪生命周期，终态 CAS 防重
+- 需要并发 → 拆多个 worker（不同 agent_id），不要给单 worker 堆队列
+- 崩溃恢复：worker 端 `mailbox recover-stale` 回收 >300s 的 processing 租约后继续
+
 ## Session 规则
 
 默认 auto-resume：同一 host+workdir+backend+agent 继续同一上下文。

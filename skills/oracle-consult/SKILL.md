@@ -157,6 +157,36 @@ memory_search / history / git log。只追加：
 - 反方审查：「请从反对者角度指出最可能失败在哪里」
 - 拆 commit：「把方案拆成可在一个 commit 内完成的最小步骤」
 
+## 远程验证流程
+
+Oracle 结论需要跨主机验证/实施时，用 **mailbox 协议**派发远程任务，**禁止 `ssh + tmux send-keys`**（会打断远程 OMP 进程正在生成的回合，且无法证明送达）。具体命令与状态判定见 `skill://aimeshchat-cli/` 的「远程 Worker 管理」。
+
+### 派发步骤（manager-pull）
+
+```bash
+SID="ora-$(date +%s)"
+
+# 1. 建 session + 注册 worker（本地）
+aimeshchat swarm create-session "$SID" --manager manager --members <w>
+aimeshchat swarm register "$SID" --agent <w> --host <H> --backend omp
+
+# 2. 远程 host 初始化 mailbox 目录
+aimeshchat mailbox session-init --session "$SID" --manager manager --agents <w> --host <H>
+
+# 3. INIT 握手 → 验证 IDLE 后派发 TASK（body 带 request_id/run_id）
+aimeshchat mailbox send --session "$SID" --from manager --to <w> --kind TASK \
+  --subject "验证 <结论>" --body '<{"request_id":"req1","run_id":"r1",...}>' --host <H>
+
+# 4. 轮询等待 REPORT（每 5s）→ 验证 request_id 匹配 + 证据/产物 → finalize
+aimeshchat mailbox read --session "$SID" --agent manager --owner manager --host <H> --json
+```
+
+### 纪律
+
+- 派发前确认目标 worker `state != BUSY` 且无未消费 REPORT（Dispatch Gate，见 aimeshchat-cli）
+- 验证类任务要求 REPORT 附证据引用（AttachmentRef：source_host/remote_root/relative_path/size/sha256），核对一致才算验证通过
+- 结论落地需要并行验证多个点 → 拆多个 worker 并行派发，不串行排队
+
 ## 成本优化
 
 | 方案 | 说明 |
