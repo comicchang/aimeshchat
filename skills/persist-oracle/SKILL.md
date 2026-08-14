@@ -130,3 +130,27 @@ aimeshchat oracle gc [--dry-run] [--json]
 - `oracle gc`：清理过期 released session（hard_expires_at 过期 或 last_activity_at > 2天）
 - 自动触发于 `oracle start` / `oracle list` / `oracle status`（24h 节流）
 - session 隔离：oracle session 存储在 `~/.omp/agent/sessions/_oracle/<safe-key>/`
+
+## 输出过滤禁令
+
+**调用 aimeshchat oracle 命令时，禁止使用管道（`|`）过滤输出。**
+
+原因：
+- 管道会导致 bash 工具的 timeout 机制失效
+- oracle 命令的输出可能包含关键状态信息（如 runtime ID、session ID）
+- 管道截断会导致后续命令依赖缺失信息
+
+正确做法：
+```bash
+# ✓ 正确：直接运行，完整输出
+aimeshchat oracle status "$KEY"
+
+# ✗ 错误：管道过滤会丢失信息
+aimeshchat oracle status "$KEY" | grep "runtime_id"
+aimeshchat oracle list | grep "oracle"
+```
+
+如需提取特定信息，用 `--json` 标志 + 后续处理：
+```bash
+aimeshchat oracle status "$KEY" --json | python3 -c "import sys,json; ..."
+```
