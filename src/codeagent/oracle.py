@@ -3346,9 +3346,11 @@ def _run_gc_silent() -> None:
 def cmd_oracle_gc(args: argparse.Namespace) -> int:
     """P2: Garbage-collect expired released oracle sessions.
 
-    Scans ParkRegistry for manifests where lifecycle in {released_soft,
-    released_hard} and the hard_expires_at timestamp has passed.  For each
-    expired session:
+    Scans ParkRegistry for manifests where:
+      1. lifecycle in {released_soft, released_hard} and hard_expires_at passed
+      2. last_activity_at > 2 days ago (stale sessions)
+
+    For each expired session:
       1. Purge OpenCode session data (_purge_opencode_session)
       2. Delete OMP session files (_purge_omp_session)
       3. Delete the park registry row
@@ -3363,6 +3365,7 @@ def cmd_oracle_gc(args: argparse.Namespace) -> int:
     as_json = bool(getattr(args, "json", False))
 
     now = time.time()
+    stale_threshold = now - 2 * 24 * 3600  # 2 days
     scanned = 0
     skipped = 0
     cleaned = 0
@@ -3401,13 +3404,17 @@ def cmd_oracle_gc(args: argparse.Namespace) -> int:
 
         hard_exp = d.get("hard_expires_at", 0)
         soft_exp = d.get("soft_expires_at", 0)
+        last_activity = d.get("last_activity_at", 0)
 
         # Expired = hard_expires_at passed (authoritative), or released_hard
-        # with soft_expires_at passed (hard release has no revive path).
+        # with soft_expires_at passed (hard release has no revive path),
+        # or last_activity_at > 2 days ago (stale session).
         is_expired = False
         if hard_exp and hard_exp <= now:
             is_expired = True
         elif lc == "released_hard" and soft_exp and soft_exp <= now:
+            is_expired = True
+        elif last_activity and last_activity < stale_threshold:
             is_expired = True
 
         if not is_expired:
