@@ -10,15 +10,27 @@ description: 何时、如何向 Oracle 提问，并按困难程度路由到 orac
 
 ## 模型选择（成本优先）
 
-| 档位 | 模型 | 适用场景 | 成本 |
-|------|------|----------|------|
-| **oracle-lite**（默认） | deepseek-v4-pro | 代码审查、文档质量、测试覆盖、格式审查、日常问题 | 低 |
-| **oracle** | gpt-5.6-sol | 架构 trade-off、根因分析、风险评审、跨领域问题 | 中 |
-| **oracle-opus** | claude-opus-4-8 | **仅用户明确要求时使用**（太贵） | 高 |
+| 档位 | 模型（provider/model） | 适用场景 | 成本 |
+|------|------------------------|----------|------|
+| **oracle-lite**（默认） | `Mify/deepseek/deepseek-v4-pro` | 代码审查、文档质量、测试覆盖、格式审查、日常问题 | 低 |
+| **oracle** | `bytecat-gpt/gpt-5.6-sol` | 架构 trade-off、根因分析、风险评审、跨领域问题 | 中 |
+| **oracle-opus** | `bytecat/claude-opus-4-8` | **仅用户明确要求时使用**（太贵） | 高 |
+
+> 实际模型以 `~/.omp/agent/agents/<profile>.md` 的 `model:` 为准。
+> 改模型后跑 `grep -E '^model:' ~/.omp/agent/agents/oracle*.md` 校验一致性。
 
 **默认规则**：用户说「咨询 oracle」→ 用 `oracle-lite`。
 只有场景命中高难度行或用户明确说「用 oracle」「用 full oracle」时才升级。
 **oracle-opus 除非用户明确说「用 opus」「用 oracle-opus」，否则禁止使用。**
+
+### task 调用时的档位映射
+
+用 `task` 工具直接咨询时，`agent` 参数决定模型：
+- `agent="oracle-lite"` → `Mify/deepseek/deepseek-v4-pro`
+- `agent="oracle"` → `bytecat-gpt/gpt-5.6-sol`
+- `agent="oracle-opus"` → `bytecat/claude-opus-4-8`
+
+未指定 `agent` 时默认 `oracle-lite`。
 
 ## 咨询方式（task 直接调用）
 

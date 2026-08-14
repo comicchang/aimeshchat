@@ -119,44 +119,46 @@ aimeshchat events watch --session <id> --cursor <c> --jsonl   # 观察事件流�
 
 正确做法：
 ```bash
-# 1. 提交异步任务
+# 1. 提交异步任务（立即返回 job ID 到 stderr）
 aimeshchat route 12-OHOS '分析 SpatialGlass 效果调用链' --background
-# 输出: [background] route job submitted: job_abc123
+# stderr: [background] route job submitted: <12位hex> (pid=NNN)
 
 # 2. 查进度（不阻塞）
-aimeshchat job status job_abc123
+aimeshchat job status <job_id>
 
-# 3. 等完成（阻塞，但不会被 bash timeout 杀死）
-aimeshchat job wait job_abc123
+# 3. 等完成（阻塞，结果在 stdout JSON 的 stdout 字段）
+aimeshchat job wait <job_id>
 
-# 4. 取结果（从 session registry）
-aimeshchat sessions show '12-OHOS:omp'
+# 4. 取结果（job wait 返回的 JSON 包含 stdout）
+# 或直接读: $XDG_STATE_HOME/aimeshchat/jobs/<job_id>/result.json
 ```
 
-**关键**：`--background` 立即返回 job ID，任务在后台运行。用 `job status/wait` 轮询。
+**关键**：
+- `--background` 立即返回 job ID（在 stderr），任务在后台运行
+- `job wait` 返回 JSON，结果在 `stdout` 字段
+- `job list` 列出所有后台 job
+- `job wait --timeout <秒>` 可设超时（默认 0=永久）
 
 ## 输出过滤禁令
 
-**调用 aimeshchat 命令时，禁止使用管道（`|`）过滤输出。**
+**调用 aimeshchat 命令时，禁止使用提前退出的管道（`| head`/`| tail`/`| grep`）过滤输出。**
 
 原因：
-- 管道会导致 bash 工具的 timeout 机制失效
-- 后台任务的输出可能被管道截断
-- 状态信息（如 job ID）可能被过滤掉
+- `route --background` 的 job ID 打印到 **stderr**，stdout 为空，`| tail` 抓不到 job ID
+- 提前退出消费者（如 `| head`）会触发 SIGPIPE 杀死命令
 
-正确做法：
+允许的管道：
 ```bash
-# ✓ 正确：直接运行，完整输出
-aimeshchat route 12-OHOS '任务描述' --background
-
-# ✗ 错误：管道过滤会丢失信息
-aimeshchat route 12-OHOS '任务描述' --background | tail -5
-aimeshchat sessions list | grep "12-OHOS"
+# ✓ 结构化转换（--json 输出后处理）
+aimeshchat oracle result "$KEY" | python3 -c "import sys,json; ..."
+aimeshchat oracle gc --json | jq '.cleaned'
 ```
 
-如需提取特定信息，用 `--json` 标志 + 后续处理：
+禁止的管道：
 ```bash
-aimeshchat sessions list --json | python3 -c "import sys,json; ..."
+# ✗ 提前退出过滤
+aimeshchat route 12-OHOS '任务' --background | tail -5
+aimeshchat oracle status "$KEY" | grep "runtime_id"
 ```
 
 ## 从 code_route.py 迁移

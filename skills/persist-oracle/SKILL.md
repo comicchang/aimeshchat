@@ -133,24 +133,22 @@ aimeshchat oracle gc [--dry-run] [--json]
 
 ## 输出过滤禁令
 
-**调用 aimeshchat oracle 命令时，禁止使用管道（`|`）过滤输出。**
+**调用 aimeshchat oracle 命令时，禁止使用提前退出的管道（`| head`/`| tail`/`| grep`）过滤输出。**
 
 原因：
-- 管道会导致 bash 工具的 timeout 机制失效
 - oracle 命令的输出可能包含关键状态信息（如 runtime ID、session ID）
-- 管道截断会导致后续命令依赖缺失信息
+- 提前退出消费者会触发 SIGPIPE 杀死命令
 
-正确做法：
+允许的管道：
 ```bash
-# ✓ 正确：直接运行，完整输出
-aimeshchat oracle status "$KEY"
-
-# ✗ 错误：管道过滤会丢失信息
-aimeshchat oracle status "$KEY" | grep "runtime_id"
-aimeshchat oracle list | grep "oracle"
+# ✓ 结构化转换
+aimeshchat oracle result "$KEY" | python3 -c "import sys,json; ..."
+aimeshchat oracle gc --json | jq '.cleaned'
 ```
 
-如需提取特定信息，用 `--json` 标志 + 后续处理：
+禁止的管道：
 ```bash
-aimeshchat oracle status "$KEY" --json | python3 -c "import sys,json; ..."
+# ✗ 提前退出过滤
+aimeshchat oracle status "$KEY" | grep "runtime_id"
+aimeshchat oracle list | head -5
 ```
