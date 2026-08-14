@@ -44,8 +44,8 @@ Worker 的唯一入口是 `mailbox read` + 两阶段消费；消息到达由 OMP
 
 | Source (precedence) | Role |
 |---|---|
-| CLI `--role` flag | manager / worker / oracle |
 | launcher `CODEAGENT_ROLE` env | manager / worker / oracle |
+| worker launcher `OMP_WORKER_ID` env（gateway spawn 注入） | worker / oracle |
 | session manifest (roster/manager) | manager ↔ worker |
 
 `$OMP_WORKER_ID` unset does **NOT** default to Worker — role is undetermined → error.
@@ -61,6 +61,7 @@ Read **one** role file based on your role:
 ## Shared Protocol Reference
 
 The canonical mailbox protocol (message schema, status.json contract, two-phase consumption, CLI commands, error handling) lives in `skill://agent-swarm/protocol/mailbox.md`. Both roles reference it; neither duplicates its content.
+
 ## Deployment Modes
 
 部署模式由**拓扑可达性**和 **execution_mode** 共同决定。
@@ -175,7 +176,7 @@ These rules apply to **every** agent regardless of role:
 
 ## Initialization Flow
 
-1. **Determine role** from explicit role/manifest (`CODEAGENT_ROLE` / session manifest / CLI `--role`) — never infer from env presence.
+1. **Determine role** from explicit role/manifest (`CODEAGENT_ROLE` / `OMP_WORKER_ID` / session manifest) — never infer from env presence.
 2. **Load your role file** — `roles/manager.md` or `roles/worker.md`.
 3. **Read the protocol** — `protocol/mailbox.md` for the canonical CLI schema and state machine.
 4. **Load deployment mode** — `operations/local.md` or `operations/remote.md` based on session topology.

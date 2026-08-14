@@ -8,6 +8,7 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
 > Oracle 推理较慢（30-60 分钟常见）。长任务由 gateway+tmux 监督，**没有 hard timeout**；
 > 只有显式 `oracle release` 才能终止 runtime。禁止回退 OMP task 子 Agent、
 > 一次性 shell 或 `communicate()`。
+> 何时咨询、按困难程度路由、提问模板与追问技巧 → 见 `oracle-consult` skill。
 
 ## 原生优先原则
 
@@ -23,27 +24,34 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
 模型权威 = **ExecutionSpec 显式字段**：调用方（skill）直接传 `--model`（及
 `--variant`/`--system`/`--prompt`），代码 `ExecutionSpec.from_args` 只解析：
 显式 `--model` → 主 agent runtime context → execution-context → agents/*.md `model:` 兜底。
-**`config.yml` 的 `fallbackChains` / `modelRoles` 完全不解析**；
-`--agent` 仅为兼容占位参数（无模型语义，传了打弃用告警）。
 
 ### 三档模型定义
 
-| 档位 | provider/model | variant | system 建议 | 适用场景 |
+**模型权威 = `~/.omp/agent/agents/<profile>.md` 的 `model:` 字段**（work/home 环境
+provider 不同）。下表为当前本机推荐值；改模型后必须跑下方一致性校验命令。
+
+| 档位 | provider/model（当前本机值） | variant 建议 | system 建议 | 适用场景 |
 |------|----------------|---------|-------------|----------|
-| `oracle`（慢思考） | `ppio/pa/gpt-5.6-sol` | `reasoning` | 深度分析 + 风险评估 | 架构评审、根因分析 |
-| `oracle-lite`（快思考） | `deepseek/v4-pro` | `fast` | 轻量审查 + 快速反馈 | 代码质量、日常 review |
-| `oracle-opus`（最强推理） | `anthropic/claude-opus-4-8` | `balanced` | 严格形式化 + 证据链 | 安全审计、高风险变更 |
+| `oracle`（慢思考） | `bytecat-gpt/gpt-5.6-sol` | `reasoning` | 深度分析 + 风险评估 | 架构评审、根因分析 |
+| `oracle-lite`（快思考） | `Mify/deepseek/deepseek-v4-pro` | `fast` | 轻量审查 + 快速反馈 | 代码质量、日常 review |
+| `oracle-opus`（最强推理） | `bytecat/claude-opus-4-8` | `balanced` | 严格形式化 + 证据链 | 安全审计、高风险变更 |
 
 ### 一致性校验命令
 
 ```bash
 # 校验 agent profile 的 model: 与 skill 推荐值一致
-grep -E '^model:' ~/.omp/agents/oracle.md ~/.omp/agents/oracle-lite.md ~/.omp/agents/oracle-opus.md
+grep -E '^model:' ~/.omp/agent/agents/oracle.md ~/.omp/agent/agents/oracle-lite.md ~/.omp/agent/agents/oracle-opus.md
 ```
 
 ### 优先级链
 
 用户 CLI 显式指定（--model/--variant/--system）> 主 agent runtime context 继承 > execution-context > agents/*.md `model:` 兜底 > 报错。
+
+## 废弃项（勿再使用）
+
+- `--agent`：兼容占位参数，无模型语义——传了只打弃用告警，不参与模型解析。
+- `config.yml` 的 `fallbackChains` / `modelRoles`：不参与模型解析（仅用于配置指纹
+  哈希，检测 manifest 漂移）。模型策略已归 skill + agent profile。
 
 ## 绑定语义（A1）
 
@@ -64,7 +72,7 @@ grep -E '^model:' ~/.omp/agents/oracle.md ~/.omp/agents/oracle-lite.md ~/.omp/ag
 KEY='<project>:oracle:<domain>:<topic>[:<model_suffix>]'
 
 # 首轮：新建 review/session/runtime
-aimeshchat oracle start "$KEY" --model gpt-5.6-sol --variant reasoning --system "..." --prompt '初始问题'
+aimeshchat oracle start "$KEY" --model bytecat-gpt/gpt-5.6-sol --variant reasoning --system "..." --prompt '初始问题'
 
 # 追加/追问：hot in-loop send（同 backend session，不新开进程）
 aimeshchat oracle ask "$KEY" '追加信息'
@@ -86,6 +94,12 @@ aimeshchat oracle result "$KEY" --raw    # 纯文本
 aimeshchat oracle revive "$KEY" [--mode bg|pane|resume]
 aimeshchat oracle attach "$KEY" '问题'
 aimeshchat oracle release "$KEY" [--purge]
+
+# 一致性检查（gateway ↔ park ↔ 会话记录 三源校验）
+aimeshchat oracle doctor [--fix]
+
+# 清理过期 released session（--dry-run 先看再删）
+aimeshchat oracle gc [--dry-run] [--json]
 ```
 
 ## 降级策略（Hot→Warm→Cold）

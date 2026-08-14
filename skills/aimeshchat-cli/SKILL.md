@@ -7,9 +7,9 @@ requires:
 
 # aimeshchat — 多主机代码任务唯一入口
 
-> **编排协议**: `skill://agent-swarm/` — tmux-agent 编排协议（Manager/Worker 角色、INIT 握手、v2 direct inbox）
-> **部署模式**: `skill://agent-swarm/SKILL.md#deployment-modes` — Shared FS vs Remote Transport 决策树
-> **默认模式**: B (Remote Transport) — 无共享文件系统，跨主机通信走 SSH wire protocol
+> **编排协议**: `skill://agent-swarm/` — mailbox + gateway 编排协议（Manager/Worker 角色、INIT 握手、v2 session-based）
+> **部署模式**: `skill://agent-swarm/SKILL.md#deployment-modes` — Mode A (Shared FS) vs 跨主机 transport 决策树
+> **默认拓扑**: 跨主机（无共享 FS）— SSH wire protocol / relay-login 传输
 
 ## 何时使用
 
@@ -74,6 +74,12 @@ aimeshchat swarm register s1 --agent w1 --host dev-server
 aimeshchat swarm direct s1 --from mgr --to w1 --kind TASK --subject hi --body "..."
 aimeshchat swarm poll s1 --agent w1
 aimeshchat swarm watch s1 --agent w1 --interval 2
+
+# Gateway（跨设备运行时控制面，v2）
+aimeshchat gateway ensure --host <H>      # 远端预检（wire v2）+ 启动 gateway
+aimeshchat gateway status                 # 本机 gateway 状态
+aimeshchat gateway rpc --stdio            # SSH 有界控制（session.ensure/runtime.spawn/send/stop）
+aimeshchat events watch --session <id> --cursor <c> --jsonl   # 观察事件流（断线补流）
 ```
 
 ## Mailbox & Swarm
@@ -82,9 +88,10 @@ aimeshchat swarm watch s1 --agent w1 --interval 2
 
 - `aimeshchat mailbox ... --host <alias>`: 跨主机 mailbox 操作（底层 SSH wire protocol）
 - `aimeshchat swarm ...`: 高级 IPC（session/roster/ACL/routing、delivery engine）
+- `aimeshchat gateway ...`: 跨设备运行时控制面（v2，见上）
 - 本地 mailbox: 直接使用 `mailbox` CLI（PATH command）
 
-**部署模式默认值**: Remote Transport (Mode B)。如需使用 Shared FS (Mode A)，必须显式设置 `MAILBOX_ROOT=.mailbox`。详见 `skill://agent-swarm/SKILL.md#deployment-modes`。
+**默认拓扑**: 跨主机（无共享 FS）。如需 Shared FS (Mode A)，必须显式设置 `MAILBOX_ROOT=.mailbox`。详见 `skill://agent-swarm/SKILL.md#deployment-modes`。
 
 ## Session 规则
 
@@ -95,6 +102,8 @@ aimeshchat swarm watch s1 --agent w1 --interval 2
 - 旧上下文被错误假设污染
 - 涉及敏感隔离
 - 需要独立对照实验
+
+仅关闭自动续接而不换上下文 → `--no-auto-resume`。
 
 显式 `--session-key` 推荐格式：`<project>:<role>:<domain-or-topic>`。不要只写 `oracle`。
 
