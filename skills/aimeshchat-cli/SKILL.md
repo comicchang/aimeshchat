@@ -275,6 +275,29 @@ aimeshchat mailbox finalize --session <sid> --agent manager --msg-id <id> --owne
 - 需要并发 → 拆多个 worker（不同 agent_id），不要给单 worker 堆队列
 - 崩溃恢复：worker 端 `mailbox recover-stale` 回收 >300s 的 processing 租约后继续
 
+## SSH 连接与瞬态重试
+
+**SSH alias 预校验**：跨主机命令（`mailbox --host <H>`/`run --host <H>`/`gateway ensure`）前，先验证 alias 能解析：
+
+```bash
+# 校验 alias 是否在 ~/.ssh/config 定义（-G 解析出 HostName 即成功）
+ssh -G <H> 2>&1 | grep -E "^(host|hostname|user)"
+```
+
+- 无输出 / `grep` 无 host 行 → **alias 未配置**：报「SSH alias <H> 未定义，请检查 ~/.ssh/config」，这是配置 bug，重试无济于事
+- 有 host 行 → alias 有效，可继续
+
+**瞬态失败重试**（已内置在 `ControlMaster.create()`，v0.2.8+）：
+- `Could not resolve hostname`/`Temporary failure in name resolution`/`connection refused`/`timed out` → 判定为 network 类，**自动重试 2 次**（1s/2s 退避）
+- `permission denied`/`authentication failed`/`host key verification failed`/`bad configuration option` → 判定为 auth/config 类，**立即失败不重试**
+- 重试耗尽仍失败 → `TransportError` 带分类标签（auth/config/network/unknown）
+
+**遇到 `Could not resolve hostname <H>` 时**：
+1. 不要手动 `ssh <H> tmux ...` 变通
+2. 先 `ssh -G <H>` 确认 alias 是否配置
+3. 配置了 → 是瞬态，重试（CLI 已内置），仍失败则报 blocker
+4. 没配置 → 报配置错误，要求用户补 ~/.ssh/config
+
 ## Session 规则
 
 默认 auto-resume：同一 host+workdir+backend+agent 继续同一上下文。

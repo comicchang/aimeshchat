@@ -9,7 +9,9 @@ so different aliases never share a socket.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -22,6 +24,15 @@ from pathlib import Path
 from codeagent.transport.base import TransportError
 
 log = logging.getLogger(__name__)
+
+
+class SSHAliasError(TransportError):
+    """Raised when a host alias is not defined in any ssh config.
+
+    Distinct from network/auth/config failures: an undefined alias is a
+    configuration bug that retrying can never fix, so it fails fast with
+    an actionable message instead of a generic resolution error.
+    """
 
 def _known_hosts_file() -> str:
     """Explicit known_hosts path for aimeshchat SSH connections.
@@ -55,6 +66,216 @@ _MASTER_OPTS: list[str] = [
     "-o", "ConnectTimeout=10",
     *HOST_KEY_OPTS,
 ]
+
+# ── create() retry policy ───────────────────────────────────────────────
+#
+# SSH name resolution / connection setup can fail transiently (network
+# flap, resolver hiccup — e.g. "Temporary failure in name resolution" on a
+# config alias whose HostName is an IP literal, which means ssh never
+# touched DNS and the failure was a transient config/network glitch).  A
+# short backoff retry clears most of those.  Config/auth failures are
+# permanent by nature and must fail fast — never retried.
+
+_CREATE_ATTEMPTS = 3                 # initial attempt + 2 retries
+_CREATE_RETRY_BACKOFF_S = (1.0, 2.0)  # sleep between attempts
+
+# stderr patterns that retrying will never fix.  Order matters: auth/config
+# patterns are checked before network patterns because a "Permission denied"
+# banner can be followed by server text that also matches a transient pattern.
+_NONTRANSIENT_SSH_PATTERNS = (
+    "permission denied",
+    "authentication failed",
+    "too many authentication failures",
+    "host key verification failed",
+    "bad configuration option",
+    "unknown option",
+    "could not open",
+    "unable to open",
+    "no such file or directory",
+    "not a regular file",
+    "no matching host key",
+    "no matching cipher",
+    "no matching key exchange",
+    "invalid format",
+    "configuration error",
+)
+
+# stderr patterns indicating a transient network/resolver failure.
+_TRANSIENT_SSH_PATTERNS = (
+    "temporary failure in name resolution",
+    "could not resolve hostname",
+    "nodename nor servname provided",
+    "name or service not known",
+    "connection refused",
+    "connection timed out",
+    "connection reset",
+    "connection closed",
+    "network is unreachable",
+    "no route to host",
+    "host is unreachable",
+    "operation timed out",
+    "resource temporarily unavailable",
+    "too many open files",
+    "broken pipe",
+    "connection attempt failed",
+)
+
+
+def classify_ssh_error(stderr: str, returncode: int = 255) -> str:
+    """Classify an ssh failure into ``auth`` | ``config`` | ``network`` | ``unknown``.
+
+    Used to decide whether ``create()`` may retry (only ``network``) and to
+    produce an actionable error message.  ``returncode`` is accepted for
+    interface completeness; classification is driven by stderr text.
+    """
+    text = (stderr or "").strip().lower()
+    if not text:
+        return "unknown"
+    for pat in _NONTRANSIENT_SSH_PATTERNS:
+        if pat in text:
+            if (
+                "permission denied" in text
+                or "authentication" in text
+                or "too many authentication" in text
+            ):
+                return "auth"
+            return "config"
+    for pat in _TRANSIENT_SSH_PATTERNS:
+        if pat in text:
+            return "network"
+    return "unknown"
+
+
+def _looks_like_ip(alias: str) -> bool:
+    """True if *alias* is a literal IPv4/IPv6 address (no DNS involved)."""
+    try:
+        ipaddress.ip_address(alias.strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _host_pattern_matches(pattern: str, alias: str) -> bool:
+    """Match one OpenSSH ``Host`` pattern against *alias*.
+
+    OpenSSH host patterns support ``*``, ``?`` and ``[...]`` (fnmatch
+    semantics) and are matched case-insensitively.
+    """
+    return fnmatch.fnmatchcase(alias.lower(), pattern.lower())
+
+
+def _host_line_matches(patterns: list[str], alias: str) -> bool:
+    """Evaluate a ``Host`` line's pattern list against *alias*.
+
+    OpenSSH semantics: patterns are tested left to right and the first
+    match decides; a ``!``-prefixed pattern that matches *excludes* the
+    host (the line does not apply).
+    """
+    for pat in patterns:
+        p = pat.strip()
+        if not p:
+            continue
+        if p.startswith("!"):
+            if _host_pattern_matches(p[1:].lstrip(), alias):
+                return False
+        elif _host_pattern_matches(p, alias):
+            return True
+    return False
+
+
+def _scan_config_host_matches(path: Path, alias: str, _depth: int = 0) -> bool:
+    """Recursively scan an ssh config file for a ``Host`` line matching *alias*.
+
+    Handles ``Include`` (relative to the including file's directory, glob
+    expansion, missing files ignored) and ``Host`` pattern lists.  Only
+    ``Host`` lines matter for alias existence — ``Match`` blocks never
+    define new host entries, and HostName overrides are already visible
+    via ``ssh -G`` (``resolve_alias`` compares the resolved hostname).
+    """
+    if _depth > 8 or not path.is_file():
+        return False
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return False
+    base = path.parent
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        key = parts[0].lower()
+        value = parts[1].strip() if len(parts) > 1 else ""
+        if key == "include" and value:
+            for pat in value.split():
+                expanded = os.path.expanduser(pat)
+                if any(ch in pat for ch in "*?["):
+                    if pat.startswith("/") or pat.startswith("~"):
+                        p = Path(expanded)
+                        matches = sorted(p.parent.glob(p.name))
+                    else:
+                        matches = sorted(base.glob(pat))
+                else:
+                    p = Path(expanded)
+                    matches = [p if p.is_absolute() else base / p]
+                for inc in matches:
+                    if _scan_config_host_matches(inc, alias, _depth + 1):
+                        return True
+        elif key == "host" and value:
+            patterns = [p.strip() for p in value.replace(",", " ").split()]
+            if _host_line_matches(patterns, alias):
+                return True
+    return False
+
+
+def _alias_configured(alias: str, config_path: str | None = None) -> bool:
+    """True if any user ssh config ``Host`` pattern matches *alias*.
+
+    ``config_path`` overrides ``~/.ssh/config`` for tests.
+    """
+    if config_path is not None:
+        return _scan_config_host_matches(Path(config_path), alias)
+    return _scan_config_host_matches(Path.home() / ".ssh" / "config", alias)
+
+
+def resolve_alias(alias: str, ssh_bin: str = "ssh") -> str:
+    """Resolve *alias* to its effective HostName via ``ssh -G``.
+
+    Returns the ``hostname`` field of ``ssh -G <alias>`` — the address ssh
+    will actually connect to (config HostName override, or the alias itself
+    when no override exists).
+
+    Raises:
+        TransportError: ssh binary missing, or ``ssh -G`` itself failed
+            (e.g. broken config — ``ssh -G`` exits non-zero).
+        SSHAliasError: *alias* is not a literal IP, has no ``Host`` match
+            in any user config, and no HostName override — i.e. it would
+            fall back to DNS on the bare name.  This is the "未配置 SSH
+            alias" case: fail fast instead of surfacing an ambiguous
+            ``Temporary failure in name resolution`` later.
+    """
+    ssh = shutil.which(ssh_bin)
+    if not ssh:
+        raise TransportError(f"ssh binary not found: {ssh_bin}")
+    proc = subprocess.run(
+        [ssh, "-G", alias], capture_output=True, text=True, timeout=10
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        raise TransportError(f"ssh -G failed for {alias}: {detail}")
+    hostname = alias
+    for line in proc.stdout.splitlines():
+        if line.lower().startswith("hostname "):
+            val = line.split(None, 1)[1].strip()
+            if val:
+                hostname = val
+            break
+    if hostname != alias or _looks_like_ip(alias) or _alias_configured(alias):
+        return hostname
+    raise SSHAliasError(
+        f"未配置 SSH alias: {alias!r} — ~/.ssh/config 中没有匹配的 Host 条目"
+        f"（若目标是直连主机名，请使用完整域名或 IP）"
+    )
 
 
 def _host_hash(alias: str) -> str:
@@ -196,10 +417,31 @@ class ControlMaster:
         """Open a ControlMaster connection.
 
         Idempotent — if the socket is already alive, this is a no-op.
+
+        Flow: alias pre-validation (``ssh -G``) → stale-socket cleanup →
+        master creation with transient-network retry.
+
+        - Alias not defined in any ssh config (and not a literal IP) →
+          ``SSHAliasError`` immediately; retrying cannot fix a missing
+          config entry.
+        - Network-class create failures (e.g. ``Could not resolve
+          hostname``, ``Connection refused``) are retried with backoff
+          (``_CREATE_ATTEMPTS`` / ``_CREATE_RETRY_BACKOFF_S``).
+        - Auth/config failures raise immediately — never retried.
         """
         if self.is_alive():
             log.debug("master already alive for %s", self.alias)
             return
+
+        ssh = shutil.which(self._ssh)
+        if not ssh:
+            raise TransportError(f"ssh binary not found: {self._ssh}")
+
+        # Alias pre-validation: catch an unconfigured alias before any
+        # connection attempt, so the failure is actionable instead of an
+        # ambiguous "Could not resolve hostname".  Transient resolution
+        # failures on a *configured* alias fall through to the retry loop.
+        resolve_alias(self.alias, ssh_bin=self._ssh)
 
         # P2-13: 清理陈旧 socket——is_alive() 为 False 但 socket 文件残留时
         # （master 被 kill/crash 后未走 stop() 清理），ssh -M -N -f 会因
@@ -222,10 +464,6 @@ class ControlMaster:
             except OSError:
                 pass
 
-        ssh = shutil.which(self._ssh)
-        if not ssh:
-            raise TransportError(f"ssh binary not found: {self._ssh}")
-
         cmd = [
             ssh,
             "-M", "-N", "-f",
@@ -233,21 +471,53 @@ class ControlMaster:
             *_MASTER_OPTS,
             self.alias,
         ]
-        log.debug("creating master: %s", " ".join(cmd))
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            raise TransportError(
-                f"failed to create master for {self.alias}: "
-                f"{proc.stderr.strip() or proc.stdout.strip() or 'exit code ' + str(proc.returncode)}"
+        last_detail = ""
+        last_cls = "unknown"
+        for attempt in range(_CREATE_ATTEMPTS):
+            log.debug(
+                "creating master (attempt %d/%d): %s",
+                attempt + 1, _CREATE_ATTEMPTS, " ".join(cmd),
             )
-        log.info("master created for %s (socket %s)", self.alias, self._socket)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode == 0:
+                log.info("master created for %s (socket %s)", self.alias, self._socket)
 
-        # Write companion metadata so other processes can map socket → alias.
-        meta = self._socket.with_suffix(".meta")
-        try:
-            meta.write_text(json.dumps({"alias": self.alias, "created": time.time()}))
-        except OSError as exc:
-            log.warning("failed to write .meta for %s: %s", self.alias, exc)
+                # Write companion metadata so other processes can map socket → alias.
+                meta = self._socket.with_suffix(".meta")
+                try:
+                    meta.write_text(
+                        json.dumps({"alias": self.alias, "created": time.time()})
+                    )
+                except OSError as exc:
+                    log.warning("failed to write .meta for %s: %s", self.alias, exc)
+                return
+
+            last_detail = (
+                proc.stderr.strip()
+                or proc.stdout.strip()
+                or f"exit code {proc.returncode}"
+            )
+            last_cls = classify_ssh_error(last_detail, proc.returncode)
+            if last_cls != "network" or attempt == _CREATE_ATTEMPTS - 1:
+                break
+            backoff = _CREATE_RETRY_BACKOFF_S[attempt]
+            log.warning(
+                "transient SSH error creating master for %s (attempt %d/%d): %s "
+                "— retrying in %.1fs",
+                self.alias, attempt + 1, _CREATE_ATTEMPTS, last_detail, backoff,
+            )
+            time.sleep(backoff)
+
+        labels = {
+            "auth": "authentication failed",
+            "config": "SSH configuration error",
+            "network": "network error (transient; retries exhausted)",
+            "unknown": "unknown error",
+        }
+        raise TransportError(
+            f"failed to create master for {self.alias}: "
+            f"{labels.get(last_cls, last_cls)}: {last_detail}"
+        )
 
     def is_alive(self) -> bool:
         """Check if the ControlMaster socket is active."""
