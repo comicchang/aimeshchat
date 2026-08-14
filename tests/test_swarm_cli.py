@@ -996,15 +996,13 @@ class TestSkillReferences:
 
     def test_tmux_agent_manager_no_omp_mailbox_plugin(self):
         skill = Path(__file__).resolve().parent.parent / "skills" / "tmux-agent-manager" / "SKILL.md"
-        content = skill.read_text()
-        assert "omp-mailbox-plugin" not in content, \
-            "tmux-agent-manager/SKILL.md still references omp-mailbox-plugin"
+        assert not skill.exists(), \
+            "tmux-agent-manager/SKILL.md should not exist (deprecated, merged into agent-swarm)"
 
     def test_tmux_agent_worker_no_omp_mailbox_plugin(self):
         skill = Path(__file__).resolve().parent.parent / "skills" / "tmux-agent-worker" / "SKILL.md"
-        content = skill.read_text()
-        assert "omp-mailbox-plugin" not in content, \
-            "tmux-agent-worker/SKILL.md still references omp-mailbox-plugin"
+        assert not skill.exists(), \
+            "tmux-agent-worker/SKILL.md should not exist (deprecated, merged into agent-swarm)"
 
     def test_manager_skill_mentions_swarm(self):
         skill = Path(__file__).resolve().parent.parent / "skills" / "agent-swarm" / "SKILL.md"
