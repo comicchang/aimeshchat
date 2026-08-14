@@ -135,6 +135,30 @@ aimeshchat sessions show '12-OHOS:omp'
 
 **关键**：`--background` 立即返回 job ID，任务在后台运行。用 `job status/wait` 轮询。
 
+## 输出过滤禁令
+
+**调用 aimeshchat 命令时，禁止使用管道（`|`）过滤输出。**
+
+原因：
+- 管道会导致 bash 工具的 timeout 机制失效
+- 后台任务的输出可能被管道截断
+- 状态信息（如 job ID）可能被过滤掉
+
+正确做法：
+```bash
+# ✓ 正确：直接运行，完整输出
+aimeshchat route 12-OHOS '任务描述' --background
+
+# ✗ 错误：管道过滤会丢失信息
+aimeshchat route 12-OHOS '任务描述' --background | tail -5
+aimeshchat sessions list | grep "12-OHOS"
+```
+
+如需提取特定信息，用 `--json` 标志 + 后续处理：
+```bash
+aimeshchat sessions list --json | python3 -c "import sys,json; ..."
+```
+
 ## 从 code_route.py 迁移
 
 | 旧命令 | 新命令 |
