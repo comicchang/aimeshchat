@@ -108,6 +108,9 @@ def _build_parser() -> argparse.ArgumentParser:
     route_p.add_argument("--skills")
     route_p.add_argument("--session-key")
     route_p.add_argument("--output")
+    route_p.add_argument("--background", action="store_true", default=False,
+                         help="Run in background (non-blocking; poll with 'aimeshchat job status <id>')")
+    route_p.add_argument("--_bg-job-id", default=None, help=argparse.SUPPRESS)
 
     # sessions
     sess_p = sub.add_parser("sessions", help="Manage session registry")
@@ -1642,6 +1645,69 @@ def _run_in_background(args: argparse.Namespace, task: str) -> int:
     return 0
 
 
+def _route_in_background(args: argparse.Namespace, topic_name: str, task_text: str) -> int:
+    """Submit a route task as a detached subprocess and return immediately.
+
+    Similar to _run_in_background but for aimeshchat route.
+    """
+    from codeagent.job import get_manager
+
+    mgr = get_manager()
+    job_id = mgr.create_placeholder(
+        task=task_text[:120],
+        host=f"route:{topic_name}",
+        workdir="",
+    )
+
+    # Reconstruct the equivalent aimeshchat route command (no --background),
+    # adding --_bg-job-id so the child knows where to write its result.
+    argv: list[str] = [sys.executable, "-m", "codeagent.cli", "route", topic_name]
+    argv.append(task_text)
+    if args.repo:
+        argv.extend(["--repo", str(args.repo)])
+    if args.backend:
+        argv.extend(["--backend", args.backend])
+    if args.agent:
+        argv.extend(["--agent", args.agent])
+    if args.model:
+        argv.extend(["--model", args.model])
+    if getattr(args, 'raw', False):
+        argv.append("--raw")
+    if getattr(args, 'json_output', False):
+        argv.append("--json")
+    if args.new_session:
+        argv.append("--new-session")
+    if args.no_auto_resume:
+        argv.append("--no-auto-resume")
+    if args.skip_permissions:
+        argv.append("--skip-permissions")
+    if getattr(args, "skills", None):
+        argv.extend(["--skills", args.skills])
+    if args.session_key:
+        argv.extend(["--session-key", args.session_key])
+    if args.output:
+        argv.extend(["--output", args.output])
+    # Hidden flag: child writes result to job dir.
+    argv.extend(["--_bg-job-id", job_id])
+
+    # Detach: start_new_session so SIGHUP from terminal doesn't kill the child.
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    # Write the child PID so the job dir can track liveness.
+    mgr.mark_running(job_id, pid=proc.pid)
+
+    print(f"[background] route job submitted: {job_id}  (pid={proc.pid})", file=sys.stderr)
+    print(f"  topic: {topic_name}", file=sys.stderr)
+    print(f"  poll:  aimeshchat job status {job_id}", file=sys.stderr)
+    print(f"  wait:  aimeshchat job wait {job_id}", file=sys.stderr)
+    return 0
+
+
 def _build_route_prompt(topic: str, task: str) -> str:
     """Wrap task with standard route prompt for structured output."""
     return (
@@ -1748,6 +1814,23 @@ def _cmd_route(args: argparse.Namespace) -> int:
         else:
             print(info)
         return 0
+
+    # Background mode: submit as detached subprocess
+    if getattr(args, 'background', False):
+        return _route_in_background(args, topic_name, task_text)
+
+    # Background child mode (--_bg-job-id): run sync, persist result
+    bg_job_id = getattr(args, "_bg_job_id", None)
+    if bg_job_id:
+        registry = SessionRegistry()
+        result = _execute(request, target, registry, repo_map)
+        try:
+            from codeagent.job import get_manager
+            mgr = get_manager()
+            mgr.mark_done(bg_job_id, RunResult(returncode=result.returncode))
+        except Exception as exc:
+            log.warning("bg child route: failed to persist job %s: %s", bg_job_id, exc)
+        return result.returncode
 
     registry = SessionRegistry()
     result = _execute(request, target, registry, repo_map)

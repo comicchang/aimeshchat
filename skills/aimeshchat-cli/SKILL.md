@@ -43,14 +43,20 @@ requires:
 ## 命令速查
 
 ```bash
-# 路由
+# 路由（同步，阻塞到完成）
 aimeshchat route list
 aimeshchat route where <topic>
 printf '%s\n' '<task>' | aimeshchat route <topic> --repo 0 --model <provider/model>
 aimeshchat route <topic> '<task>' --dry-run
 
-# 直接执行
+# 路由（异步，后台执行，立即返回 job ID）
+aimeshchat route <topic> '<task>' --background
+aimeshchat job status <job_id>    # 查进度
+aimeshchat job wait <job_id>      # 等完成
+
+# 直接执行（同步/异步）
 aimeshchat run '<task>' <workdir> --host <host> --model <provider/model>
+aimeshchat run '<task>' <workdir> --background  # 异步
 
 # Session 管理
 aimeshchat sessions list [--host H] [--topic T]
@@ -106,6 +112,28 @@ aimeshchat events watch --session <id> --cursor <c> --jsonl   # 观察事件流�
 仅关闭自动续接而不换上下文 → `--no-auto-resume`。
 
 显式 `--session-key` 推荐格式：`<project>:<role>:<domain-or-topic>`。不要只写 `oracle`。
+
+## 异步执行模式（重要）
+
+远程任务可能需要数分钟甚至更长时间。**不要用同步模式等待**，会超时。
+
+正确做法：
+```bash
+# 1. 提交异步任务
+aimeshchat route 12-OHOS '分析 SpatialGlass 效果调用链' --background
+# 输出: [background] route job submitted: job_abc123
+
+# 2. 查进度（不阻塞）
+aimeshchat job status job_abc123
+
+# 3. 等完成（阻塞，但不会被 bash timeout 杀死）
+aimeshchat job wait job_abc123
+
+# 4. 取结果（从 session registry）
+aimeshchat sessions show '12-OHOS:omp'
+```
+
+**关键**：`--background` 立即返回 job ID，任务在后台运行。用 `job status/wait` 轮询。
 
 ## 从 code_route.py 迁移
 
