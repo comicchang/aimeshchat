@@ -378,6 +378,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ora_doctor.add_argument("--fix", action="store_true", default=False,
                             help="Attempt conservative fixes")
 
+    # P2: garbage-collect expired released oracle sessions
+    ora_gc = ora_sub.add_parser("gc", help="P2: clean expired oracle sessions")
+    ora_gc.add_argument("--dry-run", action="store_true", default=False,
+                        help="Only report what would be deleted, don't actually delete")
+    ora_gc.add_argument("--json", action="store_true", default=False,
+                        help="Output JSON report")
+
     return p
 
 
@@ -2141,11 +2148,12 @@ def _warn_deprecated_agent(args: argparse.Namespace) -> None:
 
 
 def _cmd_oracle(args: argparse.Namespace) -> int:
-    """Dispatch oracle subcommands (start/ask/status/list/watch/wait/release/revive/result/attach/doctor)."""
+    """Dispatch oracle subcommands (start/ask/status/list/watch/wait/release/revive/result/attach/doctor/gc)."""
     from codeagent.oracle import (
         cmd_oracle_ask,
         cmd_oracle_attach,
         cmd_oracle_doctor,
+        cmd_oracle_gc,
         cmd_oracle_list,
         cmd_oracle_release,
         cmd_oracle_result,
@@ -2172,6 +2180,7 @@ def _cmd_oracle(args: argparse.Namespace) -> int:
         "result": cmd_oracle_result,
         "attach": cmd_oracle_attach,
         "doctor": cmd_oracle_doctor,
+        "gc": cmd_oracle_gc,
     }
     if cmd in ("start", "ask"):
         # P0-B/P1-B: 去 role——--agent 无模型语义（仅兼容占位，传了打弃用

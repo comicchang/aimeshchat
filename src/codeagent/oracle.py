@@ -1958,6 +1958,15 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
         out["mailbox"] = None
 
     print(json.dumps(out, indent=2))
+
+    # Auto-trigger gc if throttle allows (non-blocking, silent).
+    if _gc_throttle():
+        try:
+            import threading
+            threading.Thread(target=_run_gc_silent, daemon=True).start()
+        except Exception:
+            pass  # best-effort; never block status output
+
     return 0
 
 
@@ -1987,7 +1996,13 @@ def cmd_oracle_list(args: argparse.Namespace) -> int:
         })
     print(json.dumps({"reviews": reviews}, indent=2))
 
-
+    # Auto-trigger gc if throttle allows (non-blocking, silent).
+    if _gc_throttle():
+        try:
+            import threading
+            threading.Thread(target=_run_gc_silent, daemon=True).start()
+        except Exception:
+            pass  # best-effort; never block list output
 
     return 0
 
@@ -3256,6 +3271,218 @@ def _lazy_db_cleanup(threshold_mb: int = 100,
             cleaned, db_size_mb, final_mb,
         )
     return cleaned
+
+
+# ── GC: expired released session cleanup ──────────────────────────────
+
+# GC throttle interval (seconds) — auto-trigger from list/status skips if
+# last gc was within this window.
+_GC_THROTTLE_SECONDS = 24 * 3600  # 24 hours
+
+# Released lifecycles eligible for GC.
+_RELEASED_LIFECYCLES = frozenset({"released_soft", "released_hard"})
+
+# GC metadata file (persisted in park state dir alongside park.sqlite3).
+def _gc_meta_path() -> Path:
+    from codeagent.park.constants import park_state_dir
+    return park_state_dir() / "gc_meta.json"
+
+
+def _gc_read_meta() -> dict:
+    """Read gc metadata (last_gc_at, etc.)."""
+    p = _gc_meta_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _gc_write_meta(meta: dict) -> None:
+    """Persist gc metadata."""
+    p = _gc_meta_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        p.write_text(json.dumps(meta))
+    except OSError as exc:
+        log.debug("gc: meta write failed: %s", exc)
+
+
+def _gc_throttle() -> bool:
+    """Check if gc should run. Returns True if gc is needed (proceed), False if throttled.
+
+    Called automatically from cmd_oracle_list and cmd_oracle_status.
+    Updates last_gc_at on successful gc run.
+    """
+    meta = _gc_read_meta()
+    last = meta.get("last_gc_at", 0)
+    now = time.time()
+    if (now - last) < _GC_THROTTLE_SECONDS:
+        return False
+    return True
+
+
+def _gc_update_timestamp() -> None:
+    """Update last_gc_at after a gc run."""
+    meta = _gc_read_meta()
+    meta["last_gc_at"] = time.time()
+    _gc_write_meta(meta)
+
+
+def _run_gc_silent() -> None:
+    """Run gc silently from auto-trigger (list/status). Logs to stderr."""
+    try:
+        args = argparse.Namespace(dry_run=False, json=False)
+        rc = cmd_oracle_gc(args)
+        if rc != 0:
+            log.debug("auto-gc: completed with errors (rc=%d)", rc)
+        else:
+            log.debug("auto-gc: completed successfully")
+    except Exception as exc:
+        log.debug("auto-gc failed: %s", exc)
+
+
+def cmd_oracle_gc(args: argparse.Namespace) -> int:
+    """P2: Garbage-collect expired released oracle sessions.
+
+    Scans ParkRegistry for manifests where lifecycle in {released_soft,
+    released_hard} and the hard_expires_at timestamp has passed.  For each
+    expired session:
+      1. Purge OpenCode session data (_purge_opencode_session)
+      2. Delete OMP session files (_purge_omp_session)
+      3. Delete the park registry row
+
+    Flags:
+      --dry-run   Only report what would be deleted.
+      --json      Output JSON report.
+
+    Returns 0 if all clean, 1 if some failed.
+    """
+    dry_run = bool(getattr(args, "dry_run", False))
+    as_json = bool(getattr(args, "json", False))
+
+    now = time.time()
+    scanned = 0
+    skipped = 0
+    cleaned = 0
+    failed = 0
+    errors: list[str] = []
+
+    registry = ParkRegistry()
+
+    # Query released entries with expired hard_expires_at from the DB.
+    # We fetch all non-hot_parked rows and filter in Python for
+    # manifest-level field access (hard_expires_at is in manifest_json,
+    # not a top-level column).
+    try:
+        with registry._connect() as conn:
+            rows = conn.execute(
+                "SELECT key, manifest_json, lifecycle FROM park_leases "
+                "WHERE lifecycle IN ('released_soft', 'released_hard')",
+            ).fetchall()
+    except Exception as exc:
+        msg = f"gc: registry scan failed: {exc}"
+        errors.append(msg)
+        log.error(msg)
+        if as_json:
+            print(json.dumps({"scanned": 0, "skipped": 0, "cleaned": 0,
+                              "failed": 1, "errors": errors}, indent=2))
+        return 1
+
+    for key, mj, lc in rows:
+        scanned += 1
+        try:
+            d = json.loads(mj)
+        except (json.JSONDecodeError, KeyError) as exc:
+            errors.append(f"gc: corrupt manifest for {key}: {exc}")
+            failed += 1
+            continue
+
+        hard_exp = d.get("hard_expires_at", 0)
+        soft_exp = d.get("soft_expires_at", 0)
+
+        # Expired = hard_expires_at passed (authoritative), or released_hard
+        # with soft_expires_at passed (hard release has no revive path).
+        is_expired = False
+        if hard_exp and hard_exp <= now:
+            is_expired = True
+        elif lc == "released_hard" and soft_exp and soft_exp <= now:
+            is_expired = True
+
+        if not is_expired:
+            skipped += 1
+            continue
+
+        review_key = d.get("review_key", key)
+        backend_sid = d.get("backend_session_id", "")
+        session_dir = d.get("omp_session_dir", "") or ""
+
+        if dry_run:
+            cleaned += 1
+            log.info("gc [dry-run]: would clean %s (lifecycle=%s, hard_expires=%.0f)",
+                     review_key, lc, hard_exp or 0)
+            continue
+
+        # Step 1: Purge OpenCode session data.
+        if backend_sid and _is_opencode_session_id(backend_sid):
+            try:
+                purge_result = _purge_opencode_session(backend_sid)
+                if purge_result.get("error"):
+                    log.debug("gc: opencode purge for %s: %s",
+                              review_key, purge_result["error"])
+            except Exception as exc:
+                log.debug("gc: opencode purge exception for %s: %s",
+                          review_key, exc)
+
+        # Step 2: Delete OMP session files.
+        try:
+            # Reconstruct a minimal manifest for _purge_omp_session.
+            manifest = registry._dict_to_manifest(d)
+            removed = _purge_omp_session(manifest)
+            if removed:
+                log.info("gc: removed %d session files for %s",
+                         len(removed), review_key)
+        except Exception as exc:
+            msg = f"gc: session file cleanup failed for {review_key}: {exc}"
+            errors.append(msg)
+            log.warning(msg)
+
+        # Step 3: Delete the park registry row.
+        try:
+            registry.delete(review_key)
+            cleaned += 1
+            log.info("gc: deleted park entry %s", review_key)
+        except Exception as exc:
+            msg = f"gc: park delete failed for {review_key}: {exc}"
+            errors.append(msg)
+            log.warning(msg)
+            failed += 1
+
+    # Update throttle timestamp after successful run.
+    _gc_update_timestamp()
+
+    report = {
+        "scanned": scanned,
+        "skipped": skipped,
+        "cleaned": cleaned,
+        "failed": failed,
+        "errors": errors,
+    }
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        if cleaned or failed:
+            print(f"gc: scanned={scanned} skipped={skipped} "
+                  f"cleaned={cleaned} failed={failed}", file=sys.stderr)
+            for err in errors:
+                print(f"  error: {err}", file=sys.stderr)
+        elif scanned:
+            print(f"gc: scanned={scanned}, no expired sessions found", file=sys.stderr)
+        else:
+            print("gc: no released sessions to scan", file=sys.stderr)
+
+    return 0 if failed == 0 else 1
 
 
 # ── P2-2: advisor tiered retention（digest 留存）───────────────────────
