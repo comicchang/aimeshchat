@@ -265,15 +265,17 @@ class TestMailboxHook:
         store = MailboxStore(root=tmp_path)
         store.session_init("s1", "mgr", ["w1"])
         monkeypatch.setenv("MAILBOX_ROOT", str(tmp_path))
+        monkeypatch.setattr(mailbox_hook, "_DEDUP_FILE", tmp_path / "dedup.json")
         mailbox_hook.main(["s1", "w1"])
-        assert "empty" in capsys.readouterr().out
+        assert "empty" in capsys.readouterr().err
 
     def test_hook_pending(self, tmp_path, monkeypatch, capsys):
         store = MailboxStore(root=tmp_path)
         store.session_init("s1", "mgr", ["w1"])
         store.send("s1", "mgr", "w1", "subject here", "body", "TASK", run_id="run-1", request_id="req-1")
         monkeypatch.setenv("MAILBOX_ROOT", str(tmp_path))
+        monkeypatch.setattr(mailbox_hook, "_DEDUP_FILE", tmp_path / "dedup.json")
         mailbox_hook.main(["s1", "w1"])
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "1 pending" in out
         assert "subject here" in out

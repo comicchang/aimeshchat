@@ -24,30 +24,48 @@ Agent 主动咨询 → 需全部满足：
 - 用 oracle / oracle-opus 做 explore / 格式审查（这类走本地工具或 oracle-lite）
 - 咨询可本地 5 分钟验证的低价值问题
 
-## 模型选择（成本优先）
+## 档位选择（场景驱动）
 
-| 档位 | 模型（provider/model） | task `agent=` | 适用场景 | 成本 |
-|------|------------------------|---------------|----------|------|
-| **oracle-lite**（默认） | `Mify/deepseek/deepseek-v4-pro` | `oracle-lite` | 代码审查、文档质量、测试覆盖、格式审查、日常问题 | 低 |
-| **oracle** | `bytecat-gpt/gpt-5.6-sol` | `oracle` | 架构 trade-off、根因分析、风险评审、跨领域问题 | 中 |
-| **oracle-opus** | `bytecat/claude-opus-4-8` | `oracle-opus` | **仅用户明确要求时使用**（太贵） | 高 |
+咨询时使用对应档位的 agent profile，具体模型由该 profile 按环境/provider 决定。
 
-> 实际模型以 `~/.omp/agent/agents/<profile>.md` 的 `model:` 为准。
-> 改模型后跑 `grep -E '^model:' ~/.omp/agent/agents/oracle*.md` 校验一致性。
+| 档位 | task `agent=` | agent profile | 适用场景 | 推理强度 | 成本 |
+|------|---------------|---------------|----------|----------|------|
+| **oracle-lite**（默认） | `oracle-lite` | `agents/oracle-lite.md` | 代码审查、文档质量、测试覆盖、格式审查、日常问题 | 中 | 低 |
+| **oracle** | `oracle` | `agents/oracle.md` | 架构 trade-off、根因分析、风险评审、跨领域问题 | 高 | 中 |
+| **oracle-opus** | `oracle-opus` | `agents/oracle-opus.md` | **仅用户明确要求时使用** | 最高 | 高 |
+
+> 具体模型 = agent profile 的 `model:` 字段（如 `agents/oracle-lite.md` 的 `model:`），由各 agent 按环境决定。
+> 调用者也可通过 `--model` 显式覆盖。skill 不读取、不校验、不硬编码模型值。
 
 **默认规则**：用户说「咨询 oracle」→ 用 `oracle-lite`，除非：
 - 场景命中高难度行（架构 trade-off / 同题多次失败 / 上线前风险评审 / 跨领域），或
 - 用户明确说「用 oracle」「用 full oracle」
 - **oracle-opus 除非用户明确说「用 opus」「用 oracle-opus」，否则禁止使用。**
 
-`task` 工具咨询时，`agent` 参数决定模型（未指定默认 `oracle-lite`），映射见上表。
+## ⚠️ agent 参数必须显式传递（防模型漂移）
+
+**`task` 工具的 `agent` 参数必须显式指定，禁止省略。**
+
+省略 `agent` 时，task 工具继承主会话模型，**不会**自动使用 oracle 档位模型。这是咨询 oracle 唤醒错误模型的根因。
+
+```
+# ✓ 正确：显式指定 agent
+task(agent="oracle-lite", task="...")
+task(agent="oracle", task="...")
+
+# ✗ 错误：省略 agent → 继承主会话模型，不是 oracle
+task(task="...")
+```
 
 ## 咨询方式（task 直接调用）
 
 ### 默认：task 直接咨询
 
 用户说「咨询 oracle」「问 oracle」「oracle review」「找 oracle 验收」时：
-1. 用 `task` 工具直接 spawn oracle agent（不走 persist-oracle CLI）
+1. 用 `task` 工具 **显式指定 `agent` 参数**（不走 persist-oracle CLI）
+   - 默认：`agent="oracle-lite"`
+   - 高难度：`agent="oracle"`
+   - 用户要求时：`agent="oracle-opus"`
 2. 在 task prompt 中包含收集好的上下文
 3. 记录返回的 `agent://<id>`，告知用户已创建咨询
 

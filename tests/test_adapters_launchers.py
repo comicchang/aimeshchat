@@ -65,7 +65,9 @@ class TestLaunchers:
             mock_run.return_value = MagicMock(returncode=0, stdout="%6\n")
             result = create_pane(PaneConfig(session="test", cwd="/work"))
             assert result == "%6"
-            cmd = mock_run.call_args[0][0]
+            # 第一次调用 = split-window（含 -c cwd）；后续 send-keys 不含
+            cmd = mock_run.call_args_list[0][0][0]
+            assert "split-window" in cmd
             assert "-c" in cmd
             assert "/work" in cmd
 

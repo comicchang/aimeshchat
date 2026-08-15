@@ -67,6 +67,16 @@ class _FakeProcess:
             return line
         return ""
 
+    def __iter__(self):
+        """adapter 用 ``for line in proc.stdout`` 迭代（PIPE 排空修复 6eef992）。"""
+        return self
+
+    def __next__(self) -> str:
+        line = self.readline()
+        if line == "":
+            raise StopIteration
+        return line
+
     def fileno(self) -> int:
         # Selectable — returns a valid fd.
         return 0

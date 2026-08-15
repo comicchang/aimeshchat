@@ -1198,11 +1198,16 @@ class TestMainEntrypoint:
         """Running the module directly exits with --help."""
         import subprocess
         import sys
+        import os
 
+        env = dict(os.environ)
+        # src/ 布局：模块需从仓库 src 导入
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent / "src")
         proc = subprocess.run(
             [sys.executable, "-m", "codeagent.cli", "--help"],
             capture_output=True, text=True,
             cwd=str(Path(__file__).resolve().parent.parent),
+            env=env,
         )
         assert proc.returncode == 0
         assert "route" in proc.stdout

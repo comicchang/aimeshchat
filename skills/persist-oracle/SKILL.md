@@ -25,33 +25,28 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
 `--variant`/`--system`/`--prompt`），代码 `ExecutionSpec.from_args` 只解析：
 显式 `--model` → 主 agent runtime context → execution-context → agents/*.md `model:` 兜底。
 
-### 三档模型定义
+### 三档模型参考
 
-**模型权威 = `~/.omp/agent/agents/<profile>.md` 的 `model:` 字段**（work/home 环境
-provider 不同）。下表为当前本机推荐值；改模型后必须跑下方一致性校验命令。
+使用对应档位的 agent profile，具体模型由该 profile 按环境/provider 决定。
 
-| 档位 | provider/model（当前本机值） | variant 建议 | system 建议 | 适用场景 |
-|------|----------------|---------|-------------|----------|
-| `oracle`（慢思考） | `bytecat-gpt/gpt-5.6-sol` | `reasoning` | 深度分析 + 风险评估 | 架构评审、根因分析 |
-| `oracle-lite`（快思考） | `Mify/deepseek/deepseek-v4-pro` | `fast` | 轻量审查 + 快速反馈 | 代码质量、日常 review |
-| `oracle-opus`（最强推理） | `bytecat/claude-opus-4-8` | `balanced` | 严格形式化 + 证据链 | 安全审计、高风险变更 |
+| 档位 | agent profile | 推理强度 | variant 建议 | 适用场景 | 成本 |
+|------|---------------|----------|---------|----------|------|
+| `oracle`（慢思考） | `agents/oracle.md` | 高 | `reasoning` | 架构评审、根因分析、风险评估 | 中 |
+| `oracle-lite`（快思考） | `agents/oracle-lite.md` | 中 | `fast` | 代码质量、日常 review、轻量审查 | 低 |
+| `oracle-opus`（最强推理） | `agents/oracle-opus.md` | 最高 | `balanced` | 安全审计、高风险变更、严格形式化 | 高 |
 
-### 一致性校验命令
-
-```bash
-# 校验 agent profile 的 model: 与 skill 推荐值一致
-grep -E '^model:' ~/.omp/agent/agents/oracle.md ~/.omp/agent/agents/oracle-lite.md ~/.omp/agent/agents/oracle-opus.md
-```
+> 具体模型 = agent profile 的 `model:` 字段，由各 agent 按环境决定。
+> 调用者可通过 `--model` 显式覆盖。skill 不读取、不校验、不硬编码模型值。
 
 ### 优先级链
 
-用户 CLI 显式指定（--model/--variant/--system）> 主 agent runtime context 继承 > execution-context > agents/*.md `model:` 兜底 > 报错。
+用户 CLI 显式指定（--model/--variant/--system）> 主 agent runtime context 继承 > execution-context > agent profile `model:` 兜底 > 报错。
 
 ## 废弃项（勿再使用）
 
 - `--agent`：兼容占位参数，无模型语义——传了只打弃用告警，不参与模型解析。
 - `config.yml` 的 `fallbackChains` / `modelRoles`：不参与模型解析（仅用于配置指纹
-  哈希，检测 manifest 漂移）。模型策略已归 skill + agent profile。
+  哈希，检测 manifest 漂移）。
 
 ## 绑定语义（A1）
 
@@ -71,8 +66,8 @@ grep -E '^model:' ~/.omp/agent/agents/oracle.md ~/.omp/agent/agents/oracle-lite.
 ```
 KEY='<project>:oracle:<domain>:<topic>[:<model_suffix>]'
 
-# 首轮：新建 review/session/runtime
-aimeshchat oracle start "$KEY" --model bytecat-gpt/gpt-5.6-sol --variant reasoning --system "..." --prompt '初始问题'
+# 首轮：新建 review/session/runtime（--model 由调用者按环境决定）
+aimeshchat oracle start "$KEY" --model <调用者选择的模型> --variant reasoning --system "..." --prompt '初始问题'
 
 # 追加/追问：hot in-loop send（同 backend session，不新开进程）
 aimeshchat oracle ask "$KEY" '追加信息'
