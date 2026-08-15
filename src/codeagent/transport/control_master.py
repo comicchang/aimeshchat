@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import time
@@ -165,11 +166,13 @@ def _host_pattern_matches(pattern: str, alias: str) -> bool:
 
 
 def _host_line_matches(patterns: list[str], alias: str) -> bool:
-    """Evaluate a ``Host`` line's pattern list against *alias*.
+    """Evaluate a ``Host`` line's pattern list against *alias* (OpenSSH rules).
 
-    OpenSSH semantics: patterns are tested left to right and the first
-    match decides; a ``!``-prefixed pattern that matches *excludes* the
-    host (the line does not apply).
+    Verified against real ``ssh -G`` behavior: patterns are tested left to
+    right; a ``!``-prefixed pattern *excludes* the host when its body
+    matches (``Host !secret.internal *.internal`` excludes
+    ``secret.internal`` but includes ``other.internal``); the first
+    positive match includes the host.
     """
     for pat in patterns:
         p = pat.strip()
@@ -178,6 +181,30 @@ def _host_line_matches(patterns: list[str], alias: str) -> bool:
         if p.startswith("!"):
             if _host_pattern_matches(p[1:].lstrip(), alias):
                 return False
+        elif _host_pattern_matches(p, alias):
+            return True
+    return False
+
+
+def _host_line_defines(patterns: list[str], alias: str) -> bool:
+    """True if a ``Host`` line *defines* *alias* (as opposed to a defaults block).
+
+    Same semantics as ``_host_line_matches``, except a bare ``*`` pattern
+    is treated as a catch-all defaults block (``Host *`` with
+    ``User``/``ControlPath``/… sets defaults, not an alias entry) and does
+    not count as defining the alias.  Without this, a ubiquitous
+    ``Host *`` block would make every bare name look "configured" and the
+    unconfigured-alias check could never fire.
+    """
+    for pat in patterns:
+        p = pat.strip()
+        if not p:
+            continue
+        if p.startswith("!"):
+            if _host_pattern_matches(p[1:].lstrip(), alias):
+                return False
+        elif p == "*":
+            continue
         elif _host_pattern_matches(p, alias):
             return True
     return False
@@ -223,7 +250,7 @@ def _scan_config_host_matches(path: Path, alias: str, _depth: int = 0) -> bool:
                         return True
         elif key == "host" and value:
             patterns = [p.strip() for p in value.replace(",", " ").split()]
-            if _host_line_matches(patterns, alias):
+            if _host_line_defines(patterns, alias):
                 return True
     return False
 
@@ -238,6 +265,15 @@ def _alias_configured(alias: str, config_path: str | None = None) -> bool:
     return _scan_config_host_matches(Path.home() / ".ssh" / "config", alias)
 
 
+def _dns_resolve_error(hostname: str) -> str | None:
+    """Return a DNS error description if *hostname* does not resolve, else None."""
+    try:
+        socket.getaddrinfo(hostname, None)
+        return None
+    except socket.gaierror as exc:
+        return str(exc)
+
+
 def resolve_alias(alias: str, ssh_bin: str = "ssh") -> str:
     """Resolve *alias* to its effective HostName via ``ssh -G``.
 
@@ -248,11 +284,12 @@ def resolve_alias(alias: str, ssh_bin: str = "ssh") -> str:
     Raises:
         TransportError: ssh binary missing, or ``ssh -G`` itself failed
             (e.g. broken config — ``ssh -G`` exits non-zero).
-        SSHAliasError: *alias* is not a literal IP, has no ``Host`` match
-            in any user config, and no HostName override — i.e. it would
-            fall back to DNS on the bare name.  This is the "未配置 SSH
-            alias" case: fail fast instead of surfacing an ambiguous
-            ``Temporary failure in name resolution`` later.
+        SSHAliasError: *alias* has no HostName override, no literal IP, no
+            ``Host`` match in any user config, and does not resolve via
+            DNS — i.e. it is a misconfigured alias (typo).  Fail fast
+            instead of surfacing an ambiguous ``Temporary failure in name
+            resolution`` later.  Bare names that DO resolve (``localhost``,
+            a public hostname) are legitimate direct targets and pass.
     """
     ssh = shutil.which(ssh_bin)
     if not ssh:
@@ -272,9 +309,16 @@ def resolve_alias(alias: str, ssh_bin: str = "ssh") -> str:
             break
     if hostname != alias or _looks_like_ip(alias) or _alias_configured(alias):
         return hostname
+    # No config entry and not an IP: ssh would connect to the bare name via
+    # DNS.  A resolvable bare name (e.g. `localhost`) is a valid direct
+    # target; only a name that DNS cannot resolve is a misconfigured alias.
+    dns_error = _dns_resolve_error(alias)
+    if dns_error is None:
+        return hostname
     raise SSHAliasError(
-        f"未配置 SSH alias: {alias!r} — ~/.ssh/config 中没有匹配的 Host 条目"
-        f"（若目标是直连主机名，请使用完整域名或 IP）"
+        f"未配置 SSH alias: {alias!r} — ~/.ssh/config 中没有匹配的 Host 条目，"
+        f"且 DNS 解析失败: {dns_error}"
+        f"（若目标是直连主机名，请检查拼写；直连 IP 可直接使用 IP）"
     )
 
 

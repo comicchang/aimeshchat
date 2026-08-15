@@ -337,6 +337,9 @@ class TestControlMaster:
         with (
             patch("shutil.which", return_value="/usr/bin/ssh"),
             patch.object(cm, "_check", return_value=1),
+            # create() pre-validates the alias via ssh -G before connecting;
+            # bypass it so the test exercises the master-creation phase.
+            patch("codeagent.transport.control_master.resolve_alias", return_value="testhost"),
             patch("subprocess.run", return_value=MagicMock(returncode=0)),
             patch("pathlib.Path.write_text", side_effect=OSError("disk full")),
         ):
