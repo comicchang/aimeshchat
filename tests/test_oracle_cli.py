@@ -869,3 +869,140 @@ class TestReadTailLines:
         from codeagent.oracle import _read_tail_lines
 
         assert _read_tail_lines(tmp_path / "absent.jsonl", 10) == []
+
+
+class TestSidConsistency:
+    """Bug 2 回归：确定性 sid——bootstrap/start/冷路径必须用同一 sid，消除 session 碎片。"""
+
+    def test_review_sid_is_deterministic_and_collision_safe(self):
+        from codeagent.oracle import _review_sid
+
+        rk = "mi-docs:oracle:review:gateway-sid-bugs"
+        s1 = _review_sid(rk)
+        s2 = _review_sid(rk)
+        # 同一 review_key 每次相同（确定性）
+        assert s1 == s2
+        # postmesh-{sha256[:16]} 格式
+        assert s1.startswith("postmesh-")
+        assert len(s1) == len("postmesh-") + 16
+        # 不同 review_key 不同 sid（截断碰撞安全）
+        assert s1 != _review_sid("other:review:key")
+
+    def test_bootstrap_uses_review_sid_not_random_run_id(self, tmp_path, monkeypatch):
+        """_bootstrap_oracle_swarm 必须用确定性 _review_sid，而非每次 uuid4 的 run_id。"""
+        import codeagent.cli as cli_mod
+        from codeagent.oracle import _review_sid
+
+        created = {}
+
+        class FakeKernel:
+            def __init__(self, *_a, **_k): pass
+            def create_session(self, session_id, *a, **k):
+                created["sid"] = session_id
+            def register(self, *a, **k): pass
+            def direct(self, *a, **k): pass
+
+        monkeypatch.setattr(cli_mod, "_get_swarm_kernel", lambda **k: (FakeKernel(), object()))
+        monkeypatch.setattr(cli_mod, "resolve_root", lambda: tmp_path / "root")
+
+        req = MagicMock()
+        req.review_key = "mi-docs:oracle:review:gateway-sid-bugs"
+        req.request_id = "req1"
+        req.session_key = None
+        req.host = None
+        req.workdir = str(tmp_path)
+
+        # RunContext 需要的基础字段
+        from codeagent.cli import RunContext
+        from types import SimpleNamespace
+
+        with patch.object(cli_mod, "RunContext", lambda **k: SimpleNamespace(**k)):
+            cli_mod._bootstrap_oracle_swarm(req, "mi-docs:oracle:review:gateway-sid-bugs")
+
+        # bootstrap 创建的 session 必须 = 确定性 _review_sid（与 start/冷路径一致）
+        assert created.get("sid") == _review_sid("mi-docs:oracle:review:gateway-sid-bugs")
+        # 绝不能是 ora-{key}-{random} 形态
+        assert not created.get("sid", "").startswith("ora-")
+
+
+class TestSupervisorGeneration:
+    """Bug 1 回归：supervisor 重启后必须递增 generation + 轮换 nonce，
+    否则 gateway A7 检查（同 generation 必须同 owner_pid+nonce）拒绝注册。"""
+
+    def _write_spec(self, runtime_dir, runtime_id="rt-g1", generation=1, nonce="oldnonce"):
+        from codeagent.runtime.supervisor import RuntimeSpec
+        spec = RuntimeSpec(
+            runtime_id=runtime_id,
+            session_id="postmesh-abc",
+            agent_id="oracle",
+            runtime="omp",
+            review_key="mi-docs:oracle:review:gateway-sid-bugs",
+            generation=generation,
+            gateway_socket="/tmp/fake.sock",
+            nonce=nonce,
+            workdir="/tmp",
+            mode="interactive_plugin",
+            spec_path=str(runtime_dir / "spec.json"),
+        )
+        p = runtime_dir / "spec.json"
+        p.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
+        return spec
+
+    def _run_supervisor(self, spec_path, monkeypatch):
+        """跑 supervisor.main 到 identity 写入点（mock Popen 防真启动）。"""
+        import codeagent.runtime.supervisor as sup_mod
+
+        # mock Popen：不真启动 agent 进程
+        fake_proc = MagicMock()
+        monkeypatch.setattr(sup_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+        # mock _report（gateway socket 不存在）
+        monkeypatch.setattr(sup_mod, "_report", lambda *a, **k: None)
+        # 返回前 kill 掉 Popen 后返回码 0
+        fake_proc.wait.return_value = 0
+        fake_proc.returncode = 0
+
+        import codeagent.runtime.supervisor as m
+        return m.main([str(spec_path)])
+
+    def test_restart_bumps_generation_when_old_owner_dead(self, tmp_path, monkeypatch):
+        """旧 identity.json 的 owner_pid 已死 → generation+1 + nonce 轮换。"""
+        from codeagent.runtime import supervisor as sup_mod
+        from codeagent.runtime.supervisor import _runtime_dir
+
+        runtime_id = "rt-restart-1"
+        d = _runtime_dir(runtime_id)
+        d.mkdir(parents=True, exist_ok=True)
+
+        # 写一个"旧进程已死"的 identity（owner_pid=999999 不存在）
+        dead_pid = 999999  # 不可能存在的 pid
+        (d / "identity.json").write_text(json.dumps({
+            "runtime_id": runtime_id, "generation": 1,
+            "owner_pid": dead_pid, "nonce": "oldnonce123456",
+        }), encoding="utf-8")
+
+        spec = self._write_spec(d, runtime_id=runtime_id, generation=1, nonce="oldnonce123456")
+        # 预写旧 spec 目录下的 identity 由 spec_path 定位
+
+        rc = self._run_supervisor(d / "spec.json", monkeypatch)
+        # 跑完应生成新 identity
+        new_identity = json.loads((d / "identity.json").read_text(encoding="utf-8"))
+        assert rc == 0
+        # generation 递增
+        assert new_identity["generation"] == 2
+        # nonce 轮换（≠ 旧值）
+        assert new_identity["nonce"] != "oldnonce123456"
+
+    def test_same_generation_keeps_identity_when_no_restart(self, tmp_path, monkeypatch):
+        """无旧 identity（首次启动）→ 保持 spec.generation + spec.nonce。"""
+        from codeagent.runtime.supervisor import _runtime_dir
+
+        runtime_id = "rt-fresh-1"
+        d = _runtime_dir(runtime_id)
+        d.mkdir(parents=True, exist_ok=True)
+
+        spec = self._write_spec(d, runtime_id=runtime_id, generation=3, nonce="keptnonce")
+        rc = self._run_supervisor(d / "spec.json", monkeypatch)
+        new_identity = json.loads((d / "identity.json").read_text(encoding="utf-8"))
+        assert rc == 0
+        assert new_identity["generation"] == 3
+        assert new_identity["nonce"] == "keptnonce"

@@ -1291,10 +1291,15 @@ def _bootstrap_oracle_swarm(
       - Registers oracle AgentLocation in kernel routing table
       - Writes INIT envelope to oracle mailbox
     """
+    from codeagent.oracle import _review_sid
+
     run_id = uuid4().hex[:10]
     request_id = uuid4().hex[:12]
-    safe_key = ns_key.replace(":", "-")[-12:]
-    sid = f"ora-{safe_key}-{run_id}"
+    # P0-A fix: 确定性 sid —— 复用 oracle.py 的 _review_sid() 生成
+    # postmesh-{sha256[:16]}，与 cmd_oracle_start / cmd_oracle_ask 冷路径
+    # 使用同一 sid，消除 ora-{key}-{random} 每次不同的 session 碎片。
+    review_key = request.review_key or ns_key
+    sid = _review_sid(review_key)
     mailbox_root = resolve_root()
     kernel, _store = _get_swarm_kernel(store_root=mailbox_root)
 

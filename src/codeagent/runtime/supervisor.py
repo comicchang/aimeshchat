@@ -394,17 +394,43 @@ def main(argv: list[str] | None = None) -> int:
         # owner_pid MUST be the supervisor (long-lived runtime owner) — the
         # launcher CLI process exits right after spawn, and the plugin's
         # stale-identity check (process.kill(owner,0)) would reject it.
+        # A7 fix: 检测 supervisor 重启（tmux 重启复用同一 spec.json）。
+        # 旧 identity.json 存在且 owner_pid 已死 → 递增 generation，
+        # 确保 gateway A7 检查（同 generation 必须同 owner）不拒绝。
+        generation = spec.generation
+        nonce = spec.nonce or uuid4().hex[:16]
+        identity_path = d / "identity.json"
+        if identity_path.exists():
+            try:
+                old = json.loads(identity_path.read_text(encoding="utf-8"))
+                old_pid = int(old.get("owner_pid", 0))
+                old_gen = int(old.get("generation", 0))
+                # 旧进程仍存活 → 不应到这里（tmux 不会重启活进程）；
+                # 旧进程已死 → generation 递增，允许新 owner 接管。
+                if old_pid and old_pid != os.getpid():
+                    try:
+                        os.kill(old_pid, 0)
+                    except OSError:
+                        # 旧进程已死：递增 generation + 轮换 nonce
+                        generation = old_gen + 1
+                        nonce = uuid4().hex[:16]
+                        log.info(
+                            "supervisor: detected restart (old pid %d dead), "
+                            "bumping generation %d → %d",
+                            old_pid, old_gen, generation,
+                        )
+            except (json.JSONDecodeError, OSError, ValueError):
+                pass  # 损坏的 identity → 用 spec 原值
         identity = {
             "session_id": spec.session_id,
             "agent_id": spec.agent_id,
             "runtime_id": spec.runtime_id,
             "review_key": spec.review_key,
-            "generation": spec.generation,
+            "generation": generation,
             "gateway_socket": spec.gateway_socket,
             "owner_pid": os.getpid(),
-            "nonce": spec.nonce,
+            "nonce": nonce,
         }
-        identity_path = d / "identity.json"
         tmp_id = d / f".tmp-identity-{uuid4().hex[:8]}.json"
         with open(tmp_id, "w") as f:
             f.write(json.dumps(identity))
@@ -414,8 +440,8 @@ def main(argv: list[str] | None = None) -> int:
         os.replace(str(tmp_id), str(identity_path))
         os.chmod(identity_path, 0o600)
         env["OMP_MAILBOX_IDENTITY_FILE"] = str(identity_path)
-        if spec.nonce:
-            env["OMP_MAILBOX_NONCE"] = spec.nonce
+        if nonce:
+            env["OMP_MAILBOX_NONCE"] = nonce
         # Runtime adapter mode for the plugin.
         env["CODEAGENT_ROLE"] = "oracle" if spec.agent_id.startswith("oracle") else "worker"
         env["AIMESHCHAT_GATEWAY_SOCKET"] = spec.gateway_socket
