@@ -8,3 +8,6 @@ build/
 *.sqlite3
 *.lock
 uv.lock
+
+# 本地工作草稿（不入库，见 AGENTS 约定）
+.drafts/
