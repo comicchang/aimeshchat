@@ -438,7 +438,8 @@ class TestOMPRunner:
 
     def test_oracle_timeout_override(self, tmp_path: Path) -> None:
         """Oracle-class agents should get _ORACLE_TIMEOUT instead of DEFAULT_EXEC_TIMEOUT."""
-        from codeagent.runners.omp import AgentProfile, _ORACLE_TIMEOUT
+        from codeagent.runners.omp import AgentProfile
+        from codeagent.constants import ORACLE_TIMEOUT as _ORACLE_TIMEOUT
 
         profile = AgentProfile(
             name="oracle", model="gpt-5", park=True, auto_exit=False,

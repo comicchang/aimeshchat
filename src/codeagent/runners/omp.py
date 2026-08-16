@@ -5,8 +5,9 @@ Invocation::
     omp --print --mode json --cwd <workdir> [--model <model>] [--auto-approve] @<prompt-file>
     omp --print --mode json --cwd <workdir> --resume <session_id> [--model <model>] [--auto-approve] @<prompt-file>
 
-IMPORTANT: omp does NOT read from stdin pipe.  Must use ``@<temp-file>`` for the
-prompt.  Temp file must be mode 0600, deleted after use.
+IMPORTANT: omp's ``readPipedInput`` blocks on non-TTY stdin (awaiting EOF that never
+arrives).  Must use ``@<temp-file>`` for the prompt AND ``stdin=subprocess.DEVNULL``
+(never PIPE).  Temp file must be mode 0600, deleted after use.
 
 OMP JSONL output lines::
 
@@ -30,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from codeagent.constants import ISO_TIMESTAMP_FORMAT
+from codeagent.constants import ISO_TIMESTAMP_FORMAT, ORACLE_TIMEOUT
 from codeagent.domain import RunRequest, RunResult
 from codeagent.hooks.swarm_hooks import on_agent_start, on_agent_stop
 
@@ -42,7 +43,7 @@ _DEFAULT_BINARY = "omp"
 
 # Oracle-class agents (park=true, auto-exit=false) get a 1-hour timeout
 # instead of the default 10-minute DEFAULT_EXEC_TIMEOUT.
-_ORACLE_TIMEOUT = 3600
+# Re-exported from constants.py — single source of truth.
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +250,11 @@ class OMPRunner(BaseRunner):
         original_timeout: Optional[int] = None
         if self._agent_profile and self._agent_profile.park and not self._agent_profile.auto_exit:
             original_timeout = self.config.timeout
-            self.config.timeout = _ORACLE_TIMEOUT
+            self.config.timeout = ORACLE_TIMEOUT
             LOG.debug(
                 "agent=%s is oracle-class (park=true, auto-exit=false); "
                 "overriding timeout %ds → %ds",
-                request.agent, original_timeout, _ORACLE_TIMEOUT,
+                request.agent, original_timeout, ORACLE_TIMEOUT,
             )
 
         # Ensure swarm session for oracle agents so _extra_env activates

@@ -11,6 +11,7 @@ import logging
 import os
 import select
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -19,6 +20,7 @@ from codeagent.mailbox.store import MailboxStore
 from codeagent.constants import (
     DEFAULT_EXEC_TIMEOUT,
     MAX_LINE_LENGTH,
+    RUN_HEARTBEAT_INTERVAL,
     STREAM_HEARTBEAT_INTERVAL,
     STREAM_CURSOR_INITIAL,
 )
@@ -158,23 +160,50 @@ def _handle_run(req: dict) -> None:
         _send({"type": "error", "message": f"{exc.code}: {exc.message}"})
         return
 
-    try:
-        handle = adapter.spawn({
-            "task": task,
-            "workdir": workdir,
-            "agent_id": agent or "",
-            "model": model or "",
-            "session_id": session_key or "",
-            "review_key": review_key,
-            "request_id": request_id,
-            "run_id": run_id,
-            "backend_session_id": resume_session_id,
-            "short_task": True,
-            "timeout": timeout,
-            "profile_args": [],
-        })
-    except Exception as exc:
-        _send({"type": "error", "message": f"run failed: {exc}"})
+    spawn_payload = {
+        "task": task,
+        "workdir": workdir,
+        "agent_id": agent or "",
+        "model": model or "",
+        "session_id": session_key or "",
+        "review_key": review_key,
+        "request_id": request_id,
+        "run_id": run_id,
+        "backend_session_id": resume_session_id,
+        "short_task": True,
+        "timeout": timeout,
+        "profile_args": [],
+    }
+
+    # P2-18: Run spawn in a worker thread while the main thread emits
+    # heartbeat frames every RUN_HEARTBEAT_INTERVAL seconds.  This keeps
+    # the SSH wire alive during long LLM inference (mimo-v2.5-pro can
+    # take 10–15 min); without heartbeats the Manager-side SSH deadline
+    # kills the connection at 600s.
+    _spawn_result: dict = {}
+    _spawn_error: list = []
+
+    def _spawn_worker() -> None:
+        try:
+            _spawn_result["handle"] = adapter.spawn(spawn_payload)
+        except Exception as exc:
+            _spawn_error.append(exc)
+
+    worker = threading.Thread(target=_spawn_worker, daemon=True)
+    worker.start()
+
+    while worker.is_alive():
+        worker.join(timeout=RUN_HEARTBEAT_INTERVAL)
+        if worker.is_alive():
+            _send({"type": "progress", "message": "still running"})
+
+    if _spawn_error:
+        _send({"type": "error", "message": f"run failed: {_spawn_error[0]}"})
+        return
+
+    handle = _spawn_result.get("handle")
+    if handle is None:
+        _send({"type": "error", "message": "run failed: no handle returned"})
         return
 
     # Bounded adapters put their result in handle.extra["result"].

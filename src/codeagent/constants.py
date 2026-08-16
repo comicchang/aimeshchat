@@ -11,6 +11,8 @@ DEFAULT_SSH_TIMEOUT = 600  # default timeout for an SSH wire round-trip
 DEFAULT_RELAY_TIMEOUT = 600  # default timeout for a relay-login PTY session
 DEFAULT_MAILBOX_TIMEOUT = 60  # default timeout for mailbox wire requests
 DEFAULT_PULL_TIMEOUT = 60  # default timeout for an scp artifact pull
+ORACLE_TIMEOUT = 3600  # oracle-class agents (park=true, auto-exit=false) — covers 30–60min LLM turns
+RUN_HEARTBEAT_INTERVAL = 30  # seconds between progress heartbeats during remote exec (distinguishes slow vs stuck)
 
 # ── startup / handshake timeouts (seconds) ─────────────────────────────
 READY_TIMEOUT = 15  # how long to wait for the remote helper to print ``ready``

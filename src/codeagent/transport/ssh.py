@@ -377,67 +377,124 @@ def _run_ssh_wire(
     # P1-4: consecutive unparseable frames counter (abort on N).
     consecutive_bad = 0
 
+    # P2-18: Queue-based streaming instead of proc.communicate(timeout).
+    # A daemon thread reads stdout line-by-line into a queue.  The main
+    # loop does queue.get(timeout=idle_window) — on queue.Empty the idle
+    # deadline has truly expired (no frames from remote), so we kill.
+    # Each received frame resets the deadline, so heartbeats keep us alive.
+    import queue as _queue
+
+    # Send the payload and close stdin so the remote sees EOF.
     try:
-        stdout, stderr = proc.communicate(input=payload, timeout=timeout)
+        assert proc.stdin is not None
+        proc.stdin.write(payload)
+        proc.stdin.close()
+    except (OSError, BrokenPipeError) as exc:
+        proc.kill()
+        proc.wait()
+        raise TransportError(f"failed to send request to SSH: {exc}") from exc
+
+    _EOF = object()  # sentinel for end-of-stream
+    _line_q: _queue.Queue = _queue.Queue()
+
+    def _drain_stdout() -> None:
+        try:
+            for raw in (proc.stdout or []):
+                _line_q.put(raw)
+        except (OSError, ValueError):
+            pass
+        finally:
+            _line_q.put(_EOF)
+
+    def _drain_stderr() -> None:
+        try:
+            for line in (proc.stderr or []):
+                if isinstance(line, bytes):
+                    stderr_lines.append(line.decode("utf-8", errors="replace"))
+                else:
+                    stderr_lines.append(str(line))
+        except (OSError, ValueError):
+            pass
+
+    stderr_lines: list[str] = []
+    threading.Thread(target=_drain_stdout, daemon=True).start()
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    # Each received frame resets the deadline via queue.get(timeout).
+    # The caller's timeout IS the idle window — heartbeats from the
+    # remote (every RUN_HEARTBEAT_INTERVAL) reset it automatically.
+    idle_window = timeout
+
+    try:
+        while True:
+            try:
+                raw = _line_q.get(timeout=idle_window)
+            except _queue.Empty:
+                proc.kill()
+                proc.wait()
+                raise TransportError(
+                    f"SSH execution timed out after {idle_window}s (no frames from remote)"
+                )
+
+            if raw is _EOF:
+                break
+
+            raw_line = raw.decode("utf-8", errors="replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+            if not raw_line:
+                continue
+            try:
+                msg = decode_line(raw_line, strict=False)
+            except ValueError:
+                consecutive_bad += 1
+                if consecutive_bad >= MAX_CONSECUTIVE_BAD_FRAMES:
+                    log.warning(
+                        "_run_ssh_wire: %d consecutive bad frames from remote; aborting parse",
+                        consecutive_bad,
+                    )
+                    break
+                continue
+            consecutive_bad = 0
+
+            if msg.type == MSG_READY:
+                remote_ver = msg.payload.get("wire_version", 0)
+                if remote_ver != WIRE_VERSION:
+                    proc.kill()
+                    proc.wait()
+                    raise TransportError(
+                        f"wire version mismatch: remote={remote_ver}, local={WIRE_VERSION}. "
+                        f"Update codeagent-py on the remote host."
+                    )
+                continue
+            if msg.type == MSG_ACCEPTED:
+                continue
+            # Progress heartbeats — consumed from queue, don't count as terminal.
+            if msg.type == "progress":
+                continue
+            if msg.type == MSG_SESSION:
+                session_id = msg.session_id
+            elif msg.type == MSG_RESULT:
+                got_terminal = True
+                result_stdout = msg.stdout
+                result_stderr = msg.stderr
+                exit_code = msg.exit_code
+            elif msg.type == MSG_ERROR:
+                got_terminal = True
+                result_stderr = msg.message
+                exit_code = 1
+
+        proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        raise TransportError(f"SSH execution timed out after {timeout}s")
+        raise TransportError("SSH process did not exit after stream completion")
+    except TransportError:
+        raise
     except Exception:
         proc.kill()
         proc.wait()
         raise
 
-    stdout_str = stdout.decode("utf-8", errors="replace") if stdout else ""
-    ssh_stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
-
-    # Parse JSONL response lines.
-    for raw_line in stdout_str.splitlines():
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        try:
-            # P1-4: strict=False — a v1 remote's bare {"type":"ready"}
-            # decodes with wire_version 0 so the version check below
-            # reports a mismatch instead of the frame being skipped.
-            msg = decode_line(raw_line, strict=False)
-        except ValueError:
-            # P1-4: N consecutive bad frames → give up loudly instead of
-            # skipping garbage (which could hide a dropped terminal frame).
-            consecutive_bad += 1
-            if consecutive_bad >= MAX_CONSECUTIVE_BAD_FRAMES:
-                log.warning(
-                    "_run_ssh_wire: %d consecutive bad frames from remote; aborting parse",
-                    consecutive_bad,
-                )
-                break
-            continue
-        consecutive_bad = 0
-
-        if msg.type == MSG_READY:
-            # Check wire version compatibility
-            remote_ver = msg.payload.get("wire_version", 0)
-            if remote_ver != WIRE_VERSION:
-                raise TransportError(
-                    f"wire version mismatch: remote={remote_ver}, local={WIRE_VERSION}. "
-                    f"Update codeagent-py on the remote host."
-                )
-            continue
-        if msg.type == MSG_ACCEPTED:
-            continue
-        if msg.type == MSG_SESSION:
-            session_id = msg.session_id
-        elif msg.type == MSG_RESULT:
-            got_terminal = True
-            result_stdout = msg.stdout
-            result_stderr = msg.stderr
-            exit_code = msg.exit_code
-        elif msg.type == MSG_ERROR:
-            # P1-2: 远端显式报错，必须返回非零码。
-            # 不用 -1 哨兵值，否则回落到 proc.returncode（通常为 0）。
-            got_terminal = True
-            result_stderr = msg.message
-            exit_code = 1
+    ssh_stderr = "".join(stderr_lines)
 
     # P1-3: got_terminal invariant — EOF without a terminal frame (frame
     # dropped by the >1MiB guard, truncated output, garbage-only stream)

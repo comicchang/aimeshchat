@@ -1,7 +1,9 @@
 """Tests for codeagent.transport.local and codeagent.transport.ssh."""
 from __future__ import annotations
 
+import io
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -65,15 +67,34 @@ def _mock_popen_success(session_id: str | None = None, returncode: int = 0):
     stdout_bytes = b"".join(stdout_lines)
     mock_proc.communicate.return_value = (stdout_bytes, b"")
     mock_proc.returncode = returncode
+    # P2-18: streaming readline path needs real file-like stdin/stdout/stderr.
+    mock_proc.stdin = MagicMock()
+    mock_proc.stdout = io.BytesIO(stdout_bytes)
+    mock_proc.stderr = io.BytesIO(b"")
     return mock_proc
 
 
+class _BlockingIO(io.RawIOBase):
+    """A raw IO that blocks on read — simulates a slow remote that never responds."""
+    def readable(self):
+        return True
+    def writable(self):
+        return False
+    def readinto(self, b):
+        threading.Event().wait()  # block forever
+        return 0  # unreachable
+
+
 def _mock_popen_timeout():
-    """Return a MagicMock Popen that times out on communicate()."""
+    """Return a MagicMock Popen that times out (streaming path)."""
     mock_proc = MagicMock()
     mock_proc.communicate.side_effect = subprocess.TimeoutExpired(cmd="test", timeout=5)
     mock_proc.kill = MagicMock()
     mock_proc.wait = MagicMock()
+    # P2-18: streaming path uses proc.stdin/stdout directly.
+    mock_proc.stdin = MagicMock()
+    mock_proc.stdout = _BlockingIO()
+    mock_proc.stderr = io.BytesIO(b"")
     return mock_proc
 
 
@@ -82,6 +103,10 @@ def _mock_popen_exit255_stderr(stderr: str = "Connection refused"):
     mock_proc = MagicMock()
     mock_proc.communicate.return_value = (b"", stderr.encode("utf-8"))
     mock_proc.returncode = 255
+    # P2-18: streaming path uses proc.stdin/stdout directly.
+    mock_proc.stdin = MagicMock()
+    mock_proc.stdout = io.BytesIO(b"")
+    mock_proc.stderr = io.BytesIO(stderr.encode("utf-8"))
     return mock_proc
 
 
@@ -841,6 +866,9 @@ class TestRunSSHWire:
         mock_proc = MagicMock()
         mock_proc.communicate.return_value = (b"", b"some error\n")
         mock_proc.returncode = 127
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = io.BytesIO(b"")
+        mock_proc.stderr = io.BytesIO(b"some error\n")
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
@@ -859,6 +887,9 @@ class TestRunSSHWire:
         result_msg = encode_line({"type": MSG_RESULT, "stdout": "done", "stderr": "", "exit_code": 0})
         mock_proc.communicate.return_value = (ready + result_msg, b"")
         mock_proc.returncode = 0
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = io.BytesIO(ready + result_msg)
+        mock_proc.stderr = io.BytesIO(b"")
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
@@ -883,12 +914,12 @@ class TestRunSSHWire:
             )
 
     @patch("subprocess.Popen")
-    def test_communicate_error_kills_and_reraises(self, mock_popen: MagicMock):
-        """Generic communicate() failure kills the proc and re-raises."""
+    def test_stdin_write_error_kills_and_reraises(self, mock_popen: MagicMock):
+        """stdin write failure kills the proc and raises TransportError."""
         mock_proc = MagicMock()
-        mock_proc.communicate.side_effect = RuntimeError("boom")
+        mock_proc.stdin.write.side_effect = OSError("broken pipe")
         mock_popen.return_value = mock_proc
-        with pytest.raises(RuntimeError, match="boom"):
+        with pytest.raises(TransportError, match="failed to send request"):
             _run_ssh_wire(
                 ["ssh", "host", "python3"],
                 {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
@@ -906,6 +937,9 @@ class TestRunSSHWire:
         result_msg = encode_line({"type": MSG_RESULT, "stdout": "ok", "stderr": "", "exit_code": 0})
         mock_proc.communicate.return_value = (b"\n\n" + result_msg, b"")
         mock_proc.returncode = 0
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = io.BytesIO(b"\n\n" + result_msg)
+        mock_proc.stderr = io.BytesIO(b"")
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
@@ -923,6 +957,9 @@ class TestRunSSHWire:
         stdout = b"some noise\n" + encode_line({"type": MSG_RESULT, "stdout": "ok", "stderr": "", "exit_code": 0})
         mock_proc.communicate.return_value = (stdout, b"")
         mock_proc.returncode = 0
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = io.BytesIO(stdout)
+        mock_proc.stderr = io.BytesIO(b"")
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
@@ -940,6 +977,9 @@ class TestRunSSHWire:
         stdout = encode_line({"type": MSG_READY, "wire_version": 99, "package_version": "0.2.0"})
         mock_proc.communicate.return_value = (stdout, b"")
         mock_proc.returncode = 0
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = io.BytesIO(stdout)
+        mock_proc.stderr = io.BytesIO(b"")
         mock_popen.return_value = mock_proc
         with pytest.raises(TransportError, match="wire version mismatch"):
             _run_ssh_wire(
@@ -957,6 +997,9 @@ class TestRunSSHWire:
         stdout = encode_line({"type": MSG_ERROR, "message": "workdir not found"})
         mock_proc.communicate.return_value = (stdout, b"")
         mock_proc.returncode = 0
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = io.BytesIO(stdout)
+        mock_proc.stderr = io.BytesIO(b"")
         mock_popen.return_value = mock_proc
         result = _run_ssh_wire(
             ["ssh", "host", "python3"],
@@ -1105,6 +1148,9 @@ class TestSSHTransport:
         mock_proc = MagicMock()
         mock_proc.communicate.return_value = (b"", b"some random error")
         mock_proc.returncode = 255
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = io.BytesIO(b"")
+        mock_proc.stderr = io.BytesIO(b"some random error")
         mock_popen.return_value = mock_proc
 
         transport = SSHTransport()

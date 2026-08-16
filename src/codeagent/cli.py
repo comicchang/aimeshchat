@@ -17,6 +17,7 @@ from typing import Optional
 from uuid import uuid4
 
 from codeagent.config.repo_map import load_repo_map
+from codeagent.constants import DEFAULT_EXEC_TIMEOUT, ORACLE_TIMEOUT
 from codeagent.domain import (
     HostSpec,
     RunContext,
@@ -66,6 +67,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--no-auto-resume", action="store_true")
     run_p.add_argument("--skip-permissions", action="store_true", default=False)
     run_p.add_argument("--output", help="Write structured JSON to file")
+    run_p.add_argument("--timeout", type=int, default=None,
+                       help="Task timeout in seconds (default: 600; oracle agents auto-use 3600)")
     # Execution mode flags (mutually exclusive, default = synchronous foreground)
     run_mode = run_p.add_mutually_exclusive_group()
     run_mode.add_argument(
@@ -108,6 +111,8 @@ def _build_parser() -> argparse.ArgumentParser:
     route_p.add_argument("--skills")
     route_p.add_argument("--session-key")
     route_p.add_argument("--output")
+    route_p.add_argument("--timeout", type=int, default=None,
+                         help="Task timeout in seconds (default: 600; oracle agents auto-use 3600)")
     route_p.add_argument("--background", action="store_true", default=False,
                          help="Run in background (non-blocking; poll with 'aimeshchat job status <id>')")
     route_p.add_argument("--_bg-job-id", default=None, help=argparse.SUPPRESS)
@@ -1450,6 +1455,7 @@ def _run_sync(args: argparse.Namespace, task: str) -> int:
         new_session=args.new_session,
         no_auto_resume=args.no_auto_resume,
         host=args.host,
+        timeout=getattr(args, 'timeout', None) or DEFAULT_EXEC_TIMEOUT,
     )
 
     # Propagate --output path so OMPRunner._build_cmd can pass it to omp
@@ -1472,7 +1478,12 @@ def _run_sync(args: argparse.Namespace, task: str) -> int:
     if request.agent and request.agent.startswith("oracle"):
         ns_key = request.session_key or registry.compute_key(request, target)
         run_context = _bootstrap_oracle_swarm(request, ns_key)
-        # Timeout handled by OMPRunner._ORACLE_TIMEOUT (3600s) — don't override here
+        # P2-18: oracle agents need 3600s on BOTH the SSH wire deadline AND
+        # the remote runner.  The old comment "don't override here" was wrong —
+        # OMPRunner._ORACLE_TIMEOUT only covered the remote kill timer, leaving
+        # the Manager-side SSH wire at 600s.
+        if request.timeout < ORACLE_TIMEOUT:
+            request.timeout = ORACLE_TIMEOUT
 
         # Warm resume: check oracle inbox for pending manager messages
         if not request.new_session and run_context is not None:
@@ -1807,6 +1818,7 @@ def _cmd_route(args: argparse.Namespace) -> int:
         no_auto_resume=args.no_auto_resume,
         raw=getattr(args, 'raw', False),
         skip_permissions=getattr(args, 'skip_permissions', False),
+        timeout=getattr(args, 'timeout', None) or DEFAULT_EXEC_TIMEOUT,
     )
     target = resolve_target(request, repo_map)
 

@@ -63,7 +63,7 @@ class BaseRunner(ABC):
             env.update(extra_env)
         return subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,  # P2-17: OMP readPipedInput blocks on non-TTY stdin waiting for EOF that never arrives; prompt is via @file
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
