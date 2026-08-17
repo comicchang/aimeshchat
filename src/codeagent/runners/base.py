@@ -68,7 +68,10 @@ class BaseRunner(ABC):
             stderr=subprocess.PIPE,
             text=True,
             cwd=request.workdir or None,
-            start_new_session=True,
+            # P2-19: NO start_new_session — OMP must stay in the SSH shell's
+            # process group so SIGHUP propagates when the SSH connection drops.
+            # With start_new_session=True, OMP becomes a session leader immune
+            # to SIGHUP, turning into an orphan on every SSH timeout.
             env=env,
         )
 
