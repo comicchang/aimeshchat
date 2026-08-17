@@ -619,12 +619,26 @@ class TestRunOmpJsonFix:
 
 
 class TestProcessGroupIsolation:
-    def test_start_new_session_in_base_runner(self):
-        """Verify start_new_session=True is used in subprocess.run in BaseRunner."""
+    def test_no_start_new_session_in_base_runner(self):
+        """P2-19: BaseRunner.spawn() must NOT use start_new_session.
+
+        Without it, child stays in the SSH shell's process group so SIGHUP
+        propagates when the connection drops.
+        """
         src = Path(__file__).resolve().parents[1] / "src" / "codeagent" / "runners" / "base.py"
         code = src.read_text()
-        # Should have start_new_session=True
-        assert "start_new_session=True" in code
+        # Extract spawn() method body (from 'def spawn' to next def/class at same indent)
+        import re
+        spawn_match = re.search(
+            r'(    def spawn\(.*?\n)(    def |\nclass |\Z)', code, re.DOTALL
+        )
+        assert spawn_match, "Could not find spawn() method"
+        spawn_body = spawn_match.group(1)
+        # Remove comment lines
+        code_lines = [l for l in spawn_body.split('\n') if not l.strip().startswith('#')]
+        code_text = '\n'.join(code_lines)
+        assert 'start_new_session' not in code_text, \
+            "spawn() should not use start_new_session"
 
     def test_kill_in_base_runner_timeout(self):
         """Verify os.kill is called on TimeoutExpired in BaseRunner."""

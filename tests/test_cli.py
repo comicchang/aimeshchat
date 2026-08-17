@@ -1225,3 +1225,38 @@ class TestMainEntrypoint:
             assert exc.value.code == 1
         finally:
             sys.argv = old_argv
+
+
+class TestPositiveInt:
+    """_positive_int rejects non-positive values."""
+
+    def test_positive_value(self):
+        from codeagent.cli import _positive_int
+        assert _positive_int("600") == 600
+        assert _positive_int("1") == 1
+
+    def test_zero_rejected(self):
+        import argparse
+        from codeagent.cli import _positive_int
+        with pytest.raises(argparse.ArgumentTypeError, match="must be >0"):
+            _positive_int("0")
+
+    def test_negative_rejected(self):
+        import argparse
+        from codeagent.cli import _positive_int
+        with pytest.raises(argparse.ArgumentTypeError, match="must be >0"):
+            _positive_int("-5")
+
+
+class TestIsOracleAgent:
+    """_is_oracle_agent unifies name + profile determination."""
+
+    def test_oracle_name(self):
+        from codeagent.cli import _is_oracle_agent
+        assert _is_oracle_agent("oracle") is True
+        assert _is_oracle_agent("oracle-lite") is True
+
+    def test_none_returns_false(self):
+        from codeagent.cli import _is_oracle_agent
+        assert _is_oracle_agent(None) is False
+        assert _is_oracle_agent("") is False
