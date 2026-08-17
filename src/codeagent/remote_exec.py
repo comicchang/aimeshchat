@@ -178,7 +178,7 @@ def _handle_run(req: dict) -> None:
     # P2-19: Set a hard deadline env var for the child process watchdog.
     # If the remote_exec process itself becomes orphaned (parent SSH died
     # and SIGHUP didn't propagate), the watchdog in BaseRunner.spawn()
-    # will SIGKILL the process group after deadline.  The session is
+    # will SIGKILL the child process (PID-only, no killpg) after deadline.  The session is
     # resumable via --resume, so force-killing is safe.
     # Deadline = 1× timeout (hard wall-clock limit).  Heartbeats keep
     # the SSH wire alive for "slow but alive" scenarios; this deadline

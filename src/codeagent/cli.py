@@ -119,7 +119,7 @@ def _build_parser() -> argparse.ArgumentParser:
     route_p.add_argument("--skills")
     route_p.add_argument("--session-key")
     route_p.add_argument("--output")
-    route_p.add_argument("--timeout", type=int, default=None,
+    route_p.add_argument("--timeout", type=_positive_int, default=None,
                          help="Task timeout in seconds (default: 600; oracle agents auto-use 3600)")
     route_p.add_argument("--background", action="store_true", default=False,
                          help="Run in background (non-blocking; poll with 'aimeshchat job status <id>')")
