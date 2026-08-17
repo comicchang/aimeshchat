@@ -184,7 +184,7 @@ def _handle_run(req: dict) -> None:
     import os as _os
     _deadline_key = "AIMESHCHAT_DEADLINE"
     _prev_deadline = _os.environ.get(_deadline_key)
-    _os.environ[_deadline_key] = str(int(time.time()) + timeout * 2)
+    _os.environ[_deadline_key] = str(time.monotonic() + timeout * 2)
 
     # P2-18: Run spawn in a worker thread while the main thread emits
     # heartbeat frames every RUN_HEARTBEAT_INTERVAL seconds.  This keeps

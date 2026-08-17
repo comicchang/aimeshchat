@@ -95,9 +95,16 @@ class BaseRunner(ABC):
                     remaining = deadline - time.monotonic()
                     if remaining > 0:
                         time.sleep(remaining)
-                    # Deadline exceeded — kill the entire process group.
+                    # Deadline exceeded — kill the child.
+                    # If the child is a process group leader (e.g., orphaned
+                    # remote process), kill the whole group.  Otherwise kill
+                    # just the child to avoid killing the parent's group.
                     try:
-                        os.killpg(os.getpgid(proc.pid), 9)
+                        pgid = os.getpgid(proc.pid)
+                        if pgid == proc.pid:
+                            os.killpg(pgid, 9)
+                        else:
+                            os.kill(proc.pid, 9)
                     except (ProcessLookupError, OSError):
                         pass  # already dead
 
@@ -147,9 +154,18 @@ class BaseRunner(ABC):
         )
 
     def stop(self, proc: subprocess.Popen) -> None:
-        """Terminate the process group (SIGKILL) — for timeouts/aborts."""
+        """Terminate the child (SIGKILL) — for timeouts/aborts.
+
+        P2-19: If the child is a process group leader (orphaned remote
+        process), kill the whole group.  Otherwise kill just the child
+        to avoid killing the parent's group.
+        """
         try:
-            os.killpg(os.getpgid(proc.pid), 9)
+            pgid = os.getpgid(proc.pid)
+            if pgid == proc.pid:
+                os.killpg(pgid, 9)
+            else:
+                os.kill(proc.pid, 9)
         except (ProcessLookupError, OSError):
             pass
         try:

@@ -350,9 +350,10 @@ def _run_ssh_wire(
     """Run an SSH command that hosts ``codeagent.remote_exec`` and exchange
     a single JSONL request/response cycle.
 
-    Uses ``Popen.communicate(timeout=deadline)`` for proper timeout handling.
-    Stderr from the SSH process is captured and included in RunResult.stderr
-    for diagnostics.
+    P2-18: Uses queue-based streaming — a daemon thread reads stdout
+    line-by-line into a queue; the main loop does queue.get(timeout).
+    On queue.Empty the idle deadline has expired (no frames from remote),
+    so we kill.  Each received frame resets the deadline via heartbeats.
     """
     payload = encode_line(request)
 
@@ -395,7 +396,7 @@ def _run_ssh_wire(
         raise TransportError(f"failed to send request to SSH: {exc}") from exc
 
     _EOF = object()  # sentinel for end-of-stream
-    _line_q: _queue.Queue = _queue.Queue()
+    _line_q: _queue.Queue[object] = _queue.Queue()
 
     def _drain_stdout() -> None:
         try:
