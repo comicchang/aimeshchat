@@ -55,6 +55,25 @@ def _positive_int(v: str) -> int:
     return iv
 
 
+def _is_oracle_agent(agent_name: str | None) -> bool:
+    """Check if agent is oracle-class (needs extended timeout).
+
+    Unifies the two determination systems:
+    - Name heuristic: agent.startswith("oracle")
+    - Profile semantic: park=True and auto_exit=False
+    """
+    if not agent_name:
+        return False
+    if agent_name.startswith("oracle"):
+        return True
+    try:
+        from codeagent.runners.omp import resolve_agent_profile
+        profile = resolve_agent_profile(agent_name)
+        return profile.park and not profile.auto_exit
+    except Exception:
+        return False
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("aimeshchat", description="Multi-host code agent orchestration")
     p.add_argument("--version", "-v", action="version", version=f"%(prog)s {__version__}")
@@ -1383,7 +1402,7 @@ def _resolve_agent_backend(agent: Optional[str], requested: str) -> str:
     with the persist-oracle required capability ``warm_resume``. Generic is
     only used when explicitly requested. Non-oracle agents pass through.
     """
-    if not agent or not agent.startswith("oracle"):
+    if not _is_oracle_agent(agent):
         return requested
     from codeagent.runtime.base import CAP_WARM_RESUME
     from codeagent.runtime.registry import RuntimeRegistry
@@ -1481,21 +1500,21 @@ def _run_sync(args: argparse.Namespace, task: str) -> int:
     registry = SessionRegistry()
     target = resolve_target(request, repo_map)
 
-    # P3: Clamp --timeout for remote targets.  Old values (300/600) bypass
-    # the heartbeat mechanism; floor at SSH_IDLE_WINDOW.  Warn if the user
-    # explicitly set --timeout on a remote target.
-    if not target.is_local and getattr(args, 'timeout', None) is not None:
-        if request.timeout < SSH_IDLE_WINDOW:
+    # P3: Clamp --timeout for remote targets.  Floor at SSH_IDLE_WINDOW
+    # unconditionally (guards against DEFAULT_EXEC_TIMEOUT dropping below
+    # the floor in the future).  Warning only when user explicitly set --timeout.
+    if not target.is_local and request.timeout < SSH_IDLE_WINDOW:
+        if getattr(args, 'timeout', None) is not None:
             log.warning(
                 "--timeout %d < SSH_IDLE_WINDOW(%d) for remote target %s; "
                 "clamped to %d. Heartbeats manage remote liveness automatically.",
                 request.timeout, SSH_IDLE_WINDOW, target.host.name, SSH_IDLE_WINDOW,
             )
-            request.timeout = SSH_IDLE_WINDOW
+        request.timeout = SSH_IDLE_WINDOW
 
     # Oracle pre-spawn bootstrap: create RunContext + swarm session + INIT envelope
     run_context: Optional[RunContext] = None
-    if request.agent and request.agent.startswith("oracle"):
+    if _is_oracle_agent(request.agent):
         ns_key = request.session_key or registry.compute_key(request, target)
         run_context = _bootstrap_oracle_swarm(request, ns_key)
         # P2-18: oracle agents need 3600s on BOTH the SSH wire deadline AND
@@ -1600,6 +1619,8 @@ def _run_in_tmux(args: argparse.Namespace, task: str) -> int:
         argv.append("--skip-permissions")
     if args.output:
         argv.extend(["--output", args.output])
+    if getattr(args, "timeout", None) is not None:
+        argv.extend(["--timeout", str(args.timeout)])
 
     try:
         pane_id = spawn_in_current_tmux(
@@ -1661,6 +1682,8 @@ def _run_in_background(args: argparse.Namespace, task: str) -> int:
         argv.append("--skip-permissions")
     if args.output:
         argv.extend(["--output", args.output])
+    if getattr(args, "timeout", None) is not None:
+        argv.extend(["--timeout", str(args.timeout)])
     # Hidden flag: child writes result to job dir.
     argv.extend(["--_bg-job-id", job_id])
 
@@ -1843,17 +1866,17 @@ def _cmd_route(args: argparse.Namespace) -> int:
     target = resolve_target(request, repo_map)
 
     # P3: Clamp --timeout for remote targets (same logic as _run_sync).
-    if not target.is_local and getattr(args, 'timeout', None) is not None:
-        if request.timeout < SSH_IDLE_WINDOW:
+    if not target.is_local and request.timeout < SSH_IDLE_WINDOW:
+        if getattr(args, 'timeout', None) is not None:
             log.warning(
                 "--timeout %d < SSH_IDLE_WINDOW(%d) for remote target %s; "
                 "clamped to %d. Heartbeats manage remote liveness automatically.",
                 request.timeout, SSH_IDLE_WINDOW, target.host.name, SSH_IDLE_WINDOW,
             )
-            request.timeout = SSH_IDLE_WINDOW
+        request.timeout = SSH_IDLE_WINDOW
 
     # P2-c: oracle agents need 3600s on route path too (matches _run_sync).
-    if request.agent and request.agent.startswith("oracle"):
+    if _is_oracle_agent(request.agent):
         if request.timeout < ORACLE_TIMEOUT:
             request.timeout = ORACLE_TIMEOUT
 
