@@ -577,8 +577,8 @@ class TestBaseRunnerContract:
         assert result.returncode == 0
         assert result.stdout.strip() == "hello"
 
-    def test_timeout_calls_killpg(self) -> None:
-        """BaseRunner should call os.killpg on timeout."""
+    def test_timeout_calls_kill(self) -> None:
+        """BaseRunner should call os.kill on timeout (no start_new_session)."""
         import io
 
         mock_proc = mock.MagicMock()
@@ -600,12 +600,11 @@ class TestBaseRunnerContract:
         mock_proc.wait.side_effect = timeout_exc
 
         with mock.patch("subprocess.Popen", mock_popen), \
-             mock.patch("os.killpg") as mock_killpg, \
-             mock.patch("os.getpgid", return_value=12345):
+             mock.patch("os.kill") as mock_kill:
             d = Dummy(config=RunnerConfig(timeout=5))
             result = d.run(RunRequest(task="long"))
             assert result.returncode == -1
-            mock_killpg.assert_called_once_with(12345, 9)
+            mock_kill.assert_called_once()
 
     def test_watchdog_kills_on_deadline(self, tmp_path: Path) -> None:
         """AIMESHCHAT_DEADLINE watchdog SIGKILLs the process group on expiry."""

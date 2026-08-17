@@ -420,7 +420,8 @@ def _run_ssh_wire(
 
     stderr_lines: list[str] = []
     threading.Thread(target=_drain_stdout, daemon=True).start()
-    threading.Thread(target=_drain_stderr, daemon=True).start()
+    _stderr_t = threading.Thread(target=_drain_stderr, daemon=True)
+    _stderr_t.start()
 
     # Each received frame resets the deadline via queue.get(timeout).
     # Floor at SSH_IDLE_WINDOW so old --timeout values (300/600/60)
@@ -497,6 +498,9 @@ def _run_ssh_wire(
         proc.wait()
         raise
 
+    # P2-a: join stderr drain thread before reading — proc.wait ensures
+    # the write end of stderr pipe is closed, so join won't deadlock.
+    _stderr_t.join(timeout=5)
     ssh_stderr = "".join(stderr_lines)
 
     # P1-3: got_terminal invariant — EOF without a terminal frame (frame

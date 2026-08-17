@@ -626,11 +626,12 @@ class TestProcessGroupIsolation:
         # Should have start_new_session=True
         assert "start_new_session=True" in code
 
-    def test_killpg_in_base_runner_timeout(self):
-        """Verify os.killpg is called on TimeoutExpired in BaseRunner."""
+    def test_kill_in_base_runner_timeout(self):
+        """Verify os.kill is called on TimeoutExpired in BaseRunner."""
         src = Path(__file__).resolve().parents[1] / "src" / "codeagent" / "runners" / "base.py"
         code = src.read_text()
-        assert "os.killpg" in code
+        # P2-19: no start_new_session → child in our group → os.kill (not killpg)
+        assert "os.kill" in code
         assert "TimeoutExpired" in code
 
     def test_remote_exec_uses_runners_not_subprocess(self):

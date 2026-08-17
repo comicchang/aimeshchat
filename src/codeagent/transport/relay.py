@@ -392,6 +392,9 @@ class RelayTransport(Transport):
                             elif msg_type == MSG_ACCEPTED:
                                 _set_state("msg:accepted")
                                 pass  # protocol handshake
+                            elif msg_type == "progress":
+                                # P2-18: heartbeat frame — ignore (ssh.py does the same)
+                                _set_state("msg:progress")
                             else:
                                 # Non-wire output (relay UI, QR codes, etc.) → stderr
                                 _set_state("msg:other")

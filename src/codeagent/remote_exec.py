@@ -180,11 +180,13 @@ def _handle_run(req: dict) -> None:
     # and SIGHUP didn't propagate), the watchdog in BaseRunner.spawn()
     # will SIGKILL the process group after deadline.  The session is
     # resumable via --resume, so force-killing is safe.
-    # Deadline = 2× timeout (generous margin for LLM inference).
+    # Deadline = 1× timeout (hard wall-clock limit).  Heartbeats keep
+    # the SSH wire alive for "slow but alive" scenarios; this deadline
+    # is the absolute upper bound — matching --timeout semantics.
     import os as _os
     _deadline_key = "AIMESHCHAT_DEADLINE"
     _prev_deadline = _os.environ.get(_deadline_key)
-    _os.environ[_deadline_key] = str(time.monotonic() + timeout * 2)
+    _os.environ[_deadline_key] = str(time.monotonic() + timeout)
 
     # P2-18: Run spawn in a worker thread while the main thread emits
     # heartbeat frames every RUN_HEARTBEAT_INTERVAL seconds.  This keeps

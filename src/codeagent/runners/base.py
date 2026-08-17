@@ -95,16 +95,11 @@ class BaseRunner(ABC):
                     remaining = deadline - time.monotonic()
                     if remaining > 0:
                         time.sleep(remaining)
-                    # Deadline exceeded — kill the child.
-                    # If the child is a process group leader (e.g., orphaned
-                    # remote process), kill the whole group.  Otherwise kill
-                    # just the child to avoid killing the parent's group.
+                    # Deadline exceeded — kill the child process.
+                    # Without start_new_session the child is in our process
+                    # group (pgid != pid), so killpg would hit us too.
                     try:
-                        pgid = os.getpgid(proc.pid)
-                        if pgid == proc.pid:
-                            os.killpg(pgid, 9)
-                        else:
-                            os.kill(proc.pid, 9)
+                        os.kill(proc.pid, 9)
                     except (ProcessLookupError, OSError):
                         pass  # already dead
 
@@ -154,18 +149,13 @@ class BaseRunner(ABC):
         )
 
     def stop(self, proc: subprocess.Popen) -> None:
-        """Terminate the child (SIGKILL) — for timeouts/aborts.
+        """Terminate the child process (SIGKILL) — for timeouts/aborts.
 
-        P2-19: If the child is a process group leader (orphaned remote
-        process), kill the whole group.  Otherwise kill just the child
-        to avoid killing the parent's group.
+        Without start_new_session the child shares our process group,
+        so we kill by PID only (not killpg, which would hit us too).
         """
         try:
-            pgid = os.getpgid(proc.pid)
-            if pgid == proc.pid:
-                os.killpg(pgid, 9)
-            else:
-                os.kill(proc.pid, 9)
+            os.kill(proc.pid, 9)
         except (ProcessLookupError, OSError):
             pass
         try:

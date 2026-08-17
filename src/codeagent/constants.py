@@ -57,4 +57,6 @@ LOOP_TICK = 0.25  # max block in receiver loop() per iteration
 STREAM_CURSOR_INITIAL = "0"
 STREAM_CURSOR_FILE = ".stream-cursor"
 SEQ_WIDTH = 6  # zero-pad width for the seq component (P0-b: "10" must sort after "9")
-
+# ── invariants ─────────────────────────────────────────────────────────
+assert DEFAULT_EXEC_TIMEOUT >= SSH_IDLE_WINDOW, \
+    f"DEFAULT_EXEC_TIMEOUT({DEFAULT_EXEC_TIMEOUT}) must >= SSH_IDLE_WINDOW({SSH_IDLE_WINDOW})"

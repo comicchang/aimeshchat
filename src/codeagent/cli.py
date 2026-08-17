@@ -47,6 +47,14 @@ def _get_transport(host: HostSpec, repo_map=None):
     return _router.get(host, repo_map)
 
 
+def _positive_int(v: str) -> int:
+    """argparse type: positive integer (>0)."""
+    iv = int(v)
+    if iv <= 0:
+        raise argparse.ArgumentTypeError(f"must be >0, got {iv}")
+    return iv
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("aimeshchat", description="Multi-host code agent orchestration")
     p.add_argument("--version", "-v", action="version", version=f"%(prog)s {__version__}")
@@ -67,7 +75,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--no-auto-resume", action="store_true")
     run_p.add_argument("--skip-permissions", action="store_true", default=False)
     run_p.add_argument("--output", help="Write structured JSON to file")
-    run_p.add_argument("--timeout", type=int, default=None,
+    run_p.add_argument("--timeout", type=_positive_int, default=None,
                        help="Task timeout in seconds (default: 600; oracle agents auto-use 3600)")
     # Execution mode flags (mutually exclusive, default = synchronous foreground)
     run_mode = run_p.add_mutually_exclusive_group()
@@ -1843,6 +1851,11 @@ def _cmd_route(args: argparse.Namespace) -> int:
                 request.timeout, SSH_IDLE_WINDOW, target.host.name, SSH_IDLE_WINDOW,
             )
             request.timeout = SSH_IDLE_WINDOW
+
+    # P2-c: oracle agents need 3600s on route path too (matches _run_sync).
+    if request.agent and request.agent.startswith("oracle"):
+        if request.timeout < ORACLE_TIMEOUT:
+            request.timeout = ORACLE_TIMEOUT
 
     if args.dry_run:
         info = f"Topic: {topic_name} → host={target.host.name} path={target.workdir} local={target.is_local}"
