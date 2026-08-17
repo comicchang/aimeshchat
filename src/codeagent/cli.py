@@ -17,7 +17,7 @@ from typing import Optional
 from uuid import uuid4
 
 from codeagent.config.repo_map import load_repo_map
-from codeagent.constants import DEFAULT_EXEC_TIMEOUT, ORACLE_TIMEOUT
+from codeagent.constants import DEFAULT_EXEC_TIMEOUT, ORACLE_TIMEOUT, SSH_IDLE_WINDOW
 from codeagent.domain import (
     HostSpec,
     RunContext,
@@ -1473,6 +1473,18 @@ def _run_sync(args: argparse.Namespace, task: str) -> int:
     registry = SessionRegistry()
     target = resolve_target(request, repo_map)
 
+    # P3: Clamp --timeout for remote targets.  Old values (300/600) bypass
+    # the heartbeat mechanism; floor at SSH_IDLE_WINDOW.  Warn if the user
+    # explicitly set --timeout on a remote target.
+    if not target.is_local and getattr(args, 'timeout', None) is not None:
+        if request.timeout < SSH_IDLE_WINDOW:
+            log.warning(
+                "--timeout %d < SSH_IDLE_WINDOW(%d) for remote target %s; "
+                "clamped to %d. Heartbeats manage remote liveness automatically.",
+                request.timeout, SSH_IDLE_WINDOW, target.host.name, SSH_IDLE_WINDOW,
+            )
+            request.timeout = SSH_IDLE_WINDOW
+
     # Oracle pre-spawn bootstrap: create RunContext + swarm session + INIT envelope
     run_context: Optional[RunContext] = None
     if request.agent and request.agent.startswith("oracle"):
@@ -1821,6 +1833,16 @@ def _cmd_route(args: argparse.Namespace) -> int:
         timeout=getattr(args, 'timeout', None) or DEFAULT_EXEC_TIMEOUT,
     )
     target = resolve_target(request, repo_map)
+
+    # P3: Clamp --timeout for remote targets (same logic as _run_sync).
+    if not target.is_local and getattr(args, 'timeout', None) is not None:
+        if request.timeout < SSH_IDLE_WINDOW:
+            log.warning(
+                "--timeout %d < SSH_IDLE_WINDOW(%d) for remote target %s; "
+                "clamped to %d. Heartbeats manage remote liveness automatically.",
+                request.timeout, SSH_IDLE_WINDOW, target.host.name, SSH_IDLE_WINDOW,
+            )
+            request.timeout = SSH_IDLE_WINDOW
 
     if args.dry_run:
         info = f"Topic: {topic_name} → host={target.host.name} path={target.workdir} local={target.is_local}"

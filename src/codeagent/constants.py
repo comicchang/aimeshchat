@@ -13,6 +13,7 @@ DEFAULT_MAILBOX_TIMEOUT = 60  # default timeout for mailbox wire requests
 DEFAULT_PULL_TIMEOUT = 60  # default timeout for an scp artifact pull
 ORACLE_TIMEOUT = 3600  # oracle-class agents (park=true, auto-exit=false) — covers 30–60min LLM turns
 RUN_HEARTBEAT_INTERVAL = 30  # seconds between progress heartbeats during remote exec (distinguishes slow vs stuck)
+SSH_IDLE_WINDOW = 180  # minimum idle window for SSH queue.get(timeout) — prevents old --timeout values from bypassing heartbeat
 
 # ── startup / handshake timeouts (seconds) ─────────────────────────────
 READY_TIMEOUT = 15  # how long to wait for the remote helper to print ``ready``

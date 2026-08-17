@@ -833,15 +833,18 @@ class TestRunSSHWire:
         """Timeout raises TransportError after killing process."""
         mock_proc = _mock_popen_timeout()
         mock_popen.return_value = mock_proc
-        with pytest.raises(TransportError, match="timed out"):
-            _run_ssh_wire(
-                ["ssh", "host", "python3"],
-                {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
-                workdir="/tmp",
-                host_name="host",
-                backend="opencode",
-                timeout=5,
-            )
+        # P3: SSH_IDLE_WINDOW floors idle_window at 180s; patch to 0.1
+        # so max(5, 0.1)=5 triggers quickly in tests.
+        with patch("codeagent.transport.ssh.SSH_IDLE_WINDOW", 0.1):
+            with pytest.raises(TransportError, match="timed out"):
+                _run_ssh_wire(
+                    ["ssh", "host", "python3"],
+                    {"wire_version": WIRE_VERSION, "command": "run", "task": "test"},
+                    workdir="/tmp",
+                    host_name="host",
+                    backend="opencode",
+                    timeout=5,
+                )
         mock_proc.kill.assert_called_once()
         mock_proc.wait.assert_called_once()
 

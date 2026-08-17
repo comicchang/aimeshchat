@@ -19,6 +19,7 @@ from codeagent.constants import (
     DEFAULT_EXEC_TIMEOUT,
     DEFAULT_MAILBOX_TIMEOUT,
     DEFAULT_SSH_TIMEOUT,
+    SSH_IDLE_WINDOW,
     STREAM_CURSOR_INITIAL,
     STREAM_HEARTBEAT_INTERVAL,
     STREAM_RECONNECT_BASE,
@@ -422,9 +423,10 @@ def _run_ssh_wire(
     threading.Thread(target=_drain_stderr, daemon=True).start()
 
     # Each received frame resets the deadline via queue.get(timeout).
-    # The caller's timeout IS the idle window — heartbeats from the
-    # remote (every RUN_HEARTBEAT_INTERVAL) reset it automatically.
-    idle_window = timeout
+    # Floor at SSH_IDLE_WINDOW so old --timeout values (300/600/60)
+    # don't bypass the heartbeat mechanism.  Heartbeats from the
+    # remote (every RUN_HEARTBEAT_INTERVAL) reset the deadline.
+    idle_window = max(timeout, SSH_IDLE_WINDOW)
 
     try:
         while True:
