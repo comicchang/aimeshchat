@@ -18,6 +18,7 @@ import io
 import os
 import subprocess
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,7 +62,7 @@ class BaseRunner(ABC):
         if extra_env:
             env = os.environ.copy()
             env.update(extra_env)
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,  # P2-17: OMP readPipedInput blocks on non-TTY stdin waiting for EOF that never arrives; prompt is via @file
             stdout=subprocess.PIPE,
@@ -74,6 +75,35 @@ class BaseRunner(ABC):
             # to SIGHUP, turning into an orphan on every SSH timeout.
             env=env,
         )
+
+        # P2-19: Watchdog — if AIMESHCHAT_DEADLINE is set (by remote_exec),
+        # start a daemon thread that SIGKILLs the process group after the
+        # deadline.  This is defense-in-depth: even if SIGHUP doesn't
+        # propagate (e.g., SSH drops without clean close), the child will
+        # self-terminate.  Session is resumable via --resume, so force-kill
+        # is safe.
+        deadline_str = os.environ.get("AIMESHCHAT_DEADLINE")
+        if deadline_str:
+            try:
+                deadline = float(deadline_str)
+            except ValueError:
+                deadline = 0
+            if deadline > 0:
+                import threading as _threading
+
+                def _watchdog() -> None:
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(remaining)
+                    # Deadline exceeded — kill the entire process group.
+                    try:
+                        os.killpg(os.getpgid(proc.pid), 9)
+                    except (ProcessLookupError, OSError):
+                        pass  # already dead
+
+                _threading.Thread(target=_watchdog, daemon=True).start()
+
+        return proc
 
     def pump(self, proc: subprocess.Popen) -> Iterator[tuple[str, str]]:
         """Yield ``(channel, line)`` reading stdout and stderr concurrently.

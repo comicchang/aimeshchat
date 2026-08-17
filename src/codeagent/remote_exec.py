@@ -175,6 +175,17 @@ def _handle_run(req: dict) -> None:
         "profile_args": [],
     }
 
+    # P2-19: Set a hard deadline env var for the child process watchdog.
+    # If the remote_exec process itself becomes orphaned (parent SSH died
+    # and SIGHUP didn't propagate), the watchdog in BaseRunner.spawn()
+    # will SIGKILL the process group after deadline.  The session is
+    # resumable via --resume, so force-killing is safe.
+    # Deadline = 2× timeout (generous margin for LLM inference).
+    import os as _os
+    _deadline_key = "AIMESHCHAT_DEADLINE"
+    _prev_deadline = _os.environ.get(_deadline_key)
+    _os.environ[_deadline_key] = str(int(time.time()) + timeout * 2)
+
     # P2-18: Run spawn in a worker thread while the main thread emits
     # heartbeat frames every RUN_HEARTBEAT_INTERVAL seconds.  This keeps
     # the SSH wire alive during long LLM inference (mimo-v2.5-pro can
@@ -196,6 +207,12 @@ def _handle_run(req: dict) -> None:
         worker.join(timeout=RUN_HEARTBEAT_INTERVAL)
         if worker.is_alive():
             _send({"type": "progress", "message": "still running"})
+
+    # Restore previous deadline env var (don't leak into next request).
+    if _prev_deadline is not None:
+        _os.environ[_deadline_key] = _prev_deadline
+    else:
+        _os.environ.pop(_deadline_key, None)
 
     if _spawn_error:
         _send({"type": "error", "message": f"run failed: {_spawn_error[0]}"})
