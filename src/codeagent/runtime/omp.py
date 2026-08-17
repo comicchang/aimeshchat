@@ -111,7 +111,7 @@ class OMPRuntimeAdapter(RuntimeAdapter):
             capabilities=_SHORT_TASK_CAPS,
             supervisor="process",
             mode="short_task",
-            extra={"result": {"returncode": result.returncode, "stdout": result.stdout}},
+            extra={"result": {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}},
         )
 
     def send(self, handle: RuntimeHandle, message: dict) -> dict:

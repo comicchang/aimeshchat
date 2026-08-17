@@ -607,23 +607,23 @@ class TestBaseRunnerContract:
             mock_kill.assert_called_once()
 
     def test_watchdog_kills_on_deadline(self, tmp_path: Path) -> None:
-        """AIMESHCHAT_DEADLINE watchdog SIGKILLs the process group on expiry."""
+        """AIMESHCHAT_DEADLINE watchdog kills the child process on expiry."""
         import time as _time
 
         class Dummy(BaseRunner):
             def _build_cmd(self, request):
                 return ["sleep", "60"]
             def _parse_output(self, proc, request):
-                return RunResult(returncode=0)
+                return RunResult(returncode=proc.returncode, stderr=proc.stderr or "")
 
         # Set deadline 1s from now (monotonic clock — matches watchdog).
         os.environ["AIMESHCHAT_DEADLINE"] = str(_time.monotonic() + 1)
         try:
             d = Dummy(config=RunnerConfig(timeout=60))
             request = RunRequest(task="test", workdir=str(tmp_path))
-            proc = d.spawn(request)
-            # Wait for the watchdog to kill the process.
-            proc.wait(timeout=5)
-            assert proc.returncode == -9  # SIGKILL
+            result = d.run(request)
+            assert result.returncode == -9  # SIGKILL
+            assert "watchdog" in result.stderr
+            assert "60s" in result.stderr
         finally:
             os.environ.pop("AIMESHCHAT_DEADLINE", None)

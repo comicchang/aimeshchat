@@ -95,9 +95,11 @@ class BaseRunner(ABC):
                     remaining = deadline - time.monotonic()
                     if remaining > 0:
                         time.sleep(remaining)
-                    # Deadline exceeded — kill the child process.
-                    # Without start_new_session the child is in our process
-                    # group (pgid != pid), so killpg would hit us too.
+                    # Deadline exceeded — mark and kill the child process.
+                    # Check poll() first to avoid killing a reused PID.
+                    if proc.poll() is not None:
+                        return  # already exited
+                    proc._watchdog_killed = True  # type: ignore[attr-defined]
                     try:
                         os.kill(proc.pid, 9)
                     except (ProcessLookupError, OSError):
@@ -208,6 +210,10 @@ class BaseRunner(ABC):
 
         proc_obj.stdout = "".join(stdout_lines)
         proc_obj.stderr = "".join(stderr_lines)
+        # Check if watchdog killed the process — add diagnostic to stderr.
+        if getattr(proc, '_watchdog_killed', False):
+            diag = f"watchdog: killed after {self.config.timeout}s deadline (AIMESHCHAT_DEADLINE)"
+            proc_obj.stderr = (proc_obj.stderr + "\n" + diag).strip()
         try:
             return self._parse_output(proc_obj, request)
         finally:
