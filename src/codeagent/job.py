@@ -315,8 +315,13 @@ class JobManager:
                 info.stderr = r.get("stderr", "")
                 info.session_id = r.get("session_id")
                 info.backend = r.get("backend", "")
-                info.host = r.get("host", info.host)
-                info.workdir = r.get("workdir", info.workdir)
+                # host/workdir: meta.json is authoritative (immutable metadata).
+                # result.json may contain empty strings from error-path RunResults;
+                # only override if result.json has a non-empty value.
+                if r.get("host"):
+                    info.host = r["host"]
+                if r.get("workdir"):
+                    info.workdir = r["workdir"]
             except (json.JSONDecodeError, OSError):
                 pass
 

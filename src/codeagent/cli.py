@@ -1451,6 +1451,13 @@ def _run_bg_child(args: argparse.Namespace, task: str, job_id: str) -> int:
     ``_run_in_background``).  It executes the task synchronously and writes
     the full ``RunResult`` to the job directory via ``JobManager.mark_done``.
     """
+    import signal
+
+    # Register SIGTERM handler so mark_done is called on graceful shutdown.
+    def _sigterm_handler(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     try:
         result = _run_sync_result(args, task)
     except Exception as exc:
@@ -1734,8 +1741,11 @@ def _route_in_background(args: argparse.Namespace, topic_name: str, task_text: s
 
     # Reconstruct the equivalent aimeshchat route command (no --background),
     # adding --_bg-job-id so the child knows where to write its result.
+    # Always pass --raw: parent already wrapped prompt for non-raw mode,
+    # so child must not wrap again.
     argv: list[str] = [sys.executable, "-m", "codeagent.cli", "route", topic_name]
     argv.append(task_text)
+    argv.append("--raw")
     if args.repo:
         argv.extend(["--repo", str(args.repo)])
     if args.backend:
@@ -1744,8 +1754,6 @@ def _route_in_background(args: argparse.Namespace, topic_name: str, task_text: s
         argv.extend(["--agent", args.agent])
     if args.model:
         argv.extend(["--model", args.model])
-    if getattr(args, 'raw', False):
-        argv.append("--raw")
     if getattr(args, 'json_output', False):
         argv.append("--json")
     if args.new_session:
@@ -1913,8 +1921,17 @@ def _cmd_route(args: argparse.Namespace) -> int:
     # Background child mode (--_bg-job-id): run sync, persist full result
     bg_job_id = getattr(args, "_bg_job_id", None)
     if bg_job_id:
+        import signal
         registry = SessionRegistry()
-        result = _execute(request, target, registry, repo_map)
+        try:
+            # Register signal handlers so mark_done is called on SIGTERM/SIGINT.
+            def _sigterm_handler(signum, frame):
+                raise SystemExit(128 + signum)
+            signal.signal(signal.SIGTERM, _sigterm_handler)
+
+            result = _execute(request, target, registry, repo_map)
+        except BaseException as exc:
+            result = RunResult(returncode=1, stderr=f"route bg child exception: {exc}")
         try:
             from codeagent.job import get_manager
             mgr = get_manager()
