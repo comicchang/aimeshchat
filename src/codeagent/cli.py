@@ -1451,7 +1451,13 @@ def _run_bg_child(args: argparse.Namespace, task: str, job_id: str) -> int:
     ``_run_in_background``).  It executes the task synchronously and writes
     the full ``RunResult`` to the job directory via ``JobManager.mark_done``.
     """
-    result = _run_sync_result(args, task)
+    try:
+        result = _run_sync_result(args, task)
+    except Exception as exc:
+        # Execution failed before producing a RunResult — persist an error
+        # result so the job doesn't get stuck as "running" → "stale".
+        log.warning("bg child: execution failed for job %s: %s", job_id, exc)
+        result = RunResult(returncode=1, stderr=f"bg child exception: {exc}")
     try:
         from codeagent.job import get_manager
         mgr = get_manager()

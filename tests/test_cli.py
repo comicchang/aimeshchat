@@ -1449,6 +1449,25 @@ class TestRunBgChild:
         assert rc == 3
         mock_get_mgr.return_value.mark_done.assert_called_once()
 
+    def test_execution_exception_persists_error_result(self):
+        """If _run_sync_result throws, mark_done still called with error RunResult."""
+        from unittest.mock import patch, MagicMock
+        from codeagent.cli import _run_bg_child
+
+        args = self._make_args()
+
+        with patch("codeagent.cli._run_sync_result", side_effect=FileNotFoundError("no repo map")), \
+             patch("codeagent.job.get_manager") as mock_get_mgr:
+            mgr = mock_get_mgr.return_value
+
+            rc = _run_bg_child(args, "do something", "job-err")
+
+        assert rc == 1
+        mgr.mark_done.assert_called_once()
+        persisted = mgr.mark_done.call_args.args[1]
+        assert persisted.returncode == 1
+        assert "no repo map" in persisted.stderr
+
 
 # ── TestRouteBgChild ─────────────────────────────────────────────────────
 
@@ -2513,7 +2532,7 @@ class TestCliUncoveredPaths:
         mgr.create_placeholder.assert_called_once_with(task="task", host="h", workdir="/wd")
         mgr.mark_running.assert_called_once_with("job-1", pid=1234)
         argv = popen.call_args.args[0]
-        assert argv[:4] == [sys.executable, "-m", "codeagent.cli", "run", "task", "/wd"][:4]
+        assert argv[:6] == [sys.executable, "-m", "codeagent.cli", "run", "task", "/wd"]
         assert argv[-2:] == ["--_bg-job-id", "job-1"]
         assert popen.call_args.kwargs["start_new_session"] is True
 
@@ -2537,7 +2556,7 @@ class TestCliUncoveredPaths:
                 "--repo", "1", "--backend", "omp", "--agent", "a", "--model", "m",
                 "--raw", "--json", "--new-session", "--no-auto-resume",
                 "--skip-permissions", "--skills", "s", "--session-key", "k",
-                "--output", "/tmp/o.json",
+                "--output", "/tmp/o.json", "--timeout", "120",
             ])
         assert rc == 0
         err = capsys.readouterr().err
@@ -2552,6 +2571,7 @@ class TestCliUncoveredPaths:
         assert argv[-2:] == ["--_bg-job-id", "job-route-1"]
         assert "--raw" in argv
         assert "--json" in argv
+        assert argv[argv.index("--timeout") + 1] == "120"
 
     # ── _cmd_route oracle / remote-timeout / bg-child ────────────────────
 

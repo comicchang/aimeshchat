@@ -230,7 +230,7 @@ stats 命令成功 + status.json 存在 ≠ 进程存活（文件可能是历史
 | oracle 类 agent | 3600s | `_is_oracle_agent` 自动识别 |
 | 远程目标 timeout < 180s | clamp 到 180s | `SSH_IDLE_WINDOW` 保底 |
 
-手动传小值会被远程目标 clamp 到 `SSH_IDLE_WINDOW=180`，传大值覆盖自动管理导致 SSH wire 与 runner 不一致。心跳机制（每 30s progress 帧）自动保活慢但正常的 LLM 推理，无需手动延长。
+手动传小值会被远程目标 clamp 到 `SSH_IDLE_WINDOW=180`，传大值覆盖 CLI 的自动调优（oracle 3600s / 远程 180s 保底）。心跳机制（每 30s progress 帧）自动保活慢但正常的 LLM 推理，无需手动延长。
 
 ```bash
 # ✗ 手动传 timeout

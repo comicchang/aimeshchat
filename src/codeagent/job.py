@@ -315,6 +315,8 @@ class JobManager:
                 info.stderr = r.get("stderr", "")
                 info.session_id = r.get("session_id")
                 info.backend = r.get("backend", "")
+                info.host = r.get("host", info.host)
+                info.workdir = r.get("workdir", info.workdir)
             except (json.JSONDecodeError, OSError):
                 pass
 
