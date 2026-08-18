@@ -1449,23 +1449,29 @@ def _run_bg_child(args: argparse.Namespace, task: str, job_id: str) -> int:
 
     This function is reached only via ``--_bg-job-id`` (hidden flag set by
     ``_run_in_background``).  It executes the task synchronously and writes
-    the ``RunResult`` to the job directory via ``JobManager.mark_done``.
+    the full ``RunResult`` to the job directory via ``JobManager.mark_done``.
     """
-    result = _run_sync(args, task)
+    result = _run_sync_result(args, task)
     try:
         from codeagent.job import get_manager
         mgr = get_manager()
-        # Reconstruct a RunResult from the exit code (stdout/stderr already
-        # printed to /dev/null by the parent Popen; the wire result is in
-        # the session registry, not here).  We persist the returncode.
-        mgr.mark_done(job_id, RunResult(returncode=result))
+        mgr.mark_done(job_id, result)
     except Exception as exc:
         log.warning("bg child: failed to persist job %s: %s", job_id, exc)
-    return result
+    return result.returncode
 
 
 def _run_sync(args: argparse.Namespace, task: str) -> int:
-    """Original synchronous foreground execution — no behavior change."""
+    """Synchronous foreground execution — returns exit code only."""
+    return _run_sync_result(args, task).returncode
+
+
+def _run_sync_result(args: argparse.Namespace, task: str) -> RunResult:
+    """Core execution logic — returns the full RunResult.
+
+    Extracted from _run_sync so that _run_bg_child can persist all fields
+    (stdout, stderr, session_id, backend) rather than just the exit code.
+    """
     # Runtime resolution via the registry — oracle agents are NOT hardcoded
     # to OMP (they prefer it, but degrade to OpenCode when unavailable).
     backend = _resolve_agent_backend(args.agent, args.backend)
@@ -1575,7 +1581,7 @@ def _run_sync(args: argparse.Namespace, task: str) -> int:
             "workdir": result.workdir,
             "exit_code": result.returncode,
         }, indent=2))
-    return result.returncode
+    return result
 
 
 def _run_in_tmux(args: argparse.Namespace, task: str) -> int:
@@ -1595,10 +1601,11 @@ def _run_in_tmux(args: argparse.Namespace, task: str) -> int:
         return 1
 
     # Reconstruct the equivalent aimeshchat CLI command (no tmux flags).
+    # Parser declares task first, workdir second — match that order.
     argv: list[str] = ["aimeshchat", "run"]
+    argv.append(task)
     if args.workdir:
         argv.append(args.workdir)
-    argv.append(task)
     if args.host:
         argv.extend(["--host", args.host])
     if args.backend:
@@ -1658,10 +1665,11 @@ def _run_in_background(args: argparse.Namespace, task: str) -> int:
 
     # Reconstruct the equivalent aimeshchat run command (no --background),
     # adding --_bg-job-id so the child knows where to write its result.
+    # Parser declares task first, workdir second — match that order.
     argv: list[str] = [sys.executable, "-m", "codeagent.cli", "run"]
+    argv.append(task)
     if args.workdir:
         argv.append(args.workdir)
-    argv.append(task)
     if args.host:
         argv.extend(["--host", args.host])
     if args.backend:
@@ -1746,6 +1754,8 @@ def _route_in_background(args: argparse.Namespace, topic_name: str, task_text: s
         argv.extend(["--session-key", args.session_key])
     if args.output:
         argv.extend(["--output", args.output])
+    if getattr(args, "timeout", None) is not None:
+        argv.extend(["--timeout", str(args.timeout)])
     # Hidden flag: child writes result to job dir.
     argv.extend(["--_bg-job-id", job_id])
 
@@ -1894,7 +1904,7 @@ def _cmd_route(args: argparse.Namespace) -> int:
     if getattr(args, 'background', False):
         return _route_in_background(args, topic_name, task_text)
 
-    # Background child mode (--_bg-job-id): run sync, persist result
+    # Background child mode (--_bg-job-id): run sync, persist full result
     bg_job_id = getattr(args, "_bg_job_id", None)
     if bg_job_id:
         registry = SessionRegistry()
@@ -1902,7 +1912,7 @@ def _cmd_route(args: argparse.Namespace) -> int:
         try:
             from codeagent.job import get_manager
             mgr = get_manager()
-            mgr.mark_done(bg_job_id, RunResult(returncode=result.returncode))
+            mgr.mark_done(bg_job_id, result)
         except Exception as exc:
             log.warning("bg child route: failed to persist job %s: %s", bg_job_id, exc)
         return result.returncode

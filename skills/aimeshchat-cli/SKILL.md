@@ -220,6 +220,26 @@ stats 命令成功 + status.json 存在 ≠ 进程存活（文件可能是历史
 
 调用 aimeshchat 命令时**永远禁止**提前退出管道（`| head`/`| tail`/`| grep`）：`run --background` 的 job ID 在 **stderr**，stdout 为空，`| tail` 抓不到；`| head` 触发 SIGPIPE 杀死命令并让 timeout 机制失效。只允许结构化转换管道（`--json` 输出后处理，见「输出过滤禁令」）。
 
+### --timeout 禁令（远程目标）
+
+调用 `aimeshchat run` / `aimeshchat route` 时，**禁止手动传 `--timeout` 给远程目标**。CLI 自动管理超时：
+
+| 场景 | 默认 timeout | 说明 |
+|------|-------------|------|
+| 普通任务 | 600s | `DEFAULT_EXEC_TIMEOUT` |
+| oracle 类 agent | 3600s | `_is_oracle_agent` 自动识别 |
+| 远程目标 timeout < 180s | clamp 到 180s | `SSH_IDLE_WINDOW` 保底 |
+
+手动传小值会被远程目标 clamp 到 `SSH_IDLE_WINDOW=180`，传大值覆盖自动管理导致 SSH wire 与 runner 不一致。心跳机制（每 30s progress 帧）自动保活慢但正常的 LLM 推理，无需手动延长。
+
+```bash
+# ✗ 手动传 timeout
+aimeshchat run '分析代码' ~/src --host yellow --timeout 3600
+
+# ✓ 让 CLI 自动管理（oracle agent 自动 3600s，普通 600s）
+aimeshchat run '分析代码' ~/src --host yellow
+```
+
 ## 远程 Worker 管理
 
 编排远程 Worker（跨主机 mailbox-worker）时，**禁止 `ssh + tmux send-keys` 向远程 OMP 进程注入任务**：
