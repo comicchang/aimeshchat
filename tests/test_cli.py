@@ -1468,6 +1468,27 @@ class TestRunBgChild:
         assert persisted.returncode == 1
         assert "no repo map" in persisted.stderr
 
+    def test_sigterm_calls_mark_done(self):
+        """SIGTERM handler raises SystemExit (BaseException) — mark_done still called."""
+        import signal
+        from unittest.mock import patch, MagicMock
+        from codeagent.cli import _run_bg_child
+
+        args = self._make_args()
+
+        def _raise_sigterm(*a, **kw):
+            raise SystemExit(128 + signal.SIGTERM)
+
+        with patch("codeagent.cli._run_sync_result", side_effect=_raise_sigterm), \
+             patch("codeagent.job.get_manager") as mock_get_mgr:
+            mgr = mock_get_mgr.return_value
+
+            rc = _run_bg_child(args, "do something", "job-sig")
+
+        # SystemExit is caught by except BaseException → RunResult(returncode=1)
+        assert rc == 1
+        mgr.mark_done.assert_called_once()
+
 
 # ── TestRouteBgChild ─────────────────────────────────────────────────────
 

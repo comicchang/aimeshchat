@@ -1460,7 +1460,7 @@ def _run_bg_child(args: argparse.Namespace, task: str, job_id: str) -> int:
 
     try:
         result = _run_sync_result(args, task)
-    except Exception as exc:
+    except BaseException as exc:
         # Execution failed before producing a RunResult — persist an error
         # result so the job doesn't get stuck as "running" → "stale".
         log.warning("bg child: execution failed for job %s: %s", job_id, exc)
