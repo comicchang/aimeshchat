@@ -1006,3 +1006,3091 @@ class TestSupervisorGeneration:
         assert rc == 0
         assert new_identity["generation"] == 3
         assert new_identity["nonce"] == "keptnonce"
+
+
+# ── uncovered paths: pure helpers ─────────────────────────────────────
+
+
+class TestOracleUncoveredPaths:
+    """Coverage expansion for src/codeagent/oracle.py (pure helpers first)."""
+
+    # ── _ensure_gateway_or_hint ──────────────────────────────────────
+
+    def test_ensure_gateway_hint_fast_path(self, capsys):
+        from codeagent.oracle import _ensure_gateway_or_hint
+
+        gw = MagicMock()
+        gw.call.return_value = {"capabilities": []}
+        with patch("codeagent.oracle.GatewayClient", return_value=gw), \
+             patch("codeagent.oracle.subprocess.run") as m_run:
+            assert _ensure_gateway_or_hint() is True
+        m_run.assert_not_called()
+
+    def test_ensure_gateway_hint_autostart_success(self, capsys):
+        from codeagent.oracle import _ensure_gateway_or_hint
+
+        gw = MagicMock()
+        gw.call.side_effect = [Exception("socket not found"), {"capabilities": []}]
+        with patch("codeagent.oracle.GatewayClient", return_value=gw), \
+             patch("codeagent.oracle.subprocess.run") as m_run, \
+             patch("codeagent.oracle.time.sleep"):
+            m_run.return_value.returncode = 0
+            assert _ensure_gateway_or_hint() is True
+        m_run.assert_called_once()
+        argv = m_run.call_args[0][0]
+        assert argv[1:] == ["-m", "codeagent.gateway.cli", "start"]
+        assert capsys.readouterr().err == ""
+
+    def test_ensure_gateway_hint_autostart_fail(self, capsys):
+        from codeagent.oracle import _ensure_gateway_or_hint
+
+        gw = MagicMock()
+        gw.call.side_effect = Exception("down")
+        with patch("codeagent.oracle.GatewayClient", return_value=gw), \
+             patch("codeagent.oracle.subprocess.run") as m_run, \
+             patch("codeagent.oracle.time.sleep"):
+            m_run.return_value.returncode = 1
+            m_run.return_value.stderr = "boom\nlast line"
+            assert _ensure_gateway_or_hint() is False
+        err = capsys.readouterr().err
+        assert "gateway not running" in err
+        assert "aimeshchat gateway start" in err
+
+    def test_ensure_gateway_hint_timeout(self, capsys):
+        import subprocess as _subprocess
+
+        from codeagent.oracle import _ensure_gateway_or_hint
+
+        gw = MagicMock()
+        gw.call.side_effect = Exception("down")
+        with patch("codeagent.oracle.GatewayClient", return_value=gw), \
+             patch("codeagent.oracle.subprocess.run",
+                   side_effect=_subprocess.TimeoutExpired("x", 20)), \
+             patch("codeagent.oracle.time.sleep"):
+            assert _ensure_gateway_or_hint() is False
+        assert "gateway not running" in capsys.readouterr().err
+
+    def test_ensure_gateway_hint_filenotfound(self, capsys):
+        from codeagent.oracle import _ensure_gateway_or_hint
+
+        gw = MagicMock()
+        gw.call.side_effect = Exception("down")
+        with patch("codeagent.oracle.GatewayClient", return_value=gw), \
+             patch("codeagent.oracle.subprocess.run",
+                   side_effect=FileNotFoundError("no python")), \
+             patch("codeagent.oracle.time.sleep"):
+            assert _ensure_gateway_or_hint() is False
+        assert "gateway not running" in capsys.readouterr().err
+
+    def test_ensure_gateway_hint_unknown_exception(self, capsys):
+        from codeagent.oracle import _ensure_gateway_or_hint
+
+        gw = MagicMock()
+        gw.call.side_effect = Exception("down")
+        with patch("codeagent.oracle.GatewayClient", return_value=gw), \
+             patch("codeagent.oracle.subprocess.run", side_effect=RuntimeError("weird")), \
+             patch("codeagent.oracle.time.sleep"):
+            assert _ensure_gateway_or_hint() is False
+
+    # ── _adopt_runtime ───────────────────────────────────────────────
+
+    def test_adopt_runtime_skipped_omp(self):
+        from codeagent.oracle import _adopt_runtime
+
+        assert _adopt_runtime("k", "sid", _handle(), "omp") == "skipped"
+
+    def test_adopt_runtime_register_ok(self):
+        from codeagent.oracle import _adopt_runtime
+
+        gw = MagicMock()
+        gw.call.return_value = {}
+        with patch("codeagent.gateway.client.GatewayClient", return_value=gw):
+            assert _adopt_runtime("k1", "sid-1", _handle(), "opencode") is True
+        params = gw.call.call_args[0][1]
+        assert params["session_id"] == "sid-1"
+        assert params["runtime_id"] == "rt-1"
+        assert params["review_key"] == "k1"
+
+    def test_adopt_runtime_register_fail(self, capsys):
+        from codeagent.oracle import _adopt_runtime
+
+        gw = MagicMock()
+        gw.call.side_effect = Exception("register refused")
+        with patch("codeagent.gateway.client.GatewayClient", return_value=gw):
+            assert _adopt_runtime("k1", "sid-1", _handle(), "opencode") is False
+        assert "gateway runtime adoption failed" in capsys.readouterr().err
+
+    # ── omp config paths / flat yaml / agent model ───────────────────
+
+    def test_omp_config_paths_env_and_home(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _omp_config_paths
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        monkeypatch.delenv("OMP_CONFIG", raising=False)
+        assert _omp_config_paths() == []
+        cfg = tmp_path / ".omp" / "agent" / "config.yml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("a: b\n", encoding="utf-8")
+        assert _omp_config_paths() == [cfg]
+        # env var wins
+        env_cfg = tmp_path / "env.yml"
+        env_cfg.write_text("x: 1\n", encoding="utf-8")
+        monkeypatch.setenv("OMP_CONFIG", str(env_cfg))
+        assert _omp_config_paths()[0] == env_cfg
+
+    def test_parse_flat_yaml_sections_and_noise(self, tmp_path):
+        from codeagent.oracle import _parse_flat_yaml
+
+        p = tmp_path / "config.yml"
+        p.write_text(
+            "# comment\n\n"
+            "memory:\n"
+            "  backend: memsearch\n"
+            "memsearch:\n"
+            "  autoRecall: true\n"
+            "not-a-section\n"
+            "top: bare\n",
+            encoding="utf-8",
+        )
+        parsed = _parse_flat_yaml(p)
+        assert parsed["memory"]["backend"] == "memsearch"
+        assert parsed["memsearch"]["autoRecall"] == "true"
+        assert parsed["top"] == {}
+
+    def test_parse_flat_yaml_missing_and_oserror(self, tmp_path):
+        from codeagent.oracle import _parse_flat_yaml
+
+        assert _parse_flat_yaml(tmp_path / "absent.yml") == {}
+        d = tmp_path / "adir"
+        d.mkdir()
+        assert _parse_flat_yaml(d) == {}  # IsADirectoryError → OSError → {}
+
+    def test_read_agent_model_forms(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _read_agent_model
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        agents = tmp_path / ".omp" / "agent" / "agents"
+        agents.mkdir(parents=True)
+        assert _read_agent_model("oracle") == ""
+        (agents / "oracle.md").write_text("model: prof/gpt-5.6-sol\n", encoding="utf-8")
+        assert _read_agent_model("oracle") == "prof/gpt-5.6-sol"
+        (agents / "lite.md").write_text("model=prof/v4-pro\n", encoding="utf-8")
+        assert _read_agent_model("lite") == "prof/v4-pro"
+        # profile without model line → ""
+        (agents / "none.md").write_text("description: hi\n", encoding="utf-8")
+        assert _read_agent_model("none") == ""
+        # profile is a directory → read OSError → ""
+        (agents / "dir.md").mkdir()
+        assert _read_agent_model("dir") == ""
+
+    # ── _config_fingerprint ──────────────────────────────────────────
+
+    def test_config_fingerprint_profile(self, tmp_path, monkeypatch):
+        import hashlib as _h
+
+        from codeagent.oracle import _config_fingerprint
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        agents = tmp_path / ".omp" / "agent" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "oracle.md").write_text("model: prof/x\n", encoding="utf-8")
+        content = "model: prof/x"
+        assert _config_fingerprint("oracle") == _h.sha256(content.encode()).hexdigest()[:16]
+
+    def test_config_fingerprint_fallback_and_none(self, tmp_path, monkeypatch):
+        import hashlib as _h
+
+        from codeagent.oracle import _config_fingerprint
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        assert _config_fingerprint("") == ""
+        cfg = tmp_path / ".omp" / "agent" / "config.yml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("modelRoles:\n  oracle: m/1\nretry:\n  n: 2\nother:\n  x: 1\n",
+                       encoding="utf-8")
+        raw = json.dumps({"modelRoles": {"oracle": "m/1"}, "retry": {"n": "2"}},
+                         sort_keys=True, ensure_ascii=True)
+        assert _config_fingerprint("") == _h.sha256(raw.encode()).hexdigest()[:16]
+
+    def test_config_fingerprint_empty_profile_falls_back(self, tmp_path, monkeypatch):
+        import hashlib as _h
+
+        from codeagent.oracle import _config_fingerprint
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        agents = tmp_path / ".omp" / "agent" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "oracle.md").write_text("", encoding="utf-8")
+        cfg = tmp_path / ".omp" / "agent" / "config.yml"
+        cfg.write_text("modelRoles:\n  oracle: m/1\n", encoding="utf-8")
+        raw = json.dumps({"modelRoles": {"oracle": "m/1"}}, sort_keys=True, ensure_ascii=True)
+        assert _config_fingerprint("oracle") == _h.sha256(raw.encode()).hexdigest()[:16]
+
+    # ── _runtime_context_model ───────────────────────────────────────
+
+    def test_runtime_context_model_no_env(self, monkeypatch):
+        from codeagent.oracle import _runtime_context_model
+
+        monkeypatch.delenv("AIMESHCHAT_RUNTIME_ID", raising=False)
+        assert _runtime_context_model("oracle") is None
+
+    def test_runtime_context_model_ctx(self, monkeypatch):
+        from codeagent.oracle import _runtime_context_model
+
+        monkeypatch.setenv("AIMESHCHAT_RUNTIME_ID", "rt-1")
+        gw = MagicMock()
+        gw.call.return_value = {"model_context": {"model": "m/x", "variant": "v1", "provider": "p1"}}
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert _runtime_context_model("oracle") == ("m/x", "v1", "p1")
+        gw.call.assert_called_once_with("runtime.context_get", {"runtime_id": "rt-1"})
+
+    def test_runtime_context_model_gateway_error(self, monkeypatch):
+        from codeagent.domain import ModelContextUnavailable
+        from codeagent.oracle import _runtime_context_model
+
+        monkeypatch.setenv("AIMESHCHAT_RUNTIME_ID", "rt-1")
+        gw = MagicMock()
+        gw.call.side_effect = Exception("socket not found")
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            with pytest.raises(ModelContextUnavailable):
+                _runtime_context_model("oracle")
+
+    def test_runtime_context_model_empty_model(self, monkeypatch):
+        from codeagent.domain import ModelContextUnavailable
+        from codeagent.oracle import _runtime_context_model
+
+        monkeypatch.setenv("AIMESHCHAT_RUNTIME_ID", "rt-1")
+        gw = MagicMock()
+        gw.call.return_value = {"model_context": {}}
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            with pytest.raises(ModelContextUnavailable):
+                _runtime_context_model("oracle")
+
+    # ── _ask_model_chain_realtime ────────────────────────────────────
+
+    def test_ask_model_chain_realtime_explicit(self):
+        from dataclasses import replace
+
+        from codeagent.oracle import _ask_model_chain_realtime
+
+        m = replace(_manifest("k1"), model="explicit/x")
+        assert _ask_model_chain_realtime("oracle", m) == ["explicit/x"]
+        # manifest.model 优先于 explicit_override；仅当 manifest 无 model 时
+        # explicit_override 生效
+        m2 = replace(_manifest("k1"), model="")
+        assert _ask_model_chain_realtime("oracle", m2, explicit_override="ask/y") == ["ask/y"]
+
+    def test_ask_model_chain_realtime_ctx_priority(self):
+        from dataclasses import replace
+
+        from codeagent.oracle import _ask_model_chain_realtime
+
+        m = replace(_manifest("k1"), model="", primary_model="persisted/x")
+        with patch("codeagent.oracle._runtime_context_model",
+                   return_value=("ctx/x", "", "")):
+            assert _ask_model_chain_realtime("oracle", m) == ["ctx/x"]
+
+    def test_ask_model_chain_realtime_ctx_unavailable_falls_back(self):
+        from dataclasses import replace
+
+        from codeagent.domain import ModelContextUnavailable
+        from codeagent.oracle import _ask_model_chain_realtime
+
+        m = replace(_manifest("k1"), model="", primary_model="persisted/x")
+        with patch("codeagent.oracle._runtime_context_model",
+                   side_effect=ModelContextUnavailable("no ctx")):
+            assert _ask_model_chain_realtime("oracle", m) == ["persisted/x"]
+
+    def test_ask_model_chain_realtime_fingerprint_change(self):
+        from dataclasses import replace
+
+        from codeagent.oracle import _ask_model_chain_realtime
+
+        m = replace(_manifest("k1"), model="", primary_model="persisted/x",
+                    config_fingerprint="oldfp")
+        with patch("codeagent.oracle._runtime_context_model", return_value=None), \
+             patch("codeagent.oracle._config_fingerprint", return_value="newfp"), \
+             patch("codeagent.oracle._resolve_oracle_model_chain",
+                   return_value=["derived/x"]) as resolve:
+            assert _ask_model_chain_realtime("oracle", m) == ["derived/x"]
+            resolve.assert_called_once_with("oracle", "")
+
+    def test_ask_model_chain_realtime_old_manifest(self):
+        from dataclasses import replace
+
+        from codeagent.oracle import _ask_model_chain_realtime
+
+        m = replace(_manifest("k1"), model="", primary_model="")
+        with patch("codeagent.oracle._runtime_context_model", return_value=None), \
+             patch("codeagent.oracle._config_fingerprint", return_value=""), \
+             patch("codeagent.oracle._resolve_oracle_model_chain",
+                   return_value=["migrated/x"]):
+            assert _ask_model_chain_realtime("oracle-lite", m) == ["migrated/x"]
+
+    # ── _merge_flat_yaml / ensure_omp_memory_config ──────────────────
+
+    def test_merge_flat_yaml_existing_section(self, tmp_path):
+        from codeagent.oracle import _merge_flat_yaml
+
+        p = tmp_path / "config.yml"
+        p.write_text("memsearch:\n  backend: memsearch\ncompaction:\n  x: 1\n",
+                     encoding="utf-8")
+        assert _merge_flat_yaml(p, {"memsearch": {"autoRecall": "true"}}) is True
+        out = p.read_text(encoding="utf-8")
+        assert "  autoRecall: true" in out
+        # inserted at the END of the memsearch section, before compaction
+        assert out.index("autoRecall") < out.index("compaction")
+        backups = list(tmp_path.glob("config.yml.bak-*"))
+        assert len(backups) == 1
+
+    def test_merge_flat_yaml_new_section(self, tmp_path):
+        from codeagent.oracle import _merge_flat_yaml
+
+        p = tmp_path / "config.yml"
+        p.write_text("memsearch:\n  autoRecall: true\n", encoding="utf-8")
+        assert _merge_flat_yaml(p, {"memory": {"backend": "memsearch"}}) is True
+        out = p.read_text(encoding="utf-8")
+        assert "memory:" in out and "  backend: memsearch" in out
+
+    def test_merge_flat_yaml_noop(self, tmp_path):
+        from codeagent.oracle import _merge_flat_yaml
+
+        p = tmp_path / "config.yml"
+        p.write_text("memsearch:\n  autoRecall: true\n", encoding="utf-8")
+        assert _merge_flat_yaml(p, {"memsearch": {"autoRecall": "true"}}) is False
+        assert not list(tmp_path.glob("config.yml.bak-*"))
+
+    def test_merge_flat_yaml_creates_missing_file(self, tmp_path):
+        from codeagent.oracle import _merge_flat_yaml
+
+        p = tmp_path / "config.yml"
+        assert _merge_flat_yaml(p, {"memory": {"backend": "memsearch"}}) is True
+        assert "backend: memsearch" in p.read_text(encoding="utf-8")
+
+    def test_ensure_omp_memory_config_no_paths(self, tmp_path, monkeypatch):
+        from codeagent.oracle import ensure_omp_memory_config
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        monkeypatch.delenv("OMP_CONFIG", raising=False)
+        r = ensure_omp_memory_config()
+        assert r["config_path"] == ""
+        assert any("omp config file not found" in m for m in r["missing"])
+
+    def test_ensure_omp_memory_config_all_set(self, tmp_path, monkeypatch):
+        from codeagent.oracle import ensure_omp_memory_config
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        monkeypatch.delenv("OMP_CONFIG", raising=False)
+        cfg = tmp_path / ".omp" / "agent" / "config.yml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(
+            "memory:\n  backend: memsearch\nmemsearch:\n  autoRecall: true\n"
+            "compaction:\n  handoffSaveToDisk: true\n",
+            encoding="utf-8",
+        )
+        r = ensure_omp_memory_config()
+        assert r["auto_recall"] is True
+        assert r["handoff_save_to_disk"] is True
+        assert r["backend"] == "memsearch"
+        assert r["missing"] == []
+
+    def test_ensure_omp_memory_config_missing_no_apply(self, tmp_path, monkeypatch):
+        from codeagent.oracle import ensure_omp_memory_config
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        monkeypatch.delenv("OMP_CONFIG", raising=False)
+        cfg = tmp_path / ".omp" / "agent" / "config.yml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("memory:\n  backend: memsearch\n", encoding="utf-8")
+        r = ensure_omp_memory_config()
+        assert r["merged"] is False
+        assert "memsearch.autoRecall=true" in r["missing"]
+        assert "compaction.handoffSaveToDisk=true" in r["missing"]
+
+    def test_ensure_omp_memory_config_apply_merges(self, tmp_path, monkeypatch):
+        from codeagent.oracle import ensure_omp_memory_config
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        monkeypatch.delenv("OMP_CONFIG", raising=False)
+        cfg = tmp_path / ".omp" / "agent" / "config.yml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("memsearch:\n  autoRecall: true\n", encoding="utf-8")
+        r = ensure_omp_memory_config(apply=True)
+        assert r["merged"] is True
+        out = cfg.read_text(encoding="utf-8")
+        assert "handoffSaveToDisk: true" in out
+        assert "backend: memsearch" in out
+
+    def test_ensure_omp_memory_config_merge_error(self, tmp_path, monkeypatch):
+        from codeagent.oracle import ensure_omp_memory_config
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        monkeypatch.delenv("OMP_CONFIG", raising=False)
+        cfg = tmp_path / ".omp" / "agent" / "config.yml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("memsearch:\n  autoRecall: true\n", encoding="utf-8")
+        with patch("codeagent.oracle._merge_flat_yaml", side_effect=OSError("disk full")):
+            r = ensure_omp_memory_config(apply=True)
+        assert "disk full" in r["merge_error"]
+
+    # ── _ensure_oracle_overlay / _check_mailbox_plugin ───────────────
+
+    def test_ensure_oracle_overlay_idempotent(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _ensure_oracle_overlay
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        overlay = _ensure_oracle_overlay()
+        assert overlay.exists()
+        assert "advisor:" in overlay.read_text(encoding="utf-8")
+        # second call must NOT rewrite
+        monkeypatch.setattr(Path, "write_text", lambda *a, **k: (_ for _ in ()).throw(AssertionError("rewrote")))
+        assert _ensure_oracle_overlay() == overlay
+
+    def test_check_mailbox_plugin_missing(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _check_mailbox_plugin
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        err = _check_mailbox_plugin()
+        assert err is not None and "not found" in err
+
+    def test_check_mailbox_plugin_predates(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _check_mailbox_plugin
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        plugin = (tmp_path / ".omp" / "plugins" / "node_modules"
+                  / "omp-mailbox-plugin" / "src" / "index.ts")
+        plugin.parent.mkdir(parents=True)
+        plugin.write_text("export {};\n", encoding="utf-8")
+        err = _check_mailbox_plugin()
+        assert err is not None and "predates" in err
+
+    def test_check_mailbox_plugin_ok(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _check_mailbox_plugin
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        plugin = (tmp_path / ".omp" / "plugins" / "node_modules"
+                  / "omp-mailbox-plugin" / "src" / "index.ts")
+        plugin.parent.mkdir(parents=True)
+        plugin.write_text("class RuntimeEventReporter {}\n", encoding="utf-8")
+        assert _check_mailbox_plugin() is None
+
+    # ── meta.json ────────────────────────────────────────────────────
+
+    def test_oracle_meta_path_and_session_dir_sanitize(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _oracle_meta_path, _oracle_session_dir
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        assert _oracle_meta_path("a:b/c\\d") == tmp_path / ".omp" / "oracle" / "a-b-c-d" / "meta.json"
+        assert _oracle_session_dir("a:b/c\\d") == str(
+            tmp_path / ".omp" / "agent" / "sessions" / "_oracle" / "a-b-c-d")
+
+    def test_read_write_oracle_meta_roundtrip(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _read_oracle_meta, _write_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        meta = _write_oracle_meta("k1", "sid-1", "bound", swarm_session_id="sw-1")
+        assert meta["backend_session_id"] == "sid-1"
+        assert meta["status"] == "bound"
+        got = _read_oracle_meta("k1")
+        assert got["backend_session_id"] == "sid-1"
+        assert got["swarm_session_id"] == "sw-1"
+
+    def test_read_oracle_meta_corrupt(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _read_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        assert _read_oracle_meta("k1") == {}
+        p = tmp_path / ".omp" / "oracle" / "k1" / "meta.json"
+        p.parent.mkdir(parents=True)
+        p.write_text("{not-json", encoding="utf-8")
+        assert _read_oracle_meta("k1") == {}
+        p.write_text("[1, 2]", encoding="utf-8")
+        assert _read_oracle_meta("k1") == {}
+
+    def test_write_oracle_meta_oserror_warns(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _write_oracle_meta
+
+        blocker = tmp_path / "blocker"
+        blocker.write_text("file", encoding="utf-8")
+        monkeypatch.setattr("codeagent.oracle._oracle_meta_path",
+                            lambda _k: blocker / "meta.json")
+        meta = _write_oracle_meta("k1", "sid-1", "bound")
+        assert meta["backend_session_id"] == "sid-1"
+        assert "oracle meta write failed" in capsys.readouterr().err
+
+    # ── runtime log / session-id binding ─────────────────────────────
+
+    def test_runtime_log_path_spec_and_fallback(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _runtime_log_path
+
+        rt_dir = tmp_path / "rt"
+        rt_dir.mkdir()
+        h = replace(_handle("rt-x"), extra={"spec_path": str(rt_dir / "spec.json")})
+        assert _runtime_log_path(h) == rt_dir / "rt-x.log"
+        # spec parent missing → supervisor fallback
+        h2 = replace(_handle("rt-y"), extra={"spec_path": str(tmp_path / "nope" / "spec.json")})
+        monkeypatch.setattr("codeagent.runtime.supervisor._runtime_dir",
+                            lambda _rid: tmp_path / "sup")
+        assert _runtime_log_path(h2) == tmp_path / "sup" / "rt-y.log"
+
+    def test_runtime_log_path_exception(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _runtime_log_path
+
+        h = replace(_handle("rt-z"), extra={})
+        monkeypatch.setattr("codeagent.runtime.supervisor._runtime_dir",
+                            lambda _rid: (_ for _ in ()).throw(Exception("boom")))
+        assert _runtime_log_path(h) is None
+
+    def test_scan_runtime_log_backend_wins(self, tmp_path):
+        from codeagent.oracle import _scan_runtime_log_for_session_id
+
+        logp = tmp_path / "rt.log"
+        logp.write_text("session_id=postmesh-x backend_session=ses_999\n"
+                        "backend_session_id=ses_777 session_id=ora-1\n", encoding="utf-8")
+        assert _scan_runtime_log_for_session_id(logp) == "ses_777"
+
+    def test_scan_runtime_log_session_id_filter(self, tmp_path):
+        from codeagent.oracle import _scan_runtime_log_for_session_id
+
+        logp = tmp_path / "rt.log"
+        logp.write_text("session_id=postmesh-x\nsession_id=ora-9\n", encoding="utf-8")
+        assert _scan_runtime_log_for_session_id(logp) == ""
+        logp.write_text("session_id=ses_1\nsession_id=ses_2\n", encoding="utf-8")
+        assert _scan_runtime_log_for_session_id(logp) == "ses_2"
+
+    def test_scan_runtime_log_missing_and_oserror(self, tmp_path):
+        from codeagent.oracle import _scan_runtime_log_for_session_id
+
+        assert _scan_runtime_log_for_session_id(None) == ""
+        assert _scan_runtime_log_for_session_id(tmp_path / "absent.log") == ""
+        d = tmp_path / "logdir"
+        d.mkdir()
+        assert _scan_runtime_log_for_session_id(d) == ""
+
+    def test_poll_backend_session_id_direct(self):
+        from codeagent.oracle import _poll_backend_session_id
+
+        with patch("codeagent.oracle.time.sleep",
+                   side_effect=AssertionError("must not sleep")):
+            assert _poll_backend_session_id(_handle()) == "b1"
+
+    def test_poll_backend_session_id_from_log(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _poll_backend_session_id
+
+        logp = tmp_path / "rt.log"
+        logp.write_text("backend_session=ses_abc\n", encoding="utf-8")
+        h = replace(_handle("rt-l"), backend_session_id="")
+        monkeypatch.setattr("codeagent.oracle._runtime_log_path", lambda _h: logp)
+        with patch("codeagent.oracle.time.sleep",
+                   side_effect=AssertionError("must not sleep")):
+            assert _poll_backend_session_id(h, timeout=1.0) == "ses_abc"
+
+    def test_poll_backend_session_id_timeout(self, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _poll_backend_session_id
+
+        h = replace(_handle("rt-t"), backend_session_id="")
+        monkeypatch.setattr("codeagent.oracle._runtime_log_path", lambda _h: None)
+        assert _poll_backend_session_id(h, timeout=0.0) == ""
+
+    # ── _resolve_bound_session_id / lazy sync ────────────────────────
+
+    def test_resolve_bound_session_id_manifest(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _resolve_bound_session_id
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        assert _resolve_bound_session_id("k1", _manifest("k1", backend_session_id="b1")) == "b1"
+
+    def test_resolve_bound_session_id_meta(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _resolve_bound_session_id, _write_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        _write_oracle_meta("k1", "m-1", "bound")
+        m = _manifest("k1", backend_session_id="")
+        assert _resolve_bound_session_id("k1", m) == "m-1"
+
+    def test_resolve_bound_session_id_lazy_sync(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _read_oracle_meta, _resolve_bound_session_id
+        from codeagent.park.registry import ParkRegistry
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        reg = ParkRegistry()
+        reg.acquire("k1", _manifest("k1", backend_session_id=""))
+        gw = MagicMock()
+        gw.call.return_value = {"backend_session_id": "g-1"}
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert _resolve_bound_session_id("k1", reg.lookup("k1")) == "g-1"
+        # backfilled into both manifest and meta
+        assert reg.lookup("k1").backend_session_id == "g-1"
+        assert _read_oracle_meta("k1")["backend_session_id"] == "g-1"
+
+    def test_resolve_bound_session_id_gateway_error(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _resolve_bound_session_id
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.side_effect = Exception("down")
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert _resolve_bound_session_id("k1", _manifest("k1", backend_session_id="")) == ""
+
+    def test_resolve_bound_session_id_gateway_empty(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _resolve_bound_session_id
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.return_value = {}
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert _resolve_bound_session_id("k1", _manifest("k1", backend_session_id="")) == ""
+
+    # ── cmd_oracle_start paths ───────────────────────────────────────
+
+    def _start_ctx(self, tmp_path, monkeypatch, spawn_return=None):
+        """Deterministic start context: gateway up, plugin ok, no gc thread.
+
+        Returns (ExitStack, kernel, store, spawn_mock) — caller enters st.
+        """
+        from contextlib import ExitStack
+
+        st = ExitStack()
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        st.enter_context(patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True))
+        st.enter_context(patch("codeagent.oracle._check_mailbox_plugin", return_value=None))
+        st.enter_context(patch("codeagent.oracle._gc_throttle", return_value=False))
+        kernel = MagicMock()
+        store = MagicMock()
+        store.root = tmp_path / "mb"
+        st.enter_context(patch("codeagent.cli._get_swarm_kernel", return_value=(kernel, store)))
+        spawn = st.enter_context(patch(
+            "codeagent.oracle.RuntimeRegistry.spawn",
+            return_value=spawn_return if spawn_return is not None else _handle()))
+        return st, kernel, store, spawn
+
+    def test_start_gateway_down_returns_1(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_start
+
+        ns = _NS(review_key="k1", agent="oracle", backend="omp",
+                 workdir=str(tmp_path), model="m/x", prompt="hi")
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=False), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn") as spawn:
+            assert cmd_oracle_start(ns) == 1
+        spawn.assert_not_called()
+        assert capsys.readouterr().out == ""
+
+    def test_start_plugin_missing_returns_1(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_start
+
+        ns = _NS(review_key="k1", agent="oracle", backend="omp",
+                 workdir=str(tmp_path), model="m/x", prompt="hi")
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+             patch("codeagent.oracle._check_mailbox_plugin",
+                   return_value="plugin missing"), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn") as spawn:
+            assert cmd_oracle_start(ns) == 1
+        spawn.assert_not_called()
+        err = json.loads(capsys.readouterr().err)
+        assert err["error"] == "mailbox_plugin_unavailable"
+        assert err["review_key"] == "k1"
+
+    def test_start_model_strict_unavailable(self, tmp_path, monkeypatch, capsys):
+        from codeagent.domain import ModelContextUnavailable
+        from codeagent.oracle import cmd_oracle_start
+
+        ns = _NS(review_key="k1", agent="oracle", backend="omp",
+                 workdir=str(tmp_path), model="", prompt="hi", model_strict=True)
+        st, kernel, store, spawn = self._start_ctx(tmp_path, monkeypatch)
+        st.enter_context(patch(
+            "codeagent.oracle.ExecutionSpec.from_args",
+            side_effect=ModelContextUnavailable("no runtime context")))
+        with st:
+            assert cmd_oracle_start(ns) == 1
+        spawn.assert_not_called()
+        assert "MODEL_CONTEXT_UNAVAILABLE" in capsys.readouterr().err
+
+    def test_start_no_model_returns_1(self, tmp_path, monkeypatch, capsys):
+        from codeagent.domain import ExecutionSpec
+        from codeagent.oracle import cmd_oracle_start
+
+        ns = _NS(review_key="k1", agent="oracle", backend="omp",
+                 workdir=str(tmp_path), model="", prompt="hi")
+        spec = ExecutionSpec(provider="", model="", variant="", system_prompt="",
+                             full_prompt="hi", model_source="")
+        st, kernel, store, spawn = self._start_ctx(tmp_path, monkeypatch)
+        st.enter_context(patch("codeagent.oracle.ExecutionSpec.from_args", return_value=spec))
+        with st:
+            assert cmd_oracle_start(ns) == 1
+        spawn.assert_not_called()
+        assert "请显式 --model" in capsys.readouterr().err
+
+    def test_start_success_path(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_start
+        from codeagent.park.registry import ParkRegistry
+
+        ns = _NS(review_key="proj:oracle:gfx:blur", agent="", backend="omp",
+                 workdir=str(tmp_path), model="m/x", prompt="hi")
+        st, kernel, store, spawn = self._start_ctx(tmp_path, monkeypatch)
+        with st:
+            assert cmd_oracle_start(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["bound"] is True
+        assert out["backend_session_id"] == "b1"
+        assert out["adopted"] == "skipped"
+        assert out["model_chain"] == ["m/x"]
+        assert out["spec"]["model_source"] == "explicit"
+        req = spawn.call_args[0][1]
+        assert req["model"] == "m/x"
+        assert req["session_id"] == out["session_id"]
+        assert req["env"]["OMP_MODEL_FALLBACK_CHAIN"] == "m/x"
+        m = ParkRegistry().lookup(ns.review_key)
+        assert m is not None
+        assert m.lifecycle == Lifecycle.HOT_PARKED
+        assert m.backend_session_id == "b1"
+        assert m.primary_model == "m/x"
+        assert m.omp_session_dir == str(
+            tmp_path / ".omp" / "agent" / "sessions" / "_oracle" / "proj-oracle-gfx-blur")
+
+    def test_start_binding_pending(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _read_oracle_meta, cmd_oracle_start
+
+        ns = _NS(review_key="k-pend", agent="oracle", backend="omp",
+                 workdir=str(tmp_path), model="m/x", prompt="hi")
+        st, kernel, store, spawn = self._start_ctx(tmp_path, monkeypatch)
+        st.enter_context(patch("codeagent.oracle._poll_backend_session_id", return_value=""))
+        with st:
+            assert cmd_oracle_start(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["bound"] is False
+        assert out["binding"] == "pending"
+        assert _read_oracle_meta("k-pend")["status"] == "pending"
+
+    def test_start_idempotent_session_register(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_start
+        from codeagent.park.registry import ParkRegistry
+
+        ns = _NS(review_key="k-idem", agent="oracle", backend="omp",
+                 workdir=str(tmp_path), model="m/x", prompt="hi")
+        st, kernel, store, spawn = self._start_ctx(tmp_path, monkeypatch)
+        kernel.create_session.side_effect = ValueError("session already exists")
+        kernel.register.side_effect = ValueError("agent already registered")
+        with st:
+            assert cmd_oracle_start(ns) == 0
+        assert ParkRegistry().lookup("k-idem") is not None
+
+    def test_start_init_task_dispatch_warning(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_start
+
+        ns = _NS(review_key="k-disp", agent="oracle", backend="omp",
+                 workdir=str(tmp_path), model="m/x", prompt="hi")
+        st, kernel, store, spawn = self._start_ctx(tmp_path, monkeypatch)
+        st.enter_context(patch("codeagent.mailbox.service.MailboxService.send",
+                               side_effect=Exception("mailbox busy")))
+        with st:
+            assert cmd_oracle_start(ns) == 0
+        assert "initial task dispatch failed" in capsys.readouterr().err
+
+    def test_start_opencode_adopts_runtime(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_start
+
+        ns = _NS(review_key="k-oc", agent="oracle", backend="opencode",
+                 workdir=str(tmp_path), model="m/x", prompt="hi")
+        gw = MagicMock()
+        gw.call.return_value = {}
+        st, kernel, store, spawn = self._start_ctx(tmp_path, monkeypatch)
+        st.enter_context(patch("codeagent.gateway.client.GatewayClient", return_value=gw))
+        with st:
+            assert cmd_oracle_start(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["backend"] == "opencode"
+        assert out["adopted"] is True
+        req = spawn.call_args[0][1]
+        # non-omp: prompt travels via spawn task; no overlay; no session dir
+        assert req["task"] == "hi"
+        assert req["profile_args"] == []
+        assert req["session_dir"] == ""
+
+    def test_start_restart_preserves_manifest_fields(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_start
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k-rst", _manifest("k-rst", backend_session_id="old-sid"))
+        ns = _NS(review_key="k-rst", agent="oracle", backend="omp",
+                 workdir=str(tmp_path), model="m/x", prompt="hi")
+        st, kernel, store, spawn = self._start_ctx(tmp_path, monkeypatch)
+        with st:
+            assert cmd_oracle_start(ns) == 0
+        m = registry.lookup("k-rst")
+        assert m.backend_session_id == "b1"  # updated
+        assert m.lifecycle == Lifecycle.HOT_PARKED
+        assert m.release_mode == ""
+
+    # ── cmd_oracle_ask paths ─────────────────────────────────────────
+
+    def test_ask_no_prompt_returns_1(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_ask
+
+        ns = _NS(review_key="k1", prompt="   ", agent="oracle", backend="omp")
+        assert cmd_oracle_ask(ns) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["error"] == "no_prompt"
+
+    def test_ask_hot_blocked_binding_pending(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_ask
+
+        ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp")
+        info = {"runtime_id": "rt-1", "status": "active",
+                "backend_session_id": "", "runtime_health": {"alive": True}}
+        gw = MagicMock()
+        gw.call.return_value = info
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert cmd_oracle_ask(ns) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["status"] == "binding_pending"
+        assert err["method"] == "blocked"
+
+    def test_ask_hot_wait_binding_success(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_ask
+
+        ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp",
+                 wait_binding=True)
+        no_sid = {"runtime_id": "rt-1", "status": "active",
+                  "backend_session_id": "", "runtime_health": {"alive": True}}
+        with_sid = {"runtime_id": "rt-1", "status": "active",
+                    "backend_session_id": "b1", "runtime_health": {"alive": True}}
+        gw = MagicMock()
+        gw.call.side_effect = [no_sid, with_sid,
+                               {"msg_id": "m-1", "status": "delivered"}]
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.time.sleep"):
+            assert cmd_oracle_ask(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["method"] == "hot_pending_ack"
+        assert out["msg_id"] == "m-1"
+
+    def test_ask_hot_wait_binding_timeout(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_ask
+
+        ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp",
+                 wait_binding=True)
+        no_sid = {"runtime_id": "rt-1", "status": "active",
+                  "backend_session_id": "", "runtime_health": {"alive": True}}
+        gw = MagicMock()
+        gw.call.return_value = no_sid
+        mono_counter = iter(range(0, 100))
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.time.sleep"), \
+             patch("codeagent.oracle.time.monotonic",
+                   side_effect=lambda: float(next(mono_counter))):
+            assert cmd_oracle_ask(ns) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["status"] == "binding_pending"
+        assert "did not bind within" in err["detail"]
+
+    def test_ask_warm_spawn_quota_failure(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_ask
+        from codeagent.park.registry import ParkRegistry
+
+        ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="native-1"))
+        ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp")
+        gw = MagicMock()
+        gw.call.side_effect = _raise(Exception("GATEWAY_DOWN: socket not found"))
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._ask_model_chain_realtime", return_value=["q/x"]), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn",
+                   side_effect=Exception("insufficient_quota (402)")):
+            assert cmd_oracle_ask(ns) == 1
+        err = capsys.readouterr().err
+        assert '"method": "warm_failed"' in err
+        assert "insufficient_quota" in err
+        assert '"method": "cold_failed"' in err
+
+    def test_ask_warm_sid_pending_warning(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_ask
+        from codeagent.park.registry import ParkRegistry
+
+        ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="native-1"))
+        ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp")
+        gw = MagicMock()
+        gw.call.side_effect = _raise(Exception("GATEWAY_DOWN: socket not found"))
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._ask_model_chain_realtime", return_value=["q/x"]), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn",
+                   return_value=_handle("rt-w", backend_session_id="")) as spawn:
+            assert cmd_oracle_ask(ns) == 0
+        captured = capsys.readouterr()  # pytest 9: single read, resets buffer
+        err, out = captured.err, captured.out
+        assert "preserving previous id" in err
+        out = json.loads(out)
+        assert out["method"] == "warm"
+        assert out["new_backend_session_id"] == "native-1"
+        # manifest round advanced + backend id preserved
+        m = ParkRegistry().lookup("k1")
+        assert m.round == 1
+        assert m.backend_session_id == "native-1"
+        assert m.lifecycle == Lifecycle.HOT_PARKED
+
+    def test_ask_warm_enqueue_failure_continues(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_ask
+        from codeagent.park.registry import ParkRegistry
+
+        ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="native-1"))
+        ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp")
+        gw = MagicMock()
+        gw.call.side_effect = _raise(Exception("GATEWAY_DOWN: socket not found"))
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._ask_model_chain_realtime", return_value=["q/x"]), \
+             patch("codeagent.mailbox.service.MailboxService.send",
+                   side_effect=Exception("enqueue boom")), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn",
+                   return_value=_handle("rt-w2", backend_session_id="b2")):
+            assert cmd_oracle_ask(ns) == 0
+        assert "warm task enqueue failed" in capsys.readouterr().err
+
+    def test_ask_cold_with_manifest_persists(self, tmp_path, capsys):
+        from dataclasses import replace
+
+        from codeagent.oracle import cmd_oracle_ask
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k-cold", replace(
+            _manifest("k-cold", backend_session_id="", lifecycle=Lifecycle.HOT_PARKED),
+            primary_model="prof/gpt-5.6-sol"))
+        ns = _NS(review_key="k-cold", prompt="fresh", agent="oracle", backend="omp")
+        gw = MagicMock()
+        gw.call.side_effect = _raise(Exception("GATEWAY_DOWN: socket not found"))
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.build_cold_context", return_value="snapshot"), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn",
+                   return_value=_handle("rt-c", backend_session_id="bc")) as spawn:
+            assert cmd_oracle_ask(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["method"] == "cold"
+        assert out["model_chain"] == ["prof/gpt-5.6-sol"]
+        m = registry.lookup("k-cold")
+        assert m.round == 1
+        assert m.lifecycle == Lifecycle.HOT_PARKED
+        assert m.backend_session_id == "bc"
+        req = spawn.call_args[0][1]
+        assert "snapshot" in req["task"] and "fresh" in req["task"]
+
+    def test_ask_cold_wait_forwards(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_ask
+
+        ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp", wait=True)
+        gw = MagicMock()
+        gw.call.side_effect = _raise(Exception("GATEWAY_DOWN: socket not found"))
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.build_cold_context", return_value="ctx"), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn",
+                   return_value=_handle("rt-w3", backend_session_id="b3")), \
+             patch("codeagent.oracle._wait_for_new_output", return_value=0) as wait:
+            assert cmd_oracle_ask(ns) == 0
+        wait.assert_called_once()
+        assert wait.call_args[0][0] == "k1"
+
+    def test_ask_hot_wait_forwards(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_ask
+
+        ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp", wait=True)
+        info = {"runtime_id": "rt-1", "status": "active", "session_id": "ses-1",
+                "backend_session_id": "b1", "runtime_health": {"alive": True}}
+        gw = MagicMock()
+        gw.call.side_effect = lambda m, p=None: (
+            info if m == "runtime.info" else
+            {"msg_id": "m-9", "status": "delivered"})
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_for_new_output", return_value=0) as wait:
+            assert cmd_oracle_ask(ns) == 0
+        wait.assert_called_once_with("k1", "rt-1", "ses-1", session_dir="")
+
+    # ── cmd_oracle_status paths ──────────────────────────────────────
+
+    def test_status_quota_error(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_status
+
+        ns = _NS(review_key="k1")
+        gw = MagicMock()
+        gw.call.return_value = {
+            "runtime_id": "rt-1", "status": "active",
+            "runtime_health": {"alive": True, "quota_error": "insufficient_quota for X"},
+        }
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._detect_oracle_stuck", return_value=None), \
+             patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_status(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["runtime"]["quota_error"] == "insufficient_quota for X"
+        assert "degrade_hint" in out["runtime"]
+
+    def test_status_gateway_down_structured(self, tmp_path, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import cmd_oracle_status
+
+        ns = _NS(review_key="k1")
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("GATEWAY_DOWN", "socket not found")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_status(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["runtime"]["status"] == "gateway_down"
+        assert "aimeshchat gateway start" in out["runtime"]["hint"]
+
+    def test_status_other_gateway_error(self, tmp_path, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import cmd_oracle_status
+
+        ns = _NS(review_key="k1")
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("SOMETHING_ELSE", "boom")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_status(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["runtime"] == {"status": "unavailable", "error": "boom"}
+
+    def test_status_request_ledger(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_status
+        from codeagent.mailbox.store import MailboxStore
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        m = registry.lookup("k1")
+        req_dir = (MailboxStore().session_dir(m.swarm_session_id)
+                   / "oracle" / "events" / "req-1")
+        req_dir.mkdir(parents=True)
+        (req_dir / "events.jsonl").write_text(
+            json.dumps({"request_id": "req-1", "run_id": "run-1",
+                        "event": "DONE", "ts": 1.0, "meta": {}}) + "\n",
+            encoding="utf-8")
+        gw = MagicMock()
+        gw.call.return_value = {"runtime_id": "rt-1", "status": "active",
+                                "runtime_health": {"alive": True}}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._detect_oracle_stuck", return_value=None), \
+             patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_status(_NS(review_key="k1")) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["requests"] == [{
+            "request_id": "req-1", "run_id": "run-1",
+            "states": ["DONE"], "terminal": "DONE",
+        }]
+        assert out["mailbox"]["unread"] == 0
+
+    def test_status_receipts_and_mailbox_unread(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_status
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        m = registry.lookup("k1")
+        mock_store = MagicMock()
+        mock_store.read_history.return_value = [
+            {"kind": "RECEIPT", "msg_id": "m-1", "reply_to": "r-1", "from": "oracle"},
+            {"kind": "PROGRESS", "msg_id": "m-0", "reply_to": "r-0", "from": "oracle"},
+        ]
+        report_file = tmp_path / "report.json"
+        report_file.write_text(json.dumps({
+            "kind": "REPORT", "msg_id": "m-2", "from": "oracle",
+            "created_at": "2026-08-13T00:00:00Z", "subject": "done",
+            "body": "result body",
+        }), encoding="utf-8")
+        mock_store.list_messages.return_value = [report_file]
+        gw = MagicMock()
+        gw.call.return_value = {"runtime_id": "rt-1", "status": "active",
+                                "runtime_health": {"alive": True}}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._detect_oracle_stuck", return_value=None), \
+             patch("codeagent.oracle.MailboxStore", return_value=mock_store), \
+             patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_status(_NS(review_key="k1")) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["receipts"] == [
+            {"msg_id": "m-1", "reply_to": "r-1", "from": "oracle"},
+        ]
+        assert out["mailbox"]["unread"] == 1
+        assert out["mailbox"]["latest_report"]["msg_id"] == "m-2"
+        assert out["mailbox"]["recommendation"] == "read or ack REPORT before release"
+
+    def test_status_stuck_reported(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_status
+
+        gw = MagicMock()
+        gw.call.return_value = {"runtime_id": "rt-1", "status": "active",
+                                "runtime_health": {"alive": True}}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._detect_oracle_stuck",
+                   return_value={"detected": True, "signal": "strong",
+                                 "detail": "stuck detail", "hint": "release+revive"}), \
+             patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_status(_NS(review_key="k1")) == 0
+        captured = capsys.readouterr()
+        out = json.loads(captured.out)
+        assert out["stuck"]["signal"] == "strong"
+        assert "stuck detail" in captured.err
+
+    def test_status_stuck_detection_error(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_status
+
+        gw = MagicMock()
+        gw.call.return_value = {"runtime_id": "rt-1", "status": "active",
+                                "runtime_health": {"alive": True}}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._detect_oracle_stuck",
+                   side_effect=Exception("probe failed")), \
+             patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_status(_NS(review_key="k1")) == 0
+        assert "stuck" not in json.loads(capsys.readouterr().out)
+
+    def test_status_snapshot_age(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_status
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        gw = MagicMock()
+        gw.call.side_effect = Exception("down")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._snapshot_age_days", return_value=9.5), \
+             patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_status(_NS(review_key="k1")) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["snapshot"] == {"age_days": 9.5, "stale": True,
+                                   "threshold_days": 7}
+
+    # ── cmd_oracle_list ─────────────────────────────────────────────
+
+    def test_list_reviews_and_empty(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_list
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        registry.acquire("k2", _manifest("k2", backend_session_id="b2"))
+        with patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_list(_NS()) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert [r["review_key"] for r in out["reviews"]] == ["k1", "k2"]
+        assert out["reviews"][0]["lifecycle"] == "hot_parked"
+        # empty registry
+        registry.delete("k1")
+        registry.delete("k2")
+        with patch("codeagent.oracle._gc_throttle", return_value=False):
+            assert cmd_oracle_list(_NS()) == 0
+        assert json.loads(capsys.readouterr().out)["reviews"] == []
+
+    # ── session-file / message extraction helpers ────────────────────
+
+    def test_get_session_dir(self):
+        from dataclasses import replace
+
+        from codeagent.oracle import _get_session_dir
+
+        assert _get_session_dir(_manifest("k1")) == ""
+        m = replace(_manifest("k1"), omp_session_path="/a/b/c.jsonl")
+        assert _get_session_dir(m) == "/a/b"
+
+    def test_find_session_file_primary_and_fallback(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _find_session_file
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        root = tmp_path / ".omp" / "agent" / "sessions"
+        assert _find_session_file("sid-1") is None
+        (root / "proj-a").mkdir(parents=True)
+        f1 = root / "proj-a" / "x_sid-1.jsonl"
+        f1.write_text("a", encoding="utf-8")
+        os.utime(f1, (1, 1))
+        (root / "_oracle" / "legacy").mkdir(parents=True)
+        f2 = root / "_oracle" / "legacy" / "y_sid-1.jsonl"
+        f2.write_text("b", encoding="utf-8")
+        os.utime(f2, (2, 2))
+        # primary root wins when it has a match
+        assert _find_session_file("sid-1") == f1
+        # session_dir override: only that dir searched (same dir-as-root shape)
+        custom = tmp_path / "custom-root"
+        (custom / "proj").mkdir(parents=True)
+        f3 = custom / "proj" / "z_sid-1.jsonl"
+        f3.write_text("c", encoding="utf-8")
+        assert _find_session_file("sid-1", session_dir=str(custom)) == f3
+        assert _find_session_file("sid-2", session_dir=str(custom)) is None
+        assert _find_session_file("sid-1", session_dir=str(tmp_path / "missing")) is None
+
+    def test_find_session_file_oracle_fallback_only(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _find_session_file
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        root = tmp_path / ".omp" / "agent" / "sessions"
+        (root / "_oracle" / "legacy").mkdir(parents=True)
+        f = root / "_oracle" / "legacy" / "y_sid-9.jsonl"
+        f.write_text("b", encoding="utf-8")
+        assert _find_session_file("sid-9") == f
+
+    def test_extract_assistant_messages(self, tmp_path):
+        from codeagent.oracle import _extract_assistant_messages
+
+        p = tmp_path / "s.jsonl"
+        p.write_text("\n".join([
+            json.dumps({"type": "message", "message": {"role": "user",
+                        "content": [{"type": "text", "text": "u"}]}}),
+            "{bad-json",
+            json.dumps({"type": "event"}),
+            json.dumps({"type": "message", "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": "a1"}]}}),
+            json.dumps({"type": "message", "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": "a2"}]}}),
+            json.dumps({"type": "message", "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": "   "}]}}),
+        ]) + "\n", encoding="utf-8")
+        assert _extract_assistant_messages(p) == ["a2"]
+        assert _extract_assistant_messages(p, max_messages=5) == ["a1", "a2"]
+        assert _extract_assistant_messages(tmp_path / "absent.jsonl") == []
+        d = tmp_path / "adir"
+        d.mkdir()
+        assert _extract_assistant_messages(d) == []
+
+    def test_review_start_ts_sources(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _review_start_ts, _write_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        m = _manifest("k1", backend_session_id="b1")
+        assert _review_start_ts("k1", m) == float(m.created_at)
+        _write_oracle_meta("k1", "b1", "bound")
+        ts = _review_start_ts("k1", m)
+        assert ts is not None and ts > 1e9
+        meta = tmp_path / ".omp" / "oracle" / "k1" / "meta.json"
+        meta.write_text(json.dumps({"bound_at": "not-a-date"}), encoding="utf-8")
+        assert _review_start_ts("k1", m) == float(m.created_at)
+        assert _review_start_ts("k2", None) is None
+
+    def test_review_reply_to_candidates(self):
+        import hashlib as _h
+
+        from codeagent.oracle import _review_reply_to_candidates
+
+        rk = "proj:oracle:gfx:blur"
+        keys = _review_reply_to_candidates(rk)
+        assert rk in keys
+        assert "proj-oracle-gfx-blur" in keys
+        assert rk.replace(":", "-")[-12:] in keys
+        assert _h.sha256(rk.encode()).hexdigest()[:12] in keys
+
+    def test_scan_mailbox_report_known_session(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _scan_mailbox_report
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        m = _manifest("k1", backend_session_id="b1")
+        mock_store = MagicMock()
+        mock_store.read_history.return_value = [
+            {"kind": "REPORT", "reply_to": "k1", "body": "report-body-1"},
+            {"kind": "REPORT", "reply_to": "other", "body": "wrong"},
+            {"kind": "PROGRESS", "reply_to": "k1", "body": "not-report"},
+        ]
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("k1", m) == "report-body-1"
+        mock_store.read_history.assert_called_once_with(m.swarm_session_id, kind="REPORT")
+
+    def test_scan_mailbox_report_fallback_walk(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _scan_mailbox_report
+        from codeagent.mailbox.store import resolve_root
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        hist = resolve_root() / "some-session" / "oracle" / "history"
+        hist.mkdir(parents=True)
+        (hist / "1.json").write_text(json.dumps({
+            "kind": "REPORT", "reply_to": "proj-oracle-gfx-blur", "body": "fb-body",
+        }), encoding="utf-8")
+        mock_store = MagicMock()
+        mock_store.read_history.side_effect = Exception("no sessions")
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("proj:oracle:gfx:blur", None) == "fb-body"
+
+    def test_scan_mailbox_report_none(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _scan_mailbox_report
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        mock_store = MagicMock()
+        mock_store.read_history.return_value = []
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("k1", _manifest("k1")) is None
+
+    def test_truncate_result_boundaries(self):
+        from codeagent.oracle import _truncate_result
+
+        text = "x" * 100
+        out, was, tb, total = _truncate_result(text, 50)
+        assert was is True and total == 100
+        assert len(out.encode("utf-8")) == tb <= 50
+        # line boundary preferred in last 30%
+        t2 = "a" * 80 + "\n" + "b" * 80
+        out2, was2, _, total2 = _truncate_result(t2, 100)
+        assert was2 and total2 == 161
+        assert out2 == "a" * 80
+        # whitespace fallback
+        t3 = "a" * 80 + " " + "b" * 80
+        out3, was3, _, _ = _truncate_result(t3, 100)
+        assert was3 and out3 == "a" * 80
+        # multibyte-safe: total counts bytes
+        t4 = "é" * 100
+        out4, was4, tb4, total4 = _truncate_result(t4, 150)
+        assert was4 and total4 == 200
+        assert len(out4.encode("utf-8")) == tb4
+        # no truncation when within budget / max_bytes <= 0
+        assert _truncate_result("short", 100) == ("short", False, 0, 5)
+        assert _truncate_result("short", 0) == ("short", False, 0, 5)
+        assert _truncate_result("short", -1) == ("short", False, 0, 5)
+
+    def test_trunc_notice(self):
+        from codeagent.oracle import _trunc_notice
+
+        assert _trunc_notice("t", True, 10, 20) == "t\n\n…[truncated 10/20 bytes]"
+        assert _trunc_notice("t", False, 0, 5) == "t"
+
+    # ── cmd_oracle_result paths ──────────────────────────────────────
+
+    def test_result_session_transcript(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        session = tmp_path / "session.jsonl"
+        session.write_text(json.dumps({"type": "message", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "final answer"}]}}) + "\n",
+            encoding="utf-8")
+        ns = _NS(review_key="k1", strict=False, all=False, raw=False,
+                 include_digest=False)
+        with patch("codeagent.oracle._resolve_bound_session_id",
+                   return_value="ses_123"), \
+             patch("codeagent.oracle._find_session_file", return_value=session), \
+             patch("codeagent.oracle._strip_running_session") as strip:
+            assert cmd_oracle_result(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["source"] == "session_transcript"
+        assert out["confidence"] == 0.95
+        assert out["messages"] == ["final answer"]
+        assert out["truncated"] is False
+        assert out["meta"]["session_id"] == "ses_123"
+        strip.assert_called_once_with("ses_123")
+
+    def test_result_transcript_trunc_env(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        monkeypatch.setenv("ORACLE_RESULT_MAX_BYTES", "10")
+        session = tmp_path / "session.jsonl"
+        session.write_text(json.dumps({"type": "message", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "x" * 50}]}}) + "\n",
+            encoding="utf-8")
+        ns = _NS(review_key="k1", strict=False, all=False, raw=False,
+                 include_digest=False)
+        with patch("codeagent.oracle._resolve_bound_session_id",
+                   return_value="ses_123"), \
+             patch("codeagent.oracle._find_session_file", return_value=session):
+            assert cmd_oracle_result(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["truncated"] is True
+        assert out["hint"] == "use --all for full result"
+        assert out["total_bytes"] == 50
+
+    def test_result_raw_mode(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        session = tmp_path / "session.jsonl"
+        session.write_text(json.dumps({"type": "message", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "raw text"}]}}) + "\n",
+            encoding="utf-8")
+        ns = _NS(review_key="k1", strict=False, all=False, raw=True,
+                 include_digest=False)
+        with patch("codeagent.oracle._resolve_bound_session_id",
+                   return_value="ses_123"), \
+             patch("codeagent.oracle._find_session_file", return_value=session):
+            assert cmd_oracle_result(ns) == 0
+        assert capsys.readouterr().out == "raw text\n"
+
+    def test_result_all_and_include_digest(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        session = tmp_path / "session.jsonl"
+        lines = []
+        for t in ("first", "second"):
+            lines.append(json.dumps({"type": "message", "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": t}]}}))
+        session.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        ns = _NS(review_key="k1", strict=False, all=True, raw=False,
+                 include_digest=True)
+        with patch("codeagent.oracle._resolve_bound_session_id",
+                   return_value="ses_123"), \
+             patch("codeagent.oracle._find_session_file", return_value=session), \
+             patch("codeagent.oracle._load_advisor_digest",
+                   return_value={"conclusion": "digest-c"}):
+            assert cmd_oracle_result(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["messages"] == ["first\nsecond"]
+        assert out["truncated"] is False
+        assert out["advisor_digest"] == {"conclusion": "digest-c"}
+
+    def test_result_mailbox_report(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        ns = _NS(review_key="k1", strict=False, all=False, raw=False,
+                 include_digest=False)
+        with patch("codeagent.oracle._resolve_bound_session_id", return_value=""), \
+             patch("codeagent.oracle._scan_mailbox_report", return_value="report body"):
+            assert cmd_oracle_result(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["source"] == "mailbox_report"
+        assert out["confidence"] == 0.9
+        assert out["messages"] == ["report body"]
+
+    def test_result_filesystem_fallback(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        session = tmp_path / "fs.jsonl"
+        session.write_text(json.dumps({"type": "message", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "fs answer"}]}}) + "\n",
+            encoding="utf-8")
+        ns = _NS(review_key="k1", strict=False, all=False, raw=False,
+                 include_digest=False)
+        with patch("codeagent.oracle._resolve_bound_session_id", return_value=""), \
+             patch("codeagent.oracle._scan_mailbox_report", return_value=None), \
+             patch("codeagent.oracle._fallback_find_session_for_key",
+                   return_value=session):
+            assert cmd_oracle_result(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["source"] == "filesystem"
+        assert out["confidence"] == 0.7
+        assert out["messages"] == ["fs answer"]
+
+    def test_result_strict_nothing_returns_1(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        ns = _NS(review_key="k1", strict=True, all=False, raw=False,
+                 include_digest=False)
+        with patch("codeagent.oracle._resolve_bound_session_id", return_value="ses_x"), \
+             patch("codeagent.oracle._scan_mailbox_report", return_value=None):
+            assert cmd_oracle_result(ns) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["error"] == "no_result"
+        assert "strict mode" in err["detail"]
+
+    def test_result_no_bound_sid_detail(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        ns = _NS(review_key="k1", strict=False, all=False, raw=False,
+                 include_digest=False)
+        with patch("codeagent.oracle._resolve_bound_session_id", return_value=""), \
+             patch("codeagent.oracle._scan_mailbox_report", return_value=None):
+            assert cmd_oracle_result(ns) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert "oracle start 后才有" in err["detail"]
+
+    # ── cmd_oracle_watch ─────────────────────────────────────────────
+
+    def test_watch_delegates(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_watch
+
+        ns = _NS(review_key="k1", cursor="c-1", interval=2, timeout=30)
+        gw = MagicMock()
+        gw.call.return_value = {"runtime_id": "rt-1", "session_id": "ses-1"}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.gateway.cli.cmd_events_watch", return_value=7) as cew:
+            assert cmd_oracle_watch(ns) == 7
+        sub = cew.call_args[0][0]
+        assert sub.runtime_id == "rt-1"
+        assert sub.session == "ses-1"
+        assert sub.cursor == "c-1"
+        assert sub.limit == 200
+
+    def test_watch_gateway_error(self, tmp_path, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import cmd_oracle_watch
+
+        ns = _NS(review_key="k1", cursor="", interval=2, timeout=30)
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("GATEWAY_DOWN", "socket")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.gateway.cli.cmd_events_watch") as cew:
+            assert cmd_oracle_watch(ns) == 1
+        cew.assert_not_called()
+        err = json.loads(capsys.readouterr().err)
+        assert err["error"] == "GATEWAY_DOWN"
+
+    def test_snapshot_age_days_missing(self):
+        from codeagent.oracle import _snapshot_age_days
+
+        assert _snapshot_age_days(_manifest("k1")) == -1.0
+
+    # ── _wait_for_new_output / cmd_oracle_wait ───────────────────────
+
+    def test_wait_new_output_boot_agent_end(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _wait_for_new_output
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.return_value = {"events": [
+            {"kind": "TASK_STATE", "payload": {"state": "agent_end"}},
+        ], "cursor": 9}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_final_text", return_value="final text"):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+                                        info={}) == 0
+        assert capsys.readouterr().out == "final text\n"
+
+    def test_wait_new_output_assistant_progress(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _wait_for_new_output
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.return_value = {"events": [
+            {"kind": "ASSISTANT_PROGRESS", "payload": {"text": "thinking"}},
+        ], "cursor": 3}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_final_text", return_value="new output"):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+                                        info={}) == 0
+        assert capsys.readouterr().out == "new output\n"
+
+    def test_wait_new_output_agent_end_no_text(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _wait_for_new_output
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.return_value = {"events": [
+            {"kind": "TASK_STATE", "payload": {"state": "agent_end"}},
+        ], "cursor": 1}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_final_text", return_value=None):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+                                        info={}) == 0
+        assert capsys.readouterr().out == ""
+
+    def test_wait_new_output_gateway_error(self, tmp_path, monkeypatch, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import _wait_for_new_output
+
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("GATEWAY_DOWN", "socket")
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+                                        info={}) == 1
+        err = json.loads(capsys.readouterr().out)
+        assert err["status"] == "error"
+        assert err["error"] == "GATEWAY_DOWN"
+
+    def test_wait_new_output_timeout(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _wait_for_new_output
+
+        gw = MagicMock()
+        gw.call.return_value = {"events": [], "cursor": 0}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.time.sleep"):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+                                        info={}) == 1
+        err = json.loads(capsys.readouterr().out)
+        assert err["status"] == "timeout"
+        assert "use oracle result" in err["suggestion"]
+
+    def test_wait_new_output_stuck_returns_1(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _wait_for_new_output
+
+        gw = MagicMock()
+        gw.call.side_effect = [
+            {"events": [], "cursor": 0},  # boot
+            {"events": [], "cursor": 0},  # poll 1
+            {"events": [], "cursor": 0},  # poll 2
+            {"events": [], "cursor": 0},  # poll 3
+            {"runtime_id": "rt-1", "status": "active"},  # info refetch
+        ]
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.time.sleep"), \
+             patch("codeagent.oracle._detect_oracle_stuck",
+                   return_value={"detected": True, "signal": "strong",
+                                 "hint": "release+revive"}):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=300,
+                                        info={}) == 1
+        err = json.loads(capsys.readouterr().out)
+        assert err["status"] == "stuck"
+
+    def test_wait_new_output_keyboard_interrupt(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _wait_for_new_output
+
+        gw = MagicMock()
+        gw.call.return_value = {"events": [], "cursor": 0}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.time.sleep", side_effect=KeyboardInterrupt):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=300,
+                                        info={}) == 130
+
+    def test_wait_new_output_auto_recover_post_revive_fail(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _wait_for_new_output
+        from codeagent.park.registry import ParkRegistry
+
+        ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="b1"))
+        gw = MagicMock()
+        gw.call.side_effect = [
+            {"events": [], "cursor": 0},  # boot
+            {"events": [], "cursor": 0},  # poll 1
+            {"events": [], "cursor": 0},  # poll 2
+            {"events": [], "cursor": 0},  # poll 3
+            {"runtime_id": "rt-1", "status": "active"},  # info refetch
+            {"runtime_id": "rt-1", "status": "active"},  # release step info
+            {},  # runtime.stop
+            {},  # runtime.purge_stopped
+            {"runtime_id": "rt-1", "status": "stopped"},  # post-revive refresh
+        ]
+        decision = MagicMock()
+        decision.method = "warm"
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.time.sleep"), \
+             patch("codeagent.oracle._detect_oracle_stuck",
+                   return_value={"detected": True, "signal": "strong",
+                                 "hint": "release+revive"}), \
+             patch("codeagent.park.router.revive_or_spawn", return_value=decision), \
+             patch("codeagent.oracle._revive_warm", return_value=("rt-9", "b9", ["m"])):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=300,
+                                        info={}, auto_recover=True) == 1
+        out_text = capsys.readouterr().out
+        assert '"status": "recovering"' in out_text
+        assert '"status": "recover_failed"' in out_text
+        assert '"phase": "post_revive"' in out_text
+
+    def test_cmd_wait_routes_to_shared(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_wait
+
+        info = {"runtime_id": "rt-1", "session_id": "ses-1", "status": "active",
+                "backend_session_id": "b1", "runtime_health": {"alive": True}}
+        gw = MagicMock()
+        gw.call.return_value = info
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_for_new_output", return_value=0) as w:
+            assert cmd_oracle_wait(_NS(review_key="k1", interval=1, timeout=30,
+                                       all=False, auto_recover=True)) == 0
+        w.assert_called_once_with("k1", "rt-1", "ses-1", timeout=30.0,
+                                  interval=1.0, max_bytes=32768, info=info,
+                                  auto_recover=True, session_dir="")
+
+    def test_cmd_wait_gateway_error(self, tmp_path, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import cmd_oracle_wait
+
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("GATEWAY_DOWN", "socket")
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert cmd_oracle_wait(_NS(review_key="k1", interval=1, timeout=30,
+                                       all=False)) == 1
+        err = json.loads(capsys.readouterr().out)
+        assert err["error"] == "GATEWAY_DOWN"
+
+    def test_cmd_wait_no_runtime(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_wait
+
+        gw = MagicMock()
+        gw.call.return_value = {"runtime_id": ""}
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert cmd_oracle_wait(_NS(review_key="k1", interval=1, timeout=30,
+                                       all=False)) == 1
+        err = json.loads(capsys.readouterr().out)
+        assert err["error"] == "NO_RUNTIME"
+
+    def test_cmd_wait_not_active(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_wait
+
+        gw = MagicMock()
+        gw.call.return_value = {"runtime_id": "rt-1",
+                                "runtime_health": {"alive": False}}
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert cmd_oracle_wait(_NS(review_key="k1", interval=1, timeout=30,
+                                       all=False)) == 1
+        err = json.loads(capsys.readouterr().out)
+        assert err["error"] == "NOT_ACTIVE"
+
+    def test_cmd_wait_binding_pending_continues(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_wait
+
+        info = {"runtime_id": "rt-1", "session_id": "ses-1", "status": "active",
+                "backend_session_id": "", "runtime_health": {"alive": True}}
+        gw = MagicMock()
+        gw.call.return_value = info
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_for_new_output", return_value=5) as w:
+            assert cmd_oracle_wait(_NS(review_key="k1", interval=1, timeout=30,
+                                       all=False)) == 5
+        w.assert_called_once()
+        assert "binding_pending" in capsys.readouterr().out
+
+    # ── _tmux_kill_oracle_runtime ────────────────────────────────────
+
+    def test_tmux_kill_pid_and_pane(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _review_sid, _tmux_kill_oracle_runtime
+
+        runtime_root = (Path(os.environ["XDG_STATE_HOME"])
+                        / "aimeshchat" / "runtime" / "rt-1")
+        runtime_root.mkdir(parents=True)
+        (runtime_root / "spec.json").write_text(json.dumps({
+            "review_key": "k1", "runtime_id": "rt-1"}), encoding="utf-8")
+        (runtime_root / "rt-1.pid").write_text("4242\n", encoding="utf-8")
+
+        def fake_kill(pid, sig):
+            if sig == 0:
+                raise ProcessLookupError(3, "no process")
+            return None
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = f"{_review_sid('k1')}|%1\nora-k1-legacy|%2\n"
+        monkeypatch.setattr("codeagent.launchers.tmux.tmux_cmd",
+                            lambda *a: ["tmux", *a])
+        with patch("codeagent.oracle.os.kill", side_effect=fake_kill), \
+             patch("codeagent.oracle.subprocess.run", return_value=proc), \
+             patch("codeagent.launchers.tmux.kill_pane", return_value=True) as kp:
+            killed, targets = _tmux_kill_oracle_runtime("k1")
+        assert killed is True
+        assert "pid:4242" in targets
+        assert any(t.startswith("pane:") for t in targets)
+        assert kp.call_count == 2
+
+    def test_tmux_kill_no_targets(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _tmux_kill_oracle_runtime
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = "unrelated|%1\n"
+        monkeypatch.setattr("codeagent.launchers.tmux.tmux_cmd",
+                            lambda *a: ["tmux", *a])
+        with patch("codeagent.oracle.subprocess.run", return_value=proc), \
+             patch("codeagent.launchers.tmux.kill_pane", return_value=True):
+            killed, targets = _tmux_kill_oracle_runtime("k1")
+        assert killed is False
+        assert targets == []
+
+    def test_tmux_kill_scan_error(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _tmux_kill_oracle_runtime
+
+        monkeypatch.setattr("codeagent.launchers.tmux.tmux_cmd",
+                            lambda *a: ["tmux", *a])
+        with patch("codeagent.oracle.subprocess.run",
+                   side_effect=FileNotFoundError("no tmux")), \
+             patch("codeagent.launchers.tmux.kill_pane", return_value=True):
+            killed, targets = _tmux_kill_oracle_runtime("k1")
+        assert killed is False
+        assert targets == []
+
+    # ── opencode.db purge / strip ────────────────────────────────────
+
+    def _make_opencode_db(self, tmp_path, monkeypatch, sid="ses_111",
+                          events=((1, "session.created"), (5, "session.next.agent.switched.1"))):
+        import sqlite3 as _sqlite
+
+        db = tmp_path / "opencode.db"
+        conn = _sqlite.connect(db)
+        conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER)")
+        conn.execute("CREATE TABLE event (aggregate_id TEXT, seq INTEGER, type TEXT)")
+        conn.execute("INSERT INTO session VALUES (?)", (sid,))
+        conn.execute("INSERT INTO event_sequence VALUES (?, 5)", (sid,))
+        for seq, typ in events:
+            conn.execute("INSERT INTO event VALUES (?, ?, ?)", (sid, seq, typ))
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr("codeagent.oracle._OPENCODE_DB_PATH", db)
+        return db
+
+    def test_purge_opencode_hard(self, tmp_path, monkeypatch):
+        import sqlite3 as _sqlite
+
+        from codeagent.oracle import _purge_opencode_session
+
+        db = self._make_opencode_db(tmp_path, monkeypatch)
+        r = _purge_opencode_session("ses_111")
+        assert r["deleted_session"] is True
+        assert r["deleted_events"] is True
+        assert r["error"] is None
+        assert Path(r["backup"]).exists()
+        conn = _sqlite.connect(db)
+        assert conn.execute("SELECT 1 FROM session WHERE id='ses_111'").fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM event_sequence WHERE aggregate_id='ses_111'").fetchone() is None
+        conn.close()
+
+    def test_purge_opencode_strip_only(self, tmp_path, monkeypatch):
+        import sqlite3 as _sqlite
+
+        from codeagent.oracle import _purge_opencode_session
+
+        db = self._make_opencode_db(tmp_path, monkeypatch)
+        r = _purge_opencode_session("ses_111", strip_only=True)
+        assert r["deleted_session"] is False
+        assert r["deleted_events"] is True
+        conn = _sqlite.connect(db)
+        assert conn.execute("SELECT 1 FROM session WHERE id='ses_111'").fetchone() is not None
+        assert conn.execute(
+            "SELECT 1 FROM event_sequence WHERE aggregate_id='ses_111'").fetchone() is None
+        conn.close()
+
+    def test_purge_opencode_missing_db_and_empty_sid(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _purge_opencode_session
+
+        monkeypatch.setattr("codeagent.oracle._OPENCODE_DB_PATH",
+                            tmp_path / "nope.db")
+        r = _purge_opencode_session("ses_1")
+        assert r["error"] == "opencode.db not found"
+        self._make_opencode_db(tmp_path, monkeypatch)
+        r2 = _purge_opencode_session("")
+        assert r2["error"] == "empty backend_session_id"
+
+    def test_purge_opencode_backup_failure_continues(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _purge_opencode_session
+
+        self._make_opencode_db(tmp_path, monkeypatch)
+        with patch("codeagent.oracle.shutil.copy2",
+                   side_effect=OSError("disk full")):
+            r = _purge_opencode_session("ses_111")
+        assert r["deleted_session"] is True
+        assert r["backup"].startswith("failed:")
+
+    def test_is_turn_completed(self):
+        from codeagent.oracle import _is_turn_completed
+
+        events = [
+            {"seq": 1, "type": "session.created"},
+            {"seq": 2, "type": "tool.a"},
+            {"seq": 6, "type": "session.next.agent.switched.1"},
+        ]
+        assert _is_turn_completed(events, 0) is True
+        assert _is_turn_completed(events, 1) is True
+        assert _is_turn_completed(events, 2) is False
+        assert _is_turn_completed(events, 9) is False
+        assert _is_turn_completed([], 0) is False
+
+    def test_strip_running_session_trims(self, tmp_path, monkeypatch):
+        import sqlite3 as _sqlite
+
+        from codeagent.oracle import _strip_running_session
+
+        events = (
+            (1, "session.created"),
+            (2, "tool.a"),
+            (3, "tool.b"),
+            (6, "session.next.agent.switched.1"),
+            (7, "tool.c"),
+            (12, "session.next.model.switched.1"),
+            (13, "tool.d"),
+            (14, "tool.e"),
+        )
+        db = self._make_opencode_db(tmp_path, monkeypatch, events=events)
+        r = _strip_running_session("ses_111")  # keep_recent=2
+        assert r["error"] is None
+        assert r["trimmed"] == 3  # seq 1,2,3 removed
+        assert r["kept"] == 5
+        conn = _sqlite.connect(db)
+        rows = conn.execute(
+            "SELECT seq FROM event WHERE aggregate_id='ses_111'").fetchall()
+        conn.close()
+        assert [x[0] for x in rows] == [6, 7, 12, 13, 14]
+
+    def test_strip_running_session_keeps_all(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _strip_running_session
+
+        self._make_opencode_db(tmp_path, monkeypatch)
+        r = _strip_running_session("ses_111")
+        assert r["trimmed"] == 0
+        assert r["kept"] == 2
+
+    def test_strip_running_session_errors(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _strip_running_session
+
+        monkeypatch.setattr("codeagent.oracle._OPENCODE_DB_PATH",
+                            tmp_path / "nope.db")
+        assert _strip_running_session("ses_1")["error"] == "opencode.db not found"
+        self._make_opencode_db(tmp_path, monkeypatch)
+        assert _strip_running_session("")["error"] == "empty backend_session_id"
+
+    def test_lazy_db_cleanup_guards(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _lazy_db_cleanup
+
+        monkeypatch.setattr("codeagent.oracle._OPENCODE_DB_PATH",
+                            tmp_path / "nope.db")
+        assert _lazy_db_cleanup() == 0
+        small = tmp_path / "small.db"
+        small.write_bytes(b"x" * 1024)
+        monkeypatch.setattr("codeagent.oracle._OPENCODE_DB_PATH", small)
+        assert _lazy_db_cleanup() == 0
+        big = tmp_path / "big.db"
+        with open(big, "wb") as f:
+            f.truncate(101 * 1024 * 1024)  # sparse 101MB
+        monkeypatch.setattr("codeagent.oracle._OPENCODE_DB_PATH", big)
+        assert _lazy_db_cleanup() == 0  # query error (no released_at col) → 0
+
+    def test_cleanup_opencode_on_release_sources(self, tmp_path, monkeypatch):
+        from codeagent.oracle import (_cleanup_opencode_session_on_release,
+                                      _write_oracle_meta)
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        self._make_opencode_db(tmp_path, monkeypatch, sid="ses_222")
+        # no sid anywhere → skipped
+        r = _cleanup_opencode_session_on_release("k1", _manifest("k1", backend_session_id=""),
+                                                 strip_only=True)
+        assert r == {"skipped": "no backend_session_id"}
+        # meta sid
+        _write_oracle_meta("k1", "ses_222", "bound")
+        r2 = _cleanup_opencode_session_on_release("k1", _manifest("k1", backend_session_id=""),
+                                                  strip_only=False)
+        assert r2["backend_session_id"] == "ses_222"
+        assert r2["deleted_session"] is True
+        assert r2["strip_only"] is False
+        # non-opencode sid → skipped
+        r3 = _cleanup_opencode_session_on_release("k1", _manifest("k1", backend_session_id="native-1"),
+                                                  strip_only=True)
+        assert "not an opencode session" in r3["skipped"]
+
+    def test_cleanup_opencode_gateway_fallback(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _cleanup_opencode_session_on_release
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        self._make_opencode_db(tmp_path, monkeypatch, sid="ses_333")
+        gw = MagicMock()
+        gw.call.return_value = {"backend_session_id": "ses_333"}
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            r = _cleanup_opencode_session_on_release(
+                "k1", _manifest("k1", backend_session_id=""), strip_only=True)
+        assert r["backend_session_id"] == "ses_333"
+        assert r["strip_only"] is True
+
+    # ── GC ───────────────────────────────────────────────────────────
+
+    def test_gc_meta_roundtrip_and_throttle(self, tmp_path, monkeypatch):
+        from codeagent.oracle import (_gc_meta_path, _gc_read_meta,
+                                      _gc_throttle, _gc_update_timestamp,
+                                      _gc_write_meta)
+
+        assert _gc_throttle() is True
+        _gc_update_timestamp()
+        assert _gc_throttle() is False
+        assert "last_gc_at" in _gc_read_meta()
+        # corrupt meta → treated as empty
+        _gc_meta_path().write_text("{bad", encoding="utf-8")
+        assert _gc_read_meta() == {}
+        assert _gc_throttle() is True
+        # write failure tolerated (p.write_text OSError is caught)
+        d = tmp_path / "gcdir"
+        d.mkdir()
+        monkeypatch.setattr("codeagent.oracle._gc_meta_path",
+                            lambda: d / "gc.json")
+        d2 = tmp_path / "gc.json"
+        d2.mkdir()
+        monkeypatch.setattr("codeagent.oracle._gc_meta_path", lambda: d2)
+        _gc_write_meta({"a": 1})  # must not raise (write to dir → OSError)
+
+    def test_cmd_oracle_gc_empty(self, capsys):
+        from codeagent.oracle import cmd_oracle_gc
+
+        assert cmd_oracle_gc(_NS(dry_run=False, json=False)) == 0
+        assert "no released sessions" in capsys.readouterr().err
+
+    def test_cmd_oracle_gc_expired_cleans(self, tmp_path, monkeypatch, capsys):
+        import time
+        from dataclasses import replace
+
+        from codeagent.oracle import cmd_oracle_gc
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        m = replace(_manifest("k-gc", backend_session_id=""),
+                    hard_expires_at=time.time() - 100,
+                    soft_expires_at=time.time() - 100)
+        registry.acquire("k-gc", m)
+        registry.release("k-gc")  # released_soft
+        with patch("codeagent.oracle._purge_omp_session",
+                   return_value=["/sessions/x"]) as po, \
+             patch("codeagent.oracle._purge_opencode_session",
+                   return_value={"error": None}):
+            assert cmd_oracle_gc(_NS(dry_run=False, json=False)) == 0
+        po.assert_called_once()
+        assert registry.lookup("k-gc") is None  # row deleted
+        assert "cleaned=1" in capsys.readouterr().err
+
+    def test_cmd_oracle_gc_dry_run_json(self, tmp_path, monkeypatch, capsys):
+        import time
+        from dataclasses import replace
+
+        from codeagent.oracle import cmd_oracle_gc
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        m = replace(_manifest("k-gc2", backend_session_id=""),
+                    hard_expires_at=time.time() - 100)
+        registry.acquire("k-gc2", m)
+        registry.release("k-gc2")
+        with patch("codeagent.oracle._purge_omp_session", return_value=[]):
+            assert cmd_oracle_gc(_NS(dry_run=True, json=True)) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["cleaned"] == 1
+        assert registry.lookup("k-gc2") is not None  # dry-run keeps row
+
+    def test_cmd_oracle_gc_stale_by_activity(self, tmp_path, monkeypatch, capsys):
+        import time
+        from dataclasses import replace
+
+        from codeagent.oracle import cmd_oracle_gc
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        m = replace(_manifest("k-stale", backend_session_id=""),
+                    hard_expires_at=0, soft_expires_at=0,
+                    last_activity_at=time.time() - 3 * 86400)
+        registry.acquire("k-stale", m)
+        registry.release("k-stale")
+        assert cmd_oracle_gc(_NS(dry_run=False, json=False)) == 0
+        assert registry.lookup("k-stale") is None
+        assert "cleaned=1" in capsys.readouterr().err
+
+    def test_cmd_oracle_gc_skips_fresh(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_gc
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k-fresh", _manifest("k-fresh", backend_session_id="b1"))
+        registry.release("k-fresh")
+        assert cmd_oracle_gc(_NS(dry_run=False, json=False)) == 0
+        assert registry.lookup("k-fresh") is not None
+        assert "no expired sessions found" in capsys.readouterr().err
+
+    def test_cmd_oracle_gc_corrupt_manifest(self, capsys):
+        from codeagent.oracle import cmd_oracle_gc
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        with registry._connect() as conn:
+            conn.execute(
+                "INSERT INTO park_leases (key, manifest_json, lifecycle) "
+                "VALUES ('k-bad', '{not-json', 'released_soft')")
+            conn.commit()
+        assert cmd_oracle_gc(_NS(dry_run=False, json=False)) == 1
+        assert "corrupt manifest" in capsys.readouterr().err
+
+    def test_cmd_oracle_gc_scan_error_json(self, capsys):
+        from codeagent.oracle import cmd_oracle_gc
+
+        with patch("codeagent.oracle.ParkRegistry._connect",
+                   side_effect=Exception("db locked")):
+            assert cmd_oracle_gc(_NS(dry_run=False, json=True)) == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["failed"] == 1
+        assert "db locked" in out["errors"][0]
+
+    def test_run_gc_silent(self):
+        from codeagent.oracle import _run_gc_silent
+
+        with patch("codeagent.oracle.cmd_oracle_gc", return_value=0) as gc:
+            _run_gc_silent()
+        args = gc.call_args[0][0]
+        assert args.dry_run is False and args.json is False
+        with patch("codeagent.oracle.cmd_oracle_gc", side_effect=Exception("boom")):
+            _run_gc_silent()  # must not raise
+
+    # ── advisor digest ───────────────────────────────────────────────
+
+    def test_find_advisor_session_file(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _find_advisor_session_file
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        root = tmp_path / ".omp" / "agent" / "sessions"
+        (root / "proj").mkdir(parents=True)
+        main = root / "proj" / "x_ses_1.jsonl"
+        main.write_text("m", encoding="utf-8")
+        adv = root / "proj" / "__advisor_ses_1.jsonl"
+        adv.write_text("a", encoding="utf-8")
+        assert _find_advisor_session_file("") is None
+        assert _find_advisor_session_file("ses_1") == adv
+        assert _find_advisor_session_file("ses_1", session_dir=str(root / "proj")) == adv
+        # fallback recursive scan when main file absent
+        (root / "other").mkdir()
+        adv2 = root / "other" / "__advisor_ses_2.jsonl"
+        adv2.write_text("x", encoding="utf-8")
+        assert _find_advisor_session_file("ses_2") == adv2
+
+    def test_extract_advisor_digest(self, tmp_path):
+        from codeagent.oracle import _extract_advisor_digest
+
+        p = tmp_path / "advisor.jsonl"
+        lines = [
+            json.dumps({"type": "message", "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": "conclusion text"}]}}),
+            json.dumps({"type": "message", "message": {"role": "toolResult",
+                        "content": [{"type": "text", "text": "x" * 250}]}}),
+            json.dumps({"type": "message", "message": {"role": "toolResult",
+                        "content": [{"type": "text", "text": "short"}]}}),
+            json.dumps({"type": "tool_result", "text": "y" * 250}),
+            "{bad-json",
+        ]
+        p.write_text("\n".join(lines), encoding="utf-8")
+        d = _extract_advisor_digest(p)
+        assert d["conclusion"] == "conclusion text"
+        assert d["evidence_count"] == 2
+        assert d["token_estimate"] > 0
+        assert d["source"] == str(p)
+        # OSError → error digest
+        err = _extract_advisor_digest(tmp_path / "absent.jsonl")
+        assert err["error"]
+        # truncation to max_bytes
+        long = tmp_path / "long.jsonl"
+        long.write_text(json.dumps({"type": "message", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "z" * 100}]}}), encoding="utf-8")
+        t = _extract_advisor_digest(long, max_bytes=10)
+        assert len(t["conclusion"].encode("utf-8")) <= 10
+
+    def test_save_load_advisor_digest(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import (_load_advisor_digest,
+                                      _save_advisor_digest)
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        assert _save_advisor_digest("k1", None) is None
+        assert _save_advisor_digest("k1", _manifest("k1", backend_session_id="")) is None
+        assert _save_advisor_digest("k1", _manifest("k1", backend_session_id="ses_1")) is None
+        root = tmp_path / ".omp" / "agent" / "sessions"
+        (root / "proj").mkdir(parents=True)
+        (root / "proj" / "x_ses_1.jsonl").write_text("m", encoding="utf-8")
+        adv = root / "proj" / "__advisor_ses_1.jsonl"
+        adv.write_text(json.dumps({"type": "message", "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "adv conclusion"}]}}),
+            encoding="utf-8")
+        m = replace(_manifest("k1", backend_session_id="ses_1"),
+                    omp_session_path=str(root / "proj" / "x_ses_1.jsonl"))
+        d = _save_advisor_digest("k1", m)
+        assert d is not None
+        assert d["conclusion"] == "adv conclusion"
+        assert _load_advisor_digest("k1") == d
+        digest_path = tmp_path / ".omp" / "oracle" / "k1" / "digest.json"
+        digest_path.write_text("{bad", encoding="utf-8")
+        assert _load_advisor_digest("k1") is None
+        assert _load_advisor_digest("k-absent") is None
+        # write failure → None
+        blocker = tmp_path / "blocker"
+        blocker.write_text("file", encoding="utf-8")
+        monkeypatch.setattr("codeagent.oracle._oracle_digest_path",
+                            lambda _k: blocker / "digest.json")
+        assert _save_advisor_digest("k1", m) is None
+
+    # ── cmd_oracle_release paths ─────────────────────────────────────
+
+    def test_release_unread_reports_guard(self, tmp_path, capsys):
+        from codeagent.mailbox.store import MailboxStore
+        from codeagent.oracle import cmd_oracle_release
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        m = registry.lookup("k1")
+        inbox = MailboxStore().agent_subdir(m.swarm_session_id, "oracle", "inbox")
+        inbox.mkdir(parents=True)
+        (inbox / "r1.json").write_text(json.dumps({
+            "kind": "REPORT", "msg_id": "m1"}), encoding="utf-8")
+        ns = _NS(review_key="k1", force=False, purge=False, keep_advisor=False,
+                 prompt="")
+        gw = MagicMock()
+        gw.call.side_effect = _raise(Exception("no gateway"))
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("builtins.input", return_value="n"):
+            assert cmd_oracle_release(ns) == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["release_aborted"] is True
+        assert out["unread_reports"] == 1
+        # guard confirmation "y" proceeds
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("builtins.input", return_value="y"), \
+             patch("codeagent.oracle._strip_oracle_transcript",
+                   return_value={"removed": []}), \
+             patch("codeagent.oracle._save_advisor_digest", return_value=None), \
+             patch("codeagent.oracle.Path.home", lambda: tmp_path):
+            assert cmd_oracle_release(ns) == 0
+        assert registry.lookup("k1").lifecycle == Lifecycle.RELEASED_SOFT
+
+    def test_release_gateway_not_found_warning(self, tmp_path, monkeypatch, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import cmd_oracle_release
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("NOT_FOUND", "no runtime")
+        ns = _NS(review_key="k1", force=False, purge=False, keep_advisor=False,
+                 prompt="")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._strip_oracle_transcript",
+                   return_value={"removed": []}), \
+             patch("codeagent.oracle._save_advisor_digest", return_value=None):
+            assert cmd_oracle_release(ns) == 0
+        captured = capsys.readouterr()
+        out = json.loads(captured.out)
+        assert out["runtime_stopped"] is False
+        assert out["runtime_leaked"] is False
+        assert "runtime stop failed" in captured.err
+
+    def test_release_gateway_down_tmux_fallback(self, tmp_path, monkeypatch, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import cmd_oracle_release
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("GATEWAY_DOWN", "socket")
+        ns = _NS(review_key="k1", force=False, purge=False, keep_advisor=False,
+                 prompt="")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._strip_oracle_transcript",
+                   return_value={"removed": []}), \
+             patch("codeagent.oracle._save_advisor_digest", return_value=None), \
+             patch("codeagent.oracle._tmux_kill_oracle_runtime",
+                   return_value=(True, ["pid:123"])) as tmux_kill:
+            assert cmd_oracle_release(ns) == 0
+        tmux_kill.assert_called_once_with("k1")
+        out = json.loads(capsys.readouterr().out)
+        assert out["runtime_stopped"] is True
+        assert out["runtime_leaked"] is False
+
+    def test_release_gateway_down_no_targets_leak(self, tmp_path, monkeypatch, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import cmd_oracle_release
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("GATEWAY_CONNECT_FAILED", "refused")
+        ns = _NS(review_key="k1", force=False, purge=False, keep_advisor=False,
+                 prompt="")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._strip_oracle_transcript",
+                   return_value={"removed": []}), \
+             patch("codeagent.oracle._save_advisor_digest", return_value=None), \
+             patch("codeagent.oracle._tmux_kill_oracle_runtime",
+                   return_value=(False, [])):
+            assert cmd_oracle_release(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["runtime_stopped"] is False
+        assert out["runtime_leaked"] is True
+
+    def test_release_no_manifest(self, capsys):
+        from codeagent.oracle import cmd_oracle_release
+
+        ns = _NS(review_key="k-nope", force=False, purge=False,
+                 keep_advisor=False, prompt="")
+        assert cmd_oracle_release(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["park_released"] is False
+        assert out["release_mode"] == "soft"
+
+    def test_release_purge_path(self, tmp_path, monkeypatch, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import cmd_oracle_release
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("NOT_FOUND", "no runtime")
+        ns = _NS(review_key="k1", force=False, purge=True, keep_advisor=False,
+                 prompt="")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._save_advisor_digest", return_value=None), \
+             patch("codeagent.oracle._purge_omp_session",
+                   return_value=["/x.jsonl"]) as po, \
+             patch("codeagent.oracle._cleanup_opencode_session_on_release",
+                   return_value={"deleted": True}) as cl:
+            assert cmd_oracle_release(ns) == 0
+        po.assert_called_once()
+        assert po.call_args.kwargs["skip_advisor"] is False
+        cl.assert_called_once()
+        assert cl.call_args.kwargs["strip_only"] is False
+        out = json.loads(capsys.readouterr().out)
+        assert out["session_purged"] is True
+        assert out["release_mode"] == "hard"
+        assert registry.lookup("k1") is None
+
+    def test_release_keep_advisor(self, tmp_path, monkeypatch, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import cmd_oracle_release
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        gw.call.side_effect = GatewayError("NOT_FOUND", "no runtime")
+        # soft + keep_advisor: transcript strip skipped
+        ns = _NS(review_key="k1", force=False, purge=False, keep_advisor=True,
+                 prompt="")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._save_advisor_digest", return_value=None), \
+             patch("codeagent.oracle._strip_oracle_transcript") as strip:
+            assert cmd_oracle_release(ns) == 0
+        strip.assert_not_called()
+        # purge + keep_advisor: skip_advisor=True
+        ns2 = _NS(review_key="k1", force=False, purge=True, keep_advisor=True,
+                  prompt="")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._save_advisor_digest", return_value=None), \
+             patch("codeagent.oracle._purge_omp_session", return_value=[]) as po, \
+             patch("codeagent.oracle._cleanup_opencode_session_on_release",
+                   return_value={}):
+            assert cmd_oracle_release(ns2) == 0
+        assert po.call_args.kwargs["skip_advisor"] is True
+        out_text = capsys.readouterr().out
+        assert '"keep_advisor": true' in out_text
+
+    # ── doctor ───────────────────────────────────────────────────────
+
+    def test_opencode_session_exists(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _opencode_session_exists
+
+        self._make_opencode_db(tmp_path, monkeypatch, sid="ses_777")
+        assert _opencode_session_exists("ses_777") is True
+        assert _opencode_session_exists("ses_999") is False
+        assert _opencode_session_exists("") is False
+        monkeypatch.setattr("codeagent.oracle._OPENCODE_DB_PATH",
+                            tmp_path / "nope.db")
+        assert _opencode_session_exists("ses_777") is False
+
+    def test_doctor_list_all_park_entries(self, tmp_path):
+        from codeagent.oracle import _doctor_list_all_park_entries
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        registry.acquire("k2", _manifest("k2", backend_session_id="b2"))
+        registry.release("k2")  # released_soft — still listed
+        entries = _doctor_list_all_park_entries()
+        assert {e["review_key"] for e in entries} == {"k1", "k2"}
+        with registry._connect() as conn:
+            conn.execute(
+                "INSERT INTO park_leases (key, manifest_json, lifecycle) "
+                "VALUES ('k-bad', '{bad', 'released_soft')")
+            conn.commit()
+        entries2 = _doctor_list_all_park_entries()  # corrupt row skipped
+        assert "k-bad" not in {e["review_key"] for e in entries2}
+
+    def test_cmd_oracle_doctor_healthy(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_doctor
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        gw = MagicMock()
+        gw.call.side_effect = lambda m, p=None: (
+            {"ok": True} if m == "capabilities.get" else {"status": "active"})
+        proc = MagicMock()
+        proc.returncode = 1
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._OPENCODE_DB_PATH",
+                   tmp_path / "nope.db"), \
+             patch("codeagent.oracle.subprocess.run", return_value=proc):
+            assert cmd_oracle_doctor(_NS(fix=False)) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["healthy"] == 1
+        assert out["issues"] == []
+
+    def test_cmd_oracle_doctor_stale_runtime_fix(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_doctor
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        calls = {"n": 0}
+
+        def gw_call(m, p=None):
+            if m == "capabilities.get":
+                return {"ok": True}
+            if m == "runtime.info":
+                calls["n"] += 1
+                return {"status": "stopped", "runtime_id": "rt-1"} if calls["n"] >= 2 \
+                    else {"status": "stopped"}
+            return {}
+
+        gw = MagicMock()
+        gw.call.side_effect = gw_call
+        proc = MagicMock()
+        proc.returncode = 1
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._OPENCODE_DB_PATH",
+                   tmp_path / "nope.db"), \
+             patch("codeagent.oracle.subprocess.run", return_value=proc):
+            assert cmd_oracle_doctor(_NS(fix=True)) == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["issues"][0]["type"] == "STALE_RUNTIME"
+        assert out["fix_results"][0] == {
+            "type": "STALE_RUNTIME", "review_key": "k1",
+            "action": "runtime.stop", "success": True,
+        }
+
+    def test_cmd_oracle_doctor_gateway_unreachable(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_doctor
+
+        gw = MagicMock()
+        gw.call.side_effect = Exception("no gateway")
+        proc = MagicMock()
+        proc.returncode = 1
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._OPENCODE_DB_PATH",
+                   tmp_path / "nope.db"), \
+             patch("codeagent.oracle.subprocess.run", return_value=proc):
+            assert cmd_oracle_doctor(_NS(fix=False)) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["issues"][0]["type"] == "GATEWAY_UNREACHABLE"
+        assert "aimeshchat gateway start" in out["issues"][0]["fix_action"]
+
+    def test_cmd_oracle_doctor_orphan_db_fix(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_doctor
+
+        self._make_opencode_db(tmp_path, monkeypatch, sid="ses_999")
+        gw = MagicMock()
+        gw.call.return_value = {"ok": True}
+        proc = MagicMock()
+        proc.returncode = 1
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.subprocess.run", return_value=proc):
+            assert cmd_oracle_doctor(_NS(fix=True)) == 1
+        out = json.loads(capsys.readouterr().out)
+        types = [i["type"] for i in out["issues"]]
+        assert "ORPHAN_DB" in types
+        orphan = next(i for i in out["issues"] if i["type"] == "ORPHAN_DB")
+        assert orphan["detail"].startswith("session ")
+
+    # ── _purge_omp_session ───────────────────────────────────────────
+
+    def test_purge_omp_session_targets(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _purge_omp_session
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        sessions = tmp_path / ".omp" / "agent" / "sessions"
+        proj = sessions / "proj"
+        proj.mkdir(parents=True)
+        main = proj / "x_ses_1.jsonl"
+        main.write_text("m", encoding="utf-8")
+        sub = proj / "123_ses_1"
+        sub.mkdir()
+        (sub / "__advisor.jsonl").write_text("adv", encoding="utf-8")
+        m = replace(_manifest("k1", backend_session_id="ses_1"),
+                    swarm_session_id="postmesh-k1-abc",
+                    omp_session_dir=str(proj))
+        removed = _purge_omp_session(m)
+        assert str(main) in removed
+        assert str(sub) in removed
+        assert not main.exists() and not sub.exists()
+        # non-existent targets are skipped silently
+        m2 = replace(m, backend_session_id="ses_absent")
+        assert _purge_omp_session(m2) == []
+
+    def test_purge_omp_session_skip_advisor(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _purge_omp_session
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        sessions = tmp_path / ".omp" / "agent" / "sessions"
+        proj = sessions / "proj"
+        proj.mkdir(parents=True)
+        main = proj / "x_ses_1.jsonl"
+        main.write_text("m", encoding="utf-8")
+        sub = proj / "123_ses_1"
+        sub.mkdir()
+        (sub / "__advisor.jsonl").write_text("adv", encoding="utf-8")
+        (sub / "other.log").write_text("o", encoding="utf-8")
+        m = replace(_manifest("k1", backend_session_id="ses_1"),
+                    swarm_session_id="postmesh-k1-abc")
+        removed = _purge_omp_session(m, skip_advisor=True)
+        assert not main.exists()
+        assert (sub / "__advisor.jsonl").exists()  # preserved
+        assert not (sub / "other.log").exists()
+        assert sub.exists()  # dir kept (preserved advisor)
+        # advisor-named file target preserved
+        m2 = replace(m, backend_session_id="", omp_session_path=str(sub / "__advisor.jsonl"))
+        assert _purge_omp_session(m2, skip_advisor=True) == []
+
+    def test_purge_omp_session_oserror_warns(self, tmp_path, monkeypatch, capsys):
+        from dataclasses import replace
+
+        from codeagent.oracle import _purge_omp_session
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        proj = tmp_path / ".omp" / "agent" / "sessions" / "proj"
+        proj.mkdir(parents=True)
+        m = replace(_manifest("k1", backend_session_id=""),
+                    omp_session_path=str(proj),
+                    swarm_session_id="")
+        with patch("codeagent.oracle.shutil.rmtree",
+                   side_effect=OSError("permission denied")):
+            removed = _purge_omp_session(m)
+        assert removed == []
+        assert "warning: purge session file failed" in capsys.readouterr().err
+
+    # ── _is_runtime_alive / revive / attach ──────────────────────────
+
+    def test_is_runtime_alive(self):
+        from codeagent.oracle import _is_runtime_alive
+
+        m = _manifest("k1", backend_session_id="b1")
+        gw = MagicMock()
+        gw.call.return_value = {"status": "active",
+                                "runtime_health": {"alive": True}}
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert _is_runtime_alive(m) is True
+        gw.call.return_value = {"status": "active",
+                                "runtime_health": {"alive": False}}
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert _is_runtime_alive(m) is False
+        gw.call.side_effect = Exception("down")
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert _is_runtime_alive(m) is False
+
+    def test_revive_gateway_down_returns_1(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_revive
+
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=False):
+            assert cmd_oracle_revive(_NS(review_key="k1", mode="bg")) == 1
+        assert capsys.readouterr().out == ""
+
+    def test_revive_not_found_and_purged_and_broken(self, tmp_path, monkeypatch, capsys):
+        from dataclasses import replace
+        from codeagent.oracle import cmd_oracle_revive
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True):
+            assert cmd_oracle_revive(_NS(review_key="k-nope", mode="bg")) == 1
+        assert json.loads(capsys.readouterr().err)["error"] == "not_found"
+
+        for lc, err_key in ((Lifecycle.RELEASED_HARD, "purged"),
+                            (Lifecycle.BROKEN, "broken")):
+            m = _manifest(f"k-{lc.value}", backend_session_id="b1")
+            m = replace(m, lifecycle=lc)
+            with registry._connect() as conn:
+                conn.execute(
+                    "INSERT INTO park_leases (key, manifest_json, lifecycle) "
+                    "VALUES (?, ?, ?)",
+                    (m.review_key, json.dumps(registry._manifest_to_dict(m)),
+                     lc.value))
+                conn.commit()
+            with patch("codeagent.oracle._ensure_gateway_or_hint",
+                       return_value=True):
+                assert cmd_oracle_revive(
+                    _NS(review_key=m.review_key, mode="bg")) == 1
+            assert json.loads(capsys.readouterr().err)["error"] == err_key
+
+    def test_revive_hot_already_active(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_revive
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        decision = MagicMock()
+        decision.method = "hot"
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+             patch("codeagent.park.router.revive_or_spawn",
+                   return_value=decision):
+            assert cmd_oracle_revive(_NS(review_key="k1", mode="bg")) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["error"] == "already_active"
+        assert "oracle ask" in err["hint"]
+
+    def test_revive_warm_success(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_revive
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        registry.release("k1")
+        decision = MagicMock()
+        decision.method = "warm"
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+             patch("codeagent.park.router.revive_or_spawn", return_value=decision), \
+             patch("codeagent.oracle._revive_warm",
+                   return_value=("rt-1", "b1", ["m/x"])) as rw, \
+             patch("codeagent.oracle._write_oracle_meta") as wm, \
+             patch("codeagent.oracle._lazy_db_cleanup", return_value=0):
+            assert cmd_oracle_revive(_NS(review_key="k1", mode="bg")) == 0
+        manifest = registry.lookup("k1")
+        rw.assert_called_once_with("k1", manifest, "bg")
+        wm.assert_called_once()
+        out = json.loads(capsys.readouterr().out)
+        assert out["method"] == "warm"
+        assert out["declared"] is True
+        assert out["backend_session_id"] == "b1"
+
+    def test_revive_cold_success(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_revive
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id=""))
+        registry.release("k1")
+        decision = MagicMock()
+        decision.method = "cold"
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+             patch("codeagent.park.router.revive_or_spawn", return_value=decision), \
+             patch("codeagent.oracle._revive_cold",
+                   return_value=("rt-2", "", [])) as rc, \
+             patch("codeagent.oracle._lazy_db_cleanup", return_value=0):
+            assert cmd_oracle_revive(_NS(review_key="k1", mode="bg")) == 0
+        rc.assert_called_once()
+        out = json.loads(capsys.readouterr().out)
+        assert out["method"] == "cold"
+        assert out["declared"] is True
+
+    def test_revive_resume_declare_failed(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_revive
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        registry.release("k1")
+        decision = MagicMock()
+        decision.method = "warm"
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+             patch("codeagent.park.router.revive_or_spawn", return_value=decision), \
+             patch("codeagent.oracle._revive_warm",
+                   side_effect=RuntimeError("gateway declare failed: A7: owner mismatch")):
+            assert cmd_oracle_revive(_NS(review_key="k1", mode="resume")) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["error"] == "declare_failed"
+        assert err["declared"] is False
+
+    def test_revive_generic_failure(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_revive
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id=""))
+        registry.release("k1")
+        decision = MagicMock()
+        decision.method = "cold"
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+             patch("codeagent.park.router.revive_or_spawn", return_value=decision), \
+             patch("codeagent.oracle._revive_cold", side_effect=ValueError("boom")):
+            assert cmd_oracle_revive(_NS(review_key="k1", mode="bg")) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["error"] == "cold_failed"
+        assert err["declared"] is False
+
+    def test_revive_warm_bg_spawn_and_flip(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+        from codeagent.oracle import _revive_warm
+        from codeagent.park.registry import ParkRegistry
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        registry = ParkRegistry()
+        m = replace(_manifest("k1", backend_session_id="native-1"),
+                    primary_model="prof/x")
+        registry.acquire("k1", m)
+        with patch("codeagent.oracle.RuntimeRegistry.spawn",
+                   return_value=_handle("rt-w", backend_session_id="b2")) as spawn, \
+             patch("codeagent.oracle._adopt_runtime", return_value="skipped"):
+            rid, sid, chain = _revive_warm("k1", registry.lookup("k1"), "bg")
+        assert rid == "rt-w"
+        assert sid == "b2"
+        assert chain == ["prof/x"]
+        req = spawn.call_args[0][1]
+        assert req["backend_session_id"] == "native-1"
+        assert req["session_dir"] == ""  # manifest has no omp_session_dir
+        got = registry.lookup("k1")
+        assert got.lifecycle == Lifecycle.HOT_PARKED
+        assert got.backend_session_id == "b2"
+        assert got.round == 1
+
+    def test_revive_warm_sid_pending_warning(self, tmp_path, monkeypatch, capsys):
+        from dataclasses import replace
+        from codeagent.oracle import _revive_warm
+        from codeagent.park.registry import ParkRegistry
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        registry = ParkRegistry()
+        m = replace(_manifest("k1", backend_session_id="native-1"),
+                    primary_model="prof/x")
+        registry.acquire("k1", m)
+        with patch("codeagent.oracle.RuntimeRegistry.spawn",
+                   return_value=_handle("rt-w", backend_session_id="")) as spawn, \
+             patch("codeagent.oracle._adopt_runtime", return_value="skipped"):
+            rid, sid, chain = _revive_warm("k1", registry.lookup("k1"), "bg")
+        assert sid == "native-1"  # preserved
+        assert "preserving previous id" in capsys.readouterr().err
+
+    def test_revive_warm_spawn_fail_cleans_up(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _revive_warm
+        from codeagent.park.registry import ParkRegistry
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        registry = ParkRegistry()
+        m = replace(_manifest("k1", backend_session_id="native-1"),
+                    primary_model="prof/x")
+        registry.acquire("k1", m)
+        reg_mock = MagicMock()
+        reg_mock.spawn.return_value = _handle("rt-w", backend_session_id="b2")
+        with patch("codeagent.oracle.RuntimeRegistry",
+                   return_value=reg_mock), \
+             patch("codeagent.oracle._flip_to_hot",
+                   side_effect=Exception("flip exploded")):
+            with pytest.raises(Exception, match="flip exploded"):
+                _revive_warm("k1", registry.lookup("k1"), "bg")
+        reg_mock.stop.assert_called_once_with("rt-w", "revive-warm-failed")
+
+    def test_revive_warm_resume_ok_and_error(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _revive_warm
+
+        m = _manifest("k1", backend_session_id="native-1")
+        with patch("codeagent.oracle._attach_omp_session", return_value=None) as attach:
+            rid, sid, chain = _revive_warm("k1", m, "resume")
+        attach.assert_called_once_with("native-1", "k1", m.workdir)
+        assert rid == "" and sid == "native-1" and chain == []
+        with patch("codeagent.oracle._attach_omp_session",
+                   return_value="gateway declare failed: A7: x"):
+            with pytest.raises(RuntimeError, match="A7"):
+                _revive_warm("k1", m, "resume")
+
+    def test_revive_cold_resume_falls_back_bg(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+        from codeagent.oracle import _revive_cold, _review_sid
+
+        m = replace(_manifest("k1", backend_session_id=""), primary_model="m/x")
+        with patch("codeagent.oracle.build_cold_context", return_value="ctx"), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn",
+                   return_value=_handle("rt-c", backend_session_id="bc")) as spawn, \
+             patch("codeagent.oracle._flip_to_hot") as flip, \
+             patch("codeagent.oracle._adopt_runtime", return_value=True):
+            rid, sid, chain = _revive_cold("k1", m, "resume")
+        assert rid == "rt-c"
+        assert sid == "bc"
+        assert chain == ["m/x"]
+        assert spawn.call_args[0][0] == "omp"
+        assert flip.call_args.kwargs["sid"] == _review_sid("k1")
+        req = spawn.call_args[0][1]
+        assert "ctx" in req["task"]
+
+    def test_flip_to_hot_updates(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _flip_to_hot
+        from codeagent.park.registry import ParkRegistry
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        registry = ParkRegistry()
+        m = _manifest("k1", backend_session_id="",
+                      lifecycle=Lifecycle.COLD_RESUMABLE)
+        registry.acquire("k1", m)
+        _flip_to_hot("k1", registry.lookup("k1"), sid="postmesh-x",
+                     backend_session_id="b9")
+        got = registry.lookup("k1")
+        assert got.lifecycle == Lifecycle.HOT_PARKED
+        assert got.backend_session_id == "b9"
+        assert got.round == 1
+        assert got.swarm_session_id == "postmesh-x"
+        assert got.release_mode == ""
+
+    def test_attach_omp_session_paths(self, tmp_path, monkeypatch, capsys):
+        from codeagent.gateway.model import GatewayError
+        from codeagent.oracle import _attach_omp_session
+
+        gw = MagicMock()
+        gw.call.return_value = {}
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.subprocess.Popen") as popen:
+            assert _attach_omp_session("ses-1", "k1", str(tmp_path)) is None
+        argv = popen.call_args[0][0]
+        assert argv == ["omp", "--resume", "ses-1"]
+        gw.call.assert_called_once_with("runtime.declare", {
+            "review_key": "k1", "backend_session_id": "ses-1",
+            "mode": "native_resume", "agent_id": "oracle",
+        })
+        # Popen OSError → warning, declare still attempted
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.subprocess.Popen",
+                   side_effect=OSError("no omp binary")):
+            assert _attach_omp_session("ses-1", "k1") is None
+        assert "omp --resume attach failed" in capsys.readouterr().err
+        # gateway unreachable → silent None
+        gw2 = MagicMock()
+        gw2.call.side_effect = ConnectionError("no socket")
+        with patch("codeagent.oracle._gateway", return_value=gw2), \
+             patch("codeagent.oracle.subprocess.Popen"):
+            assert _attach_omp_session("ses-1", "k1") is None
+        # structured GatewayError → error string
+        gw3 = MagicMock()
+        gw3.call.side_effect = GatewayError("A7", "owner mismatch")
+        with patch("codeagent.oracle._gateway", return_value=gw3), \
+             patch("codeagent.oracle.subprocess.Popen"):
+            assert _attach_omp_session("ses-1", "k1") == \
+                "gateway declare failed: A7: owner mismatch"
+        # unexpected exception → error string
+        gw4 = MagicMock()
+        gw4.call.side_effect = ValueError("weird")
+        with patch("codeagent.oracle._gateway", return_value=gw4), \
+             patch("codeagent.oracle.subprocess.Popen"):
+            assert _attach_omp_session("ses-1", "k1") == \
+                "gateway declare failed: weird"
+
+    def test_attach_absent_returns_1(self, capsys):
+        from codeagent.oracle import cmd_oracle_attach
+
+        assert cmd_oracle_attach(_NS(review_key="k-nope", mode="bg",
+                                     prompt="")) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["error"] == "not_found"
+
+    def test_attach_hot_routes_to_ask(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_attach
+        from codeagent.park.registry import ParkRegistry
+
+        ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="b1"))
+        with patch("codeagent.oracle.cmd_oracle_ask", return_value=0) as ask:
+            assert cmd_oracle_attach(_NS(review_key="k1", mode="bg",
+                                         prompt="p")) == 0
+        ask.assert_called_once()
+
+    def test_attach_released_routes_to_revive(self, tmp_path, capsys):
+        from codeagent.oracle import cmd_oracle_attach
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k2", _manifest("k2", backend_session_id="b2"))
+        registry.release("k2")
+        with patch("codeagent.oracle.cmd_oracle_revive", return_value=0) as rev:
+            assert cmd_oracle_attach(_NS(review_key="k2", mode="bg",
+                                         prompt="")) == 0
+        rev.assert_called_once()
+
+    # ── residual branches ────────────────────────────────────────────
+
+    def test_purge_opencode_vacuum_large_db(self, tmp_path, monkeypatch):
+        from codeagent.oracle import _purge_opencode_session
+
+        db = self._make_opencode_db(tmp_path, monkeypatch)
+        with open(db, "ab") as f:
+            f.truncate(101 * 1024 * 1024)  # sparse > 100MB → VACUUM path
+        r = _purge_opencode_session("ses_111")
+        assert r["error"] is None
+        assert r["vacuum"] is True
+        assert r["vacuum_before_mb"] >= 100.0
+
+    def test_cmd_oracle_gc_park_delete_failed(self, tmp_path, monkeypatch, capsys):
+        import time
+
+        from dataclasses import replace
+
+        from codeagent.oracle import cmd_oracle_gc
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        m = replace(_manifest("k-gc", backend_session_id=""),
+                    hard_expires_at=time.time() - 100)
+        registry.acquire("k-gc", m)
+        registry.release("k-gc")
+        with patch("codeagent.oracle._purge_omp_session", return_value=[]), \
+             patch("codeagent.oracle.ParkRegistry.delete",
+                   side_effect=Exception("row locked")):
+            assert cmd_oracle_gc(_NS(dry_run=False, json=True)) == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["failed"] == 1
+        assert any("park delete failed" in e for e in out["errors"])
+
+    def test_purge_omp_session_swarm_dirs(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _purge_omp_session
+        from codeagent.mailbox.store import MailboxStore
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        m = replace(_manifest("k1", backend_session_id="ses_1"),
+                    swarm_session_id="postmesh-k1-abc")
+        store = MailboxStore()
+        swarm_dirs = [
+            store.session_dir("postmesh-k1-abc"),
+            store.root / "_outbox" / "postmesh-k1-abc",
+            store.root / "_dead_letter" / "postmesh-k1-abc",
+        ]
+        for d in swarm_dirs:
+            d.mkdir(parents=True)
+        sessions = tmp_path / ".omp" / "agent" / "sessions"
+        (sessions / "proj").mkdir(parents=True)
+        main = sessions / "proj" / "x_ses_1.jsonl"
+        main.write_text("m", encoding="utf-8")
+        removed = _purge_omp_session(m)
+        assert str(main) in removed
+        for d in swarm_dirs:
+            assert not d.exists()
+
+    def test_purge_omp_session_skip_advisor_empty_child(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _purge_omp_session
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        sessions = tmp_path / ".omp" / "agent" / "sessions"
+        proj = sessions / "proj"
+        proj.mkdir(parents=True)
+        (proj / "x_ses_1.jsonl").write_text("m", encoding="utf-8")
+        sub = proj / "123_ses_1"
+        (sub / "empty-dir").mkdir(parents=True)
+        m = replace(_manifest("k1", backend_session_id="ses_1"),
+                    swarm_session_id="postmesh-k1-abc")
+        removed = _purge_omp_session(m, skip_advisor=True)
+        assert str(sub / "empty-dir") in removed  # rmdir success path
+
+    def test_cmd_oracle_doctor_orphan_tmux(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _review_sid, cmd_oracle_doctor
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        gw = MagicMock()
+        gw.call.return_value = {"ok": True}
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = (f"{_review_sid('k1')}|%1\n"
+                       "postmesh-unmatched|%2\n"
+                       "ora-other-legacy|%3\n")
+        monkeypatch.setattr("codeagent.launchers.tmux.tmux_cmd",
+                            lambda *a: ["tmux", *a])
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._OPENCODE_DB_PATH",
+                   tmp_path / "nope.db"), \
+             patch("codeagent.oracle.subprocess.run", return_value=proc):
+            assert cmd_oracle_doctor(_NS(fix=False)) == 1
+        out = json.loads(capsys.readouterr().out)
+        types = [i["type"] for i in out["issues"]]
+        assert types.count("ORPHAN_TMUX") == 2  # unmatched windows only
+
+    def test_cmd_oracle_doctor_orphan_db_scan_error(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_doctor
+
+        db = tmp_path / "opencode.db"
+        db.write_bytes(b"this is not a sqlite database" * 100)
+        monkeypatch.setattr("codeagent.oracle._OPENCODE_DB_PATH", db)
+        gw = MagicMock()
+        gw.call.return_value = {"ok": True}
+        proc = MagicMock()
+        proc.returncode = 1
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle.subprocess.run", return_value=proc):
+            assert cmd_oracle_doctor(_NS(fix=False)) == 0
+        assert json.loads(capsys.readouterr().out)["issues"] == []
+
+    def test_cmd_oracle_doctor_stale_runtime_stop_fails(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_doctor
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        calls = {"n": 0}
+
+        def gw_call(m, p=None):
+            if m == "capabilities.get":
+                return {"ok": True}
+            if m == "runtime.info":
+                calls["n"] += 1
+                return {"status": "stopped", "runtime_id": "rt-1"} if calls["n"] >= 2 \
+                    else {"status": "stopped"}
+            if m == "runtime.stop":
+                raise Exception("stop refused")
+            return {}
+
+        gw = MagicMock()
+        gw.call.side_effect = gw_call
+        proc = MagicMock()
+        proc.returncode = 1
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._OPENCODE_DB_PATH",
+                   tmp_path / "nope.db"), \
+             patch("codeagent.oracle.subprocess.run", return_value=proc):
+            assert cmd_oracle_doctor(_NS(fix=True)) == 2
+        out = json.loads(capsys.readouterr().out)
+        assert out["fix_results"][0]["success"] is False
+
+    def test_revive_cold_spawn_fail_cleanup(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+        from codeagent.oracle import _revive_cold
+
+        m = replace(_manifest("k1", backend_session_id=""), primary_model="m/x")
+        reg_mock = MagicMock()
+        reg_mock.spawn.return_value = _handle("rt-c", backend_session_id="bc")
+        with patch("codeagent.oracle.RuntimeRegistry", return_value=reg_mock), \
+             patch("codeagent.oracle.build_cold_context", return_value="ctx"), \
+             patch("codeagent.oracle._flip_to_hot",
+                   side_effect=Exception("flip exploded")):
+            with pytest.raises(Exception, match="flip exploded"):
+                _revive_cold("k1", m, "bg")
+        reg_mock.stop.assert_called_once_with("rt-c", "revive-cold-failed")
+
+    def test_revive_cold_stale_snapshot_warning(self, tmp_path, monkeypatch, capsys):
+        from dataclasses import replace
+        from codeagent.oracle import _revive_cold
+
+        m = replace(_manifest("k1", backend_session_id=""), primary_model="m/x")
+        with patch("codeagent.oracle._snapshot_age_days", return_value=9.5), \
+             patch("codeagent.oracle.build_cold_context", return_value="ctx"), \
+             patch("codeagent.oracle.RuntimeRegistry.spawn",
+                   return_value=_handle("rt-c", backend_session_id="bc")), \
+             patch("codeagent.oracle._flip_to_hot"), \
+             patch("codeagent.oracle._adopt_runtime", return_value=True):
+            rid, _sid, _chain = _revive_cold("k1", m, "bg")
+        assert rid == "rt-c"
+
+    def test_revive_lazy_db_cleanup_error_still_succeeds(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import cmd_oracle_revive
+        from codeagent.park.registry import ParkRegistry
+
+        registry = ParkRegistry()
+        registry.acquire("k1", _manifest("k1", backend_session_id="b1"))
+        registry.release("k1")
+        decision = MagicMock()
+        decision.method = "warm"
+        with patch("codeagent.oracle._ensure_gateway_or_hint", return_value=True), \
+             patch("codeagent.park.router.revive_or_spawn", return_value=decision), \
+             patch("codeagent.oracle._revive_warm",
+                   return_value=("rt-1", "b1", ["m"])), \
+             patch("codeagent.oracle._write_oracle_meta"), \
+             patch("codeagent.oracle._lazy_db_cleanup",
+                   side_effect=Exception("db busy")):
+            assert cmd_oracle_revive(_NS(review_key="k1", mode="bg")) == 0
+        assert json.loads(capsys.readouterr().out)["method"] == "warm"
+
+    def test_purge_omp_session_raw_path_target(self, tmp_path, monkeypatch):
+        from dataclasses import replace
+
+        from codeagent.oracle import _purge_omp_session
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        raw = tmp_path / "session-dir" / "s.jsonl"
+        raw.parent.mkdir(parents=True)
+        raw.write_text("m", encoding="utf-8")
+        m = replace(_manifest("k1", backend_session_id=""),
+                    omp_session_path=str(raw))
+        removed = _purge_omp_session(m)
+        assert str(raw) in removed
+        assert not raw.exists()
