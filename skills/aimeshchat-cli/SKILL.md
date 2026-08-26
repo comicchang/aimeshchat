@@ -366,16 +366,17 @@ aimeshchat oracle status "$KEY" | grep "runtime_id"
 | 续接上次对话 | 重发同命令；需要全新上下文加 `--new-session` |
 | 并发执行 | 多个 `run ... --background` + `aimeshchat job status/wait` |
 
-模型选择：用户显式指定 → 一律 `--model '<用户指定的模型>'`（覆盖一切默认建议）；
-未指定且未用 `--agent` → 默认 `--model 'Mify-mimo/xiaomi/mimo-v2.5(-pro)'`。
+模型选择优先级：
+1. 用户显式指定 → 一律 `--model '<用户指定的模型>'`（覆盖一切默认建议）；
+2. 未指定但用了 `--agent <name>` → 按 `~/.omp/agent/agents/<name>.md` frontmatter 的 `model:` 字段运行；
+3. 都未指定 → 默认 `--model 'Mify-mimo/xiaomi/mimo-v2.5(-pro)'`。
 
 ### ❌ 不要做什么
 
 | 禁止 | 替代 |
 |------|------|
 | 调用 `~/.claude/bin/codeagent-wrapper`（已废弃下线） | 上表 `aimeshchat run` |
-| 当前会话模型直接读受限路径（如 `vendor/`） | `private-code-*` 委派 |
-| 旧参数 `--parallel` | 多个 `run ... --background` |
+| 当前会话模型无授权却直读受限路径（如 `vendor/`） | 豁免：当前模型本身是私有/授权模型（如 MiMo 系）或用户明确授权 → 可直接读写；否则走 `private-code-*` 委派 |
 
 ### 🔧 需要时怎么做
 
