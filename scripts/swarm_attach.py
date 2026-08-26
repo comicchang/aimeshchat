@@ -75,14 +75,16 @@ def try_register(session_id: str, agent_id: str, mailbox_root: str) -> None:
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(f"  ⚠ swarm 注册命令失败（忽略）: {' '.join(argv)}: {exc}", file=sys.stderr)
 
-    # create-session 对已存在 session 报错 → 容错继续
+    # create-session 对已存在 session 报错 → 容错继续（无 --mailbox-root 参数）
     run("swarm", "create-session", session_id, "--manager", "manager",
         "--members", f"manager,{agent_id}")
+    # register 才接受 --mailbox-root（G4：root 属于 agent 注册，不属于 session 创建）
     if mailbox_root:
-        run("swarm", "create-session", session_id, "--manager", "manager",
-            "--members", f"manager,{agent_id}", "--mailbox-root", mailbox_root)
-    run("swarm", "register", session_id, "--agent", agent_id, "--host", "__local__",
-        "--backend", "omp")
+        run("swarm", "register", session_id, "--agent", agent_id, "--host", "__local__",
+            "--backend", "omp", "--mailbox-root", mailbox_root)
+    else:
+        run("swarm", "register", session_id, "--agent", agent_id, "--host", "__local__",
+            "--backend", "omp")
 
 
 def main() -> None:
@@ -91,12 +93,20 @@ def main() -> None:
     parser.add_argument("--agent", required=True, help="本实例的 agent id（如 w1）")
     parser.add_argument("--mailbox-root", default="",
                         help="mailbox root（默认用插件内置值 ~/.local/share/aimeshchat/mailbox）")
+    parser.add_argument("--owner-pid", type=int, default=os.getpid(),
+                        help="写入身份的存活 pid（插件 sweep 据此判断 stale；"
+                             "默认=本脚本进程——注意脚本退出后身份可能被 10min "
+                             "sweep 清理，长驻需求请传长驻进程 pid）")
     parser.add_argument("--out", default="", help="将 export 行写入该文件而非 stdout")
     parser.add_argument("--register", action="store_true",
                         help="顺带把 agent 注册进 swarm roster（幂等容错）")
     args = parser.parse_args()
 
-    payload = {"session_id": args.session_id, "agent_id": args.agent}
+    payload = {
+        "session_id": args.session_id,
+        "agent_id": args.agent,
+        "owner_pid": args.owner_pid,
+    }
     identity_path = write_identity(IDENTITY_DIR, payload)
     exports = [
         f"export OMP_MAILBOX_IDENTITY_FILE='{identity_path}'",
