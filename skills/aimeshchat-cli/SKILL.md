@@ -367,6 +367,11 @@ aimeshchat oracle status "$KEY" | grep "runtime_id"
 | `--prompt-file <f>` | `aimeshchat run "$(cat <f>)" <workdir>` |
 | `--parallel` | 多个 `aimeshchat run ... --background` + `aimeshchat job status/wait`，或 swarm 多 worker |
 
+**模型选择优先级**：用户显式指定了模型/供应商时，一律以用户指定为准
+（`--model '<用户指定的模型>'`），覆盖本文档出现的所有默认模型建议；
+仅当用户未指定时才使用本文档的默认值（如 private-code 场景的
+`Mify-mimo/xiaomi/mimo-v2.5(-pro)`）。
+
 ## 从 code_route.py 迁移
 
 | 旧命令 | 新命令 |
