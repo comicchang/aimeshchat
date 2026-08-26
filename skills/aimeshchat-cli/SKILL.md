@@ -49,7 +49,7 @@ aimeshchat route where <topic>
 printf '%s\n' '<task>' | aimeshchat route <topic> --repo 0 --model <provider/model>
 aimeshchat route <topic> '<task>' --dry-run
 
-# 异步执行（route 无 --background；先 where 查映射，再 run --background）
+# 异步执行（route/run 均支持 --background；先 where 查映射）
 aimeshchat route where <topic>                        # 查 host/path
 aimeshchat run '<task>' <workdir> --host <host> --background   # 立即返回 job ID（stderr）
 aimeshchat job list                                   # 列出后台 job
@@ -216,10 +216,6 @@ stats 命令成功 + status.json 存在 ≠ 进程存活（文件可能是历史
 
 **正确做法**：gateway 失败 → 探测可达性与 wire → 分类重试 → worker 存活则 mailbox 直连完成全部可交付工作 → 能力缺口（events/park/receipts）如实上报为降级代价，而不是用 tmux 手搓补上。
 
-### 管道禁令（reinforce）
-
-调用 aimeshchat 命令时**永远禁止**提前退出管道（`| head`/`| tail`/`| grep`）：`run --background` 的 job ID 在 **stderr**，stdout 为空，`| tail` 抓不到；`| head` 触发 SIGPIPE 杀死命令并让 timeout 机制失效。只允许结构化转换管道（`--json` 输出后处理，见「输出过滤禁令」）。
-
 ### --timeout 禁令（远程目标）
 
 调用 `aimeshchat run` / `aimeshchat route` 时，**禁止手动传 `--timeout` 给远程目标**。CLI 自动管理超时：
@@ -254,7 +250,7 @@ aimeshchat run '分析代码' ~/src --host yellow
 | 信息 | 命令 | 含义 |
 |---|---|---|
 | Worker 计数 | `aimeshchat mailbox stats --session <sid> --agent <w> --host <H>` | inbox/processing/archive/_corrupt 计数 |
-| 状态快照 | `ssh <H> "cat <mailbox-root>/<sid>/<w>/status.json"` | 5 字段：state/current_task/last_conclusion/updated_at |
+| 状态快照 | `ssh <H> "cat <mailbox-root>/<sid>/<w>/status.json"` | 5 字段：session_id/state/current_task/last_conclusion/updated_at |
 | 待收 REPORT | `aimeshchat mailbox peek --session <sid> --agent manager --host <H>` | manager 在远程 host 的 inbox 是否有未消费消息 |
 
 **IDLE 判定 = 三者同时成立**：`status.json.state == IDLE` + `stats` 中 inbox=0 + manager inbox 无未消费 REPORT。
@@ -369,22 +365,22 @@ aimeshchat oracle status "$KEY" | grep "runtime_id"
 模型选择优先级：
 1. 用户显式指定 → 一律 `--model '<用户指定的模型>'`（覆盖一切默认建议）；
 2. 未指定但用了 `--agent <name>` → 按 `~/.omp/agent/agents/<name>.md` frontmatter 的 `model:` 字段运行；
-3. 都未指定 → 默认 `--model 'Mify-mimo/xiaomi/mimo-v2.5(-pro)'`。
+3. 都未指定 → 不传 `--model`，由 OMP `modelRoles.default` 兜底（当前 work 为 `Mify-mimo/xiaomi/mimo-v2.5-pro`）。
 
 ### ❌ 不要做什么
 
 | 禁止 | 替代 |
 |------|------|
 | 调用 `~/.claude/bin/codeagent-wrapper`（已废弃下线） | 上表 `aimeshchat run` |
-| 当前会话模型无授权却直读受限路径（如 `vendor/`） | 豁免：当前模型本身是私有/授权模型（如 MiMo 系）或用户明确授权 → 可直接读写；否则走 `private-code-*` 委派 |
+| 当前会话模型无授权却直读受限路径（如 `vendor/`） | 豁免：当前模型本身是 xiaomi 私有系（MiMo/kimi）或用户明确授权 → 可直接读写；否则走 `private-code-*` 委派 |
 
 ### 🔧 需要时怎么做
 
 | 需求 | 做法 |
 |------|------|
 | 从文件读任务正文 | `aimeshchat run "$(cat <f>)" <workdir>` |
-| 用 `--agent private-code-*` 的前置条件 | profile 已同步到 `~/.omp/agent/agents/`；否则只用显式 `--model` |
-| 手动续接指定会话 | 见「Session 规则」（session key 含 host+workdir+backend+agent 四维） |
+| 用 `--agent private-code-*` 的前置条件 | profile 已由 dotai `sync-omp-agents.py --apply` 同步到 `~/.omp/agent/agents/`；缺失时 `--agent` 解析报 Unknown agent profile，改用显式 `--model` |
+| 手动续接指定会话 | 默认 auto-resume 键为 host+workdir+backend+agent 四维；跨此维度续接用 `--session-key '<project>:<role>:<topic>'` 显式命名（见「Session 规则」） |
 
 ## 从 code_route.py 迁移
 
