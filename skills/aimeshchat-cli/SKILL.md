@@ -328,6 +328,15 @@ ssh -G <H> 2>&1 | grep -E "^(host|hostname|user)"
 
 显式 `--session-key` 推荐格式：`<project>:<role>:<domain-or-topic>`。不要只写 `oracle`。
 
+### 跨实例协作唤醒前提
+
+要与**手工启动的另一个 omp 实例**通过 mailbox/swarm 协作，该实例必须在启动前
+source 身份（`scripts/swarm_attach.py`，见「委派速查表」）——无身份 env 的实例
+收不到任何唤醒，视为聋哑节点。
+
+**hub ≠ mailbox**：OMP 内部 `hub` 仅限同进程 subagent 编排；跨进程/跨实例
+唯一通道是 `aimeshchat mailbox/swarm`。
+
 ## 输出过滤禁令
 
 **调用 aimeshchat 命令时，禁止使用提前退出的管道（`| head`/`| tail`/`| grep`）过滤输出。**
