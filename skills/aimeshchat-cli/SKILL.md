@@ -331,8 +331,10 @@ ssh -G <H> 2>&1 | grep -E "^(host|hostname|user)"
 ### 跨实例协作唤醒前提
 
 要与**手工启动的另一个 omp 实例**通过 mailbox/swarm 协作，该实例必须在启动前
-source 身份（`scripts/swarm_attach.py`，见「委派速查表」）——无身份 env 的实例
-收不到任何唤醒，视为聋哑节点。
+source 身份——`python3 scripts/swarm_attach.py <sid> --agent <id>`（本仓 scripts/ 下，
+完整用法见 `skill://agent-swarm/SKILL.md#interactive-peer-mode`）——无身份 env 的实例
+收不到任何唤醒，视为聋哑节点。注意：身份默认绑定当前 shell 的 pid，
+插件 sweep（10min 周期）会清理无存活 pid 的身份；长会话请在启动 omp 前重新 attach。
 
 **hub ≠ mailbox**：OMP 内部 `hub` 仅限同进程 subagent 编排；跨进程/跨实例
 唯一通道是 `aimeshchat mailbox/swarm`。
