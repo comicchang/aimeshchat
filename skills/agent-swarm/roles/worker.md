@@ -143,6 +143,26 @@ mailbox send --session <session-id> --from <worker-id> --to manager \
 5. Wrong target, insufficient capability, or underspecified task: send `NOTICE`, set `BLOCKED`, stop. Never silently execute.
 6. After processing, call `mailbox finalize` to archive.
 
+### 单写者锁前置（共享工作树）
+
+首次 edit 共享工作树（与其他 worker 同仓/同设备）之前，必须完成 **MUTEX 握手**：
+
+```bash
+# 申请：向 manager 发 MUTEX-LOCK，锁体 = workdir + scope
+aimeshchat swarm direct <session-id> --from <worker-id> --to manager \
+  --kind MUTEX-LOCK --subject "lock: <workdir>:<scope>" --body '{"request_id":"..."}'
+# 拿到 manager 的 MUTEX-ACK 才允许 edit；未持锁就改文件 = 事后补票，协议违规。
+```
+
+### 消费卫生
+
+- `mailbox read` 后回合被 steering 打断 → processing 租约悬挂；
+  **恢复后第一动作** = finalize 该 request 或执行
+  `aimeshchat mailbox recover-stale` 回收 >300s 租约。
+- 每完成一个动作块，peek 一次 inbox（`mailbox stats --session <sid> --agent <worker-id>`）
+  确认没有积压的新 TASK。
+
+
 ## ACK Semantics
 
 There are two distinct acknowledgments in the mailbox protocol. Workers MUST NOT conflate them.

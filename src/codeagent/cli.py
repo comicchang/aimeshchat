@@ -10,8 +10,11 @@ from codeagent.domain import RepoMap
 import json
 import logging
 import os
+import secrets
+import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -93,6 +96,15 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--new-session", action="store_true")
     run_p.add_argument("--no-auto-resume", action="store_true")
     run_p.add_argument("--skip-permissions", action="store_true", default=False)
+    run_p.add_argument("--mailbox-agent", default="",
+                       help="Attach swarm mailbox identity: write an identity file and inject "
+                            "OMP_MAILBOX_* env so omp-mailbox-plugin activates (interactive "
+                            "wake-up mode; implies CODEAGENT_ROLE=worker)")
+    run_p.add_argument("--mailbox-session", default="",
+                       help="Swarm session id for --mailbox-agent (default: SWARM_SESSION_ID env, "
+                            "else auto-generated)")
+    run_p.add_argument("--mailbox-root", default="",
+                       help="Mailbox root for --mailbox-agent (default: plugin built-in)")
     run_p.add_argument("--output", help="Write structured JSON to file")
     run_p.add_argument("--timeout", type=_positive_int, default=None,
                        help="Task timeout in seconds (default: 600; oracle agents auto-use 3600)")
@@ -1419,7 +1431,62 @@ def _resolve_agent_backend(agent: Optional[str], requested: str) -> str:
         return requested
 
 
+def _mailbox_identity_env(args: argparse.Namespace) -> dict[str, str] | None:
+    """Build the OMP_MAILBOX_* env for ``--mailbox-agent`` runs.
+
+    Returns ``None`` when ``--mailbox-agent`` is not set.  The identity file
+    deliberately omits ``nonce`` and ``owner_pid``: the plugin's nonce check
+    is conditional (absent → pass) and skipping the owner-pid liveness probe
+    suits long-lived interactive runtimes that outlive this CLI process.
+    """
+    agent_id = getattr(args, "mailbox_agent", "")
+    if not agent_id:
+        return None
+
+    # Idempotent within this process: tmux/background/sync paths may call
+    # multiple times — reuse the same identity file & session id (G7).
+    cached = getattr(args, "_mailbox_env_cache", None)
+    if cached is not None:
+        return cached
+
+    from codeagent.runners.omp import _write_identity_file
+
+    session_id = (
+        getattr(args, "mailbox_session", "")
+        or os.environ.get("SWARM_SESSION_ID")
+        or os.environ.get("OMP_SESSION_ID")
+        or f"swarm_{int(time.time())}_{secrets.token_hex(4)}"
+    )
+    identity_dir = Path.home() / ".omp" / "mailbox-identity"
+    identity_path = _write_identity_file(identity_dir, {
+        "session_id": session_id,
+        "agent_id": agent_id,
+    })
+
+    env = {
+        "OMP_MAILBOX_IDENTITY_FILE": str(identity_path),
+        "OMP_MAILBOX_SESSION_ID": session_id,
+        "OMP_MAILBOX_AGENT_ID": agent_id,
+        "CODEAGENT_ROLE": "worker",
+        "SWARM_SESSION_ID": session_id,
+        "OMP_WORKER_ID": agent_id,
+    }
+    args._mailbox_env_cache = env
+    mailbox_root = getattr(args, "mailbox_root", "") or os.environ.get("MAILBOX_ROOT", "")
+    if mailbox_root:
+        env["MAILBOX_ROOT"] = mailbox_root
+    return env
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
+    # ── mailbox identity (--mailbox-agent) ──────────────────────────────
+    # Prepare identity file + env before any execution path: the sync
+    # runner picks it up via os.environ (OMPRunner._extra_env fallback);
+    # tmux/background paths pass it down explicitly to the child.
+    mailbox_env = _mailbox_identity_env(args)
+    if mailbox_env:
+        os.environ.update(mailbox_env)
+
     task = args.task or sys.stdin.read().strip()
     if not task:
         print("error: no task provided", file=sys.stderr)
@@ -1615,7 +1682,12 @@ def _run_in_tmux(args: argparse.Namespace, task: str) -> int:
 
     # Reconstruct the equivalent aimeshchat CLI command (no tmux flags).
     # Parser declares task first, workdir second — match that order.
-    argv: list[str] = ["aimeshchat", "run"]
+    mailbox_env = _mailbox_identity_env(args) or {}
+    # Env assignments prefixed to the argv survive tmux's shell invocation.
+    argv: list[str] = [
+        f"{k}={shlex.quote(v)}" for k, v in mailbox_env.items()
+    ]
+    argv.extend(["aimeshchat", "run"])
     argv.append(task)
     if args.workdir:
         argv.append(args.workdir)
@@ -1679,6 +1751,9 @@ def _run_in_background(args: argparse.Namespace, task: str) -> int:
     # Reconstruct the equivalent aimeshchat run command (no --background),
     # adding --_bg-job-id so the child knows where to write its result.
     # Parser declares task first, workdir second — match that order.
+    # NOTE: mailbox identity env MUST NOT be prefixed into argv — Popen with
+    # shell=False would treat "K=V" as the executable name. It is passed via
+    # the ``env=`` kwarg below instead.
     argv: list[str] = [sys.executable, "-m", "codeagent.cli", "run"]
     argv.append(task)
     if args.workdir:
@@ -1709,12 +1784,14 @@ def _run_in_background(args: argparse.Namespace, task: str) -> int:
     argv.extend(["--_bg-job-id", job_id])
 
     # Detach: start_new_session so SIGHUP from terminal doesn't kill the child.
+    child_env = {**os.environ, **mailbox_env} if mailbox_env else None
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        env=child_env,
     )
     # Write the child PID so the job dir can track liveness.
     mgr.mark_running(job_id, pid=proc.pid)

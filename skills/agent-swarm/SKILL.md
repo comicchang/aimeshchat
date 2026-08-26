@@ -38,6 +38,35 @@ Worker 的唯一入口是 `mailbox read` + 两阶段消费；消息到达由 OMP
 `mailbox-worker` 和 `local-omp-mcp` 不得在同一 session 内同时用于同一 agent_id。
 `session-init` 必须校验 manifest 一致性，manager ID 冲突时拒绝创建（而非静默合并）。
 
+## Interactive-Peer Mode
+
+共享 FS（Mode A）下**手工多开对等 omp 实例**的协作形态。两个实例都由用户手工启动，
+没有 launcher 注入身份——必须先 attach 再开工。
+
+### 标准流程
+
+```bash
+# ① 编排者建 session 并注册 roster（幂等容错）
+aimeshchat swarm create-session <sid> --manager manager --members manager,w1,w2
+
+# ② 每个 peer 启动 omp 之前生成并 source 身份（缺此步骤 = 聋哑节点）
+python3 scripts/swarm_attach.py <sid> --agent w1 --out /tmp/attach-w1.sh
+source /tmp/attach-w1.sh && omp        # 身份 env 随进程注入，插件轮询激活
+```
+
+### 聋哑节点禁令
+
+**无身份 env 的实例视为聋哑节点：禁止承担 worker 角色、禁止派发 TASK 给它。**
+判据：`echo $OMP_MAILBOX_IDENTITY_FILE` 为空 ⇒ 该实例收不到任何 mailbox 唤醒。
+旁证：session 全程零次 `skill-prompt`/`irc:incoming` 注入。
+
+### 消费与等待纪律（Interactive-Peer 同样适用）
+
+- 启动后第一动作：drain-inbox（`mailbox read` → 处理 → `finalize`）清掉历史积压再开工。
+- read 后回合被打断 → processing 租约悬挂；恢复后第一动作 = finalize 该 request
+  或执行 `aimeshchat mailbox recover-stale`。
+- 其余 Dispatch Gate / 等待纪律 / 关轮护栏 / 单写者锁见对应角色文件。
+
 ## Role Determination
 
 **Role comes ONLY from explicit role/manifest** — never inferred from env presence.
@@ -173,6 +202,9 @@ These rules apply to **every** agent regardless of role:
 6. **Two-phase consumption** — `mailbox read` (inbox→processing) → process → `mailbox finalize` (processing→archive). No shortcuts.
 7. **status.json is a snapshot** — five fields only. Full conclusions belong in REPORT messages and artifacts, not in status.
 8. **Lifecycle vs mailbox status 正交** — `mailbox status` 仅描述工作状态（IDLE/BUSY/DONE/BLOCKED）。Park 是独立的 lifecycle 概念（由 `aimeshchat park registry` 管理），不在 status.json 表达。Park 期间 agent 保持 IDLE 且 archive 受保护（禁止 `mailbox clear`）。
+9. **通道边界禁令** — 跨进程/跨实例协作的唯一通道是 `aimeshchat mailbox/swarm`；
+   OMP 内部 `hub` 仅限同一 OMP 进程内的 subagent 编排。禁止用 hub 向另一个
+   omp 实例投递任务，也禁止用文件系统旁路（直接写对方 inbox 之外的路径）传递指令。
 
 ## Initialization Flow
 

@@ -155,6 +155,30 @@ Status interpretation for dispatch:
 - **BUSY** → do not dispatch
 - **STALE** (`updated_at` exceeds SLA) → diagnostic only, not IDLE; check inbox, Syncthing, pane liveness
 
+### Dispatch Gate（强制）
+
+发送 TASK 前必须完成单行检查（模板，替换 `<sid>/<w>`）：
+
+```bash
+cat .mailbox/<sid>/<w>/status.json | python3 -c "import sys,json; s=json.load(sys.stdin); assert s['state'] in ('IDLE','DONE','BLOCKED'), f\"BUSY — 不派发\""
+```
+
+- 检查失败（state=BUSY）→ 禁止派发；允许排队但 TASK body 必须标注 `queue-depth: <n>`。
+- 同时确认本端 inbox 无该 worker 的未决 REPORT（`mailbox peek --agent manager`）。
+
+### 等待纪律
+
+- 等 REPORT 使用 `aimeshchat swarm watch <session-id>` 或 **≥10 分钟的有界循环**；
+  禁止 <5 分钟短轮询后单方面推进任务。
+- 超时未收到 REPORT → 自身状态置 **BLOCKED** 并上报用户，不得代替 Worker 推进。
+
+### 关轮护栏
+
+- 发出 CLOSED/CANCEL 类 NOTICE 的**前置条件**：对应 `request_id` 的 REPORT 已进入
+  本端 archive（`mailbox read` → 验证 → `finalize` 完成三步）。
+- REPORT 未到达时只允许发 PROGRESS 或 EXTEND-WAIT；**禁止假关轮**——
+  关轮消息早于 verdict 到达 = verdict 永远无人读。
+
 ## 6. Report Verification
 
 Manager does NOT accept `status DONE` as proof of artifact validity. Every REPORT that claims completion MUST include an **AttachmentRef** — a structured reference with all seven fields:
