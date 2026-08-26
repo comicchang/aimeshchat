@@ -18,10 +18,10 @@ requires:
 - topic 有 `.repo-map.json`
 - 目标 host 与本机 hostname 不匹配
 - 需要在 SSH/relay-login 主机运行工具
-- 需要持久 session
+- 目标路径受项目访问限制不可直读（如 vendor/），需委派授权模型——即使 CWD 已在目标仓内
 
 不要路由：
-- CWD 已位于目标仓且本机可直接 Read/Grep/LSP
+- CWD 已位于目标仓且本机可直接 Read/Grep/LSP。该排除仅在当前会话模型有权直读目标路径时成立
 - 纯文档 topic 无 repo-map
 - 只需处理当前本地文件
 
@@ -29,7 +29,7 @@ requires:
 
 ```
 1. CWD 是否已在目标仓内？
-   是 → 直接本地工具
+   是 → 当前会话模型可直读？可 → 直接本地工具；否 → 本机 aimeshchat run 委派授权模型
 2. aimeshchat route where <topic> 能否找到映射？
    否 → 本地文档或先补配置
    是 → 继续
@@ -353,6 +353,19 @@ aimeshchat oracle gc --json | jq '.cleaned'
 aimeshchat run '任务' <workdir> --background | tail -5
 aimeshchat oracle status "$KEY" | grep "runtime_id"
 ```
+
+## 从 codeagent-wrapper 迁移
+
+**硬禁令**：`~/.claude/bin/codeagent-wrapper` 已废弃，任何场景禁止调用。本机仓内私有代码（如 `vendor/`）的委派同样走 `aimeshchat run`。
+
+命令映射表：
+
+| 旧 | 新 |
+|---|---|
+| `codeagent-wrapper --agent private-code-explore --skip-permissions '<task>' [workdir]` | `aimeshchat run --skip-permissions '<task>' <workdir> --model 'Mify-mimo/xiaomi/mimo-v2.5'`（或 `--agent private-code-explore`，见下） |
+| `... resume <session_id> '<task>'` | 同命令重发即可（同一 workdir+backend 自动续接上下文）；需全新上下文加 `--new-session` |
+| `--prompt-file <f>` | `aimeshchat run "$(cat <f>)" <workdir>` |
+| `--parallel` | 多个 `aimeshchat run ... --background` + `aimeshchat job status/wait`，或 swarm 多 worker |
 
 ## 从 code_route.py 迁移
 
