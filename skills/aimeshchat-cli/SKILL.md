@@ -13,7 +13,7 @@ requires:
 
 ## 何时使用
 
-满足任一条件时使用 `aimeshchat route`：
+满足任一条件时使用 aimeshchat（按下方判断树选择 `run` 或 `route`）：
 - 目标仓不在当前 CWD
 - topic 有 `.repo-map.json`
 - 目标 host 与本机 hostname 不匹配
@@ -362,8 +362,8 @@ aimeshchat oracle status "$KEY" | grep "runtime_id"
 
 | 旧 | 新 |
 |---|---|
-| `codeagent-wrapper --agent private-code-explore --skip-permissions '<task>' [workdir]` | `aimeshchat run --skip-permissions '<task>' <workdir> --model 'Mify-mimo/xiaomi/mimo-v2.5'`（或 `--agent private-code-explore`，见下） |
-| `... resume <session_id> '<task>'` | 同命令重发即可（同一 workdir+backend 自动续接上下文）；需全新上下文加 `--new-session` |
+| `codeagent-wrapper --agent private-code-explore --skip-permissions '<task>' [workdir]` | `aimeshchat run --skip-permissions '<task>' <workdir> --model 'Mify-mimo/xiaomi/mimo-v2.5'`（或 `--agent private-code-explore`——前置条件：dotai 已把该 profile 同步到 `~/.omp/agent/agents/`，否则只用显式 `--model`） |
+| `... resume <session_id> '<task>'` | 同命令重发即可（session key 含 host+workdir+backend+agent 四维，四者一致即自动续接上下文）；需全新上下文加 `--new-session` |
 | `--prompt-file <f>` | `aimeshchat run "$(cat <f>)" <workdir>` |
 | `--parallel` | 多个 `aimeshchat run ... --background` + `aimeshchat job status/wait`，或 swarm 多 worker |
 
