@@ -373,6 +373,7 @@ aimeshchat oracle status "$KEY" | grep "runtime_id"
 |------|------|
 | 调用 `~/.claude/bin/codeagent-wrapper`（已废弃下线） | 上表 `aimeshchat run` |
 | 当前会话模型无授权却直读受限路径（如 `vendor/`） | 豁免：当前模型本身是 xiaomi 私有系（MiMo/kimi）或用户明确授权 → 可直接读写；否则走 `private-code-*` 委派 |
+| 旧参数 `--parallel` | 多个 `run ... --background`（见「✅ 要做什么」并发执行行） |
 
 ### 🔧 需要时怎么做
 
