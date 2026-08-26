@@ -354,23 +354,36 @@ aimeshchat run '任务' <workdir> --background | tail -5
 aimeshchat oracle status "$KEY" | grep "runtime_id"
 ```
 
-## 从 codeagent-wrapper 迁移
+## 委派速查表（含受限路径场景）
 
-**硬禁令**：`~/.claude/bin/codeagent-wrapper` 已废弃，任何场景禁止调用。本机仓内私有代码（如 `vendor/`）的委派同样走 `aimeshchat run`。
+### ✅ 要做什么
 
-命令映射表：
+| 任务 | 命令 |
+|------|------|
+| 探索受限路径（如 `vendor/`） | `aimeshchat run --skip-permissions '<task>' <workdir> --agent private-code-explore` |
+| 在受限路径开发修复 | `aimeshchat run --skip-permissions '<task>' <workdir> --agent private-code-develop` |
+| 受限路径技术咨询 | `aimeshchat run --skip-permissions '<task>' <workdir> --agent private-code-oracle` |
+| 续接上次对话 | 重发同命令；需要全新上下文加 `--new-session` |
+| 并发执行 | 多个 `run ... --background` + `aimeshchat job status/wait` |
 
-| 旧 | 新 |
-|---|---|
-| `codeagent-wrapper --agent private-code-explore --skip-permissions '<task>' [workdir]` | `aimeshchat run --skip-permissions '<task>' <workdir> --model 'Mify-mimo/xiaomi/mimo-v2.5'`（或 `--agent private-code-explore`——前置条件：dotai 已把该 profile 同步到 `~/.omp/agent/agents/`，否则只用显式 `--model`） |
-| `... resume <session_id> '<task>'` | 同命令重发即可（session key 含 host+workdir+backend+agent 四维，四者一致即自动续接上下文）；需全新上下文加 `--new-session` |
-| `--prompt-file <f>` | `aimeshchat run "$(cat <f>)" <workdir>` |
-| `--parallel` | 多个 `aimeshchat run ... --background` + `aimeshchat job status/wait`，或 swarm 多 worker |
+模型选择：用户显式指定 → 一律 `--model '<用户指定的模型>'`（覆盖一切默认建议）；
+未指定且未用 `--agent` → 默认 `--model 'Mify-mimo/xiaomi/mimo-v2.5(-pro)'`。
 
-**模型选择优先级**：用户显式指定了模型/供应商时，一律以用户指定为准
-（`--model '<用户指定的模型>'`），覆盖本文档出现的所有默认模型建议；
-仅当用户未指定时才使用本文档的默认值（如 private-code 场景的
-`Mify-mimo/xiaomi/mimo-v2.5(-pro)`）。
+### ❌ 不要做什么
+
+| 禁止 | 替代 |
+|------|------|
+| 调用 `~/.claude/bin/codeagent-wrapper`（已废弃下线） | 上表 `aimeshchat run` |
+| 当前会话模型直接读受限路径（如 `vendor/`） | `private-code-*` 委派 |
+| 旧参数 `--parallel` | 多个 `run ... --background` |
+
+### 🔧 需要时怎么做
+
+| 需求 | 做法 |
+|------|------|
+| 从文件读任务正文 | `aimeshchat run "$(cat <f>)" <workdir>` |
+| 用 `--agent private-code-*` 的前置条件 | profile 已同步到 `~/.omp/agent/agents/`；否则只用显式 `--model` |
+| 手动续接指定会话 | 见「Session 规则」（session key 含 host+workdir+backend+agent 四维） |
 
 ## 从 code_route.py 迁移
 
