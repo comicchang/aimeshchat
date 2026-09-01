@@ -794,8 +794,8 @@ def _scan_runtime_log_for_session_id(log_path: Optional[Path]) -> str:
     return ""
 
 
-def _poll_backend_session_id(handle, timeout: float = 60.0, interval: float = 0.5) -> str:
-    """A1: synchronously bind the backend session id after spawn (≤60s).
+def _poll_backend_session_id(handle, timeout: float = 120.0, interval: float = 0.5) -> str:
+    """A1: synchronously bind the backend session id after spawn (≤120s).
 
     Fast path: the handle already carries a ``backend_session_id`` (adapters
     that resolve it synchronously). Otherwise poll the runtime log for up to
@@ -1058,7 +1058,7 @@ def cmd_oracle_start(args: argparse.Namespace) -> int:
     })
 
     # ── A1: session_id 同步绑定 ──────────────────────────────────────
-    # Poll the runtime log (≤60s) for the native backend session id so the
+    # Poll the runtime log (≤120s) for the native backend session id so the
     # review's warm resume point is known BEFORE start returns, then persist
     # it to ~/.omp/oracle/<review_key>/meta.json for revive/ask reuse.
     # NOTE: slow-starting oracle (oracle-full/opus reads config, long first

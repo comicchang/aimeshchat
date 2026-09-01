@@ -1,6 +1,6 @@
 ---
 name: persist-oracle
-description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshchat oracle start/ask/status/list/watch/wait/result/revive/attach/release。仅在用户明确说「persist-oracle」「持久化这个 review」时使用；默认咨询走 oracle-consult 的 task 直接调用。
+description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshchat oracle start/ask/status/list/watch/wait/result/revive/attach/release/doctor/gc。仅在用户明确说「persist-oracle」「持久化这个 review」时使用；默认咨询走 oracle-consult 的 task 直接调用。
 ---
 
 # persist-oracle — 持久化多轮 Oracle Review
@@ -10,56 +10,22 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
 >
 > 何时咨询、按困难程度路由、提问模板与追问技巧 → 见 `oracle-consult` skill。
 
-## 原生优先原则
+## 默认行为：复用已有 Oracle
 
-- **OMP（首选 full-capability）**：`omp-config.common.yml` 的 memory 配置
-  （memsearch backend / autoRecall / handoffSaveToDisk）+ parked-revive 机制。
-  runtime 是 tmux 监督的交互式 OMP 进程，可接收 in-loop steer/followUp。
-- **OpenCode（warm-only 降级）**：原生 session DB（SQLite）+ `--session` 续接。
-  已知缺陷：task_id 只在成功路径返回，失败/中断时丢失 → 走 cold snapshot 兜底。
-- generic（无 warm）仅在显式指定时允许。
+- Oracle 会话以 KEY 为唯一标识：`<project>:oracle:<domain>:<topic>[:<model_suffix>]`。
+- `oracle start "$KEY"` 幂等：KEY 已存在时**复用已有 review/session/runtime**，不重复创建。
+- `oracle ask "$KEY"` 一律在已有 backend session 上热投递（hot in-loop，不新开进程）；runtime 未存活时自动走 warm/cold 降级。
+- 多轮 review **复用同一实例** → 上下文完整保留。同一话题不要换新 KEY 重开。
+- 换话题 / 重置上下文 → 用新 KEY，或先 `oracle release "$KEY"` 再 `start`。
 
-## 模型一致性（防漂移）
+## task 工具使用说明（默认咨询路径）
 
-模型权威 = **ExecutionSpec 显式字段**：调用方（skill）直接传 `--model`（及
-`--variant`/`--system`/`--prompt`），代码 `ExecutionSpec.from_args` 只解析：
-显式 `--model` → 主 agent runtime context → execution-context → agents/*.md `model:` 兜底。
+默认的 oracle 咨询不经过本 skill 的 CLI，而是用 `task` 工具直接调用（见 `oracle-consult`）：
 
-### 三档模型参考
-
-使用对应档位的 agent profile，具体模型由该 profile 按环境/provider 决定。
-
-| 档位 | agent profile | 推理强度 | variant 建议 | 适用场景 | 成本 |
-|------|---------------|----------|---------|----------|------|
-| `oracle`（慢思考） | `agents/oracle.md` | 高 | `reasoning` | 架构评审、根因分析、风险评估 | 中 |
-| `oracle-lite`（快思考） | `agents/oracle-lite.md` | 中 | `fast` | 代码质量、日常 review、轻量审查 | 低 |
-| `oracle-opus`（最强推理） | `agents/oracle-opus.md` | 最高 | `balanced` | 安全审计、高风险变更、严格形式化 | 高 |
-
-> 具体模型 = agent profile 的 `model:` 字段，由各 agent 按环境决定。
-> 调用者可通过 `--model` 显式覆盖。skill 不读取、不校验、不硬编码模型值。
-
-### 优先级链
-
-用户 CLI 显式指定（--model/--variant/--system）> 主 agent runtime context 继承 > execution-context > agent profile `model:` 兜底 > 报错。
-
-## 废弃项（勿再使用）
-
-- `--agent`：兼容占位参数，无模型语义——传了只打弃用告警，不参与模型解析。
-- `config.yml` 的 `fallbackChains` / `modelRoles`：不参与模型解析（仅用于配置指纹
-  哈希，检测 manifest 漂移）。
-
-## 绑定语义（A1）
-
-`oracle start` 同步轮询 backend session id ≤60s；慢启动 oracle 超时则返回
-`binding=pending`，**runtime 保持存活**。backend_session_id 后续由 gateway
-`runtime.register` 异步回写 park manifest。status 显示 `binding: pending` 属正常。
-
-## 顾问双模式
-
-- **模式 A：CLI 主会话**（`aimeshchat oracle start/ask/result/wait`）
-- **模式 B：agent-swarm worker**（`OMP_WORKER_ID=oracle` + mailbox REPORT）
-
-两者不冲突，取决于会话是否在 swarm 编排内。
+- `task` 工具**没有 model 字段**——模型由所选 agent 决定（agent profile 的 `model:` 按环境/provider 决定）。
+- 档位通过 `task(agent=...)` 选择：默认 `oracle-lite`，高难度 `oracle`，仅用户明确要求时 `oracle-opus`。**`agent` 参数必须显式传递**，省略会继承主会话模型（防模型漂移）。
+- 需要显式指定模型/变体时走 CLI：`oracle start "$KEY" --model ... --variant ...`。
+- 追问复用同一 task 实例（见 `oracle-consult` 的「追问」），不重新 spawn。
 
 ## CLI 契约
 
@@ -77,9 +43,11 @@ aimeshchat oracle ask "$KEY" '首轮后追加' --wait-binding
 aimeshchat oracle status "$KEY"
 aimeshchat oracle list
 
-# 进度/等待
-aimeshchat oracle watch "$KEY" --exit-on ASSISTANT_PROGRESS
+# 完成等待（主命令）：阻塞到新产出或 agent_end，内联打印最终文本
 aimeshchat oracle wait "$KEY" --timeout 300
+
+# 事件观测（非完成信号）：cursor-resumable 事件流
+aimeshchat oracle watch "$KEY"
 
 # 结果
 aimeshchat oracle result "$KEY"          # JSON
@@ -97,13 +65,42 @@ aimeshchat oracle doctor [--fix]
 aimeshchat oracle gc [--dry-run] [--json]
 ```
 
+## watch：事件观测（不是完成信号）
+
+`oracle watch` 只用于观测运行事件（cursor-resumable 事件流），**不是完成等待**：
+
+- 默认持续输出事件流；`--exit-on <KIND[.STATE]>` 命中首个匹配事件即退出 0。
+- ⚠️ **首个 progress 即返回，不是完成信号**——只说明「有新产出」，完整回答要等 `oracle wait` / `oracle result`。
+- 完成等待请用 `oracle wait "$KEY" --timeout 300`（阻塞到新产出或 agent_end，内联打印最终文本）。
+
+## 模型（CLI 语义）
+
+- 模型由调用者按环境决定：`oracle start` 显式传 `--model`（及 `--variant`/`--system`/`--prompt`）。
+- 优先级链：用户 CLI 显式指定（`--model`/`--variant`/`--system`）> runtime context 继承 > execution-context > agent profile `model:` 兜底 > 报错。
+- skill 不读取、不校验、不硬编码模型值；档位/agent 选择见 `oracle-consult`。
+- `--agent`：兼容占位参数，无模型语义——传了只打弃用告警，不参与模型解析。
+
+## 绑定语义（A1）
+
+`oracle start` 同步轮询 backend session id ≤120s；慢启动 oracle 超时则返回
+`binding=pending`，**runtime 保持存活**。backend_session_id 后续异步回写。
+status 显示 `binding: pending` 属正常。`ask` 在绑定未完成时默认快速失败并提示
+`--wait-binding`（阻塞到绑定完成后再投递）。
+
+## 顾问双模式
+
+- **模式 A：CLI 主会话**（`aimeshchat oracle start/ask/result/wait`）
+- **模式 B：agent-swarm worker**（mailbox REPORT 回报模式，worker 身份由 CLI 自动注入）
+
+两者不冲突，取决于会话是否在 swarm 编排内。
+
 ## 降级策略（Hot→Warm→Cold）
 
-1. **Hot revive**（同进程）：`hub send` 到 parked agent，上下文完整
-2. **Warm resume**（原生 session）：`omp --resume <backend_session_id>` 或 `opencode --session <sid>`
-3. **Cold reconstruction**（新实例 + 快照）：`oracle revive` 自动走 cold 路径
+1. **Hot**（同进程）：复用已存活 runtime 的 backend session，上下文完整
+2. **Warm**（原生 session 续接）：复用已落盘的 backend session id 恢复
+3. **Cold**（新实例 + 快照）：`oracle revive` 自动走 cold 路径重建
 
-每步降级显式报告用户。`ask` 成功 JSON 含 `adopted` 字段。
+由 CLI 自动选择；每步降级显式报告用户。`ask` 成功 JSON 含 `adopted` 字段。
 
 ## 触发条件
 
@@ -116,7 +113,7 @@ aimeshchat oracle gc [--dry-run] [--json]
 | （已在持久会话内）"追加信息" / "追问" / 新证据 | `oracle ask` |
 | （已在持久会话内）"oracle 现在怎么样" | `oracle status` |
 | （已在持久会话内）"有哪些进行中的 oracle review" | `oracle list` |
-| （已在持久会话内）"oracle 回答了什么" / "取结果" | `oracle result` / `oracle wait` |
+| （已在持久会话内）"oracle 回答了什么" / "取结果" | `oracle wait` / `oracle result` |
 | （已在持久会话内）"唤醒已释放的 review" | `oracle revive` / `oracle attach` |
 | （已在持久会话内）"结束 review" / "释放" | `oracle release` |
 
@@ -124,7 +121,7 @@ aimeshchat oracle gc [--dry-run] [--json]
 
 - `oracle gc`：清理过期 released session（hard_expires_at 过期 或 last_activity_at > 2天）
 - 自动触发于 `oracle start` / `oracle list` / `oracle status`（24h 节流）
-- session 隔离：oracle session 存储在 `~/.omp/agent/sessions/_oracle/<safe-key>/`
+- session 隔离：oracle session 按 review key 隔离存储，互不串扰
 
 ## 输出过滤禁令
 
