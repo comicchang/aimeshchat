@@ -65,8 +65,11 @@ class ParkRegistry:
 
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        with sqlite3.connect(str(self._db_path)) as conn:
+        conn = sqlite3.connect(str(self._db_path))
+        try:
             yield conn
+        finally:
+            conn.close()
 
     def _lock(self, key: str) -> SessionLock:
         return SessionLock('park:' + key)

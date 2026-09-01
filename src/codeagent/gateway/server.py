@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import resource
 import socket
 import sys
 import threading
@@ -90,10 +91,23 @@ class GatewayServer:
         self._write_pid_file()
         log.info("gateway listening on %s", self._socket_path)
 
+        # Increase fd limit to prevent EMFILE on accept()
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft < 4096:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 4096), hard))
+        except (ValueError, OSError):
+            pass
+
         while not self._shutdown.is_set():
             try:
                 conn, _addr = sock.accept()
-            except OSError:
+            except OSError as exc:
+                if exc.errno == 24:  # EMFILE
+                    log.warning("gateway: accept EMFILE, sleeping 1s")
+                    import time
+                    time.sleep(1)
+                    continue
                 break
             # P3-12: reject connection when at concurrency cap (64).
             if not self._conn_semaphore.acquire(timeout=0):
