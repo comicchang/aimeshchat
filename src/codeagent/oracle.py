@@ -798,19 +798,41 @@ def _poll_backend_session_id(handle, timeout: float = 120.0, interval: float = 0
     """A1: synchronously bind the backend session id after spawn (≤120s).
 
     Fast path: the handle already carries a ``backend_session_id`` (adapters
-    that resolve it synchronously). Otherwise poll the runtime log for up to
-    *timeout* seconds, scanning for ``session_id=`` / ``backend_session=``.
+    that resolve it synchronously). Otherwise poll two parallel sources:
+      1. Runtime log — scan for ``session_id=`` / ``backend_session=`` markers
+         (opencode runner prints these; OMP plugin does NOT).
+      2. Gateway ``runtime.info`` — the OMP plugin re-registers with the real
+         ``backend_session_id`` on ``session_start``; the gateway's in-memory
+         record is authoritative.
+
+    Source 2 fixes the OMP binding gap: the plugin's initial handshake sends
+    an empty ``backend_session_id`` (session not yet created), then re-
+    registers on ``session_start``.  The log scanner never sees this because
+    the plugin writes to the gateway via RPC, not to the log file.
+
     Returns "" when binding times out (caller must NOT report success).
     """
     direct = getattr(handle, "backend_session_id", "") or ""
     if direct:
         return direct
     log_path = _runtime_log_path(handle)
+    runtime_id = getattr(handle, "runtime_id", "")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        # Source 1: log file scan (opencode / generic backends)
         sid = _scan_runtime_log_for_session_id(log_path)
         if sid:
             return sid
+        # Source 2: gateway runtime.info (OMP plugin re-register path)
+        if runtime_id:
+            try:
+                info = GatewayClient(timeout=2).call(
+                    "runtime.info", {"runtime_id": runtime_id})
+                sid = info.get("backend_session_id", "") or ""
+                if sid:
+                    return sid
+            except Exception:
+                pass  # gateway unreachable or runtime not yet registered
         time.sleep(interval)
     return ""
 

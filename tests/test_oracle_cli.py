@@ -1600,6 +1600,51 @@ class TestOracleUncoveredPaths:
         monkeypatch.setattr("codeagent.oracle._runtime_log_path", lambda _h: None)
         assert _poll_backend_session_id(h, timeout=0.0) == ""
 
+    def test_poll_backend_session_id_from_gateway(self, monkeypatch):
+        """Source 2: log empty but gateway has backend_session_id."""
+        from dataclasses import replace
+
+        from codeagent.oracle import _poll_backend_session_id
+
+        h = replace(_handle("rt-gw"), backend_session_id="")
+        monkeypatch.setattr("codeagent.oracle._runtime_log_path", lambda _h: None)
+        gw_client = MagicMock()
+        gw_client.call.return_value = {"backend_session_id": "ses_from_gw"}
+        monkeypatch.setattr("codeagent.oracle.GatewayClient", lambda **_: gw_client)
+        with patch("codeagent.oracle.time.sleep"):
+            assert _poll_backend_session_id(h, timeout=1.0) == "ses_from_gw"
+
+    def test_poll_backend_session_id_gateway_error_returns_empty(self, monkeypatch):
+        """Source 2: gateway raises → poll times out → returns ''."""
+        from dataclasses import replace
+
+        from codeagent.oracle import _poll_backend_session_id
+
+        h = replace(_handle("rt-gw-err"), backend_session_id="")
+        monkeypatch.setattr("codeagent.oracle._runtime_log_path", lambda _h: None)
+        gw_client = MagicMock()
+        gw_client.call.side_effect = RuntimeError("gateway down")
+        monkeypatch.setattr("codeagent.oracle.GatewayClient", lambda **_: gw_client)
+        assert _poll_backend_session_id(h, timeout=0.0) == ""
+
+    def test_poll_backend_session_id_log_short_circuits_gateway(self, monkeypatch):
+        """Source 1 hit → return immediately, never call gateway."""
+        from dataclasses import replace
+
+        from codeagent.oracle import _poll_backend_session_id
+
+        logp = MagicMock()
+        logp.exists.return_value = True
+        logp.read_text.return_value = "backend_session=ses_log\n"
+        h = replace(_handle("rt-sc"), backend_session_id="")
+        monkeypatch.setattr("codeagent.oracle._runtime_log_path", lambda _h: logp)
+        gw_cls = MagicMock()
+        monkeypatch.setattr("codeagent.oracle.GatewayClient", gw_cls)
+        with patch("codeagent.oracle.time.sleep",
+                   side_effect=AssertionError("must not sleep")):
+            assert _poll_backend_session_id(h, timeout=1.0) == "ses_log"
+        gw_cls.assert_not_called()
+
     # ── _resolve_bound_session_id / lazy sync ────────────────────────
 
     def test_resolve_bound_session_id_manifest(self, tmp_path, monkeypatch):
