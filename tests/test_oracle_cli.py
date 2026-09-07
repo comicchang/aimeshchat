@@ -478,7 +478,7 @@ def test_ask_hot_surfaces_quota_warning(tmp_path, capsys):
     assert code == 0
     err = capsys.readouterr().err
     assert "insufficient_quota" in err
-    assert "oracle-lite" in err
+    assert "cheaper model" in err
 
 
 def test_looks_like_quota():

@@ -103,7 +103,8 @@ aimeshchat gateway rpc --stdio            # SSH 有界控制（session.ensure/ru
 aimeshchat events watch --session <sid> --cursor <c> --jsonl   # 观察事件流（断线补流）
 
 # Park（auto-exit:false 实例生命周期，如 oracle 系列）
-aimeshchat park acquire <review_key> --agent-type oracle --peer-id <id>
+# --agent-type 传实际 agent 名：oracle-gpt / oracle-opus / oracle-gemini / oracle-deepseek / oracle-glm
+aimeshchat park acquire <review_key> --agent-type oracle-gpt --peer-id <id>
 aimeshchat park renew <review_key>
 aimeshchat park release <review_key>
 aimeshchat park sweep
@@ -223,7 +224,7 @@ stats 命令成功 + status.json 存在 ≠ 进程存活（文件可能是历史
 | 场景 | 默认 timeout | 说明 |
 |------|-------------|------|
 | 普通任务 | 600s | `DEFAULT_EXEC_TIMEOUT` |
-| oracle 类 agent | 3600s | `_is_oracle_agent` 自动识别 |
+| oracle 类 agent（oracle-gpt/opus/gemini/deepseek/glm，前缀匹配 `startswith("oracle")`） | 3600s | `_is_oracle_agent` 自动识别 |
 | 远程目标 timeout < 180s | clamp 到 180s | `SSH_IDLE_WINDOW` 保底 |
 
 手动传小值会被远程目标 clamp 到 `SSH_IDLE_WINDOW=180`，传大值覆盖 CLI 的自动调优（oracle 3600s / 远程 180s 保底）。心跳机制（每 30s progress 帧）自动保活慢但正常的 LLM 推理，无需手动延长。
@@ -326,7 +327,7 @@ ssh -G <H> 2>&1 | grep -E "^(host|hostname|user)"
 
 仅关闭自动续接而不换上下文 → `--no-auto-resume`。
 
-显式 `--session-key` 推荐格式：`<project>:<role>:<domain-or-topic>`。不要只写 `oracle`。
+显式 `--session-key` 推荐格式：`<project>:<role>:<domain-or-topic>[:<oracle后缀>]`。不要只写 `oracle`；Oracle 系列请带上厂商后缀（gpt/opus/gemini/deepseek/glm）。
 
 ### 跨实例协作唤醒前提
 
@@ -376,7 +377,7 @@ aimeshchat oracle status "$KEY" | grep "runtime_id"
 模型选择优先级：
 1. 用户显式指定 → 一律 `--model '<用户指定的模型>'`（覆盖一切默认建议）；
 2. 未指定但用了 `--agent <name>` → 按 `~/.omp/agent/agents/<name>.md` frontmatter 的 `model:` 字段运行；
-3. 都未指定 → 不传 `--model`，由 OMP `modelRoles.default` 兜底（当前 work 为 `Mify-mimo/xiaomi/mimo-v2.5-pro`）。
+3. 都未指定 → 不传 `--model`，由 OMP `modelRoles.default` 兜底。
 
 ### ❌ 不要做什么
 

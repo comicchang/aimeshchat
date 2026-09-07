@@ -384,8 +384,9 @@ def _resolve_oracle_model_chain(agent_type: str, explicit_model: str) -> list[st
 
     - ``explicit_model`` 非空 → 单元素 ``[explicit_model]``（用户显式
       --model，永远优先，不被 profile 覆盖）。
-    - 否则读 agent profile 的 model:（oracle → gpt-5.6-sol、oracle-lite →
-      v4-pro、oracle-opus → claude-opus；以 profile 实际值为准）。
+    - 否则读 agent profile 的 model:（oracle-gpt → gpt-5.6-sol、oracle-opus →
+      claude-opus-5、oracle-gemini/deepseek/glm → 对应厂商模型；以 profile
+      实际值为准）。
     - 空/未知 agent → ``_normalize_oracle_agent`` 归一为明确默认 oracle。
     - 全部缺失 → ``[]``（调用方显式处理，不静默降级）。
     """
@@ -1301,7 +1302,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                 "warning": "insufficient_quota",
                 "review_key": review_key,
                 "detail": quota[:300],
-                "degrade_hint": "primary model quota exhausted — retry with oracle-lite or a cheaper model",
+                "degrade_hint": "primary model quota exhausted — retry with a cheaper model or an explicit --model",
             }, indent=2), file=sys.stderr)
     except GatewayError as exc:
         # 改进项3: the hot path always degrades to warm/cold — log WHY the

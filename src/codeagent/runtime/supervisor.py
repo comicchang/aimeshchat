@@ -490,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
             "model": spec.model,
             "detail": quota_hit[:400],
             "degrade_hint": "model quota exhausted — retry with a cheaper model "
-                            "(oracle-lite / default chain) or wait for quota reset",
+                            "(explicit --model or the default chain) or wait for quota reset",
         })
     _report(spec.gateway_socket, spec, "RUNTIME_STATE", {
         "state": "agent_exited", "exit_code": rc,

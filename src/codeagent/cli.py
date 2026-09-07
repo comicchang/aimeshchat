@@ -233,14 +233,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     park_release_p = park_sub.add_parser("release", help="Release a park instance")
     park_release_p.add_argument("review_key", help="Review key")
-    park_release_p.add_argument("--agent-type", help="Agent type (oracle/oracle-lite/etc)")
+    park_release_p.add_argument("--agent-type", help="Agent type (oracle-gpt/oracle-opus/oracle-gemini/oracle-deepseek/oracle-glm)")
     park_release_p.add_argument("--peer-id", help="OMP peer agent ID")
     park_release_p.add_argument("--mailbox-id", help="Mailbox agent ID")
     park_release_p.add_argument("--backend-id", help="Backend session ID")
 
     park_acquire_p = park_sub.add_parser("acquire", help="Acquire a park instance")
     park_acquire_p.add_argument("review_key", help="Review key")
-    park_acquire_p.add_argument("--agent-type", default="oracle", help="Agent type (oracle/oracle-lite/etc)")
+    park_acquire_p.add_argument("--agent-type", default="oracle", help="Agent type (oracle-gpt/oracle-opus/oracle-gemini/oracle-deepseek/oracle-glm; bare 'oracle' kept for back-compat)")
     park_acquire_p.add_argument("--peer-id", default="", help="OMP peer agent ID")
     park_acquire_p.add_argument("--mailbox-id", default="", help="Mailbox agent ID")
     park_acquire_p.add_argument("--backend-id", default="", help="Backend session ID")

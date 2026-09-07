@@ -23,16 +23,21 @@
       "model": "provider/reasoning-model",
       "description": "Code review"
     },
-    "oracle-lite": {
-      "backend": "codex",
-      "model": "provider/fast-model",
-      "description": "Cost-effective code review advisor"
-    },
-    "oracle": {
+    "oracle-gpt": {
       "backend": "codex",
       "model": "provider/strong-model",
-      "description": "Persistent context technical advisor",
+      "description": "Technical advisor (GPT) — pick the vendor-suffixed Oracle explicitly",
       "yolo": true
+    },
+    "oracle-opus": {
+      "backend": "claude",
+      "model": "provider/strongest-model",
+      "description": "Technical advisor (Claude Opus)"
+    },
+    "oracle-gemini": {
+      "backend": "opencode",
+      "model": "provider/long-context-model",
+      "description": "Technical advisor (Gemini)"
     }
   }
 }

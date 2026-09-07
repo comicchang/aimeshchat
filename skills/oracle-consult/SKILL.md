@@ -1,11 +1,11 @@
 ---
 name: oracle-consult
-description: 何时、如何向 Oracle 提问，并按困难程度路由到 oracle-lite / oracle。覆盖调用纪律、上下文收集、标准 prompt 模板与追问技巧。默认直接咨询，不走 persist-oracle 除非用户明确要求。
+description: 何时、如何向 Oracle 提问。必须显式指定 oracle-gpt / oracle-opus / oracle-gemini / oracle-deepseek / oracle-glm（或对应供应商 OpenAI/Anthropic/Google/DeepSeek/智谱）；覆盖调用纪律、上下文收集、标准 prompt 模板与追问技巧。默认直接咨询，不走 persist-oracle 除非用户明确要求。
 ---
 
 # oracle-consult — Oracle 咨询工作流
 
-> 本 skill 管「该不该问、问哪个档、怎么组织问题、怎么追问」。
+> 本 skill 管「该不该问、问哪个 Oracle、怎么组织问题、怎么追问」。
 > 具体调用方式因 harness 而异，本 skill 只规定咨询内容，不限定调用形式。
 
 ## 调用纪律（该不该问）
@@ -21,29 +21,31 @@ Agent 主动咨询 → 需全部满足：
 禁止：
 - 每步都问「下一步」
 - 同题换说法反复问
-- 用 oracle / oracle-opus 做 explore / 格式审查（这类走本地工具或 oracle-lite）
+- 用 Oracle 做 explore / 格式审查（这类走本地工具或 task agent）
 - 咨询可本地 5 分钟验证的低价值问题
 
-## 档位选择（场景驱动）
+## Oracle 选择（必须显式）
 
-按困难程度选择档位，具体模型由 harness 按环境/provider 决定，本 skill 不读取、不校验、不硬编码模型值。
+咨询 Oracle 时**必须显式指定**使用哪一个 Oracle；未指定时**先向用户询问**，不要自行默认。
 
-| 档位 | 适用场景 | 推理强度 | 成本 |
-|------|----------|----------|------|
-| **oracle-lite**（默认） | 代码审查、文档质量、测试覆盖、格式审查、日常问题 | 中 | 低 |
-| **oracle** | 架构 trade-off、根因分析、风险评审、跨领域问题 | 高 | 中 |
-| **oracle-opus** | **仅用户明确要求时使用** | 最高 | 高 |
+| Oracle | 厂商 | 相对成本 | 适用场景 |
+|--------|------|----------|----------|
+| **oracle-gpt** | OpenAI | 低 | 架构 trade-off、根因分析、风险评审 |
+| **oracle-opus** | Anthropic | 中（高推理开销） | 复杂架构决策、根因分析 |
+| **oracle-gemini** | Google | 低～中（按环境差异大） | 长上下文、多模态相关咨询 |
+| **oracle-deepseek** | DeepSeek | 低 | 1M 上下文、长文档深度顾问 |
+| **oracle-glm** | 智谱 | 中 | 中文/agentic 强、工具调用密集 |
 
-**默认规则**：用户说「咨询 oracle」→ 用 `oracle-lite`，除非：
-- 场景命中高难度行（架构 trade-off / 同题多次失败 / 上线前风险评审 / 跨领域），或
-- 用户明确说「用 oracle」「用 full oracle」
-- **oracle-opus 除非用户明确说「用 opus」「用 oracle-opus」，否则禁止使用。**
+> **具体路由与单价由部署方的权威配置决定**（不同机器/环境的 provider 与价格不同）。
+> 本 skill 不硬编码模型 ID 或价格；调用前请从部署方配置读取实际成本，并向用户报出预期费用后再发起。
+
+**无默认 Oracle**：用户说「咨询 oracle」但未说明厂商时，必须追问「用 oracle-gpt、oracle-opus、oracle-gemini、oracle-deepseek 还是 oracle-glm？」。用户也可直接指定供应商：OpenAI→oracle-gpt、Anthropic→oracle-opus、Google→oracle-gemini、DeepSeek→oracle-deepseek、智谱→oracle-glm。
+
+> **跨 runtime 命名映射**：OMP / codeagent 使用 `oracle-gpt`；OpenCode oh-my-openagent 保留裸 `oracle`（历史兼容），两者都指向 GPT 系列。其余后缀名在所有 runtime 一致。
 
 ## 咨询方式
 
-具体调用方式因 harness 而异（工具调用、CLI、持久化会话等），本 skill 只规定咨询内容，不限定调用形式。
-
-- **默认**：直接发起一次咨询，默认 `oracle-lite`，高难度 `oracle`，用户要求时 `oracle-opus`；prompt 中包含收集好的上下文，完成后告知用户咨询结论来源。
+- **默认**：直接发起一次咨询，prompt 中包含收集好的上下文，完成后告知用户咨询结论来源与所用 Oracle。
 - **追问**：复用同一咨询实例发送增量问题，不要重新发起。
 - **持久化**：仅用户明确说「persist-oracle」「持久化这个 review」时，才走持久化流程（见 `persist-oracle` skill）。
 
@@ -125,7 +127,7 @@ memory_search / history / git log。只追加：
 |------|------|
 | 先 explore 再 Oracle | explore 收集后一次性传给 Oracle |
 | 压缩上下文 | 只传相关文件/函数，不传整个目录 |
-| 默认 oracle-lite | 文档/格式/测试覆盖不需要最强模型 |
+| 显式选择 Oracle | 不要默认选最贵的；按问题难度选 oracle-gpt / oracle-gemini / oracle-deepseek / oracle-glm |
 | 限制轮次 | 同一 session 不超过 3-5 轮追问 |
 | 实例复用 | 多轮 review 复用同一实例，避免重复上下文 |
-| 禁止 oracle-opus | 除非用户明确要求，否则不使用（太贵） |
+| 禁止 oracle-opus | 除非用户明确要求，否则不使用（高推理开销） |

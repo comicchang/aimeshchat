@@ -176,7 +176,7 @@ If all are absent the command fails and asks for `--model`.
 - `--agent` is a deprecated compatibility placeholder with **no model
   semantics** (passing it emits a deprecation warning). Pass
   `--model`/`--variant`/`--system` explicitly.
-- Oracle advisors (`oracle` / `oracle-lite` / `oracle-opus`) work the same
+- Oracle advisors (`oracle-gpt` / `oracle-opus` / `oracle-gemini` / `oracle-deepseek` / `oracle-glm`, plus the bare `oracle` alias) work the same
   way — the skill owns the model/prompt strategy and passes it explicitly;
   see `skills/persist-oracle/SKILL.md`.
 

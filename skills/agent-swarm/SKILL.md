@@ -80,6 +80,8 @@ source /tmp/attach-w1.sh && omp        # 身份 env 随进程注入，插件轮�
 `$OMP_WORKER_ID` unset does **NOT** default to Worker — role is undetermined → error.
 Manager role = manifest `manager`; Worker role = roster member ≠ manager.
 
+**Oracle/顾问任务分派必须显式指定**：agent 名称（OMP 用 `oracle-gpt`/`oracle-opus`/`oracle-gemini`/`oracle-deepseek`/`oracle-glm`；OpenCode 保留裸 `oracle`，等价于 GPT 版）、模型名，或供应商（OpenAI/Anthropic/Google/DeepSeek/智谱）。禁止让 Manager 自行挑选默认 Oracle。
+
 Read **one** role file based on your role:
 
 | Role | Load |
