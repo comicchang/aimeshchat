@@ -1,6 +1,6 @@
 ---
 name: oracle-consult
-description: 何时、如何向 Oracle 提问。必须显式指定 oracle-gpt / oracle-opus / oracle-gemini / oracle-deepseek / oracle-glm（或对应供应商 OpenAI/Anthropic/Google/DeepSeek/智谱）；覆盖调用纪律、上下文收集、标准 prompt 模板与追问技巧。默认直接咨询，不走 persist-oracle 除非用户明确要求。
+description: 何时、如何向顾问 agent 提问。必须显式指定 agent role；覆盖调用纪律、上下文收集、标准 prompt 模板与追问技巧。默认直接咨询，不走 persist-oracle 除非用户明确要求。
 ---
 
 # oracle-consult — Oracle 咨询工作流
@@ -24,28 +24,26 @@ Agent 主动咨询 → 需全部满足：
 - 用 Oracle 做 explore / 格式审查（这类走本地工具或 task agent）
 - 咨询可本地 5 分钟验证的低价值问题
 
-## Oracle 选择（必须显式）
+## 顾问 role 选择（必须显式）
 
-咨询 Oracle 时**必须显式指定**使用哪一个 Oracle；未指定时**先向用户询问**，不要自行默认。
+咨询顾问时**必须显式指定 agent role**；未指定时先向用户询问，不自行默认。
 
-| Oracle | 厂商 | 相对成本 | 适用场景 |
-|--------|------|----------|----------|
-| **oracle-gpt** | OpenAI | 低 | 架构 trade-off、根因分析、风险评审 |
-| **oracle-opus** | Anthropic | 中（高推理开销） | 复杂架构决策、根因分析 |
-| **oracle-gemini** | Google | 低～中（按环境差异大） | 长上下文、多模态相关咨询 |
-| **oracle-deepseek** | DeepSeek | 低 | 1M 上下文、长文档深度顾问 |
-| **oracle-glm** | 智谱 | 中 | 中文/agentic 强、工具调用密集 |
+| Agent role | 适用场景 |
+|------------|----------|
+| oracle-gpt | 架构 trade-off、根因分析、风险评审 |
+| oracle-opus | 复杂架构决策、根因分析 |
+| oracle-gemini | 长上下文、多模态相关咨询 |
+| oracle-deepseek / oracle-glm | 中文分析、工具调用密集任务 |
 
-> **具体路由与单价由部署方的权威配置决定**（不同机器/环境的 provider 与价格不同）。
-> 本 skill 不硬编码模型 ID 或价格；调用前请从部署方配置读取实际成本，并向用户报出预期费用后再发起。
+> role 到 runtime/backend 的映射由部署方权威配置决定；本 skill 不硬编码具体模型、厂商或价格。
 
-**无默认 Oracle**：用户说「咨询 oracle」但未说明厂商时，必须追问「用 oracle-gpt、oracle-opus、oracle-gemini、oracle-deepseek 还是 oracle-glm？」。用户也可直接指定供应商：OpenAI→oracle-gpt、Anthropic→oracle-opus、Google→oracle-gemini、DeepSeek→oracle-deepseek、智谱→oracle-glm。
+**无默认顾问**：用户说「咨询顾问」但未说明 agent role 时，必须先询问 role。
 
-> **跨 runtime 命名映射**：OMP / codeagent 使用 `oracle-gpt`；OpenCode oh-my-openagent 保留裸 `oracle`（历史兼容），两者都指向 GPT 系列。其余后缀名在所有 runtime 一致。
+> 跨 runtime 的 role 名称映射由部署配置提供；本 skill 不维护 provider 或模型名称映射。
 
 ## 咨询方式
 
-- **默认**：直接发起一次咨询，prompt 中包含收集好的上下文，完成后告知用户咨询结论来源与所用 Oracle。
+- **默认**：直接发起一次咨询，prompt 中包含收集好的上下文，完成后告知用户咨询结论来源与所用 agent role。
 - **追问**：复用同一咨询实例发送增量问题，不要重新发起。
 - **持久化**：仅用户明确说「persist-oracle」「持久化这个 review」时，才走持久化流程（见 `persist-oracle` skill）。
 
@@ -121,13 +119,13 @@ memory_search / history / git log。只追加：
 - 反方审查：「请从反对者角度指出最可能失败在哪里」
 - 拆 commit：「把方案拆成可在一个 commit 内完成的最小步骤」
 
-## 成本优化
+## 轮次与上下文优化
 
 | 方案 | 说明 |
 |------|------|
-| 先 explore 再 Oracle | explore 收集后一次性传给 Oracle |
+| 先 explore 再咨询 | explore 收集后一次性传给顾问 |
 | 压缩上下文 | 只传相关文件/函数，不传整个目录 |
-| 显式选择 Oracle | 不要默认选最贵的；按问题难度选 oracle-gpt / oracle-gemini / oracle-deepseek / oracle-glm |
+| 显式选择 agent role | 按问题难度选择合适 role，不让部署默认值悄悄改变审查级别 |
 | 限制轮次 | 同一 session 不超过 3-5 轮追问 |
 | 实例复用 | 多轮 review 复用同一实例，避免重复上下文 |
-| 禁止 oracle-opus | 除非用户明确要求，否则不使用（高推理开销） |
+| 高开销顾问 role | 除非用户明确要求，否则不使用 |

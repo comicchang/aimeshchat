@@ -46,7 +46,7 @@ requires:
 # 路由（同步，阻塞到完成）
 aimeshchat route list
 aimeshchat route where <topic>
-printf '%s\n' '<task>' | aimeshchat route <topic> --repo 0 --model <provider/model>
+printf '%s\n' '<task>' | aimeshchat route <topic> --repo 0
 aimeshchat route <topic> '<task>' --dry-run
 
 # 异步执行（route/run 均支持 --background；先 where 查映射）
@@ -57,7 +57,7 @@ aimeshchat job status <job_id>                        # 查进度（不阻塞）
 aimeshchat job wait <job_id> [--timeout <秒>]         # 阻塞到完成，结果在 JSON 的 stdout 字段
 
 # 直接执行（同步）
-aimeshchat run '<task>' <workdir> --host <host> --model <provider/model>
+aimeshchat run '<task>' <workdir> --host <host>
 
 # Session 管理
 aimeshchat sessions list [--host H] [--topic T]
@@ -103,8 +103,8 @@ aimeshchat gateway rpc --stdio            # SSH 有界控制（session.ensure/ru
 aimeshchat events watch --session <sid> --cursor <c> --jsonl   # 观察事件流（断线补流）
 
 # Park（auto-exit:false 实例生命周期，如 oracle 系列）
-# --agent-type 传实际 agent 名：oracle-gpt / oracle-opus / oracle-gemini / oracle-deepseek / oracle-glm
-aimeshchat park acquire <review_key> --agent-type oracle-gpt --peer-id <id>
+# --agent-type 传部署配置中的 agent role
+aimeshchat park acquire <review_key> --agent-type <agent-role> --peer-id <id>
 aimeshchat park renew <review_key>
 aimeshchat park release <review_key>
 aimeshchat park sweep
@@ -224,16 +224,16 @@ stats 命令成功 + status.json 存在 ≠ 进程存活（文件可能是历史
 | 场景 | 默认 timeout | 说明 |
 |------|-------------|------|
 | 普通任务 | 600s | `DEFAULT_EXEC_TIMEOUT` |
-| oracle 类 agent（oracle-gpt/opus/gemini/deepseek/glm，前缀匹配 `startswith("oracle")`） | 3600s | `_is_oracle_agent` 自动识别 |
+| 长驻顾问 role | 3600s | `_is_oracle_agent` 按 profile 语义识别 |
 | 远程目标 timeout < 180s | clamp 到 180s | `SSH_IDLE_WINDOW` 保底 |
 
-手动传小值会被远程目标 clamp 到 `SSH_IDLE_WINDOW=180`，传大值覆盖 CLI 的自动调优（oracle 3600s / 远程 180s 保底）。心跳机制（每 30s progress 帧）自动保活慢但正常的 LLM 推理，无需手动延长。
+手动传小值会被远程目标 clamp 到 `SSH_IDLE_WINDOW=180`，传大值覆盖 CLI 的自动调优（长驻顾问 role 使用 3600s / 远程 180s 保底）。心跳机制（每 30s progress 帧）自动保活慢但正常的 agent 推理，无需手动延长。
 
 ```bash
 # ✗ 手动传 timeout
 aimeshchat run '分析代码' ~/src --host yellow --timeout 3600
 
-# ✓ 让 CLI 自动管理（oracle agent 自动 3600s，普通 600s）
+# ✓ 让 CLI 自动管理（顾问 role 与普通 role 使用各自默认 timeout）
 aimeshchat run '分析代码' ~/src --host yellow
 ```
 
@@ -327,7 +327,7 @@ ssh -G <H> 2>&1 | grep -E "^(host|hostname|user)"
 
 仅关闭自动续接而不换上下文 → `--no-auto-resume`。
 
-显式 `--session-key` 推荐格式：`<project>:<role>:<domain-or-topic>[:<oracle后缀>]`。不要只写 `oracle`；Oracle 系列请带上厂商后缀（gpt/opus/gemini/deepseek/glm）。
+显式 `--session-key` 推荐格式：`<project>:<role>:<domain-or-topic>[:<advisor-role>]`。不要只写泛化 role；顾问 role 必须由部署配置明确解析。
 
 ### 跨实例协作唤醒前提
 
@@ -374,17 +374,17 @@ aimeshchat oracle status "$KEY" | grep "runtime_id"
 | 续接上次对话 | 重发同命令；需要全新上下文加 `--new-session` |
 | 并发执行 | 多个 `run ... --background` + `aimeshchat job status/wait` |
 
-模型选择优先级：
-1. 用户显式指定 → 一律 `--model '<用户指定的模型>'`（覆盖一切默认建议）；
-2. 未指定但用了 `--agent <name>` → 按 `~/.omp/agent/agents/<name>.md` frontmatter 的 `model:` 字段运行；
-3. 都未指定 → 不传 `--model`，由 OMP `modelRoles.default` 兜底。
+agent role 选择优先级：
+1. 用户显式指定 → 使用该 agent role，由部署配置解析执行后端；
+2. 未指定但用了 `--agent <name>` → 按 agent profile 的 role 配置运行；
+3. 都未指定 → 不传 role，由 runtime 默认配置决定；无法解析时显式报错。
 
 ### ❌ 不要做什么
 
 | 禁止 | 替代 |
 |------|------|
 | 调用 `~/.claude/bin/codeagent-wrapper`（已废弃下线） | 上表 `aimeshchat run` |
-| 当前会话模型无授权却直读受限路径（如 `vendor/`） | 豁免：当前模型本身是 xiaomi 私有系（MiMo/kimi）或用户明确授权 → 可直接读写；否则走 `private-code-*` 委派 |
+| 当前会话 role 无授权却直读受限路径（如 `vendor/`） | 豁免：当前 role 本身具备私有代码访问权限或用户明确授权 → 可直接读写；否则走 `private-code-*` 委派 |
 | 旧参数 `--parallel` | 多个 `run ... --background`（见「✅ 要做什么」并发执行行） |
 
 ### 🔧 需要时怎么做

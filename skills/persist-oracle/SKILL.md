@@ -1,6 +1,6 @@
 ---
 name: persist-oracle
-description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshchat oracle start/ask/status/list/watch/wait/result/revive/attach/release/doctor/gc。仅在用户明确说「persist-oracle」「持久化这个 review」时使用；默认咨询走 oracle-consult 的 task 直接调用。必须显式指定 oracle-gpt / oracle-opus / oracle-gemini / oracle-deepseek / oracle-glm（或对应供应商）。
+description: 持久化多轮顾问 review — 保留上下文。仅用 aimeshchat oracle start/ask/status/list/watch/wait/result/revive/attach/release/doctor/gc。仅在用户明确说「persist-oracle」「持久化这个 review」时使用；默认咨询走 oracle-consult 的 task 直接调用。
 ---
 
 # persist-oracle — 持久化多轮 Oracle Review
@@ -8,26 +8,24 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
 > **使用时机**：仅在用户明确说「persist-oracle」「持久化这个 review」「用 persist-oracle 工具」时使用。
 > 默认的 oracle 咨询走 `oracle-consult` skill 的 `task` 直接调用，不走本 skill。
 >
-> 何时咨询、Oracle 选择、价格、提问模板与追问技巧 → 见 `oracle-consult` skill。
+> role 选择、提问模板与追问技巧 → 见 `oracle-consult` skill。
 
-## 前提：显式指定 Oracle
+## 前提：显式指定 agent role
 
-启动持久 review 前**必须明确**使用哪个 Oracle；未指定时先问用户。
+启动持久 review 前**必须明确**使用哪个 agent role；未指定时先问用户。
 
-| Oracle | 厂商 | 相对成本 |
-|--------|------|----------|
-| oracle-gpt | OpenAI | 低 |
-| oracle-opus | Anthropic | 中（高推理开销） |
-| oracle-gemini | Google | 低～中（按环境差异大） |
-| oracle-deepseek | DeepSeek | 低 |
-| oracle-glm | 智谱 | 中 |
+| Agent role | 适用场景 |
+|------------|----------|
+| oracle-gpt | 架构 trade-off、根因分析、风险评审 |
+| oracle-opus | 复杂架构决策、根因分析 |
+| oracle-gemini | 长上下文、多模态相关咨询 |
+| oracle-deepseek / oracle-glm | 中文分析、工具调用密集任务 |
 
-> **具体路由与单价由部署方的权威配置决定**；本 skill 不硬编码模型 ID 或价格，
-> 调用前请从部署方配置读取实际成本并告知用户。详见 `oracle-consult`。
+> role 到 runtime/backend 的映射由部署方权威配置决定；本 skill 不硬编码具体模型、厂商或价格。
 
 ## 默认行为：复用已有 Oracle
 
-- Oracle 会话以 KEY 为唯一标识：`<project>:oracle:<domain>:<topic>[:<model_suffix>]`；`model_suffix` 用 `gpt` / `opus` / `gemini` / `deepseek` / `glm`。
+- Oracle 会话以 KEY 为唯一标识：`<project>:advisor:<domain>:<topic>[:<role_suffix>]`；`role_suffix` 由部署配置定义。
 - `oracle start "$KEY"` 幂等：KEY 已存在时**复用已有 review/session/runtime**，不重复创建。
 - `oracle ask "$KEY"` 一律在已有 backend session 上热投递（hot in-loop，不新开进程）；runtime 未存活时自动走 warm/cold 降级。
 - 多轮 review **复用同一实例** → 上下文完整保留。同一话题不要换新 KEY 重开。
@@ -37,18 +35,17 @@ description: 持久化多轮 Oracle review — 保留上下文。仅用 aimeshch
 
 默认的 oracle 咨询不经过本 skill 的 CLI，而是用 `task` 工具直接调用（见 `oracle-consult`）：
 
-- `task` 工具**没有 model 字段**——模型由所选 agent 决定。
-- **必须显式传递** `agent=oracle-gpt` / `agent=oracle-opus` / `agent=oracle-gemini` / `agent=oracle-deepseek` / `agent=oracle-glm`；省略会继承主会话模型（防模型漂移）。
-- 需要显式指定模型/变体时走 CLI：`oracle start "$KEY" --model ... --variant ...`。
+- 运行时没有独立 role 参数时，必须由调用方通过 runtime context 或部署配置提供 role；省略 role 仅在该上下文明确存在时允许。
+- 首轮 `oracle start` 使用当前 runtime role context；本 skill 不在命令中写入具体模型或 provider。
 - 追问复用同一 task 实例（见 `oracle-consult` 的「追问」），不重新 spawn。
 
 ## CLI 契约
 
 ```
-KEY='<project>:oracle:<domain>:<topic>[:gpt|opus|gemini|deepseek|glm]'
+KEY='<project>:advisor:<domain>:<topic>[:<role_suffix>]'
 
-# 首轮：新建 review/session/runtime（--model 由调用者按显式 Oracle 决定）
-aimeshchat oracle start "$KEY" --model <所选 Oracle 的模型> --variant reasoning --system "..." --prompt '初始问题'
+# 首轮：新建 review/session/runtime；role mapping 必须已由 runtime context 或部署配置提供
+aimeshchat oracle start "$KEY" --variant reasoning --system "..." --prompt '初始问题'
 
 # 追加/追问：hot in-loop send（同 backend session，不新开进程）
 aimeshchat oracle ask "$KEY" '追加信息'
@@ -88,12 +85,12 @@ aimeshchat oracle gc [--dry-run] [--json]
 - ⚠️ **首个 progress 即返回，不是完成信号**——只说明「有新产出」，完整回答要等 `oracle wait` / `oracle result`。
 - 完成等待请用 `oracle wait "$KEY" --timeout 300`（阻塞到新产出或 agent_end，内联打印最终文本）。
 
-## 模型（CLI 语义）
+## Role binding（CLI 语义）
 
-- 模型由调用者按显式 Oracle 决定：`oracle start` 显式传 `--model`（及 `--variant`/`--system`/`--prompt`）。
-- 优先级链：用户 CLI 显式指定（`--model`/`--variant`/`--system`）> runtime context 继承 > execution-context > agent profile `model:` 兜底 > 报错。
-- skill 的价格表与 `oracle-consult` 同步维护（同一权威来源，改动需两处同步）；CLI 本身不读取、不校验模型值，模型由调用者按显式 Oracle 传入。
-- `--agent`：兼容占位参数，无模型语义——传了只打弃用告警，不参与模型解析。
+- role 到 runtime/backend 的映射来自调用方上下文或部署配置。
+- 本 skill 不硬编码具体模型名称、厂商或价格。
+- 调用方显式传入的运行参数优先于默认上下文；缺少有效 role mapping 时必须报错，不静默猜测。
+- `--agent` 仅保留兼容语义，不作为 skill 内的具体模型选择入口。
 
 ## 绑定语义（A1）
 

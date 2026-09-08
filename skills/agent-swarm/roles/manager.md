@@ -223,10 +223,10 @@ If Worker fails to follow v2 protocol (hand-written JSON, no polling, no status 
 
 ## 9. Park Lifecycle（Agent Park/复活机制）
 
-某些 Agent 类型（OMP：oracle-gpt/oracle-opus/oracle-gemini/oracle-deepseek/oracle-glm；OpenCode：oracle/oracle-opus/oracle-gemini/oracle-deepseek/oracle-glm；以及 prometheus）配置了 `auto-exit: false`，
+某些顾问 agent role 配置了 `auto-exit: false`，
 任务完成后保持 parked 状态，可被 `hub send` 唤醒（上下文完整保留）。
 
-分派 Oracle/顾问类任务时，Manager **必须显式指定** agent 或模型/供应商名称；不要依赖默认档位。
+分派顾问类任务时，Manager **必须显式指定 agent role**；不要依赖默认档位。
 
 ### Manager 职责
 
