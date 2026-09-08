@@ -1,0 +1,38 @@
+{
+  "mcp": {
+    "serena": {
+      "type": "local",
+      "command": [
+        "~/.claude/bin/serena",
+        "start-mcp-server",
+        "--project-from-cwd",
+        "--open-web-dashboard",
+        "false",
+        "--tool-timeout",
+        "600"
+      ],
+      "enabled": true
+    },
+    "frida-mcp": {
+      "type": "local",
+      "command": [
+        "~/.claude/bin/frida-mcp"
+      ],
+      "enabled": true
+    },
+    "lldb-mcp": {
+      "type": "local",
+      "command": [
+        "~/.claude/bin/lldb-mcp"
+      ],
+      "enabled": true
+    },
+    "drawio": {
+      "type": "local",
+      "command": [
+        "~/.claude/bin/drawio-mcp"
+      ],
+      "enabled": true
+    }
+  }
+}

@@ -1,0 +1,8 @@
+[mcp_servers.frida-mcp]
+type = "stdio"
+command = "~/.claude/bin/frida-mcp"
+args = []
+[mcp_servers.lldb-mcp]
+type = "stdio"
+command = "~/.claude/bin/lldb-mcp"
+args = []

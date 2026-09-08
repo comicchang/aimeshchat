@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "packs": {
+    "lsp": {
+      "files": {
+        ".claude/settings.json": {
+          "json": {
+            "mcpServers": {
+              "serena": {
+                "command": "~/.claude/bin/serena",
+                "args": [
+                  "start-mcp-server",
+                  "--project-from-cwd",
+                  "--open-web-dashboard",
+                  "false",
+                  "--tool-timeout",
+                  "600"
+                ]
+              }
+            }
+          }
+        },
+        "opencode.json": {
+          "json": {
+            "mcp": {
+              "serena": {
+                "type": "local",
+                "command": [
+                  "~/.claude/bin/serena",
+                  "start-mcp-server",
+                  "--project-from-cwd",
+                  "--open-web-dashboard",
+                  "false",
+                  "--tool-timeout",
+                  "600"
+                ],
+                "enabled": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "debug": {
+      "files": {
+        ".claude/settings.json": {
+          "json": {
+            "mcpServers": {
+              "frida-mcp": {
+                "command": "~/.claude/bin/frida-mcp",
+                "args": []
+              },
+              "lldb-mcp": {
+                "command": "~/.claude/bin/lldb-mcp",
+                "args": []
+              }
+            }
+          }
+        },
+        ".codex/config.toml": {
+          "toml": {
+            "mcp_servers.frida-mcp": {
+              "type": "stdio",
+              "command": "~/.claude/bin/frida-mcp",
+              "args": []
+            },
+            "mcp_servers.lldb-mcp": {
+              "type": "stdio",
+              "command": "~/.claude/bin/lldb-mcp",
+              "args": []
+            }
+          }
+        },
+        "opencode.json": {
+          "json": {
+            "mcp": {
+              "frida-mcp": {
+                "type": "local",
+                "command": [
+                  "~/.claude/bin/frida-mcp"
+                ],
+                "enabled": true
+              },
+              "lldb-mcp": {
+                "type": "local",
+                "command": [
+                  "~/.claude/bin/lldb-mcp"
+                ],
+                "enabled": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "doc": {
+      "files": {
+        ".claude/settings.json": {
+          "json": {
+            "mcpServers": {
+              "drawio": {
+                "command": "~/.claude/bin/drawio-mcp",
+                "args": []
+              }
+            }
+          }
+        },
+        "opencode.json": {
+          "json": {
+            "mcp": {
+              "drawio": {
+                "type": "local",
+                "command": [
+                  "~/.claude/bin/drawio-mcp"
+                ],
+                "enabled": true
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "created_files": {
+    ".claude/settings.json": true,
+    "opencode.json": true,
+    ".codex/config.toml": true
+  }
+}
