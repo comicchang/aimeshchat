@@ -124,8 +124,11 @@ def _raise(exc: Exception):
 
 
 class TestOracleAsk:
-    def test_ask_hot_in_loop(self, tmp_path: Path, capsys):
+    def test_ask_hot_in_loop(self, tmp_path: Path, monkeypatch, capsys):
         """Live runtime → in-loop send, method=hot, receipt msg_id returned."""
+        from codeagent.oracle import _parse_iso_ts, _read_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
         ns = _NS(review_key="k1", prompt="follow up", agent="oracle", backend="omp")
         info = {
             "runtime_id": "rt-1", "status": "active", "backend_session_id": "b1",
@@ -134,7 +137,13 @@ class TestOracleAsk:
         gw = MagicMock()
         gw.call.side_effect = lambda m, p=None: (
             info if m == "runtime.info" else
-            {"msg_id": "m-123", "status": "delivered"} if m == "runtime.send" else {}
+            # Full gateway command receipt (§3) — echoes the generated
+            # request_id back so the CLI must output it verbatim.
+            {"request_id": p["request_id"], "command_id": "cmd-1",
+             "msg_id": "m-123", "turn_id": "turn-1", "runtime_id": "rt-1",
+             "generation": 3, "state": "QUEUED", "status": "mailbox_persisted",
+             "detail": {"mailbox": "persisted"}}
+            if m == "runtime.send" else {}
         )
         with patch("codeagent.oracle._gateway", return_value=gw):
             code = cmd_oracle_ask(ns)
@@ -143,15 +152,29 @@ class TestOracleAsk:
         out = json.loads(capsys.readouterr().out)
         assert out["method"] == "hot_pending_ack"
         assert out["msg_id"] == "m-123"
-        # send went to the live runtime with require_ack
+        # Receipt contract: generated request id bound + gateway receipt echoed.
         send_params = gw.call.call_args_list[1][0][1]
         assert send_params["runtime_id"] == "rt-1"
         assert send_params["require_ack"] is True
+        assert send_params["request_id"].startswith("ask-")
+        assert out["request_id"] == send_params["request_id"]
+        assert out["command_id"] == "cmd-1"
+        assert out["state"] == "QUEUED"
+        assert out["generation"] == 3
+        assert out["detail"] == {"mailbox": "persisted"}
+        # Latest-ask anchor persisted after the confirmed enqueue.
+        meta = _read_oracle_meta("k1")
+        assert meta["last_request_id"] == out["request_id"]
+        assert meta["last_command_state"] == "QUEUED"
+        assert meta["last_generation"] == 3
+        assert _parse_iso_ts(meta["last_ask_at"]) is not None
 
-    def test_ask_warm_resume_native_session(self, tmp_path: Path, capsys):
+    def test_ask_warm_resume_native_session(self, tmp_path: Path, monkeypatch, capsys):
         """No live runtime, but park has backend_session_id → native resume."""
+        from codeagent.oracle import _read_oracle_meta
         from codeagent.park.registry import ParkRegistry
 
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
         ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="native-1"))
         ns = _NS(review_key="k1", prompt="resume me", agent="oracle", backend="omp")
 
@@ -159,7 +182,13 @@ class TestOracleAsk:
         gw.call.side_effect = _raise(
             Exception("NOT_FOUND: no runtime"))
 
+        # The review's swarm session is not registered in this isolated env —
+        # pin the enqueue to a confirmed delivery so the receipt contract
+        # (QUEUED / mailbox_persisted) is exercised deterministically.
+        delivered = MagicMock(status="delivered", msg_id="m-warm-1")
         with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.mailbox.service.MailboxService.send",
+                   return_value=delivered) as mb_send, \
              patch("codeagent.oracle.RuntimeRegistry.spawn",
                    return_value=_handle("rt-2", backend_session_id="native-2")) as spawn:
             code = cmd_oracle_ask(ns)
@@ -172,6 +201,21 @@ class TestOracleAsk:
         # native resume: backend_session_id passed to the adapter
         req = spawn.call_args[0][1]
         assert req["backend_session_id"] == "native-1"
+        # Receipt contract: mailbox_persisted means enqueue only (QUEUED),
+        # and the same anchor is recorded as on the hot path.
+        assert mb_send.call_args.kwargs["require_ack"] is True
+        assert out["msg_id"] == "m-warm-1"
+        assert out["state"] == "QUEUED"
+        assert out["status"] == "mailbox_persisted"
+        # AC-6: warm receipt must bind the runtime generation (deterministic
+        # _handle default) the same way the hot receipt does.
+        assert out["generation"] == 1
+        assert out["request_id"].startswith("req-")
+        assert mb_send.call_args.kwargs["request_id"] == out["request_id"]
+        meta = _read_oracle_meta("k1")
+        assert meta["last_request_id"] == out["request_id"]
+        assert meta["last_command_state"] == "QUEUED"
+        assert meta["last_generation"] == 1
 
     def test_ask_cold_snapshot(self, tmp_path: Path, capsys):
         """No park backend → cold reconstruction with snapshot context."""
@@ -199,11 +243,13 @@ class TestOracleAsk:
         assert "snapshot ctx" in req["task"]
         assert "start fresh" in req["task"]
 
-    def test_ask_reports_actual_method_no_fake_hot(self, tmp_path: Path, capsys):
+    def test_ask_reports_actual_method_no_fake_hot(self, tmp_path: Path, monkeypatch, capsys):
         """Dead runtime (not alive) must NOT claim hot — falls to warm/cold."""
         from codeagent.park.registry import ParkRegistry
 
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
         ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="native-1"))
+
         ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp")
         info = {"runtime_id": "rt-1", "status": "stopped", "runtime_health": {"alive": False}}
         gw = MagicMock()
@@ -216,6 +262,36 @@ class TestOracleAsk:
         out = json.loads(capsys.readouterr().out)
         assert out["method"] == "warm"
         assert "hot" not in out["method"]
+
+    def test_ask_hot_failed_safe_writes_no_anchor(self, tmp_path: Path, monkeypatch, capsys):
+        """A failure-bypass receipt (failed_safe) is echoed but must NOT
+        become the latest-ask anchor — nothing was confirmably delivered."""
+        from codeagent.oracle import _latest_ask_anchor, _read_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        ns = _NS(review_key="k1", prompt="p", agent="oracle", backend="omp")
+        info = {
+            "runtime_id": "rt-1", "status": "active", "backend_session_id": "b1",
+            "runtime_health": {"alive": True},
+        }
+        receipt = {"request_id": "ask-dead", "command_id": "cmd-9",
+                   "msg_id": "", "turn_id": "", "runtime_id": "rt-1",
+                   "generation": 1, "state": "FAILED_SAFE",
+                   "status": "failed_safe", "detail": {"reason": "mailbox down"}}
+        gw = MagicMock()
+        gw.call.side_effect = lambda m, p=None: (
+            info if m == "runtime.info" else receipt if m == "runtime.send" else {})
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert cmd_oracle_ask(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["state"] == "FAILED_SAFE"
+        assert out["status"] == "failed_safe"
+        assert out["request_id"] == "ask-dead"
+        # No success anchor: meta untouched (no last_ask_* fields at all).
+        meta = _read_oracle_meta("k1")
+        assert "last_ask_at" not in meta
+        assert "last_request_id" not in meta
+        assert _latest_ask_anchor("k1") is None
 
 
 # ── status / release ───────────────────────────────────────────────────
@@ -242,6 +318,49 @@ class TestOracleStatusRelease:
         assert out["park"]["lifecycle"] == "hot_parked"
         assert out["runtime"]["status"] == "active"
         assert out["runtime"]["tool_stats"]["tool_count"] == 3
+
+
+    def test_status_exposes_last_ask_and_row_created_at(self, tmp_path: Path, monkeypatch, capsys):
+        """status exposes the latest-ask anchor and stamps each receipt row
+        with the request's creation time."""
+        from codeagent.park.registry import ParkRegistry
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        from codeagent.oracle import _write_oracle_meta
+
+        _write_oracle_meta("k1", "b1", "bound",
+                           extra={"last_ask_at": "2026-06-01T00:00:00Z",
+                                  "last_request_id": "req-9",
+                                  "last_command_state": "QUEUED",
+                                  "last_generation": 5})
+        ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="b1"))
+        # Ledger fixture: one request dir with two timestamped events.
+        from codeagent.mailbox.store import MailboxStore
+
+        events_dir = MailboxStore().session_dir(_manifest("k1").swarm_session_id) \
+            / "oracle" / "events" / "req-9"
+        events_dir.mkdir(parents=True)
+        (events_dir / "events.jsonl").write_text(
+            json.dumps({"request_id": "req-9", "run_id": "run-1",
+                        "event": "QUEUED", "ts": 1000.0, "meta": {}}) + "\n" +
+            json.dumps({"request_id": "req-9", "run_id": "run-1",
+                        "event": "DONE", "ts": 1005.0, "meta": {}}) + "\n",
+            encoding="utf-8")
+        ns = _NS(review_key="k1")
+        gw = MagicMock()
+        gw.call.return_value = {
+            "runtime_id": "rt-1", "status": "active", "elapsed": 42,
+            "backend_session_id": "b1", "generation": 1,
+            "runtime_health": {"alive": True},
+        }
+        with patch("codeagent.oracle._gateway", return_value=gw):
+            assert cmd_oracle_status(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["last_ask"] == {"at": "2026-06-01T00:00:00Z",
+                                   "request_id": "req-9", "state": "QUEUED",
+                                   "generation": 5}
+        row = next(r for r in out["requests"] if r["request_id"] == "req-9")
+        assert row["created_at"] == 1000.0
 
     def test_status_gateway_down_still_reports_park(self, tmp_path: Path, capsys):
         from codeagent.park.registry import ParkRegistry
@@ -1495,6 +1614,39 @@ class TestOracleUncoveredPaths:
         assert got["backend_session_id"] == "sid-1"
         assert got["swarm_session_id"] == "sw-1"
 
+
+    def test_write_oracle_meta_anchor_merge_roundtrip(self, tmp_path, monkeypatch):
+        """``extra`` merges the four anchor fields; a later plain rebind
+        carries the anchor forward instead of erasing the freshness gate."""
+        from codeagent.oracle import _latest_ask_anchor, _read_oracle_meta, \
+            _write_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        # Existing callers: no anchor fields appear without extra.
+        _write_oracle_meta("k1", "sid-1", "bound", swarm_session_id="sw-1")
+        assert "last_ask_at" not in _read_oracle_meta("k1")
+        # Anchor write merges on top of the bound-session fields.
+        _write_oracle_meta("k1", "sid-1", "bound", swarm_session_id="sw-1",
+                           extra={"last_ask_at": "2026-06-01T00:00:00Z",
+                                  "last_request_id": "req-9",
+                                  "last_command_state": "QUEUED",
+                                  "last_generation": 4})
+        got = _read_oracle_meta("k1")
+        assert got["backend_session_id"] == "sid-1"
+        assert got["last_request_id"] == "req-9"
+        assert got["last_command_state"] == "QUEUED"
+        assert got["last_generation"] == 4
+        anchor = _latest_ask_anchor("k1")
+        assert anchor is not None
+        assert anchor["at"] == _parse_iso_ts("2026-06-01T00:00:00Z")
+        assert anchor["request_id"] == "req-9"
+        # A later plain bind (e.g. lazy session sync) must NOT erase it.
+        _write_oracle_meta("k1", "sid-2", "bound", swarm_session_id="sw-1")
+        got2 = _read_oracle_meta("k1")
+        assert got2["backend_session_id"] == "sid-2"
+        assert got2["last_request_id"] == "req-9"
+        assert _latest_ask_anchor("k1")["request_id"] == "req-9"
+
     def test_read_oracle_meta_corrupt(self, tmp_path, monkeypatch):
         from codeagent.oracle import _read_oracle_meta
 
@@ -2126,7 +2278,7 @@ class TestOracleUncoveredPaths:
         out = json.loads(capsys.readouterr().out)
         assert out["requests"] == [{
             "request_id": "req-1", "run_id": "run-1",
-            "states": ["DONE"], "terminal": "DONE",
+            "states": ["DONE"], "terminal": "DONE", "created_at": 1.0,
         }]
         assert out["mailbox"]["unread"] == 0
 
@@ -2242,6 +2394,8 @@ class TestOracleUncoveredPaths:
         assert _get_session_dir(_manifest("k1")) == ""
         m = replace(_manifest("k1"), omp_session_path="/a/b/c.jsonl")
         assert _get_session_dir(m) == "/a/b"
+        isolated = replace(m, omp_session_dir="/isolated")
+        assert _get_session_dir(isolated) == "/isolated"
 
     def test_find_session_file_primary_and_fallback(self, tmp_path, monkeypatch):
         from codeagent.oracle import _find_session_file
@@ -2265,7 +2419,9 @@ class TestOracleUncoveredPaths:
         f3 = custom / "proj" / "z_sid-1.jsonl"
         f3.write_text("c", encoding="utf-8")
         assert _find_session_file("sid-1", session_dir=str(custom)) == f3
-        assert _find_session_file("sid-2", session_dir=str(custom)) is None
+        direct = custom / "direct_sid-2.jsonl"
+        direct.write_text("direct", encoding="utf-8")
+        assert _find_session_file("sid-2", session_dir=str(custom)) == direct
         assert _find_session_file("sid-1", session_dir=str(tmp_path / "missing")) is None
 
     def test_find_session_file_oracle_fallback_only(self, tmp_path, monkeypatch):
@@ -2356,6 +2512,84 @@ class TestOracleUncoveredPaths:
         mock_store.read_history.side_effect = Exception("no sessions")
         with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
             assert _scan_mailbox_report("proj:oracle:gfx:blur", None) == "fb-body"
+
+
+    def test_scan_mailbox_report_excludes_pre_anchor_history(self, tmp_path, monkeypatch):
+        """With an anchor, history REPORTs before last_ask_at (or without a
+        usable timestamp) are excluded even when reply_to matches."""
+        from codeagent.oracle import _scan_mailbox_report
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        m = _manifest("k1", backend_session_id="b1")
+        mock_store = MagicMock()
+        mock_store.read_history.return_value = [
+            # pre-anchor: excluded
+            {"kind": "REPORT", "reply_to": "k1", "body": "old-report",
+             "created_at": "2026-05-01T00:00:00Z", "request_id": "req-old"},
+            # no timestamp: cannot prove fresh → excluded
+            {"kind": "REPORT", "reply_to": "k1", "body": "undated-report"},
+            # post-anchor: accepted
+            {"kind": "REPORT", "reply_to": "k1", "body": "fresh-report",
+             "created_at": "2026-06-02T00:00:00Z", "request_id": "req-9"},
+        ]
+        since = _parse_iso_ts("2026-06-01T00:00:00Z")
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            body = _scan_mailbox_report("k1", m, since=since, request_id="req-9")
+        assert body == "fresh-report"
+
+    def test_scan_mailbox_report_request_id_mismatch_excluded(self, tmp_path, monkeypatch):
+        """A post-anchor REPORT tagged with a different request id is not
+        accepted as the answer to the latest ask."""
+        from codeagent.oracle import _scan_mailbox_report
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        m = _manifest("k1", backend_session_id="b1")
+        mock_store = MagicMock()
+        mock_store.read_history.return_value = [
+            {"kind": "REPORT", "reply_to": "k1", "body": "foreign-request",
+             "created_at": "2026-06-02T00:00:00Z", "request_id": "req-OTHER"},
+        ]
+        since = _parse_iso_ts("2026-06-01T00:00:00Z")
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("k1", m, since=since,
+                                        request_id="req-9") is None
+        # Legacy messages without any request id still pass request
+        # correlation (time window decides) — backward compatible.
+        mock_store.read_history.return_value = [
+            {"kind": "REPORT", "reply_to": "k1", "body": "legacy-report",
+             "created_at": "2026-06-02T00:00:00Z"},
+        ]
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("k1", m, since=since,
+                                        request_id="req-9") == "legacy-report"
+
+    def test_scan_mailbox_report_fallback_walk_mtime_gate(self, tmp_path, monkeypatch):
+        """Legacy timestamp-less REPORT files: mtime is the only freshness
+        proof and must clear the anchor."""
+        from codeagent.oracle import _scan_mailbox_report
+        from codeagent.mailbox.store import resolve_root
+        import os as _os
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        hist = resolve_root() / "some-session" / "oracle" / "history"
+        hist.mkdir(parents=True)
+        f = hist / "1.json"
+        f.write_text(json.dumps({
+            "kind": "REPORT", "reply_to": "proj-oracle-gfx-blur", "body": "fb-body",
+        }), encoding="utf-8")
+        mock_store = MagicMock()
+        mock_store.read_history.side_effect = Exception("no sessions")
+        since = _parse_iso_ts("2026-06-01T00:00:00Z")
+        # mtime before the anchor → excluded
+        _os.utime(f, (since - 100, since - 100))
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("proj:oracle:gfx:blur", None,
+                                        since=since) is None
+        # mtime after the anchor → accepted
+        _os.utime(f, (since + 100, since + 100))
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("proj:oracle:gfx:blur", None,
+                                        since=since) == "fb-body"
 
     def test_scan_mailbox_report_none(self, tmp_path, monkeypatch):
         from codeagent.oracle import _scan_mailbox_report
@@ -2546,6 +2780,105 @@ class TestOracleUncoveredPaths:
         err = json.loads(capsys.readouterr().err)
         assert "oracle start 后才有" in err["detail"]
 
+    def test_extract_assistant_messages_after_epoch_gate(self, tmp_path):
+        """With an anchor only post-anchor timestamped assistant messages
+        are fresh; timestamp-less messages cannot prove freshness."""
+        from codeagent.oracle import _extract_assistant_messages
+
+        def _line(ts, text):
+            msg = {"role": "assistant",
+                   "content": [{"type": "text", "text": text}]}
+            obj = {"type": "message", "message": msg}
+            if ts is not None:
+                obj["timestamp"] = ts
+            return json.dumps(obj)
+
+        f = tmp_path / "s.jsonl"
+        f.write_text("\n".join([
+            _line("2026-05-01T00:00:00.000Z", "old answer"),
+            _line("2026-06-02T00:00:00.000Z", "fresh answer"),
+            _line(None, "undated answer"),
+        ]) + "\n", encoding="utf-8")
+        # No anchor → legacy behavior (latest wins, undated included).
+        assert _extract_assistant_messages(f, max_messages=1) == ["undated answer"]
+        anchor = _parse_iso_ts("2026-06-01T00:00:00Z")
+        assert _extract_assistant_messages(f, max_messages=10,
+                                           after_epoch=anchor) == ["fresh answer"]
+        # Everything stale → empty (caller falls through to the next source).
+        late = _parse_iso_ts("2027-01-01T00:00:00Z")
+        assert _extract_assistant_messages(f, max_messages=10,
+                                           after_epoch=late) == []
+
+    def test_result_returns_only_post_anchor_transcript(self, tmp_path, monkeypatch, capsys):
+        """The session source yields the fresh answer and exposes the
+        latest-ask anchor in meta.last_ask."""
+        from codeagent.oracle import _write_oracle_meta, cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        _write_oracle_meta("k1", "b1", "bound",
+                           extra={"last_ask_at": "2026-06-01T00:00:00Z",
+                                  "last_request_id": "req-9",
+                                  "last_command_state": "QUEUED",
+                                  "last_generation": 2})
+
+        def _line(ts, text):
+            return json.dumps({"type": "message", "timestamp": ts, "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}]}})
+
+        session = tmp_path / "session.jsonl"
+        session.write_text("\n".join([
+            _line("2026-05-01T00:00:00.000Z", "stale pre-ask answer"),
+            _line("2026-06-02T00:00:00.000Z", "fresh post-ask answer"),
+        ]) + "\n", encoding="utf-8")
+        ns = _NS(review_key="k1", strict=False, all=False, raw=False,
+                 include_digest=False)
+        with patch("codeagent.oracle._resolve_bound_session_id",
+                   return_value="ses_123"), \
+             patch("codeagent.oracle._find_session_file", return_value=session), \
+             patch("codeagent.oracle._strip_running_session"):
+            assert cmd_oracle_result(ns) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["source"] == "session_transcript"
+        assert out["messages"] == ["fresh post-ask answer"]
+        assert out["meta"]["last_ask"] == {
+            "at": "2026-06-01T00:00:00Z", "request_id": "req-9",
+            "state": "QUEUED", "generation": 2,
+        }
+
+    def test_result_no_result_when_only_pre_anchor_text(self, tmp_path, monkeypatch, capsys):
+        """Pre-ask transcript text is suppressed: with an anchor and no
+        post-ask output anywhere, result returns no_result — it must NOT
+        fall back to the pre-ask answer."""
+        from codeagent.oracle import _write_oracle_meta, cmd_oracle_result
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        _write_oracle_meta("k1", "b1", "bound",
+                           extra={"last_ask_at": "2026-06-01T00:00:00Z",
+                                  "last_request_id": "req-9",
+                                  "last_command_state": "QUEUED",
+                                  "last_generation": 2})
+        session = tmp_path / "session.jsonl"
+        session.write_text(json.dumps({"type": "message",
+            "timestamp": "2026-05-01T00:00:00.000Z", "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "stale pre-ask answer"}]}}) + "\n",
+            encoding="utf-8")
+        ns = _NS(review_key="k1", strict=False, all=False, raw=False,
+                 include_digest=False)
+        with patch("codeagent.oracle._resolve_bound_session_id",
+                   return_value="ses_123"), \
+             patch("codeagent.oracle._find_session_file", return_value=session), \
+             patch("codeagent.oracle._scan_mailbox_report", return_value=None) as scan:
+            assert cmd_oracle_result(ns) == 1
+        err = json.loads(capsys.readouterr().err)
+        assert err["error"] == "no_result"
+        assert err["last_ask"]["request_id"] == "req-9"
+        assert "latest ask" in err["detail"]
+        # The mailbox source was still probed with the anchor window.
+        assert scan.call_args.kwargs["since"] == _parse_iso_ts("2026-06-01T00:00:00Z")
+        assert scan.call_args.kwargs["request_id"] == "req-9"
+
     # ── cmd_oracle_watch ─────────────────────────────────────────────
 
     def test_watch_delegates(self, tmp_path, capsys):
@@ -2645,12 +2978,30 @@ class TestOracleUncoveredPaths:
         gw = MagicMock()
         gw.call.return_value = {"events": [], "cursor": 0}
         with patch("codeagent.oracle._gateway", return_value=gw), \
-             patch("codeagent.oracle.time.sleep"):
-            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+             patch("codeagent.oracle.time.sleep"), \
+             patch("codeagent.oracle.time.monotonic", side_effect=[0.0, 1.0]):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0.001,
                                         info={}) == 1
         err = json.loads(capsys.readouterr().out)
         assert err["status"] == "timeout"
         assert "use oracle result" in err["suggestion"]
+
+
+    def test_wait_new_output_zero_timeout_waits_for_event(self, tmp_path, monkeypatch, capsys):
+        from codeagent.oracle import _wait_for_new_output
+
+        gw = MagicMock()
+        gw.call.side_effect = [
+            {"events": [], "cursor": 0},  # boot
+            {"events": [], "cursor": 0},  # first poll
+            {"events": [{"kind": "ASSISTANT_PROGRESS", "payload": {}}], "cursor": 1},
+        ]
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_final_text", return_value="delayed output"), \
+             patch("codeagent.oracle.time.sleep"):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+                                        info={}) == 0
+        assert capsys.readouterr().out == "delayed output\n"
 
     def test_wait_new_output_stuck_returns_1(self, tmp_path, monkeypatch, capsys):
         from codeagent.oracle import _wait_for_new_output
@@ -2731,6 +3082,19 @@ class TestOracleUncoveredPaths:
                                   interval=1.0, max_bytes=32768, info=info,
                                   auto_recover=True, session_dir="")
 
+    def test_cmd_wait_preserves_unbounded_timeout(self, tmp_path):
+        from codeagent.oracle import cmd_oracle_wait
+
+        info = {"runtime_id": "rt-1", "session_id": "ses-1", "status": "active",
+                "backend_session_id": "b1", "runtime_health": {"alive": True}}
+        gw = MagicMock()
+        gw.call.return_value = info
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_for_new_output", return_value=0) as waiter:
+            assert cmd_oracle_wait(_NS(review_key="k1", interval=1, timeout=0,
+                                       all=False, auto_recover=False)) == 0
+        assert waiter.call_args.kwargs["timeout"] == 0.0
+
     def test_cmd_wait_gateway_error(self, tmp_path, capsys):
         from codeagent.gateway.model import GatewayError
         from codeagent.oracle import cmd_oracle_wait
@@ -2765,6 +3129,129 @@ class TestOracleUncoveredPaths:
                                        all=False)) == 1
         err = json.loads(capsys.readouterr().out)
         assert err["error"] == "NOT_ACTIVE"
+
+    def test_wait_final_text_after_epoch(self, tmp_path, monkeypatch):
+        """_wait_final_text threads the anchor into transcript extraction and
+        tightens the filesystem-scan window the same way."""
+        from codeagent.oracle import _wait_final_text
+        from codeagent.park.registry import ParkRegistry
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        ParkRegistry().acquire("k1", _manifest("k1", backend_session_id="b1"))
+        sd = tmp_path / "sd"
+        sd.mkdir()
+
+        def _line(ts, text):
+            obj = {"type": "message", "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}]}}
+            if ts is not None:
+                obj["timestamp"] = ts
+            return json.dumps(obj)
+
+        f = sd / "x_b1.jsonl"
+        f.write_text("\n".join([
+            _line("2026-05-01T00:00:00.000Z", "pre-ask answer"),
+            _line("2026-06-02T00:00:00.000Z", "post-ask answer"),
+        ]) + "\n", encoding="utf-8")
+        anchor = _parse_iso_ts("2026-06-01T00:00:00Z")
+        assert _wait_final_text("k1", session_dir=str(sd),
+                                after_epoch=anchor) == "post-ask answer"
+        # No anchor → legacy latest-wins behavior.
+        assert _wait_final_text("k1", session_dir=str(sd)) == "post-ask answer"
+        # All text stale → None.
+        late = _parse_iso_ts("2027-01-01T00:00:00Z")
+        assert _wait_final_text("k1", session_dir=str(sd),
+                                after_epoch=late) is None
+
+    def test_wait_for_new_output_ignores_pre_anchor_progress(self, tmp_path, monkeypatch, capsys):
+        """Progress before any fresh final text keeps waiting; the anchor is
+        threaded into _wait_final_text and only post-ask output returns."""
+        from codeagent.oracle import _wait_for_new_output, _write_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        _write_oracle_meta("k1", "b1", "bound",
+                           extra={"last_ask_at": "2026-06-01T00:00:00Z",
+                                  "last_request_id": "req-1",
+                                  "last_command_state": "QUEUED",
+                                  "last_generation": 1})
+        anchor_epoch = _parse_iso_ts("2026-06-01T00:00:00Z")
+        post = "2026-06-02T00:00:00Z"
+        gw = MagicMock()
+        gw.call.side_effect = [
+            {"events": [], "cursor": 0},  # boot drain
+            {"events": [{"kind": "ASSISTANT_PROGRESS", "payload": {},
+                         "created_at": post, "generation": 1}], "cursor": 1},
+            {"events": [{"kind": "TASK_STATE", "payload": {"state": "agent_end"},
+                         "created_at": post, "generation": 1}], "cursor": 2},
+        ]
+        wf = MagicMock(side_effect=[None, "fresh answer"])
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_final_text", wf), \
+             patch("codeagent.oracle.time.sleep"):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+                                        info={}) == 0
+        assert capsys.readouterr().out == "fresh answer\n"
+        assert wf.call_args_list[0].kwargs["after_epoch"] == anchor_epoch
+        assert wf.call_count == 2
+
+    def test_wait_for_new_output_ignores_generation_mismatch(self, tmp_path, monkeypatch, capsys):
+        """Events from an explicitly different generation never complete the
+        wait — not even a boot-drain agent_end."""
+        from codeagent.oracle import _wait_for_new_output, _write_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        _write_oracle_meta("k1", "b1", "bound",
+                           extra={"last_ask_at": "2026-06-01T00:00:00Z",
+                                  "last_request_id": "req-1",
+                                  "last_command_state": "QUEUED",
+                                  "last_generation": 1})
+        post = "2026-06-02T00:00:00Z"
+        gw = MagicMock()
+        gw.call.side_effect = [
+            # boot drain: agent_end from generation 2 (runtime restarted) — ignored
+            {"events": [{"kind": "TASK_STATE", "payload": {"state": "agent_end"},
+                         "created_at": post, "generation": 2}], "cursor": 1},
+            # main loop: progress from generation 2 — ignored too
+            {"events": [{"kind": "ASSISTANT_PROGRESS", "payload": {},
+                         "created_at": post, "generation": 2}], "cursor": 2},
+        ]
+        wf = MagicMock()
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_final_text", wf), \
+             patch("codeagent.oracle.time.sleep"), \
+             patch("codeagent.oracle.time.monotonic", side_effect=[0.0, 1.0]):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0.001,
+                                        info={}) == 1
+        err = json.loads(capsys.readouterr().out)
+        assert err["status"] == "timeout"
+        wf.assert_not_called()
+
+    def test_wait_for_new_output_post_anchor_boot_agent_end(self, tmp_path, monkeypatch, capsys):
+        """A boot-drain agent_end inside the ask window (post-anchor, same
+        generation) still completes the wait with the fresh final text."""
+        from codeagent.oracle import _wait_for_new_output, _write_oracle_meta
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        _write_oracle_meta("k1", "b1", "bound",
+                           extra={"last_ask_at": "2026-06-01T00:00:00Z",
+                                  "last_request_id": "req-1",
+                                  "last_command_state": "QUEUED",
+                                  "last_generation": 1})
+        post = "2026-06-02T00:00:00Z"
+        gw = MagicMock()
+        gw.call.side_effect = [
+            {"events": [{"kind": "TASK_STATE", "payload": {"state": "agent_end"},
+                         "created_at": post, "generation": 1,
+                         "request_id": "req-1"}], "cursor": 1},
+        ]
+        wf = MagicMock(return_value="fresh answer")
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_final_text", wf):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+                                        info={}) == 0
+        assert capsys.readouterr().out == "fresh answer\n"
+        assert wf.call_args.kwargs["after_epoch"] == _parse_iso_ts("2026-06-01T00:00:00Z")
 
     def test_cmd_wait_binding_pending_continues(self, tmp_path, capsys):
         from codeagent.oracle import cmd_oracle_wait

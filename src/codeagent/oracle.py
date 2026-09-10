@@ -723,12 +723,20 @@ def _read_oracle_meta(review_key: str) -> dict:
 
 
 def _write_oracle_meta(review_key: str, backend_session_id: str, status: str,
-                       swarm_session_id: str = "") -> dict:
+                       swarm_session_id: str = "", *,
+                       extra: Optional[dict] = None) -> dict:
     """A1: persist bound-session meta (backend_session_id/bound_at/status).
 
     ``status`` is "bound" after a successful bind; the file is the warm
     resume point for revive/ask when the park manifest is missing or stale.
+
+    ``extra`` optionally merges additional metadata (the latest-ask anchor
+    fields written by ``_record_last_ask``); existing callers are unaffected.
+    Anchor fields from a previous write are carried forward unless refreshed
+    via ``extra`` — a rebinding must never erase the latest-ask freshness
+    gate consumed by result/wait.
     """
+    previous = _read_oracle_meta(review_key)
     meta = {
         "review_key": review_key,
         "swarm_session_id": swarm_session_id,
@@ -736,6 +744,11 @@ def _write_oracle_meta(review_key: str, backend_session_id: str, status: str,
         "bound_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
         "status": status,
     }
+    for _anchor_field in _LAST_ASK_FIELDS:
+        if _anchor_field in previous:
+            meta[_anchor_field] = previous[_anchor_field]
+    if extra:
+        meta.update(extra)
     try:
         path = _oracle_meta_path(review_key)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -748,6 +761,78 @@ def _write_oracle_meta(review_key: str, backend_session_id: str, status: str,
     except OSError as exc:
         print(f"warning: oracle meta write failed: {exc}", file=sys.stderr)
     return meta
+
+
+# Latest-ask anchor fields (receipt/freshness contract). These are the ONLY
+# new fields the ask paths persist into meta.json; ``last_ask_at`` is the
+# freshness floor for result/wait, the rest identify the ask receipt.
+_LAST_ASK_FIELDS = ("last_ask_at", "last_request_id", "last_command_state",
+                    "last_generation")
+
+# Gateway command states that prove the ask was NOT (confirmably) enqueued —
+# the receipt may still be reported, but no success anchor is recorded.
+_ASK_UNDELIVERED_STATES = frozenset({"FAILED_SAFE", "AMBIGUOUS", "TRIGGER_UNKNOWN"})
+
+
+def _record_last_ask(review_key: str, *, request_id: str, command_state: str = "",
+                     generation=None) -> dict:
+    """Persist the latest-ask anchor on top of the current bound-session meta.
+
+    Writes exactly the four anchor fields (``_LAST_ASK_FIELDS``); the bound
+    session fields are preserved so the anchor never clobbers the binding.
+    """
+    meta = _read_oracle_meta(review_key)
+    extra = {
+        "last_ask_at": datetime.now(timezone.utc).strftime(ISO_TIMESTAMP_FORMAT),
+        "last_request_id": request_id or "",
+        "last_command_state": command_state or "",
+        "last_generation": None,
+    }
+    if generation is not None:
+        try:
+            extra["last_generation"] = int(generation)
+        except (TypeError, ValueError):
+            pass
+    return _write_oracle_meta(
+        review_key,
+        (meta.get("backend_session_id") or ""),
+        (meta.get("status") or ""),
+        swarm_session_id=(meta.get("swarm_session_id") or ""),
+        extra=extra,
+    )
+
+
+def _latest_ask_anchor(review_key: str) -> Optional[dict]:
+    """Latest-ask anchor for a review key — ``None`` when none exists.
+
+    Returns ``{"at": epoch, "iso": ..., "request_id": ..., "state": ...,
+    "generation": ...}``. ``at`` is the freshness floor: result/wait only
+    accept output produced after it. A missing/unparseable ``last_ask_at``
+    means no gate (legacy meta compatibility).
+    """
+    meta = _read_oracle_meta(review_key)
+    at = _parse_iso_ts(meta.get("last_ask_at") or "")
+    if at is None:
+        return None
+    return {
+        "at": at,
+        "iso": meta.get("last_ask_at") or "",
+        "request_id": meta.get("last_request_id") or "",
+        "state": meta.get("last_command_state") or "",
+        "generation": meta.get("last_generation"),
+    }
+
+
+def _anchor_meta_block(anchor: Optional[dict]) -> Optional[dict]:
+    """JSON-facing ``last_ask`` sub-object for result/status output."""
+    if anchor is None:
+        return None
+    return {
+        "at": anchor.get("iso", ""),
+        "request_id": anchor.get("request_id", ""),
+        "state": anchor.get("state", ""),
+        "generation": anchor.get("generation"),
+    }
 
 
 def _runtime_log_path(handle) -> Optional[Path]:
@@ -1264,26 +1349,45 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                                   "window; steer would be silently dropped",
                     }, indent=2), file=sys.stderr)
                     return 1
+            hot_request_id = f"ask-{uuid4().hex[:10]}"
             result = _gateway().call("runtime.send", {
                 "runtime_id": info["runtime_id"],
                 "from": "manager",
                 "body": prompt,
                 "kind": "TASK",
                 "require_ack": True,
-                "request_id": f"ask-{uuid4().hex[:10]}",
+                "request_id": hot_request_id,
                 "run_id": f"run-{uuid4().hex[:10]}",
             })
             # P1: method 语义修正 —— 底层为持久命令状态机（QUEUED 等 ack），
             # 不承诺已注入 turn；status 取 runtime_send 返回的已确认阶段
             # （mailbox_persisted|claimed|session_live|turn_triggered|...）。
             hot_status = result.get("status", "mailbox_persisted")
+            hot_state = result.get("state", "")
+            # Receipt/freshness contract: record the latest-ask anchor after a
+            # confirmed enqueue so result/wait only accept post-ask output.
+            # Failure-bypass states (failed_safe/ambiguous/trigger_unknown)
+            # prove no confirmed delivery and must NOT become the anchor.
+            if hot_state not in _ASK_UNDELIVERED_STATES:
+                _record_last_ask(
+                    review_key,
+                    request_id=result.get("request_id") or hot_request_id,
+                    command_state=hot_state,
+                    generation=result.get("generation"),
+                )
             print(json.dumps({
                 "method": "hot_pending_ack",
                 "review_key": review_key,
                 "runtime_id": info["runtime_id"],
                 "backend_session_id": info.get("backend_session_id", ""),
                 "msg_id": result.get("msg_id", ""),
+                # Gateway command receipt echoed verbatim (§3 contract).
+                "request_id": result.get("request_id", hot_request_id),
+                "command_id": result.get("command_id", ""),
+                "state": hot_state,
                 "status": hot_status,
+                "generation": result.get("generation"),
+                "detail": result.get("detail", {}),
                 "note": "in-loop send to live runtime (plugin steer)",
                 "hint": _ask_retrieve_hint(review_key),  # E1
             }, indent=2))
@@ -1327,10 +1431,12 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             # Enqueue the prompt as a TASK FIRST so the resumed runtime's
             # plugin picks it up as the initial task (not a stale one).
             sid = manifest.swarm_session_id or _review_sid(review_key)
+            warm_request_id = f"req-{uuid4().hex[:10]}"
+            warm_enqueue = None
             try:
                 from codeagent.mailbox.service import MailboxService
 
-                MailboxService().send(
+                warm_enqueue = MailboxService().send(
                     session_id=sid,
                     from_id="manager",
                     to_id=_ORACLE_AGENT,
@@ -1338,10 +1444,11 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                     body=prompt,
                     kind="TASK",
                     run_id=f"run-{uuid4().hex[:10]}",
-                    request_id=f"req-{uuid4().hex[:10]}",
+                    request_id=warm_request_id,
                     require_ack=True,
                 )
             except Exception as exc:
+                warm_enqueue = None
                 print(f"warning: warm task enqueue failed: {exc}", file=sys.stderr)
             # B2: 从 manifest 读 ExecutionSpec 显式字段，不再重推导。
             # 显式 --model 覆盖 > manifest.primary_model（start 落盘的
@@ -1438,7 +1545,7 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
             # I2: surface adoption failure in the success JSON.
             adopted = _adopt_runtime(review_key, sid, warm_handle,
                                      _resolve_backend(args.agent, args.backend))
-            print(json.dumps({
+            warm_out = {
                 "method": "warm",
                 "review_key": review_key,
                 "runtime_id": warm_handle.runtime_id,
@@ -1452,7 +1559,19 @@ def cmd_oracle_ask(args: argparse.Namespace) -> int:
                     "warm runtime spawned; session id pending — previous id preserved"
                 ),
                 "hint": _ask_retrieve_hint(review_key),  # E1
-            }, indent=2))
+            }
+            # Receipt/freshness contract: a confirmed mailbox enqueue becomes
+            # the latest-ask anchor (QUEUED — not yet a backend turn).
+            if warm_enqueue is not None and getattr(warm_enqueue, "status", "") == "delivered":
+                warm_out["msg_id"] = getattr(warm_enqueue, "msg_id", "")
+                warm_out["request_id"] = warm_request_id
+                warm_out["state"] = "QUEUED"
+                warm_out["status"] = "mailbox_persisted"
+                warm_out["generation"] = warm_handle.generation
+                _record_last_ask(review_key, request_id=warm_request_id,
+                                 command_state="QUEUED",
+                                 generation=warm_handle.generation)
+            print(json.dumps(warm_out, indent=2))
             # A15: --wait — 投递成功后阻塞等新产出内联返回
             if getattr(args, "wait", False):
                 return _wait_for_new_output(
@@ -1846,6 +1965,9 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
         }
         if manifest else None
     )
+    # Receipt contract: expose the latest-ask anchor so the caller can
+    # judge delivery state and result/wait freshness.
+    out["last_ask"] = _anchor_meta_block(_latest_ask_anchor(review_key))
     # P2-3: snapshot freshness — surface age so users can see how stale
     # the cold-revive context would be.
     if manifest:
@@ -1920,12 +2042,18 @@ def cmd_oracle_status(args: argparse.Namespace) -> int:
                     # I4: use the public API — never reach into the private
                     # _read_entries_all_runs implementation.
                     for run_id, evs in lg.get_entries_all_runs(req_dir.name).items():
+                        dir_mtime = req_dir.stat().st_mtime
+                        # Receipt rows expose the request's creation time:
+                        # the earliest ledger event ts, else the dir mtime.
+                        first_ts = min((float(e.get("ts") or 0.0) for e in evs),
+                                       default=0.0)
                         reqs.append({
                             "request_id": req_dir.name,
                             "run_id": run_id,
                             "states": [e["event"] for e in evs],
                             "terminal": next((e["event"] for e in evs if e["event"] in {"DONE", "BLOCKED", "CANCELLED", "EXPIRED", "UNKNOWN_STALE"}), ""),
-                            "_mtime": req_dir.stat().st_mtime,
+                            "created_at": first_ts or dir_mtime,
+                            "_mtime": dir_mtime,
                         })
         except Exception:
             reqs = []
@@ -2043,30 +2171,35 @@ def cmd_oracle_list(args: argparse.Namespace) -> int:
 
 
 def _get_session_dir(manifest) -> str:
-    """Extract the OMP session directory from a park manifest.
+    """Return the manifest's authoritative isolated OMP session directory.
 
-    Returns the parent directory of ``manifest.omp_session_path`` (the
-    ``~/.omp/agent/sessions/<dir>/`` containing the session JSONL).
-    Empty string means "use the default global root" — callers MUST
-    treat a non-empty return as the SOLE search root to prevent stale
-    matches from old sessions in the default directory.
+    New manifests persist ``omp_session_dir`` directly because an OMP
+    backend-session JSONL path is not known until the backend binds. Older
+    manifests may only have ``omp_session_path``; use its parent as a
+    compatibility fallback. A non-empty result is the sole search root for
+    transcript/result lookup so stale global sessions cannot win.
     """
+    if manifest is None:
+        return ""
+    isolated = getattr(manifest, "omp_session_dir", "") or ""
+    if isolated:
+        return str(isolated)
     raw = getattr(manifest, "omp_session_path", "") or ""
     if not raw:
         return ""
     return str(Path(raw).parent)
 
 
+
 def _find_session_file(backend_session_id: str,
                        session_dir: str = "") -> Optional[Path]:
-    """Locate the OMP session transcript file for a backend session id.
+    """Locate the OMP transcript for a bound backend session id.
 
-    Session files live under ~/.omp/agent/sessions/<dir>/*_<session_id>.jsonl
-    where <dir> is the cwd-derived name (e.g. -src-codeagent-py). Falls back
-    to scanning all session dirs when the derived dir misses.
-
-    When *session_dir* is non-empty, ONLY that directory is searched — this
-    prevents stale matches from old sessions in the default root.
+    OMP writes the primary ``*_<session_id>.jsonl`` directly inside the
+    configured ``--session-dir``. Older/default layouts place that file one
+    directory below the global sessions root (and historical Oracle sessions
+    below ``_oracle``). Search those known layouts only; an explicit
+    ``session_dir`` remains the sole search root.
     """
     if session_dir:
         search_root = Path(session_dir)
@@ -2077,38 +2210,44 @@ def _find_session_file(backend_session_id: str,
         if not search_root.is_dir():
             return None
 
-    def _candidate_dirs() -> list[Path]:
-        dirs: list[Path] = []
-        for d in search_root.iterdir():
-            if not d.is_dir():
-                continue
-            if any(f.name.endswith(f"_{backend_session_id}.jsonl") for f in d.iterdir()):
-                dirs.append(d)
-        return dirs
+    pattern = f"*_{backend_session_id}.jsonl"
+    files: list[Path] = list(search_root.glob(pattern))
 
-    candidates = _candidate_dirs()
-    # Fallback: if not found in primary root, also check _oracle/ subdirectories
-    # (historical sessions migrated to _oracle/<project>/ layout)
-    if not candidates and not session_dir:
+    def _collect_from_dirs(root: Path) -> None:
+        for directory in root.iterdir():
+            if not directory.is_dir():
+                continue
+            files.extend(directory.glob(pattern))
+
+    if not files:
+        _collect_from_dirs(search_root)
+    # Historical sessions migrated to _oracle/<project>/ layout. This
+    # fallback is intentionally disabled for an explicit isolated directory.
+    if not files and not session_dir:
         oracle_root = search_root / "_oracle"
         if oracle_root.is_dir():
-            for d in oracle_root.iterdir():
-                if not d.is_dir():
-                    continue
-                if any(f.name.endswith(f"_{backend_session_id}.jsonl") for f in d.iterdir()):
-                    candidates.append(d)
-    if not candidates:
+            _collect_from_dirs(oracle_root)
+    if not files:
         return None
+
     best: Optional[Path] = None
-    for d in candidates:
-        for f in sorted(d.glob(f"*_{backend_session_id}.jsonl")):
-            if best is None or f.stat().st_mtime > best.stat().st_mtime:
-                best = f
+    for file_path in files:
+        try:
+            if best is None or file_path.stat().st_mtime > best.stat().st_mtime:
+                best = file_path
+        except OSError:
+            continue
     return best
 
 
-def _extract_assistant_messages(path: Path, max_messages: int = 1) -> list[str]:
-    """Extract the last *max_messages* assistant text messages from a session JSONL."""
+def _extract_assistant_messages(path: Path, max_messages: int = 1,
+                                after_epoch: float = 0.0) -> list[str]:
+    """Extract the last *max_messages* assistant text messages from a session JSONL.
+
+    When ``after_epoch > 0`` (latest-ask anchor) only timestamped assistant
+    messages at or after the anchor are fresh: a missing/unparseable
+    timestamp cannot prove freshness and is excluded.
+    """
     msgs: list[str] = []
     try:
         with open(path, encoding="utf-8") as f:
@@ -2125,6 +2264,10 @@ def _extract_assistant_messages(path: Path, max_messages: int = 1) -> list[str]:
                 m = obj.get("message", {})
                 if m.get("role") != "assistant":
                     continue
+                if after_epoch > 0:
+                    ts = _parse_iso_ts(obj.get("timestamp", ""))
+                    if ts is None or ts < after_epoch:
+                        continue
                 content = m.get("content", [])
                 text = "".join(
                     c.get("text", "") for c in content
@@ -2282,7 +2425,8 @@ def _review_reply_to_candidates(review_key: str) -> set[str]:
     return {review_key, safe, slug, hash_slug}
 
 
-def _scan_mailbox_report(review_key: str, manifest) -> Optional[str]:
+def _scan_mailbox_report(review_key: str, manifest, since: float = 0.0,
+                         request_id: str = "") -> Optional[str]:
     """A2-② mailbox source: latest REPORT envelope answering the review key.
 
     Matches REPORT messages whose ``reply_to`` encodes the review key
@@ -2290,6 +2434,13 @@ def _scan_mailbox_report(review_key: str, manifest) -> Optional[str]:
     swarm session history (manifest → meta), then falls back to a recursive
     scan of the whole mailbox root (a plugin may report under a different
     session). Returns the REPORT body when found, else None.
+
+    Latest-ask freshness gate (receipt contract): when ``since > 0`` or
+    ``request_id`` is set, a REPORT must additionally prove it answers the
+    latest ask — a parseable ``created_at`` >= ``since``, a matching
+    ``request_id``/``command_id`` when the message carries one, and — for
+    legacy timestamp-less files in the filesystem branch only — mtime >=
+    ``since``. Pre-anchor or request-mismatched REPORTs are excluded.
     """
     store = MailboxStore()
     swarm_ids: list[str] = []
@@ -2300,9 +2451,23 @@ def _scan_mailbox_report(review_key: str, manifest) -> Optional[str]:
         swarm_ids.append(meta["swarm_session_id"])
     reply_keys = _review_reply_to_candidates(review_key)
 
-    def _match(msg: dict) -> bool:
+    def _fresh(msg: dict, mtime: float = 0.0) -> bool:
+        rid = (msg.get("request_id") or msg.get("command_id") or "")
+        if request_id and rid and rid != request_id:
+            return False
+        if since <= 0:
+            return True
+        ts = _parse_iso_ts(msg.get("created_at") or "")
+        if ts is not None:
+            return ts >= since
+        # Legacy message without a usable timestamp: only the filesystem
+        # branch can fall back to mtime, and it must still clear the anchor.
+        return bool(mtime) and mtime >= since
+
+    def _match(msg: dict, mtime: float = 0.0) -> bool:
         return (msg.get("kind") == "REPORT"
-                and (msg.get("reply_to") or "") in reply_keys)
+                and (msg.get("reply_to") or "") in reply_keys
+                and _fresh(msg, mtime))
 
     # Known sessions first — canonical history, newest first.
     for swarm_id in dict.fromkeys(swarm_ids):
@@ -2332,14 +2497,15 @@ def _scan_mailbox_report(review_key: str, manifest) -> Optional[str]:
                     continue
                 p = Path(dirpath) / name
                 try:
+                    mtime = p.stat().st_mtime
+                except OSError:
+                    continue
+                try:
                     msg = json.loads(p.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                     continue
-                if _match(msg):
-                    try:
-                        candidates.append((p.stat().st_mtime, msg))
-                    except OSError:
-                        continue
+                if _match(msg, mtime):
+                    candidates.append((mtime, msg))
         if candidates:
             candidates.sort(key=lambda t: t[0], reverse=True)
             return candidates[0][1].get("body", "") or ""
@@ -2392,6 +2558,11 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
       ③ filesystem        — recursive scan matching review_key EXACTLY with
          an mtime window after the review started (fallback scan)
 
+    Latest-ask freshness gate: when meta.json carries a ``last_ask_at``
+    anchor, every source only yields output produced AFTER that ask —
+    a source left empty by the gate falls through to the next one, and
+    pre-ask text is never reported. ``meta.last_ask`` exposes the anchor.
+
     Output is JSON carrying source/confidence so callers can weigh the
     answer. ``--all`` returns every assistant message, default the latest.
     """
@@ -2403,6 +2574,10 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
     manifest = ParkRegistry().lookup(review_key)
     session_dir = _get_session_dir(manifest)
     start_since = _review_start_ts(review_key, manifest)
+    # Receipt contract: the latest-ask anchor gates every source.
+    anchor = _latest_ask_anchor(review_key)
+    anchor_epoch = anchor["at"] if anchor else 0.0
+    anchor_request = anchor["request_id"] if anchor else ""
     max_msgs = 10**6 if want_all else 1
     # P1: 截断上限——--all 跳过上限，否则读环境变量或默认值
     max_bytes = 0 if want_all else int(
@@ -2418,7 +2593,8 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
         "source": "",
         "confidence": 0.0,
         "messages": [],
-        "meta": {"strict": strict, "all": want_all},
+        "meta": {"strict": strict, "all": want_all,
+                 "last_ask": _anchor_meta_block(anchor)},
     }
 
     # ── ① session transcript（meta.json session_id → 标准 API）────────
@@ -2427,7 +2603,8 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
         out["meta"]["session_id"] = bound_sid
         path = _find_session_file(bound_sid, session_dir=session_dir)
         if path is not None:
-            msgs = _extract_assistant_messages(path, max_messages=max_msgs)
+            msgs = _extract_assistant_messages(path, max_messages=max_msgs,
+                                               after_epoch=anchor_epoch)
             if msgs:
                 display_text = msgs[-1] if len(msgs) == 1 else "\n".join(msgs)
                 trunc_text, was_trunc, trunc_bytes, total_bytes = _truncate_result(
@@ -2462,7 +2639,8 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
                 return 0
 
     # ── ② mailbox REPORT（reply_to == review_key 的终端信封）─────────
-    report = _scan_mailbox_report(review_key, manifest)
+    report = _scan_mailbox_report(review_key, manifest, since=anchor_epoch,
+                                  request_id=anchor_request)
     if report:
         trunc_text, was_trunc, trunc_bytes, total_bytes = _truncate_result(
             report, max_bytes)
@@ -2489,13 +2667,18 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
 
     # ── ③ filesystem（递归 + 精确 key + start 后时间窗）──────────────
     if not strict:
+        # The latest-ask anchor tightens the filesystem mtime window.
+        fs_since = start_since
+        if anchor_epoch > 0 and (fs_since is None or anchor_epoch > fs_since):
+            fs_since = anchor_epoch
         try:
-            path = _fallback_find_session_for_key(review_key, since=start_since,
+            path = _fallback_find_session_for_key(review_key, since=fs_since,
                                                   session_dir=session_dir)
         except Exception:  # pragma: no cover — defensive
             path = None
         if path is not None:
-            msgs = _extract_assistant_messages(path, max_messages=max_msgs)
+            msgs = _extract_assistant_messages(path, max_messages=max_msgs,
+                                               after_epoch=anchor_epoch)
             if msgs:
                 display_text = msgs[-1] if len(msgs) == 1 else "\n".join(msgs)
                 trunc_text, was_trunc, trunc_bytes, total_bytes = _truncate_result(
@@ -2530,6 +2713,11 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
                   f"backend_session_id={bound_sid!r}")
     elif not bound_sid:
         detail = "oracle start 后才有（no bound backend session）"
+    elif anchor is not None:
+        detail = (f"no output after the latest ask "
+                  f"({anchor['iso']}, request {anchor['request_id']!r}) — "
+                  f"pre-ask transcript/REPORT text is suppressed; "
+                  f"use 'oracle wait' if the turn is still running")
     else:
         detail = (f"session {bound_sid!r} not found; no mailbox REPORT; "
                   f"no matching session file")
@@ -2538,6 +2726,7 @@ def cmd_oracle_result(args: argparse.Namespace) -> int:
         "review_key": review_key,
         "strict": strict,
         "detail": detail,
+        "last_ask": _anchor_meta_block(anchor),
     }, indent=2), file=sys.stderr)
     return 1
 
@@ -2583,11 +2772,14 @@ def cmd_oracle_watch(args: argparse.Namespace) -> int:
 # ── wait（B1：阻塞到 agent_end 事件，然后内联最终文本）────────────────
 
 
-def _wait_final_text(review_key: str, session_dir: str = "") -> Optional[str]:
+def _wait_final_text(review_key: str, session_dir: str = "",
+                     after_epoch: float = 0.0) -> Optional[str]:
     """B1: extract the latest assistant text for inline printing on agent_end.
 
     Same sources as ``oracle result`` (primary backend session transcript,
     then best-effort scan) but returns the text instead of printing.
+    With ``after_epoch`` (latest-ask anchor) only post-anchor assistant text
+    counts — the filesystem scan window is tightened the same way.
     """
     manifest = ParkRegistry().lookup(review_key)
     # Root-cause fix (2026-08-12): resolve via lazy-sync so a bound backend
@@ -2598,32 +2790,82 @@ def _wait_final_text(review_key: str, session_dir: str = "") -> Optional[str]:
     path = _find_session_file(backend_id, session_dir=session_dir) if backend_id else None
     if path is None:
         try:
-            path = _fallback_find_session_for_key(review_key, session_dir=session_dir)
+            path = _fallback_find_session_for_key(
+                review_key, since=after_epoch if after_epoch > 0 else None,
+                session_dir=session_dir)
         except Exception:  # pragma: no cover — defensive
             path = None
     if path is None:
         return None
-    msgs = _extract_assistant_messages(path, max_messages=1)
+    msgs = _extract_assistant_messages(path, max_messages=1,
+                                       after_epoch=after_epoch)
     return msgs[-1] if msgs else None
 
 
+def _event_outside_ask_window(ev: dict, anchor_epoch: float,
+                              anchor_generation=None,
+                              anchor_request_id: str = "",
+                              *, strict_ts: bool = False) -> bool:
+    """True when *ev* provably predates or mismatches the latest-ask window.
+
+    Receipt contract: with an anchor, an event is ignored when its
+    ``created_at`` is parseably before the anchor, when it carries an
+    explicitly different non-empty ``generation``, or when it is tagged
+    with a different non-empty ``request_id``. Unknown/missing fields are
+    never treated as a mismatch — only explicit evidence excludes.
+    ``strict_ts`` (boot drain) additionally treats timestamp-less events
+    as stale: boot replays the full history, so freshness must be proven.
+    """
+    if anchor_epoch <= 0 and anchor_generation is None and not anchor_request_id:
+        return False  # no anchor → legacy behavior
+    created = ev.get("created_at", "") if isinstance(ev, dict) else ""
+    ts = _parse_iso_ts(created)
+    if anchor_epoch > 0:
+        if ts is not None:
+            if ts < anchor_epoch:
+                return True
+        elif strict_ts:
+            return True
+    gen = ev.get("generation") if isinstance(ev, dict) else None
+    if anchor_generation is not None and gen is not None:
+        try:
+            if int(gen) != int(anchor_generation):
+                return True
+        except (TypeError, ValueError):
+            pass
+    req = (ev.get("request_id") or "") if isinstance(ev, dict) else ""
+    if anchor_request_id and req and req != anchor_request_id:
+        return True
+    return False
+
+
 def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
-                         timeout: float = 300.0, interval: float = 5.0,
+                         timeout: float = 0.0, interval: float = 5.0,
                          max_bytes: int = 0, info: Optional[dict] = None,
                          auto_recover: bool = False,
                          session_dir: str = "") -> int:
-    """A15: 等待 oracle 新产出并内联打印——供 cmd_oracle_wait 和 ask --wait 共用。
+    """A15: wait for new Oracle output and print the final assistant text.
 
-    等待方式：boot drain 设高水位 cursor，主轮询只看 cursor 后新事件。
-    ASSISTANT_PROGRESS（新产出）或 agent_end（兜底）触发返回。
-    不做 baseline 文本对比（JSONL 更新/截断曾误触发旧内容返回）。
-    cursor 后的 ASSISTANT_PROGRESS 一定是新 turn 的产出。
+    ``timeout <= 0`` means no observation deadline: the Oracle turn remains
+    governed by its lifecycle/release state rather than an arbitrary client
+    timeout. A positive timeout is still available for bounded polling.
 
-    返回 0 = 命中新产出并打印, 1 = 超时或强卡死信号, 130 = KeyboardInterrupt。
+    Receipt contract: the latest-ask anchor (meta.json) is fixed at
+    startup — pre-anchor events, events from an explicitly different
+    generation/request, and ASSISTANT_PROGRESS without fresh final text
+    are ignored. After an auto-recover revive the generation gate re-binds
+    to the revived runtime's current generation (the ask's command is
+    re-triggered there); the time anchor itself never moves.
     """
-    # boot drain：设高水位 cursor，后续只看新事件（不再 baseline 文本对比）。
+    # Boot drain: set a high-water cursor; only events after it belong to this
+    # wait operation. No baseline text comparison is used.
     cursor: int = 0
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if timeout > 0 else None
+    # Latest-ask anchor — read once; result/wait only accept post-ask output.
+    _anchor = _latest_ask_anchor(review_key)
+    anchor_epoch = _anchor["at"] if _anchor else 0.0
+    anchor_request_id = _anchor["request_id"] if _anchor else ""
+    anchor_generation = _anchor["generation"] if _anchor else None
 
     # 内联卡死检测所需 runtime info——未传时回退拉取（供 ask --wait 等路径）。
     if info is None:
@@ -2644,7 +2886,14 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
         })
         for ev in boot.get("events", []):
             if ev.get("kind") == "TASK_STATE" and (ev.get("payload") or {}).get("state") == "agent_end":
-                final = _wait_final_text(review_key, session_dir=session_dir)
+                # Boot replays full history: with an anchor, a pre-ask (or
+                # timestamp-less, i.e. unprovable) agent_end must not
+                # complete this wait.
+                if _event_outside_ask_window(ev, anchor_epoch, anchor_generation,
+                                             anchor_request_id, strict_ts=True):
+                    continue
+                final = _wait_final_text(review_key, session_dir=session_dir,
+                                         after_epoch=anchor_epoch)
                 if final is not None:
                     trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
                     print(_trunc_notice(trunc, was_trunc, t_bytes, total))
@@ -2673,11 +2922,16 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
         for ev in result.get("events", []):
             kind = ev.get("kind")
             payload = ev.get("payload") or {}
+            # Receipt contract: skip pre-ask / foreign-generation events.
+            if _event_outside_ask_window(ev, anchor_epoch, anchor_generation,
+                                         anchor_request_id):
+                continue
             if kind == "ASSISTANT_PROGRESS":
                 # cursor 后的 ASSISTANT_PROGRESS 一定是新 turn 产出，无需 baseline 文本对比
                 # （baseline 对比曾因 JSONL 更新/截断误触发旧内容返回）。
                 # P2-0d: 不打印 quick——避免与 final 重叠；quick 仅作产出存在信号。
-                final = _wait_final_text(review_key, session_dir=session_dir)
+                final = _wait_final_text(review_key, session_dir=session_dir,
+                                         after_epoch=anchor_epoch)
                 if final is not None:
                     trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
                     print(_trunc_notice(trunc, was_trunc, t_bytes, total))
@@ -2691,9 +2945,10 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                     except Exception:
                         pass
                     return 0
-                continue  # 无文本（罕见）——继续等
+                continue  # 无 fresh final text（含 anchor 前旧文本）——继续等
             if kind == "TASK_STATE" and payload.get("state") == "agent_end":
-                final = _wait_final_text(review_key, session_dir=session_dir)
+                final = _wait_final_text(review_key, session_dir=session_dir,
+                                         after_epoch=anchor_epoch)
                 if final is not None:
                     trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
                     print(_trunc_notice(trunc, was_trunc, t_bytes, total))  # B1: 内联最终文本
@@ -2760,6 +3015,11 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                                                {"review_key": review_key})
                         runtime_id = info.get("runtime_id", "")
                         session_id = info.get("session_id", "")
+                        # The revived runtime re-triggers the ask's command
+                        # under its own generation — re-bind the gate so
+                        # post-revive events are not ignored.
+                        if info.get("generation") is not None:
+                            anchor_generation = info.get("generation")
                         if info.get("status") != "active":
                             print(json.dumps(
                                 {"status": "recover_failed",
@@ -2772,13 +3032,13 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                                           "phase": "post_revive",
                                           "error": str(exc)}, indent=2))
                         return 1
-                    deadline = time.monotonic() + timeout  # P2-0d-3: reset deadline for new runtime
+                    deadline = time.monotonic() + timeout if timeout > 0 else None  # reset only bounded waits
                     continue  # 主循环将用新 runtime 继续轮询
                 # auto_recover=False（默认）或已尝试过：保持原行为
                 print(json.dumps({"status": "stuck",
                                   "hint": stuck.get("hint", "")}, indent=2))
                 return 1
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             print(json.dumps({"status": "timeout",
                               "suggestion": "use oracle result"}, indent=2))
             return 1
@@ -2791,18 +3051,19 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
 def cmd_oracle_wait(args: argparse.Namespace) -> int:
     """B1+A3: block until NEW assistant output (or agent_end), print final text.
 
-    Polls the gateway event stream every ``--interval`` (default 5s) up to
-    ``--timeout`` (default 300s).  Waits for a NEW ``ASSISTANT_PROGRESS``
-    event (parked oracle emits this on each produced turn while staying
-    active — agent_end never fires because auto-exit/park keep the runtime
-    alive) or a terminal ``TASK_STATE.agent_end``.  On output, prints the
-    final assistant text inline and exits 0.  On timeout, emits
-    ``{status: timeout, suggestion: "use oracle result"}`` and returns 1.
+    Polls the gateway event stream every ``--interval`` (default 5s) until
+    ``--timeout``; ``timeout <= 0`` means no deadline. Waits for a NEW
+    ``ASSISTANT_PROGRESS`` event (parked oracle emits this on each produced
+    turn while staying active — agent_end never fires because auto-exit/park
+    keep the runtime alive) or a terminal ``TASK_STATE.agent_end``. On output,
+    prints the final assistant text inline and exits 0. A positive timeout
+    emits ``{status: timeout, suggestion: "use oracle result"}`` and returns 1.
     """
     review_key = args.review_key
     session_dir = _get_session_dir(ParkRegistry().lookup(review_key))
     interval = max(0.1, float(getattr(args, "interval", 5.0) or 5.0))
-    timeout = max(0.0, float(getattr(args, "timeout", 300.0) or 300.0))
+    raw_timeout = getattr(args, "timeout", 0.0)
+    timeout = max(0.0, float(raw_timeout if raw_timeout is not None else 0.0))
     # P1: 截断上限（--all 跳过上限）
     max_bytes = 0 if getattr(args, "all", False) else int(
         os.environ.get("ORACLE_RESULT_MAX_BYTES", _DEFAULT_RESULT_MAX_BYTES))

@@ -56,7 +56,7 @@ aimeshchat oracle status "$KEY"
 aimeshchat oracle list
 
 # 完成等待（主命令）：阻塞到新产出或 agent_end，内联打印最终文本
-aimeshchat oracle wait "$KEY" --timeout 300
+aimeshchat oracle wait "$KEY"
 
 # 事件观测（不是完成信号）：cursor-resumable 事件流
 aimeshchat oracle watch "$KEY"
@@ -66,7 +66,7 @@ aimeshchat oracle result "$KEY"          # JSON
 aimeshchat oracle result "$KEY" --raw    # 纯文本
 
 # 复活/附着/终止
-aimeshchat oracle revive "$KEY" [--mode bg|pane|resume]
+aimeshchat oracle revive "$KEY" [--mode bg|resume]
 aimeshchat oracle attach "$KEY" '问题'
 aimeshchat oracle release "$KEY" [--purge]
 
@@ -83,7 +83,13 @@ aimeshchat oracle gc [--dry-run] [--json]
 
 - 默认持续输出事件流；`--exit-on <KIND[.STATE]>` 命中首个匹配事件即退出 0。
 - ⚠️ **首个 progress 即返回，不是完成信号**——只说明「有新产出」，完整回答要等 `oracle wait` / `oracle result`。
-- 完成等待请用 `oracle wait "$KEY" --timeout 300`（阻塞到新产出或 agent_end，内联打印最终文本）。
+- 完成等待必须用 `oracle wait "$KEY"`（不设置有限等待参数，默认 0 = unlimited；内联打印最终文本）。
+
+## 无限等待与无终端规则
+
+- Oracle review 的思考时间可能超过 300 秒；正常 review 必须保持 `oracle wait "$KEY"` 运行到新产出或 `agent_end`。
+- Oracle CLI 及其编排 wrapper 不得设置任何 `timeout`、命令超时或 `pty`；使用非交互进程并保持 stdout/stderr 可读。
+- 外层编排器需要观察时，只查看状态或日志，不终止 wait、不把观察截止时间改写为 Oracle 失败。
 
 ## Role binding（CLI 语义）
 
@@ -98,6 +104,30 @@ aimeshchat oracle gc [--dry-run] [--json]
 `binding=pending`，**runtime 保持存活**。backend_session_id 后续异步回写。
 status 显示 `binding: pending` 属正常。`ask` 在绑定未完成时默认快速失败并提示
 `--wait-binding`（阻塞到绑定完成后再投递）。
+
+## 投递状态表（ask receipt 的 status 语义）
+
+`oracle ask` 返回的 `status` 是**投递状态**，不是回答完成信号：
+
+| status | 含义 | 允许的下一步 |
+|--------|------|--------------|
+| `mailbox_persisted` | 仅写入持久队列（state=QUEUED），**只证明入队**，未证明 backend turn | 用 `oracle wait` / `oracle result` 轮询；不得当作已回答 |
+| `binding_pending` / `claimed` / `session_live` | 命令推进中（待绑定 / 已领取 / 会话恢复） | 继续等待或稍后重试 ask（binding_pending 可安全重投） |
+| `turn_triggered` | OMP 已建立关联 turn——**唯一证明 backend 开始处理** | `oracle wait` 直到产出，然后 `oracle result` |
+| `failed_safe` | 明确未触发（未投递） | 可安全原样重发 |
+| `ambiguous` | 可能已触发，无法确认 | **禁止自动重发**；先 `oracle status` 或人工确认 |
+
+**最新 ask 锚点（receipt/freshness contract）**：
+
+- 每次 ask 成功入队后，CLI 把 `last_ask_at` / `last_request_id` / `last_command_state` / `last_generation` 写入 review meta，并在 ask 输出中原样回显 gateway receipt 的 `request_id` / `command_id` / `state` / `generation` / `detail`。调用方必须记录返回的 `request_id` 与 `generation`。
+- `oracle result` / `oracle wait` **只承认 latest ask 之后**的输出：anchor 之前的 transcript 消息、旧 mailbox REPORT 与旧会话文件一律排除（返回 `no_result` 或继续等待），绝不会把上一轮的旧回答冒充本轮结果。
+- 输出 `meta.last_ask`（result）/ `last_ask`（status）暴露当前锚点；`state` 字段语义见上表。
+
+## 异步 reply 通知
+
+- `oracle ask` 返回 receipt 后即可结束当前命令；持久化队列中的 Oracle `REPORT` 到达 manager inbox 后，启用的 manager-mode `omp-mailbox-plugin` 会发送一次关联通知并唤醒 OMP turn。
+- 通知只携带 `request_id` / `generation` / `msg_id` 等关联元数据，不消费或 finalize mailbox 消息；它是唤醒提示，不是回答完成或 freshness 证明。
+- 收到通知后必须运行 `aimeshchat oracle result "$KEY"`，按 `last_ask`、`request_id`、`generation` 校验本轮结果；没有插件通知时仍可直接使用 `oracle result` 轮询。
 
 ## 顾问双模式
 
