@@ -372,9 +372,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ora_wait = ora_sub.add_parser("wait", help="A3/B1: block until NEW assistant output (or agent_end), print final text")
     ora_wait.add_argument("review_key")
-    ora_wait.add_argument("--timeout", type=float, default=300.0,
-                          help="B1: max seconds to wait (default 300); on timeout emits "
-                               "{status: timeout, suggestion: use oracle result}")
+    ora_wait.add_argument("--timeout", type=float, default=0.0,
+                          help="B1: max seconds to wait (default 0 = unlimited); "
+                               "positive values emit {status: timeout} on expiry")
     ora_wait.add_argument("--interval", type=float, default=5.0,
                           help="B1: poll interval in seconds (default 5)")
     ora_wait.add_argument("--all", action="store_true", default=False,
