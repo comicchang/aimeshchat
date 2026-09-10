@@ -2478,24 +2478,39 @@ def _scan_mailbox_report(review_key: str, manifest, since: float = 0.0,
         except Exception:
             continue
     # Fallback: bounded recursive scan of every session history directory.
-    # P2: cap at 200 files to prevent runaway scans on large mailboxes.
+    # P2-round2: newest history directory first (a live REPORT must not be
+    # missed because an unrelated older session sorted ahead of it), and only
+    # `.json` files consume the 200-file budget — non-message files in a
+    # history dir must not exhaust it.
     try:
+        history_dirs: list[Path] = []
+        for dirpath, _dirs, _files in os.walk(resolve_root()):
+            if Path(dirpath).name == "history":
+                history_dirs.append(Path(dirpath))
+        try:
+            history_dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        except OSError:
+            pass  # sort key failure leaves directory order unspecified; harmless —
+                  # every history dir is still scanned up to the json budget
+
         candidates: list[tuple[float, dict]] = []
-        file_count = 0
+        json_count = 0
         scan_done = False
-        for dirpath, _dirs, files in os.walk(resolve_root()):
+        for hdir in history_dirs:
             if scan_done:
                 break
-            if Path(dirpath).name != "history":
+            try:
+                names = sorted(os.listdir(hdir))
+            except OSError:
                 continue
-            for name in files:
-                file_count += 1
-                if file_count > 200:
-                    scan_done = True
-                    break
+            for name in names:
                 if not name.endswith(".json"):
                     continue
-                p = Path(dirpath) / name
+                json_count += 1
+                if json_count > 200:
+                    scan_done = True
+                    break
+                p = hdir / name
                 try:
                     mtime = p.stat().st_mtime
                 except OSError:
@@ -2894,9 +2909,17 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
                     continue
                 final = _wait_final_text(review_key, session_dir=session_dir,
                                          after_epoch=anchor_epoch)
-                if final is not None:
-                    trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
-                    print(_trunc_notice(trunc, was_trunc, t_bytes, total))
+                if final is None:
+                    print(json.dumps({
+                        "status": "no_final_text",
+                        "review_key": review_key,
+                        "request_id": anchor_request_id,
+                        "generation": anchor_generation,
+                        "message": "agent_end without fresh assistant text; run `oracle result`",
+                    }, indent=2))
+                    return 1
+                trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
+                print(_trunc_notice(trunc, was_trunc, t_bytes, total))
                 return 0
         cursor = int(boot.get("cursor") or 0)
     except GatewayError:
@@ -2949,9 +2972,17 @@ def _wait_for_new_output(review_key: str, runtime_id: str, session_id: str,
             if kind == "TASK_STATE" and payload.get("state") == "agent_end":
                 final = _wait_final_text(review_key, session_dir=session_dir,
                                          after_epoch=anchor_epoch)
-                if final is not None:
-                    trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
-                    print(_trunc_notice(trunc, was_trunc, t_bytes, total))  # B1: 内联最终文本
+                if final is None:
+                    print(json.dumps({
+                        "status": "no_final_text",
+                        "review_key": review_key,
+                        "request_id": anchor_request_id,
+                        "generation": anchor_generation,
+                        "message": "agent_end without fresh assistant text; run `oracle result`",
+                    }, indent=2))
+                    return 1
+                trunc, was_trunc, t_bytes, total = _truncate_result(final, max_bytes)
+                print(_trunc_notice(trunc, was_trunc, t_bytes, total))  # B1: 内联最终文本
                 return 0
         cursor = int(result.get("cursor") or cursor or 0)
         polls += 1
@@ -3058,6 +3089,13 @@ def cmd_oracle_wait(args: argparse.Namespace) -> int:
     keep the runtime alive) or a terminal ``TASK_STATE.agent_end``. On output,
     prints the final assistant text inline and exits 0. A positive timeout
     emits ``{status: timeout, suggestion: "use oracle result"}`` and returns 1.
+    When ``agent_end`` fires without fresh assistant text, emits
+    ``{status: no_final_text}`` and returns 1 so callers can distinguish
+    "empty answer" from "no answer obtained".
+    Note: exit 1 with ``{status: no_final_text}`` can also occur when the
+    backend flushes final text to the transcript shortly AFTER ``agent_end``
+    (a bounded fail-fast, not retried). Callers should run ``oracle result``
+    and parse its JSON status — the exit code alone is not a discriminator.
     """
     review_key = args.review_key
     session_dir = _get_session_dir(ParkRegistry().lookup(review_key))

@@ -279,3 +279,51 @@ class TestMailboxHook:
         out = capsys.readouterr().err
         assert "1 pending" in out
         assert "subject here" in out
+
+    def test_hook_dedup_is_session_scoped(self, tmp_path, monkeypatch, capsys):
+        """同 MAILBOX_ROOT 下不同 session 收到同形消息时不得互相吞掉。"""
+        store = MailboxStore(root=tmp_path)
+        store.session_init("s1", "mgr", ["w1"])
+        store.session_init("s2", "mgr", ["w1"])
+        for sid in ("s1", "s2"):
+            store.send(sid, "mgr", "w1", "subject here", "body", "TASK",
+                       run_id="run-1", request_id="req-1")
+        monkeypatch.setenv("MAILBOX_ROOT", str(tmp_path))
+        monkeypatch.setattr(mailbox_hook, "_DEDUP_FILE", tmp_path / "dedup.json")
+        mailbox_hook.main(["s1", "w1"])
+        assert "pending" in capsys.readouterr().err
+        mailbox_hook.main(["s2", "w1"])
+        assert "pending" in capsys.readouterr().err
+
+    def test_hook_suppresses_repeat_within_window(self, tmp_path, monkeypatch, capsys):
+        """窗口内第二次相同通知被 suppress，stderr 不再出现 pending。"""
+        store = MailboxStore(root=tmp_path)
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "subject here", "body", "TASK",
+                   run_id="run-1", request_id="req-1")
+        monkeypatch.setenv("MAILBOX_ROOT", str(tmp_path))
+        monkeypatch.setattr(mailbox_hook, "_DEDUP_FILE", tmp_path / "dedup.json")
+        mailbox_hook.main(["s1", "w1"])
+        assert "pending" in capsys.readouterr().err
+        mailbox_hook.main(["s1", "w1"])
+        err = capsys.readouterr().err
+        assert "pending" not in err
+
+    def test_hook_notifies_again_after_window_expiry(self, tmp_path, monkeypatch, capsys):
+        """窗口过期（ts 超过 _DEDUP_WINDOW）后同形消息重新通知。"""
+        store = MailboxStore(root=tmp_path)
+        store.session_init("s1", "mgr", ["w1"])
+        store.send("s1", "mgr", "w1", "subject here", "body", "TASK",
+                   run_id="run-1", request_id="req-1")
+        monkeypatch.setenv("MAILBOX_ROOT", str(tmp_path))
+        dedup = tmp_path / "dedup.json"
+        monkeypatch.setattr(mailbox_hook, "_DEDUP_FILE", dedup)
+        mailbox_hook.main(["s1", "w1"])
+        assert "pending" in capsys.readouterr().err
+        # 把保存的 ts 推回窗口之外
+        data = json.loads(dedup.read_text())
+        key = "s1/w1"
+        data[key]["ts"] -= mailbox_hook._DEDUP_WINDOW + 1
+        dedup.write_text(json.dumps(data))
+        mailbox_hook.main(["s1", "w1"])
+        assert "pending" in capsys.readouterr().err

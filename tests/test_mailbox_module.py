@@ -1168,13 +1168,13 @@ class TestStoreUncoveredPaths:
         (inbox / "a.json").write_text("{}")
         (inbox / "b.json").write_text("{}")
         real_stat = Path.stat
-        calls = {}
 
         def flaky(self, *a, **kw):
-            # call 1 = is_file, call 2 = is_symlink (lstat→stat on 3.13),
-            # call 3 = the mtime stat inside list_messages
-            calls[self.name] = calls.get(self.name, 0) + 1
-            if self.name == "b.json" and calls[self.name] == 3:
+            # Only list_messages' explicit mtime read calls f.stat() without
+            # a follow_symlinks kwarg; pathlib's is_file()/is_symlink() pass
+            # the kwarg explicitly (or serve from scandir-cached info), so
+            # the raise is deterministic regardless of call ordering.
+            if self.name == "b.json" and "follow_symlinks" not in kw:
                 raise OSError("vanished mid-scan")
             return real_stat(self, *a, **kw)
 

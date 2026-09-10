@@ -2513,6 +2513,87 @@ class TestOracleUncoveredPaths:
         with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
             assert _scan_mailbox_report("proj:oracle:gfx:blur", None) == "fb-body"
 
+    def test_scan_mailbox_report_cap_counts_only_json(self, tmp_path, monkeypatch):
+        """Non-.json files in an earlier history dir must not consume the
+        200-file budget before the matching REPORT is reached."""
+        from codeagent.oracle import _scan_mailbox_report
+        from codeagent.mailbox.store import resolve_root
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        noisy = resolve_root() / "noisy-session" / "oracle" / "history"
+        noisy.mkdir(parents=True)
+        for i in range(250):
+            (noisy / f"note-{i}.txt").write_text("x", encoding="utf-8")
+        hist = resolve_root() / "some-session" / "oracle" / "history"
+        hist.mkdir(parents=True)
+        (hist / "1.json").write_text(json.dumps({
+            "kind": "REPORT", "reply_to": "proj-oracle-gfx-blur", "body": "fb-body",
+        }), encoding="utf-8")
+        mock_store = MagicMock()
+        mock_store.read_history.side_effect = Exception("no sessions")
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("proj:oracle:gfx:blur", None) == "fb-body"
+
+    def test_scan_mailbox_report_prefers_newest_history_dir(self, tmp_path, monkeypatch):
+        """A live REPORT in a newer history dir must not be missed because an
+        older session exhausted the 200-.json budget first."""
+        from codeagent.oracle import _scan_mailbox_report
+        from codeagent.mailbox.store import resolve_root
+        import os as _os
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        old_dir = resolve_root() / "old-session" / "oracle" / "history"
+        old_dir.mkdir(parents=True)
+        for i in range(210):
+            (old_dir / f"{i:04d}.json").write_text(json.dumps({
+                "kind": "REPORT", "reply_to": "unrelated-key", "body": f"old-{i}",
+            }), encoding="utf-8")
+        new_dir = resolve_root() / "new-session" / "oracle" / "history"
+        new_dir.mkdir(parents=True)
+        (new_dir / "1.json").write_text(json.dumps({
+            "kind": "REPORT", "reply_to": "proj-oracle-gfx-blur", "body": "fb-body",
+        }), encoding="utf-8")
+        _os.utime(old_dir, (1000, 1000))
+        _os.utime(new_dir, (2000, 2000))
+        mock_store = MagicMock()
+        mock_store.read_history.side_effect = Exception("no sessions")
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("proj:oracle:gfx:blur", None) == "fb-body"
+
+    def test_scan_mailbox_report_json_cap_boundary(self, tmp_path, monkeypatch):
+        """JSON budget boundary: exactly 200 .json files are scanned — a
+        matching REPORT as the 200th is returned, but as the 201st it is
+        never read and must NOT be returned."""
+        from codeagent.oracle import _scan_mailbox_report
+        from codeagent.mailbox.store import resolve_root
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        hist = resolve_root() / "some-session" / "oracle" / "history"
+        hist.mkdir(parents=True)
+        report = json.dumps({
+            "kind": "REPORT", "reply_to": "proj-oracle-gfx-blur", "body": "fb-body",
+        })
+        mock_store = MagicMock()
+        mock_store.read_history.side_effect = Exception("no sessions")
+
+        def _fill_filler(i: int) -> None:
+            (hist / f"filler-{i:04d}.json").write_text(json.dumps({
+                "kind": "PROGRESS", "reply_to": "unrelated-key",
+            }), encoding="utf-8")
+
+        # Matching REPORT is the 200th .json → still within budget → found.
+        for i in range(199):
+            _fill_filler(i)
+        (hist / "zz-match.json").write_text(report, encoding="utf-8")
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("proj:oracle:gfx:blur", None) == "fb-body"
+
+        # One more .json pushes the match to the 201st slot → the budget
+        # stops before it is read → not returned.
+        _fill_filler(199)
+        with patch("codeagent.oracle.MailboxStore", return_value=mock_store):
+            assert _scan_mailbox_report("proj:oracle:gfx:blur", None) is None
+
 
     def test_scan_mailbox_report_excludes_pre_anchor_history(self, tmp_path, monkeypatch):
         """With an anchor, history REPORTs before last_ask_at (or without a
@@ -2956,8 +3037,10 @@ class TestOracleUncoveredPaths:
         with patch("codeagent.oracle._gateway", return_value=gw), \
              patch("codeagent.oracle._wait_final_text", return_value=None):
             assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
-                                        info={}) == 0
-        assert capsys.readouterr().out == ""
+                                        info={}) == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["status"] == "no_final_text"
+        assert "oracle result" in out["message"]
 
     def test_wait_new_output_gateway_error(self, tmp_path, monkeypatch, capsys):
         from codeagent.gateway.model import GatewayError
@@ -2971,6 +3054,27 @@ class TestOracleUncoveredPaths:
         err = json.loads(capsys.readouterr().out)
         assert err["status"] == "error"
         assert err["error"] == "GATEWAY_DOWN"
+
+    def test_wait_for_new_output_no_final_text_is_observable(self, tmp_path, monkeypatch, capsys):
+        """Main-loop agent_end without fresh text: structured JSON + exit 1,
+        never a silent 0 — callers must tell "empty answer" from "none"."""
+        from codeagent.oracle import _wait_for_new_output
+
+        monkeypatch.setattr("codeagent.oracle.Path.home", lambda: tmp_path)
+        gw = MagicMock()
+        # Boot drain: empty. Main loop: post-anchor, same-generation agent_end.
+        gw.call.side_effect = [
+            {"events": [], "cursor": 5},
+            {"events": [
+                {"kind": "TASK_STATE", "payload": {"state": "agent_end"}},
+            ], "cursor": 6},
+        ]
+        with patch("codeagent.oracle._gateway", return_value=gw), \
+             patch("codeagent.oracle._wait_final_text", return_value=None):
+            assert _wait_for_new_output("k1", "rt-1", "ses-1", timeout=0,
+                                        info={}) == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["status"] == "no_final_text"
 
     def test_wait_new_output_timeout(self, tmp_path, monkeypatch, capsys):
         from codeagent.oracle import _wait_for_new_output

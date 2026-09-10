@@ -1783,6 +1783,11 @@ def _run_in_background(args: argparse.Namespace, task: str) -> int:
     # Hidden flag: child writes result to job dir.
     argv.extend(["--_bg-job-id", job_id])
 
+    # Mailbox identity env goes through child_env — never an argv prefix
+    # (Popen with shell=False would treat "K=V" as the executable name).
+    # _mailbox_identity_env is idempotent and returns None when
+    # --mailbox-agent is unset.
+    mailbox_env = _mailbox_identity_env(args) or {}
     # Detach: start_new_session so SIGHUP from terminal doesn't kill the child.
     child_env = {**os.environ, **mailbox_env} if mailbox_env else None
     proc = subprocess.Popen(

@@ -317,15 +317,14 @@ class TestListJobs:
         mgr = _make_manager(tmp_path)
         target = mgr._root / mgr.create_placeholder(task="x")
         orig_stat = Path.stat
-        call_count = {"n": 0}
 
         def _stat(self, *args, **kwargs):
-            # Let is_dir()/exists() (internal stat) work normally;
-            # only the explicit d.stat() for mtime should fail.
-            if self == target:
-                call_count["n"] += 1
-                if call_count["n"] > 1:
-                    raise OSError("boom")
+            # Only list_jobs' explicit d.stat() for mtime calls without a
+            # follow_symlinks kwarg; pathlib's is_dir()/exists() pass the
+            # kwarg explicitly (or serve from scandir-cached info), so the
+            # raise is deterministic regardless of call ordering.
+            if self == target and "follow_symlinks" not in kwargs:
+                raise OSError("boom")
             return orig_stat(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "stat", _stat)
