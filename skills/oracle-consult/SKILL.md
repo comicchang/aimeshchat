@@ -1,6 +1,7 @@
 ---
 name: oracle-consult
-description: 何时、如何向顾问 agent 提问。必须显式指定 agent role；覆盖调用纪律、上下文收集、标准 prompt 模板与追问技巧。默认直接咨询，不走 persist-oracle 除非用户明确要求。
+description: Oracle/顾问咨询。触发：用户明确要求咨询、存在不可本地消歧的架构 trade-off。不触发：task 派发、本地分析、代码审查。
+disable-model-invocation: true
 ---
 
 # oracle-consult — Oracle 咨询工作流
@@ -24,6 +25,15 @@ Agent 主动咨询 → 需全部满足：
 - 用 Oracle 做 explore / 格式审查（这类走本地工具或 task agent）
 - 咨询可本地 5 分钟验证的低价值问题
 
+## Oracle 生命周期纪律（红线）
+
+| 场景 | 要（MUST） | 不要（MUST NOT） |
+|------|-----------|----------------|
+| Oracle 运行中 | 耐心等待返回；利用等待期推进其他并行工作 | **严禁** cancel/kill Oracle task（`hub cancel` 不可用于 Oracle） |
+| Oracle 因上游错误中断 | `hub send` revive 同一实例，继续等待 | 放弃 Oracle、自行替代结论、不告知用户 |
+| 切换 Oracle 模型 | **必须用户明确授权**后才可切换 | 自行决定换模型、静默切换 role |
+| 取消 Oracle 咨询 | **必须用户明确授权**后才可取消 | 因等待时间长/上下文压力自行取消 |
+
 ## 顾问 role 选择（必须显式）
 
 咨询顾问时**必须显式指定 agent role**；未指定时先向用户询问，不自行默认。
@@ -46,6 +56,24 @@ Agent 主动咨询 → 需全部满足：
 - **默认**：直接发起一次咨询，prompt 中包含收集好的上下文，完成后告知用户咨询结论来源与所用 agent role。
 - **追问**：复用同一咨询实例发送增量问题，不要重新发起。
 - **持久化**：仅用户明确说「persist-oracle」「持久化这个 review」时，才走持久化流程（见 `persist-oracle` skill）。
+
+## 等待纪律（严禁中断 Oracle）
+
+> **用户原话：「严禁严禁严禁 kill / cancel oracle task」**
+
+### 等待规则
+1. **`hub wait` 必须无 deadline**——不得设超时自动取消；外层 agent 不得用 job timeout、watchdog、`hub cancel`
+2. **只有最终回答/agent_end 算完成**——progress/通知/session_live 不算完成；收到中间状态继续等待
+3. **等待期间只做不依赖结果的并行工作**——禁止为「看起来卡住」重发同题/换 role/换模型
+
+### 中断恢复
+4. **上游错误/transport 中断 → revive 同一实例**（保留 key、agent role、上下文），revive 后重新进入无限等待
+5. **禁止 cold/new task 替代或自行给结论**——revive 失败时向用户报告 BLOCKED 并保留可恢复状态
+
+### 生命周期收尾
+6. **收到最终结果后才允许结束等待**——release/purge/GC/换题须用户授权
+7. **退出前记录**：key、request_id、role 与结果来源
+8. **切换 Oracle 模型或取消咨询必须用户明确授权**——agent 不得自行决定
 
 ## 边界（Oracle 是什么 / 不是什么）
 

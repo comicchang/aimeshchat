@@ -1,6 +1,7 @@
 ---
 name: persist-oracle
-description: 持久化多轮顾问 review — 保留上下文。仅用 aimeshchat oracle start/ask/status/list/watch/wait/result/revive/attach/release/doctor/gc。仅在用户明确说「persist-oracle」「持久化这个 review」时使用；默认咨询走 oracle-consult 的 task 直接调用。
+description: 持久化多轮 Oracle review。触发：用户明确说「persist-oracle」或「持久化 review」。不触发：单次咨询、普通 task 派发。
+disable-model-invocation: true
 ---
 
 # persist-oracle — 持久化多轮 Oracle Review

@@ -1,6 +1,7 @@
 ---
 name: agent-swarm
-description: Unified agent orchestration over the aimeshchat swarm/mailbox protocol — manager dispatch or worker execution, determined by role. Progressive disclosure: loads only the relevant role file.
+description: Swarm/mailbox 协议编排。触发：aimeshchat swarm 子命令、manager/worker 角色声明、跨主机 mailbox 通信。不触发：OMP task()、本地 subagent、hub 协作。
+disable-model-invocation: true
 ---
 
 # agent-swarm — Unified Orchestration Protocol
