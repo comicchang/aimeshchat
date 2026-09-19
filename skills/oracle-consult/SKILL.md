@@ -37,21 +37,17 @@ description: >
 
 ### 实例复用
 
-| DO | DON'T |
-|---|---|
-| 追加问题复用同一实例 | 每次追问都新起 task |
-| **实例不可复用时**，按决策表处理（见下） | 盲目 revive 或丢弃上下文 |
+实例复用按下表执行：先按“实例状态 / 场景”定位行，再遵循该行的 **DO**；同一行的 **DON'T** 明确禁止对应的替代做法。
 
-**实例复用决策表**：
-
-| 实例状态 | 动作 |
-|---|---|
-| running | `hub send` 追加 |
-| 刚 parked（<5min） | `hub send` 或 `hub wait` 唤醒 |
-| parked 很久 / canceled / revive cache miss | 起新实例 + `history://<id>` 读取旧对话总结上下文 |
-| 同 topic 已有 running/parked 实例 | 复用已有实例，不起新的 |
-| 多 Oracle 并行时，将先完成者的完整结论转发给尚未完成的每个实例 | 只交付某一个 Oracle 的孤立结论 |
-| 切换 role/model 前先取得用户授权 | 自行切换 role/model |
+| 实例状态 / 场景 | DO | DON'T |
+|---|---|---|
+| 追加问题、实例可复用 | 追加问题复用同一实例 | 每次追问都新起 task |
+| running | `hub send` 追加 | 盲目 revive 或丢弃上下文 |
+| 刚 parked（<5min） | `hub send` 或 `hub wait` 唤醒 | 盲目 revive 或丢弃上下文 |
+| parked 很久 / canceled / revive cache miss | 起新实例 + `history://<id>` 读取旧对话总结上下文 | 盲目 revive 或丢弃上下文 |
+| 同 topic 已有 running/parked 实例 | 复用已有实例，不起新的 | 为同一 topic 新起实例 |
+| 多 Oracle 并行 | 将先完成者的完整结论转发给尚未完成的每个实例 | 只交付某一个 Oracle 的孤立结论 |
+| 切换 role/model 前 | 先取得用户授权 | 自行切换 role/model |
 
 ### 等待与错误恢复
 
