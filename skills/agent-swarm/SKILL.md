@@ -38,7 +38,8 @@ Manager 和 Worker 不得绕过 manifest/routing table 直接拼远端路径或�
 Manager 的唯一入口是 `swarm` 子命令（`aimeshchat swarm direct/poll/watch/status`）；bare `mailbox send` 仅用于 bootstrap 和故障诊断。
 Worker 的唯一入口是 `mailbox read` + 两阶段消费；消息到达由 OMP plugin（只通知）或主动 polling 触发。
 
-## Execution Mode
+## §3 Execution Mode
+
 
 每个 Worker agent 在 SessionManifest 中声明 `execution_mode`，二者**互斥**：
 
@@ -53,7 +54,7 @@ Worker 的唯一入口是 `mailbox read` + 两阶段消费；消息到达由 OMP
 `mailbox-worker` 和 `local-omp-mcp` 不得在同一 session 内同时用于同一 agent_id。
 `session-init` 必须校验 manifest 一致性，manager ID 冲突时拒绝创建（而非静默合并）。
 
-## Interactive-Peer Mode
+## §4 Interactive peers and role selection
 
 共享 FS（Mode A）下**手工多开对等 omp 实例**的协作形态。两个实例都由用户手工启动，
 没有 launcher 注入身份——必须先 attach 再开工。
@@ -107,8 +108,8 @@ Read **one** role file based on your role:
 ## Shared Protocol Reference
 
 The canonical mailbox protocol (message schema, status.json contract, two-phase consumption, CLI commands, error handling) lives in `skill://agent-swarm/protocol/mailbox.md`. Both roles reference it; neither duplicates its content.
+## §5 Deployment Modes
 
-## Deployment Modes
 
 部署模式由**拓扑可达性**和 **execution_mode** 共同决定。
 
@@ -157,13 +158,12 @@ The canonical mailbox protocol (message schema, status.json contract, two-phase 
 - [ ] `return_mode` 是否匹配拓扑？（单向必须 `manager-pull`）
 - [ ] `execution_mode` 是否已声明且不冲突？
 - [ ] `send-keys` 是否仅用于本地 Worker 的 INIT check prompt？（远程不可用）
+## §6 远程运行时参考
 
-## §5 远程运行时参考
 
 跨设备 Gateway、TASK 生命周期、写作边界和 v1/v2 差异：详见 `references/remote-operations.md`；完整协议细节见 `operations/remote.md`。
 
-
-## §6 Shared invariants and initialization
+## §7 Shared invariants and initialization
 
 | DO | DON'T |
 |---|---|
