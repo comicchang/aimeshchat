@@ -158,53 +158,9 @@ The canonical mailbox protocol (message schema, status.json contract, two-phase 
 - [ ] `execution_mode` 是否已声明且不冲突？
 - [ ] `send-keys` 是否仅用于本地 Worker 的 INIT check prompt？（远程不可用）
 
-## Gateway 跨设备运行时（v2 控制面）
+## §5 远程运行时参考
 
-跨设备 Agent runtime 的权威控制面是**每设备本地 Gateway**（UDS）+ Manager 主动 SSH stdio：
-远端永不反向连接 Manager，也不开放 HTTP/TCP 端口。
-
-```
-Manager(Mac)                          Remote(OA-MIANYIN-2)
-  │ aimeshchat gateway ensure --host OA-MIANYIN-2
-  │   ├─ wire v2 probe（REMOTE_UPGRADE_REQUIRED if <2）
-  │   ├─ tmux/架构预检（缺 OMP 只关对应 capability）
-  │   └─ 远端 gateway 启动（私有 tmux socket）
-  │
-  │ SSH ControlMaster 单次 `aimeshchat gateway rpc --stdio`（有界控制）
-  ├── session.ensure   → 远端缓存只读 manifest（manager/roster/version）
-  ├── runtime.spawn    → 远端 tmux supervisor 拉起 Agent（argv 无 shell）
-  └── runtime.send     → 消息进远端 inbox → 插件唤醒（steer/nextTurn）
-  │
-  │ SSHStream（长期流，复合 cursor，断线补流）
-  └── mailbox + RuntimeEvent 从远端流回 Manager → EventStore.ingest_remote
-```
-
-### 跨设备 TASK 生命周期
-
-```
-Manager 发送 --require-ack TASK
-  → DELIVERED（outbox 标记）
-  → READ（远端插件 claim → MailboxService 生成 READ receipt 回流）
-  → RUNNING（首条 PROGRESS → RequestLedger）
-  → PROGRESS…（assistant/tool 事件 → EventStore）
-  → DONE（REPORT + artifact verify 通过 → terminal CAS）
-```
-
-- 任务终态以 mailbox RequestLedger 为准；runtime 只由显式 `runtime stop` / `oracle release` 终止。
-- 断线期间消息进 DeliveryEngine durable outbox；重连后从最后 cursor 补流，去重消费。
-- `aimeshchat events watch --session <id> --cursor <c> --jsonl` 观察事件流（只控制观察连接 timeout）。
-
-### 跨设备写作流程
-
-1. Manager 将文档分区建成**互不重叠**的 request，分别 dispatch 给不同远端 Worker。
-2. TASK/REPORT 的 `body` 使用固定 JSON：
-   ```json
-   {"base_revision": "...", "target_path": "...", "artifact_id": "..."}
-   ```
-   artifact 仍按 AttachmentRef + sha256 验证。
-3. 仅 Manager 的**单一 merge request** 串行应用——Worker 不得同时修改 Manager working tree。
-4. 相同目标路径不同 hash 的并发 REPORT → `PROTOCOL_CONFLICT`，不覆盖既有 artifact。
-5. QUESTION/RESPONSE 使用 reply_to；重要消息设置 `require_ack=true`。
+跨设备 Gateway、TASK 生命周期、写作边界和 v1/v2 差异：详见 `references/remote-operations.md`；完整协议细节见 `operations/remote.md`。
 
 
 ## Shared Invariants
