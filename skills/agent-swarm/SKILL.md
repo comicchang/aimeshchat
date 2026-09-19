@@ -7,6 +7,20 @@ disable-model-invocation: true
 # agent-swarm — Unified Orchestration Protocol
 
 > Role-specific rules: `skill://agent-swarm/roles/manager.md` or `skill://agent-swarm/roles/worker.md` | Protocol reference: `skill://agent-swarm/protocol/mailbox.md`
+## §1 触发与执行契约
+
+触发：使用 `aimeshchat swarm`、声明 manager/worker、或跨主机 mailbox 通信。不触发：同一 OMP 进程内的 `task()`、本地 subagent、`hub` 协作。
+
+| DO | DON'T |
+|---|---|
+| 先读取本文件，再按角色加载 `roles/manager.md` 或 `roles/worker.md`，并按拓扑加载 `operations/local.md`/`remote.md` | 未判定角色、拓扑或 execution mode 就派发任务 |
+| 以 SessionManifest/SwarmKernel 为控制面，使用 `swarm` 路由；用 protocol 文档核对消息状态 | 直接拼远端路径、绕过 manifest，或用 hub 跨进程投递 |
+| 用 `mailbox read → process → finalize` 两阶段消费，并以匹配 `request_id` 的 REPORT 作为完成证据 | 以 status.json、capture-pane 或 send-keys 推断完成 |
+| 遇证据不足标记 `[EVIDENCE PENDING]`/`BLOCKED`，并报告缺失证据 | 猜测 worker、字段、路径或静默降级 |
+
+## §2 导航
+
+角色细则：`skill://agent-swarm/roles/manager.md`、`skill://agent-swarm/roles/worker.md`；消息协议：`skill://agent-swarm/protocol/mailbox.md`；跨主机 CLI：`skill://aimeshchat-cli/`；持久顾问：`skill://persist-oracle/`。
 
 # Architecture Authority
 

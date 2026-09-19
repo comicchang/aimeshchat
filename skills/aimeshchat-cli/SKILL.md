@@ -5,6 +5,25 @@ disable-model-invocation: true
 ---
 
 # aimeshchat — 多主机代码任务唯一入口
+## §1 触发、边界与 DO/DON'T
+
+触发：目标仓不在当前机器、跨机器调研、持久 session、受限路径需授权委派。不触发：当前 CWD 可直接读取的本地编码、单机任务、无 repo-map 的纯文档 topic。
+
+| DO | DON'T |
+|---|---|
+| 先用判断树和 `route where` 确认 host/path，再选择 `run`、`route` 或本地工具 | 猜测 host/path，或对本地可读任务强行远程路由 |
+| 跨主机走 `swarm`/`mailbox --host`，以匹配 request_id 的 REPORT 和 artifact 校验作为完成证据 | 用 tmux send-keys、capture-pane 或 status 残留代替 mailbox 生命周期 |
+| 让 CLI 自动管理远程 timeout；失败按错误分类重试一次后报告 blocker 或合法降级 | 手工传远程 timeout、无限重试，或 gateway 失败时手工启动 tmux |
+| 记录命令、stderr、host、session/job ID 和验收结果 | 用 `head`/`tail`/`grep` 提前截断 CLI 输出，丢失状态或触发 SIGPIPE |
+
+## §2 执行验收
+
+1. 定位：确认 host、workdir、权限与 session key；完成条件：输入可复现。
+2. 执行：按 §1 选择入口；完成条件：job/session 已建立并记录 ID。
+3. 回收：等待匹配终态并校验附件；完成条件：REPORT、size、sha256 均通过。
+4. 输出：报告产物、证据、降级能力和 blocker；完成条件：无未标注推测。
+
+交叉引用：编排协议见 `skill://agent-swarm/`；Oracle 持久 review 见 `skill://persist-oracle/`。
 
 > **编排协议**: `skill://agent-swarm/` — mailbox + gateway 编排协议（Manager/Worker 角色、INIT 握手、v2 session-based）
 > **部署模式**: `skill://agent-swarm/SKILL.md#deployment-modes` — Mode A (Shared FS) vs 跨主机 transport 决策树
