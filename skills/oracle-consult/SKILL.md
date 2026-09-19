@@ -47,14 +47,12 @@ description: >
 
 | DO | DON'T |
 |---|---|
-| `hub wait` 不设 deadline，只接受最终回答或 `agent_end` 作为完成信号 | 设置 timeout/watchdog，或调用 `hub cancel`/kill Oracle |
-| 等待期间只做不依赖 Oracle 结果的并行工作 | 因等待时间长而重发同题、换 role/model 或自行下结论 |
-| 一次性发送完整上下文后等待 | 反复 `hub jobs`/`hub wait` 检查状态、发送"催一下"/"进度如何"；**禁止 sleep N 秒后轮询状态** |
-| 方向相关的多个问题 append 给同一 Oracle 实例（`hub send` 追加） | 方向相关的问题新起 Oracle agent（浪费上下文、打断连续性） |
-| Oracle 返回后读取完整结果再行动 | 抢在 Oracle 返回前自行产出"临时版本" |
+| 一次性发送完整上下文后用 `hub wait` 等待最终回答或 `agent_end`，不设 deadline | 设置 timeout/watchdog、调用 `hub cancel`/kill，或反复 `hub jobs`/`hub wait`/sleep N 秒轮询、发送催促消息 |
+| 等待期间只做不依赖 Oracle 结果的并行工作；Oracle 返回后读取完整结果再行动 | 因等待时间长重发同题、切换 role/model、自行下结论，或抢先产出“临时版本” |
+| 方向相关的多个问题 append 给同一 Oracle 实例（`hub send` 追加） | 为方向相关问题新起 Oracle agent，丢失上下文连续性 |
 | transport/SSL 中断或卡住时 revive 同一实例并保留 key、role、上下文；revive 失败就报告 `BLOCKED` | 用 cold/new task 替代，或伪造结论、静默降级；取消/release/purge/结束咨询前不取得用户授权 |
 
-> **硬规则**：Oracle 负责的工作不得由本 agent 代做。用户要求“等 Oracle”或已将本次决策交给 Oracle 时，即使 Oracle 失败、超时、卡住，也只能按上表 revive/继续等待或报告 `BLOCKED`；不得自行补答案、改稿或静默降级。该规则与 `omp-history-reader` 的“常见 Agent 行为反模式”相互对应。收到最终结果后记录 key、request_id、role 与结果来源。
+> **硬规则**：违反本节任一 DON'T 即停止自行推进，按对应 DO 回退；Oracle 负责的工作不得由本 agent 代做。收到最终结果后记录 key、request_id、role 与结果来源。
 
 ## 4. Prompt 与交付边界
 
