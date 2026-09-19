@@ -25,34 +25,49 @@ description: >
 
 一次只问一个决策问题；未确认内容明确标为"假设"。
 
-## 3. Role、实例复用与多 Oracle 协作
+## 3. Role、实例复用与等待纪律
 
-- 必须显式指定 role：`oracle-gpt`、`oracle-opus`、`oracle-gemini`、`oracle-deepseek` 或 `oracle-glm`；未指定先询问用户。role 到 backend 的映射由部署配置决定，本 skill 不猜模型或厂商。
-- 调用前先检查当前运行及已结束的 Oracle。相关追加问题必须复用同一实例：运行中优先 `hub send`，已结束先 revive 同一实例再 send；不得每次新起 task，也不重复发送完整上下文。
-- 只有用户明确要求换 Oracle，或问题完全无关，才新建实例；切换 role/model 必须用户明确授权，禁止自行切换。
-- 用户明确要求同时咨询多个 Oracle 时，分别记录实例、role、key、状态。Oracle 完成有先后：先完成者的完整结论必须立即转发给尚未完成的每个 Oracle（用 `hub send`），要求后者纳入并综合分析。最终只交付综合结论，不交付单个 Oracle 的孤立结论。
+### Role 选择
 
-## 4. 等待与生命周期（硬规则）
+| DO | DON'T |
+|---|---|
+| 显式指定 role（`oracle-gpt`、`oracle-opus`、`oracle-gemini`、`oracle-deepseek` 或 `oracle-glm`） | 未指定就默认某个 role |
+| 未指定时先询问用户 | 自行猜模型或厂商 |
+| 让部署配置决定 role 到 backend 的映射 | 在 skill 中猜测模型或厂商映射 |
 
-- `hub wait` 必须无 deadline；不得设置 job timeout 或 watchdog，不得 `hub cancel` 或 kill Oracle。
-- progress、通知、`session_live` 都不是完成信号；只有最终回答或 `agent_end` 才算完成。
-- 等待期间只能做不依赖结果的并行工作；不得因等待时间长而重发同题、换 role/model 或自行下结论。
-- 上游或 transport 中断：revive 同一实例，保留 key、role、上下文，然后重新无限等待；禁止用 cold/new task 替代。
-- Oracle 配额不足、revive 失败或无法继续：报告 `BLOCKED`，说明原因并保留可恢复状态；不得伪造结论或静默降级。
-- 取消、release、purge、GC 或结束咨询均须用户明确授权。收到最终结果后记录 key、request_id、role 与结果来源。
+### 实例复用
 
-## 5. Prompt 与交付边界
+| DO | DON'T |
+|---|---|
+| 追加问题复用同一实例：运行中用 `hub send`，已结束先 revive | 每次追问都新起 task |
+| 多 Oracle 并行时，将先完成者的完整结论转发给尚未完成的每个实例 | 只交付某一个 Oracle 的孤立结论 |
+| 切换 role/model 前先取得用户授权 | 自行切换 role/model |
 
-按"项目上下文｜唯一问题｜已知事实｜未确认假设｜已尝试方案｜约束｜期望输出"组织 prompt；期望输出包含 bottom line、action plan、effort、confidence、why（≤4 点）和 risks（≤3 点）。
+### 等待与错误恢复
 
-Oracle 只提供建议，不实施改动；高风险建议须人工复核，并以可验证证据为准。上下文不足时先指出缺失的 1–3 项，不得脑补。
+| DO | DON'T |
+|---|---|
+| `hub wait` 不设 deadline，只接受最终回答或 `agent_end` 作为完成信号 | 设置 timeout/watchdog，或调用 `hub cancel`/kill Oracle |
+| 等待期间只做不依赖 Oracle 结果的并行工作 | 因等待时间长而重发同题、换 role/model 或自行下结论 |
+| 一次性发送完整上下文后等待 | 反复 `hub jobs`/`hub wait` 检查状态、发送"催一下"/"进度如何"；**禁止 sleep N 秒后轮询状态** |
+| 方向相关的多个问题 append 给同一 Oracle 实例（`hub send` 追加） | 方向相关的问题新起 Oracle agent（浪费上下文、打断连续性） |
+| Oracle 返回后读取完整结果再行动 | 抢在 Oracle 返回前自行产出"临时版本" |
+| transport/SSL 中断或卡住时 revive 同一实例并保留 key、role、上下文；revive 失败就报告 `BLOCKED` | 用 cold/new task 替代，或伪造结论、静默降级；取消/release/purge/结束咨询前不取得用户授权 |
 
-## 6. 追问
+> **硬规则**：Oracle 负责的工作不得由本 agent 代做。用户要求“等 Oracle”或已将本次决策交给 Oracle 时，即使 Oracle 失败、超时、卡住，也只能按上表 revive/继续等待或报告 `BLOCKED`；不得自行补答案、改稿或静默降级。该规则与 `omp-history-reader` 的“常见 Agent 行为反模式”相互对应。收到最终结果后记录 key、request_id、role 与结果来源。
+
+## 4. Prompt 与交付边界
+
+按“项目上下文｜唯一问题｜已知事实｜未确认假设｜已尝试方案｜约束｜期望输出”组织 prompt；期望输出包含 bottom line、action plan、effort、confidence、why（≤4 点）和 risks（≤3 点）。
+
+Oracle 只提供建议，不实施改动；高风险建议须人工复核，并以可验证证据为准。上下文不足时先指出缺失的 1–3 项，不得脑补。Oracle 返回前，agent 不得把等待中的咨询结果包装成自己的结论。
+
+## 5. 追问
 
 沿用同一实例，不重发全部上下文，只发送增量证据或问题。可要求补证据、收敛方案、展开风险、反方审查或拆成最小 commit。默认同一 session 追问不超过 3–5 轮，除非用户要求继续。
 
-## 7. `disable-model-invocation`
+## 6. `disable-model-invocation`
 
-Oracle 需由 agent 自主触发时删除该字段（默认 false）；`true` 仅适合用户手动触发。无论取值，直接 `task(agent=oracle-*)` 都可能绕过 skill；确定性执行必须在始终加载的 `system-prompt.md` 或全局 `AGENTS.md` 写入上述门槛，并由 oracle/task wrapper 或 hook 做 preflight gate：缺 role、7 项上下文、实例复用检查、等待约束或取消约束任一失败，即拒绝创建或取消。
+本 skill 面向“用户明确要求 Oracle”或“本地分析无法消歧且存在真实 trade-off”的场景，默认允许模型自动触发，因此 front matter 不应设置 `disable-model-invocation: true`；若部署需要仅用户手动触发，才设置为 `true`，并明确这会关闭上述自动触发路径。该字段只控制 skill 是否可被模型自动调用，不是 Oracle agent 的安全闸门。
 
-项目 `AGENTS.md` 只能补充指针，不能替代全局 gate。若暂保留 `true`，必须把关键硬规则同步写入 system prompt，不能只写"请读取 skill"。
+无论字段取值，直接 `task(agent=oracle-*)` 都可能绕过本 skill。确定性执行必须在始终加载的 `system-prompt.md` 或全局 `AGENTS.md` 写入调用门、上下文交接、实例复用、等待和取消约束，并由 oracle/task wrapper 或 hook 做 preflight gate：缺 role、7 项上下文、实例复用检查、等待约束或取消约束任一失败，即拒绝创建或取消。项目 `AGENTS.md` 只能补充指针，不能替代全局 gate；若保留 `true`，关键硬规则不能只写“请读取 skill”。
