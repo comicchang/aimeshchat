@@ -163,57 +163,15 @@ The canonical mailbox protocol (message schema, status.json contract, two-phase 
 跨设备 Gateway、TASK 生命周期、写作边界和 v1/v2 差异：详见 `references/remote-operations.md`；完整协议细节见 `operations/remote.md`。
 
 
-## Shared Invariants
+## §6 Shared invariants and initialization
 
-These rules apply to **every** agent regardless of role:
+| DO | DON'T |
+|---|---|
+| Verify INIT/session.json/workers.toml; correlate replies with `msg_id`/`--reply-to`; mark weak evidence `[EVIDENCE PENDING]` or `[INFERENCE]` | Fabricate fields, IDs, paths, or conclusions |
+| Mutate mailbox/status only through CLI; consume `read → process → finalize`; use status/inbox/REPORT evidence | Hand-write JSON, use capture-pane, or skip finalize |
+| Treat status.json as a five-field availability snapshot; use RequestLedger/REPORT for terminal state; keep Park lifecycle separate | Treat `DONE`/file presence as final proof or clear Park-protected archive |
+| Use `aimeshchat mailbox/swarm` across processes; load role, protocol and topology before work | Use hub or filesystem side channels across OMP instances |
 
-1. **Evidence honesty** — insufficient evidence → `[EVIDENCE PENDING]` or `[INFERENCE: reason]`. Never fabricate.
-2. **msg_id correlation** — every reply references the original `msg_id` via `--reply-to`. Never reuse or overwrite a sent message.
-3. **Never fabricate** — do not invent protocol fields, status values, inbox paths, or worker IDs. Verify from INIT, session.json, or workers.toml.
-4. **CLI-only writes** — all mailbox and status.json mutations go through the standalone `mailbox` CLI. Never hand-write JSON.
-5. **No capture-pane** — do not use terminal text to infer agent state. Use status.json and inbox polling.
-6. **Two-phase consumption** — `mailbox read` (inbox→processing) → process → `mailbox finalize` (processing→archive). No shortcuts.
-7. **status.json is a snapshot** — five fields only. Full conclusions belong in REPORT messages and artifacts, not in status.
-8. **Lifecycle vs mailbox status 正交** — `mailbox status` 仅描述工作状态（IDLE/BUSY/DONE/BLOCKED）。Park 是独立的 lifecycle 概念（由 `aimeshchat park registry` 管理），不在 status.json 表达。Park 期间 agent 保持 IDLE 且 archive 受保护（禁止 `mailbox clear`）。
-9. **通道边界禁令** — 跨进程/跨实例协作的唯一通道是 `aimeshchat mailbox/swarm`；
-   OMP 内部 `hub` 仅限同一 OMP 进程内的 subagent 编排。禁止用 hub 向另一个
-   omp 实例投递任务，也禁止用文件系统旁路（直接写对方 inbox 之外的路径）传递指令。
+**Initialization:** (1) determine explicit role/manifest; (2) load role file; (3) read `protocol/mailbox.md`; (4) load `operations/local.md` or `operations/remote.md`; (5) Manager ensures Gateway when needed; (6) complete Manager/Worker handshake.
 
-## Initialization Flow
-
-1. **Determine role** from explicit role/manifest (`CODEAGENT_ROLE` / `OMP_WORKER_ID` / session manifest) — never infer from env presence.
-2. **Load your role file** — `roles/manager.md` or `roles/worker.md`.
-3. **Read the protocol** — `protocol/mailbox.md` for the canonical CLI schema and state machine.
-4. **Load deployment mode** — `operations/local.md` or `operations/remote.md` based on session topology.
-5. **跨设备 runtime** — Manager `aimeshchat gateway ensure --host <H>` 预检 + 启动远端 gateway（见 §Gateway 跨设备运行时）。
-6. **Follow role-specific initialization** — Manager self-init or Worker INIT handshake.
-
-## CLI Resolution Order
-
-跨主机通信的权威入口是 `aimeshchat swarm` 子命令 + `aimeshchat gateway` 控制面，而非 bare `mailbox`：
-
-1. `aimeshchat gateway ensure/start/status/rpc` — 每设备本地控制面（session.ensure/runtime.spawn/register/send/stop/events.list）
-2. `aimeshchat swarm direct/poll/watch/status` — SessionManifest-aware routing + delivery（`poll`/`status` 为 local-only，跨主机聚合由 manager pull / gateway events 补足）
-3. `aimeshchat mailbox ... --host <H>` — 跨主机 leaf transport primitive（read/peek/stats/send/status 均可通过 SSH 路由到远端 host 的本地 mailbox CLI）
-4. PATH command `mailbox` — 本地 FS mailbox 操作
-
-跨主机 manager-pull 回程：Manager 使用 `aimeshchat mailbox read --session <id> --agent manager --owner manager --host <H>` 从远端 host 的 manager inbox 拉取 REPORT。
-禁止 `scripts/tmux_worker.py` 或其他 legacy wrapper。
-
-## Protocol Version
-
-本协议 active design version: **v2 (session-based)**。
-同目录内 v1 legacy 命令仅用于 unmigrated Worker；OMP Remote v2 (`omp-execd` MCP) 属于独立架构，
-不继承本协议的 mailbox lifecycle。详见 §Execution Mode。
-
-## Legacy (v1)
-
-v1 concepts deprecated by this protocol:
-
-- **control envelope** (A-plane) → replaced by `mailbox read`
-- **B-plane** (event-emit) → replaced by `status.json`
-- **mailbox/outbox → relay → mailbox/inbox** → replaced by direct inbox
-- **cursor / unread / mark-read** → replaced by `mailbox read` / `mailbox finalize` two-phase
-
-Legacy commands (`request`, `request-role`, `batch-request`, `event-emit`, `event-wait`, `mailbox-send`, `mailbox-check`, `mailbox-relay`) are for unmigrated Workers only.
-跨主机 manager pull 使用 `aimeshchat mailbox ... --host <H>`（非 legacy，是当前唯一可用的跨主机 mailbox 传输原语），详见 `roles/manager.md`。
+**CLI resolution:** cross-host use `gateway` control plane → `swarm` routing → `mailbox --host`; local shared FS may use PATH `mailbox`. Current protocol is v2; v1 commands are only for unmigrated Workers. Legacy details and remote lifecycle: `references/remote-operations.md` and `operations/remote.md`.

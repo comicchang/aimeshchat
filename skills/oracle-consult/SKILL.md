@@ -40,6 +40,7 @@ description: >
 | DO | DON'T |
 |---|---|
 | 追加问题复用同一实例：运行中用 `hub send`，已结束先 revive | 每次追问都新起 task |
+| running/刚 parked（<5min）→ `revive`；已 parked 很久（>10min 无响应）或 revive 后上下文丢失 → 起新实例并重发关键上下文 | 盲目 revive 不检查实例状态/运行时长；同 topic 同时起多个 Oracle |
 | 多 Oracle 并行时，将先完成者的完整结论转发给尚未完成的每个实例 | 只交付某一个 Oracle 的孤立结论 |
 | 切换 role/model 前先取得用户授权 | 自行切换 role/model |
 

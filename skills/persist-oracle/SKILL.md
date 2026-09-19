@@ -14,7 +14,8 @@ disable-model-invocation: true
 | 首轮确认 role、KEY、项目/主题边界，再执行 `oracle start` | 未指定 role 时猜模型，或用同一 KEY 混入不同主题 |
 | 同一主题复用 KEY 和 backend session，追加问题使用 `oracle ask` | 每轮新建实例、把 `mailbox_persisted` 当作回答完成 |
 | 用 `oracle wait`/`result` 等最终产出，按 latest ask 的 request_id/generation 校验 freshness | 用 watch/progress 当完成信号、旧 transcript 冒充本轮结果 |
-| 失败时 revive 同一实例；无法恢复就明确 `BLOCKED` | 静默 cold 降级、自动重发 ambiguous 请求或用提前退出管道过滤 |
+| 可恢复故障时先 revive 同一实例；revive 后上下文丢失按生命周期规则起新实例并重发关键上下文；真正无法恢复才明确 `BLOCKED` | 盲目用 cold 降级、自动重发 ambiguous 请求或用提前退出管道过滤 |
+| running/刚 parked（<5min）→ revive；已 parked 很久（>10min 无响应）或 revive 后 cache miss → 起新实例并重发关键上下文；起新实例前检查同 topic 的 running/parked 实例 | 盲目 revive 不检查实例状态/运行时长；同 topic 同时起多个 Oracle |
 
 ## §2 执行验收
 
