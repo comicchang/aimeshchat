@@ -61,8 +61,12 @@ disable-model-invocation: true
 - **终审升级**：需要更强复核时，skill 不指定模型名称；要求用户说明 agent role，再按该 role 调度。
 
 ### 4. 迭代直至收敛
-- 每轮都会发现新问题——迭代到一轮无新修复项
-- 收敛判据：新一轮 review 无 evidence-backed 修复项 + orchestrator gates 全绿（含最终 full gate）+ 无未标注设计缺陷/失真
+- 不要预判"没有新问题了"——每轮都可能发现上一轮遗漏的问题，直到三条件同时成立才停止
+- **收敛判据（三条件必须同时满足）**：
+  1. 新一轮 review 无 evidence-backed 修复项
+  2. orchestrator gates 全绿（含最终 full gate）
+  3. 无未标注（BLOCKED/ADAPTATION/APPROXIMATION）的设计缺陷或失真
+- 任一条件不满足 → 继续迭代；满足后才进入交付
 
 ## 高频问题模式
 |模式|例子|对策|
