@@ -74,4 +74,116 @@ Oracle 只提供建议，不实施改动；高风险建议须人工复核，并�
 
 本 skill 面向“用户明确要求 Oracle”或“本地分析无法消歧且存在真实 trade-off”的场景，默认允许模型自动触发，因此 front matter 不应设置 `disable-model-invocation: true`；若部署需要仅用户手动触发，才设置为 `true`，并明确这会关闭上述自动触发路径。该字段只控制 skill 是否可被模型自动调用，不是 Oracle agent 的安全闸门。
 
-无论字段取值，直接 `task(agent=oracle-*)` 都可能绕过本 skill。确定性执行必须在始终加载的 `system-prompt.md` 或全局 `AGENTS.md` 写入调用门、上下文交接、实例复用、等待和取消约束，并由 oracle/task wrapper 或 hook 做 preflight gate：缺 role、7 项上下文、实例复用检查、等待约束或取消约束任一失败，即拒绝创建或取消。项目 `AGENTS.md` 只能补充指针，不能替代全局 gate；若保留 `true`，关键硬规则不能只写“请读取 skill”。
+无论字段取值，直接 `task(agent=oracle-*)` 都可能绕过本 skill。确定性执行必须在始终加载的 `system-prompt.md` 或全局 `AGENTS.md` 写入调用门、上下文交接、实例复用、等待和取消约束，并由 oracle/task wrapper 或 hook 做 preflight gate：缺 role、7 项上下文、实例复用检查、等待约束或取消约束任一失败，即拒绝创建或取消。项目 `AGENTS.md` 只能补充指针，不能替代全局 gate；若保留 `true`，关键硬规则不能只写"请读取 skill"。
+
+## 7. 多 Oracle 交叉验证工作流
+
+适用场景：用户要求"全量审查""第二意见""交叉验证""反方审查"，或本地分析后仍有 ≥2 个真实架构 trade-off。
+
+### 7.1 触发门
+
+| DO | DON'T |
+|---|---|
+| 用户明确要求多 Oracle/第二意见/交叉验证/反方审查 | 5 分钟内可用本地事实/单一工具确定的问题 |
+| 安全、兼容、迁移、数据损失等高影响不可逆决定 | 格式/措辞/机械重构 |
+| 已有 Oracle 结论 confidence ≤ medium 或证据互相矛盾 | 把多 Oracle 当多数表决或替代代码/实验验证 |
+| 每个判断必须带 `path/to/file:line[-line]`；不能定位就标 `UNLOCATED` | 编造行号，或将 UNLOCATED 结论升级为共识 |
+
+### 7.2 并行调度（≤3 并发）
+
+- **冻结上下文包**：`case_id + evidence_snapshot(commit/时间) + 唯一问题 + 约束 + 已验证/未确认事实`。所有 Oracle 收到同一基础包，仅追加不同 lens。
+- **角色分工**（按需选 2-3 个）：
+  - A：架构主审（接口/边界/trade-off）
+  - B：反方审查（反例/故障/安全/边界条件）
+  - C：运维兼容（迁移/部署/验证/回滚）
+- **波次规则**：活跃 cohort ≤3；需 >3 时分波，独立波次只拿冻结基础包不拿前波结论，前波全部 terminal 后再开下一波。
+- **实例复用**：同 role/topic 已有实例则复用；多 Oracle 仅为不同 lens 开新实例，不复制同一 prompt。
+- 角色使用 `config.yml: task.agentModelOverrides` 已配置的 `oracle-*`，不在 skill 内猜模型/厂商。
+
+### 7.3 首个完成后的同步
+
+- 任一独立波首个结果完成 → **立即**转发给该波所有仍为 running/idle 的成员。
+- **不唤醒已完成/parked/canceled 实例**；如果该波无活跃成员，记录 `no-peer-relay`。
+- 转发头标注 `UNVERIFIED ANCHOR`，要求收件人**主动 challenge**，禁止默认采纳。
+
+同步模板：
+```text
+[ORACLE-CROSS-VALIDATION RELAY]
+case_id: <id>  snapshot: <commit/time>
+anchor: <role>/<agent-id>  request_id: <id>  status: UNVERIFIED ANCHOR
+question: <one decision question>
+P0: <path:line> — <claim> — <recommendation>
+P1: <path:line> — <claim> — <recommendation>
+P2: <path:line> — <claim> — <recommendation>
+Instruction: independently re-check; do not defer to anchor.
+Add a ## Cross-validation section with agree/partial/disagree + evidence path:line.
+```
+
+### 7.4 优先级定义
+
+| 级别 | 含义 | 处理 |
+|---|---|---|
+| **P0** blocker | 安全/合法性/数据损失/前提被证伪 | 未解决不得标 Done |
+| **P1** material | 改变架构选择/兼容性/性能/迁移路径 | 必须明确回应 |
+| **P2** non-blocking | 可维护性/表达/补充测试/后续优化 | 可延后 |
+
+条目格式：`- [P1][AGREE|PARTIAL|DISAGREE|NEEDS-EVIDENCE] path/to/file:42-58 — claim: …；建议: …；证据: …`
+
+### 7.5 接收方行为
+
+收到 relay 的活跃 Oracle 必须在报告末尾追加：
+
+```markdown
+## Cross-validation
+- Compared anchor: <role>/<agent-id>/<request_id>
+- Position: AGREE | PARTIAL | DISAGREE | NEEDS-EVIDENCE
+- Findings: <each with path:line + P-level + recommendation>
+- Changed assumptions: <none or exact change>
+```
+
+不得静默改写原报告、只复述 anchor、或给已完成 agent 发同步消息。发现 anchor 错误要指出反例与证据。
+
+### 7.6 最终汇总
+
+1. 收齐 raw reports，保留来源元数据与原文
+2. 每个 claim 按 stable key、P-level、path:line、建议、confidence 归一
+3. 生成矩阵 `claim | evidence | A | B | C | disposition`
+4. 证据优先级：直接代码/工具输出 > 可复现实验 > 项目文档 > 推断；**禁止用票数压过更强证据**
+5. ≥2 个独立报告一致且无未解 P0 ⇒ CONSENSUS；证据条件不同 ⇒ CONDITIONAL；P0/P1 分歧 ⇒ CONTESTED/BLOCKED
+6. 未解 P0/P1 向已有实例追加定向追问（不新起同 topic；≤3-5 转）；仍无法消歧才报告缺失证据/请求用户
+
+### 7.7 编号工作流
+
+1. **Gate**：确定触发、唯一问题、权限/安全边界
+2. **Context pack**：完成 7 项交接，冻结 snapshot
+3. **Plan**：选择 ≤3 个不同 lens，登记 active set；同 role 实例复用
+4. **Dispatch**：并行起一波；每个收到同一基础包
+5. **Relay**：首个完成 → 仅发给仍活跃成员，标 UNVERIFIED ANCHOR；不唤醒终态
+6. **Collect**：事件驱动 `hub wait` 到本波 terminal；保存 raw，不取消
+7. **Cross-validate**：每个剩余报告追加 `## Cross-validation`，逐条给 P-level + path:line + 建议
+8. **Normalize**：建 claim matrix，按证据等级核对共识/分歧；需要 >3 视角则新波（不带前波结论）
+9. **Adjudicate**：只对未解 P0/P1 向已有 Oracle 定向追问；不把追问伪装成独立初见
+10. **Deliver**：按输出契约交付；未解 P0/P1 标 BLOCKED/CONTESTED
+
+### 7.8 输出契约
+
+```markdown
+# Oracle Cross-Validation Report
+- case_id / snapshot / decision question
+- state: CONSENSUS | CONDITIONAL | CONTESTED | BLOCKED
+- sources: [{agent_id, role, request_id, status}]
+- bottom line: <one decision + conditions>
+## Evidence matrix
+| Claim | Priority | path:line | Oracle positions | Evidence grade | Disposition |
+## P0 blockers
+## P1 material findings
+## P2 follow-ups
+## Cross-validation
+| Anchor | Recipient | Position | Changed recommendation | path:line |
+## Action plan
+1. <action + completion evidence>
+## Confidence / unresolved assumptions
+## Why (≤4) / Watch out for (≤3)
+```
+
+保留 dissent、unknown、失败/缺失报告；不得把未验证 inference 写成事实；每个最终建议可回溯到 source + path:line。
