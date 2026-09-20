@@ -31,7 +31,7 @@ description: >
 
 | DO | DON'T |
 |---|---|
-| 显式指定 role（`oracle-gpt`、`oracle-opus`、`oracle-gemini`、`oracle-deepseek` 或 `oracle-glm`） | 未指定就默认某个 role |
+| 显式指定 `oracle-*` role（如 `oracle-gpt`、`oracle-gpt6`、`oracle-opus`；完整列表见 `config.yml: task.agentModelOverrides`） | 未指定就默认某个 role |
 | 未指定时先询问用户 | 自行猜模型或厂商 |
 | 让部署配置决定 role 到 backend 的映射 | 在 skill 中猜测模型或厂商映射 |
 
