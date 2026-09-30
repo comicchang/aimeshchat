@@ -1,99 +1,7 @@
 {
-  "version": 1,
+  "version": 3,
   "packs": {
-    "lsp": {
-      "files": {
-        ".claude/settings.json": {
-          "json": {
-            "mcpServers": {
-              "serena": {
-                "command": "~/.claude/bin/serena",
-                "args": [
-                  "start-mcp-server",
-                  "--project-from-cwd",
-                  "--open-web-dashboard",
-                  "false",
-                  "--tool-timeout",
-                  "600"
-                ]
-              }
-            }
-          }
-        },
-        "opencode.json": {
-          "json": {
-            "mcp": {
-              "serena": {
-                "type": "local",
-                "command": [
-                  "~/.claude/bin/serena",
-                  "start-mcp-server",
-                  "--project-from-cwd",
-                  "--open-web-dashboard",
-                  "false",
-                  "--tool-timeout",
-                  "600"
-                ],
-                "enabled": true
-              }
-            }
-          }
-        }
-      }
-    },
-    "debug": {
-      "files": {
-        ".claude/settings.json": {
-          "json": {
-            "mcpServers": {
-              "frida-mcp": {
-                "command": "~/.claude/bin/frida-mcp",
-                "args": []
-              },
-              "lldb-mcp": {
-                "command": "~/.claude/bin/lldb-mcp",
-                "args": []
-              }
-            }
-          }
-        },
-        ".codex/config.toml": {
-          "toml": {
-            "mcp_servers.frida-mcp": {
-              "type": "stdio",
-              "command": "~/.claude/bin/frida-mcp",
-              "args": []
-            },
-            "mcp_servers.lldb-mcp": {
-              "type": "stdio",
-              "command": "~/.claude/bin/lldb-mcp",
-              "args": []
-            }
-          }
-        },
-        "opencode.json": {
-          "json": {
-            "mcp": {
-              "frida-mcp": {
-                "type": "local",
-                "command": [
-                  "~/.claude/bin/frida-mcp"
-                ],
-                "enabled": true
-              },
-              "lldb-mcp": {
-                "type": "local",
-                "command": [
-                  "~/.claude/bin/lldb-mcp"
-                ],
-                "enabled": true
-              }
-            }
-          }
-        }
-      }
-    },
-    "doc": {
+    "diagram": {
       "files": {
         ".claude/settings.json": {
           "json": {
@@ -119,11 +27,64 @@
           }
         }
       }
+    },
+    "context": {
+      "files": {
+        ".claude/settings.json": {
+          "json": {
+            "mcpServers": {
+              "context-mode": {
+                "command": "context-mode",
+                "args": []
+              }
+            }
+          }
+        },
+        ".codex/config.toml": {
+          "toml": {
+            "mcp_servers.\"context-mode\"": {
+              "type": "stdio",
+              "command": "context-mode",
+              "args": []
+            }
+          }
+        },
+        ".omp/mcp.json": {
+          "json": {
+            "mcpServers": {
+              "context-mode": {
+                "command": "context-mode",
+                "args": []
+              }
+            }
+          }
+        },
+        "opencode.json": {
+          "json": {
+            "mcp": {
+              "context-mode": {
+                "type": "local",
+                "command": [
+                  "context-mode"
+                ],
+                "enabled": true
+              }
+            }
+          }
+        }
+      },
+      "requested_mcp": [
+        "context-mode"
+      ],
+      "effective_mcp": [
+        "context-mode"
+      ]
     }
   },
   "created_files": {
     ".claude/settings.json": true,
     "opencode.json": true,
-    ".codex/config.toml": true
+    ".codex/config.toml": true,
+    ".omp/mcp.json": true
   }
 }

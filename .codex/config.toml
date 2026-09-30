@@ -1,8 +1,4 @@
-[mcp_servers.frida-mcp]
+[mcp_servers."context-mode"]
 type = "stdio"
-command = "~/.claude/bin/frida-mcp"
-args = []
-[mcp_servers.lldb-mcp]
-type = "stdio"
-command = "~/.claude/bin/lldb-mcp"
+command = "context-mode"
 args = []
