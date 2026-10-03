@@ -58,6 +58,17 @@ description: >
 | 方向相关的多个问题 append 给同一 Oracle 实例（`hub send` 追加） | 为方向相关问题新起 Oracle agent，丢失上下文连续性 |
 | transport/SSL 中断或卡住时 revive 同一实例并保留 key、role、上下文；revive 失败就报告 `BLOCKED` | 用 cold/new task 替代，或伪造结论、静默降级；取消/release/purge/结束咨询前不取得用户授权 |
 
+> **窄例外（故障切换预授权）**：当且仅当本 run 已获用户**明确、事前**授权
+> `ROLE_LADDER=[<有序 role>]`（绑定配置映射版本与允许的数据边界），**且**同时满足：
+> ① harness/provider 报告**终局失败**（非一次 429、非长等待、非 agent 自设 timeout）；
+> ② 内建恢复（revive 原实例）已结束；③ 旧 request **不再在途**；④ 传输结果**不是** `ambiguous`
+> ——允许为**同一 case** 创建带**新 `generation`** 的替代实例，这是对「不得以 cold/new 替代」的
+> **唯一例外**。`ambiguous` 与非终局故障仍复用原实例，**不因等待时间降级**。
+> 切换须记录 from/to、故障回执、`AUTH_REF`、case/request/generation；复制**同一冻结交接包**，
+> `generation` 递增，**不降低验收或权限**。每 run **只向后**、不自动升回、**不作成本偏好切换**。
+> 本授权**不包含** cancel/release/purge 授权。缺少上述任一条件 ⇒ 维持原纪律并报告 `BLOCKED`。
+> 调用方：`skill://supervisor-architect` 的 `escalation-protocol` `DG_L3`。
+
 > **硬规则**：违反本节任一 DON'T 即停止自行推进，按对应 DO 回退；Oracle 负责的工作不得由本 agent 代做。收到最终结果后记录 key、request_id、role 与结果来源。
 
 ## 4. Prompt 与交付边界
